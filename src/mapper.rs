@@ -1,6 +1,6 @@
 // Map changed lines to AST nodes
 
-use crate::{ts_row_to_line, LineRange};
+use crate::{LineRange, ts_row_to_line};
 
 /// Node kinds that are relevant for mutation testing.
 const MUTABLE_NODE_KINDS: &[&str] = &[

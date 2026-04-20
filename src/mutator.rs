@@ -2,7 +2,7 @@
 
 use crate::mapper::find_mutable_nodes;
 use crate::operators::{self};
-use crate::{ts_row_to_line, ChangedFile, Mutation};
+use crate::{ChangedFile, Mutation, ts_row_to_line};
 use anyhow::Result;
 use std::path::Path;
 
