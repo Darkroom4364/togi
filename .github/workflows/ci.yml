@@ -38,3 +38,17 @@ jobs:
         run: cargo clippy -- -D warnings
       - name: Format
         run: cargo fmt -- --check
+
+  dogfood:
+    name: Dogfood (togi on togi)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build togi
+        run: cargo build --release
+      - name: Run togi on last commit
+        run: ./target/release/togi check --base HEAD~1 --test-cmd "cargo test" --format terminal || true
