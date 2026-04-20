@@ -1,6 +1,6 @@
 # togi
 
-Fast, diff-targeted, language-agnostic mutation testing engine.
+Fast, diff-targeted, multi-language mutation testing engine.
 
 ## Architecture
 
