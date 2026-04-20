@@ -20,7 +20,15 @@ async fn main() {
             test_cmd,
         } => {
             if let Err(e) = run_check(
-                base, config, format, jobs, timeout, dry_run, verbose, show_output, test_cmd,
+                base,
+                config,
+                format,
+                jobs,
+                timeout,
+                dry_run,
+                verbose,
+                show_output,
+                test_cmd,
             )
             .await
             {

@@ -56,8 +56,14 @@ impl TestRunner {
                 let mut results = Vec::new();
                 for mutation in file_mutations {
                     let _permit = sem.acquire().await.unwrap();
-                    let outcome =
-                        run_single_mutation(&command, timeout, &project_root, &mutation, show_output).await;
+                    let outcome = run_single_mutation(
+                        &command,
+                        timeout,
+                        &project_root,
+                        &mutation,
+                        show_output,
+                    )
+                    .await;
                     let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
                     if verbose {
                         let symbol = match outcome.result {
@@ -153,7 +159,12 @@ async fn run_single_mutation(
     // Read original content
     let original = match std::fs::read(&file_path) {
         Ok(content) => content,
-        Err(_) => return MutationOutcome { result: MutationResult::BuildError, test_output: None },
+        Err(_) => {
+            return MutationOutcome {
+                result: MutationResult::BuildError,
+                test_output: None,
+            };
+        }
     };
 
     // Set up file guard for guaranteed restoration
@@ -166,21 +177,35 @@ async fn run_single_mutation(
     let mut mutated = original.clone();
     let range = mutation.byte_range.clone();
     if range.end > mutated.len() {
-        return MutationOutcome { result: MutationResult::BuildError, test_output: None };
+        return MutationOutcome {
+            result: MutationResult::BuildError,
+            test_output: None,
+        };
     }
     mutated.splice(range, mutation.replacement.as_bytes().iter().copied());
 
     if std::fs::write(&file_path, &mutated).is_err() {
-        return MutationOutcome { result: MutationResult::BuildError, test_output: None };
+        return MutationOutcome {
+            result: MutationResult::BuildError,
+            test_output: None,
+        };
     }
 
     // Run test command; guard will restore the file on drop
     run_command(command, project_root, timeout, capture_output).await
 }
 
-async fn run_command(command: &[String], cwd: &PathBuf, timeout_dur: Duration, capture_output: bool) -> MutationOutcome {
+async fn run_command(
+    command: &[String],
+    cwd: &PathBuf,
+    timeout_dur: Duration,
+    capture_output: bool,
+) -> MutationOutcome {
     if command.is_empty() {
-        return MutationOutcome { result: MutationResult::BuildError, test_output: None };
+        return MutationOutcome {
+            result: MutationResult::BuildError,
+            test_output: None,
+        };
     }
 
     let mut cmd = tokio::process::Command::new(&command[0]);
@@ -196,7 +221,12 @@ async fn run_command(command: &[String], cwd: &PathBuf, timeout_dur: Duration, c
 
     let child = match cmd.spawn() {
         Ok(c) => c,
-        Err(_) => return MutationOutcome { result: MutationResult::BuildError, test_output: None },
+        Err(_) => {
+            return MutationOutcome {
+                result: MutationResult::BuildError,
+                test_output: None,
+            };
+        }
     };
 
     match tokio::time::timeout(timeout_dur, child.wait_with_output()).await {
@@ -219,10 +249,19 @@ async fn run_command(command: &[String], cwd: &PathBuf, timeout_dur: Duration, c
             } else {
                 None
             };
-            MutationOutcome { result, test_output }
+            MutationOutcome {
+                result,
+                test_output,
+            }
         }
-        Ok(Err(_)) => MutationOutcome { result: MutationResult::BuildError, test_output: None },
-        Err(_) => MutationOutcome { result: MutationResult::Timeout, test_output: None },
+        Ok(Err(_)) => MutationOutcome {
+            result: MutationResult::BuildError,
+            test_output: None,
+        },
+        Err(_) => MutationOutcome {
+            result: MutationResult::Timeout,
+            test_output: None,
+        },
     }
 }
 
