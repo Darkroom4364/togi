@@ -80,15 +80,18 @@ impl MutationOperator for ReturnEmpty {
         let first_kind = first.kind();
         let replacement = match first_kind {
             // String literals
-            "interpreted_string_literal" | "raw_string_literal" | "string"
-            | "string_literal" | "template_string" => "\"\"".to_string(),
+            "interpreted_string_literal"
+            | "raw_string_literal"
+            | "string"
+            | "string_literal"
+            | "template_string" => "\"\"".to_string(),
             // Boolean literals
             "true" | "false" | "boolean" => "false".to_string(),
             // Null/nil/None
             "null" | "nil" | "none" | "None" => text.to_string(), // already a zero-value, skip
             // Numeric literals
-            "integer_literal" | "int_literal" | "float_literal" | "number"
-            | "integer" | "float" => "0".to_string(),
+            "integer_literal" | "int_literal" | "float_literal" | "number" | "integer"
+            | "float" => "0".to_string(),
             // Fallback: use text-based heuristic
             _ => {
                 if text == "nil" || text == "null" || text == "None" {
