@@ -24,11 +24,7 @@ struct FileGuard {
 impl Drop for FileGuard {
     fn drop(&mut self) {
         if let Err(e) = std::fs::write(&self.path, &self.original) {
-            eprintln!(
-                "error: failed to restore {}: {}",
-                self.path.display(),
-                e
-            );
+            eprintln!("error: failed to restore {}: {}", self.path.display(), e);
         }
     }
 }

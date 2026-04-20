@@ -1,5 +1,5 @@
-use anyhow::Result;
 use crate::{MutationReport, MutationResult};
+use anyhow::Result;
 use serde::Serialize;
 
 #[derive(Serialize)]
