@@ -1,4 +1,5 @@
 use crate::{MutationReport, MutationResult};
+use anyhow::Result;
 use serde::Serialize;
 
 #[derive(Serialize)]
@@ -21,42 +22,14 @@ struct JsonMutation {
     result: String,
 }
 
-pub fn print_report(report: &MutationReport) {
-    let mutations: Vec<JsonMutation> = report
-        .results
-        .iter()
-        .map(|(m, r)| JsonMutation {
-            file: m.file.display().to_string(),
-            line: m.line,
-            operator: m.operator.clone(),
-            description: m.description.clone(),
-            result: match r {
-                MutationResult::Killed => "killed".to_string(),
-                MutationResult::Survived => "survived".to_string(),
-                MutationResult::Timeout => "timeout".to_string(),
-                MutationResult::BuildError => "build_error".to_string(),
-            },
-        })
-        .collect();
-
-    let json_report = JsonReport {
-        total: report.total,
-        killed: report.killed,
-        survived: report.survived,
-        timeout: report.timeout,
-        build_errors: report.build_errors,
-        duration_ms: report.duration.as_millis(),
-        mutations,
-    };
-
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&json_report).expect("failed to serialize report")
-    );
+pub fn print_report(report: &MutationReport) -> Result<()> {
+    let json = to_json_string(report)?;
+    println!("{}", json);
+    Ok(())
 }
 
 /// Serialize report to a JSON string (for testing and programmatic use).
-pub fn to_json_string(report: &MutationReport) -> String {
+pub fn to_json_string(report: &MutationReport) -> Result<String> {
     let mutations: Vec<JsonMutation> = report
         .results
         .iter()
@@ -84,7 +57,7 @@ pub fn to_json_string(report: &MutationReport) -> String {
         mutations,
     };
 
-    serde_json::to_string_pretty(&json_report).expect("failed to serialize report")
+    Ok(serde_json::to_string_pretty(&json_report)?)
 }
 
 #[cfg(test)]
@@ -138,7 +111,7 @@ mod tests {
     #[test]
     fn json_output_is_valid_json() {
         let report = sample_report();
-        let json_str = to_json_string(&report);
+        let json_str = to_json_string(&report).unwrap();
         let value: serde_json::Value =
             serde_json::from_str(&json_str).expect("output should be valid JSON");
         assert!(value.is_object());
@@ -147,7 +120,7 @@ mod tests {
     #[test]
     fn json_output_has_correct_structure() {
         let report = sample_report();
-        let json_str = to_json_string(&report);
+        let json_str = to_json_string(&report).unwrap();
         let value: serde_json::Value = serde_json::from_str(&json_str).unwrap();
 
         assert_eq!(value["total"], 2);

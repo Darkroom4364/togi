@@ -88,6 +88,7 @@ async fn end_to_end_go_fixture_some_mutations_survive() {
         parallelism: 1,
         project_root: root,
         verbose: false,
+        show_output: false,
     };
 
     let report = runner.run(mutations).await;
