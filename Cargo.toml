@@ -2,5 +2,36 @@
 name = "togi"
 version = "0.1.0"
 edition = "2024"
+description = "Fast, diff-targeted, language-agnostic mutation testing"
+license = "Apache-2.0"
+repository = "https://github.com/Darkroom4364/togi"
 
 [dependencies]
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Parsing
+tree-sitter = "0.26"
+tree-sitter-go = "0.25"
+tree-sitter-rust = "0.24"
+
+# Diff parsing
+diffy = "0.4"
+
+# Config
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+
+# Output
+colored = "3"
+serde_json = "1"
+
+# Filesystem
+tempfile = "3"
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
