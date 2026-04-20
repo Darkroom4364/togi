@@ -1,5 +1,10 @@
+pub mod c;
+pub mod cpp;
+pub mod csharp;
 pub mod go;
+pub mod java;
 pub mod python;
+pub mod ruby;
 pub mod rust_lang;
 pub mod typescript;
 
@@ -19,8 +24,13 @@ pub trait LanguageSupport: Send + Sync {
 /// Returns instances of all supported languages.
 pub fn all() -> Vec<Box<dyn LanguageSupport>> {
     vec![
+        Box::new(c::C),
+        Box::new(cpp::Cpp),
+        Box::new(csharp::CSharp),
         Box::new(go::Go),
+        Box::new(java::Java),
         Box::new(python::Python),
+        Box::new(ruby::Ruby),
         Box::new(rust_lang::Rust),
         Box::new(typescript::TypeScript),
     ]

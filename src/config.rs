@@ -38,6 +38,18 @@ fn default_test_command() -> Vec<String> {
 }
 
 /// Auto-detect the test command based on project files in the given root.
+fn has_file_with_ext(dir: &Path, ext: &str) -> bool {
+    dir.read_dir()
+        .map(|entries| {
+            entries.filter_map(Result::ok).any(|e| {
+                e.path()
+                    .extension()
+                    .is_some_and(|e| e.eq_ignore_ascii_case(ext))
+            })
+        })
+        .unwrap_or(false)
+}
+
 pub fn detect_test_command(project_root: &Path) -> Vec<String> {
     let mut detected: Vec<(&str, Vec<String>)> = Vec::new();
 
@@ -55,6 +67,25 @@ pub fn detect_test_command(project_root: &Path) -> Vec<String> {
     }
     if project_root.join("package.json").exists() {
         detected.push(("package.json", vec!["npm".into(), "test".into()]));
+    }
+    if project_root.join("pom.xml").exists() {
+        detected.push(("pom.xml", vec!["mvn".into(), "test".into()]));
+    }
+    if project_root.join("build.gradle").exists() || project_root.join("build.gradle.kts").exists()
+    {
+        detected.push(("build.gradle", vec!["./gradlew".into(), "test".into()]));
+    }
+    if project_root.join("Gemfile").exists() {
+        detected.push((
+            "Gemfile",
+            vec!["bundle".into(), "exec".into(), "rspec".into()],
+        ));
+    }
+    if project_root.join("CMakeLists.txt").exists() {
+        detected.push(("CMakeLists.txt", vec!["ctest".into()]));
+    }
+    if has_file_with_ext(project_root, "sln") || has_file_with_ext(project_root, "csproj") {
+        detected.push((".sln/.csproj", vec!["dotnet".into(), "test".into()]));
     }
 
     if detected.len() > 1 {
