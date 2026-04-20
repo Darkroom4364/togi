@@ -23,7 +23,13 @@ struct FileGuard {
 
 impl Drop for FileGuard {
     fn drop(&mut self) {
-        let _ = std::fs::write(&self.path, &self.original);
+        if let Err(e) = std::fs::write(&self.path, &self.original) {
+            eprintln!(
+                "error: failed to restore {}: {}",
+                self.path.display(),
+                e
+            );
+        }
     }
 }
 
@@ -53,6 +59,7 @@ impl TestRunner {
             let handle = tokio::spawn(async move {
                 let mut results = Vec::new();
                 for mutation in file_mutations {
+                    // Semaphore is never closed, so acquire cannot fail
                     let _permit = sem.acquire().await.unwrap();
                     let result =
                         run_single_mutation(&command, timeout, &project_root, &mutation).await;

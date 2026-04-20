@@ -153,7 +153,7 @@ async fn run_check(
     let report = runner.run(mutations).await;
 
     // 8. Print report
-    togi::report::print_report(&report, &format);
+    togi::report::print_report(&report, &format)?;
 
     // 9. Exit code
     if report.survived > 0 {
