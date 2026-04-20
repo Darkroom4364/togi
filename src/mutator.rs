@@ -2,7 +2,7 @@
 
 use crate::mapper::find_mutable_nodes;
 use crate::operators::{self};
-use crate::{ChangedFile, Mutation};
+use crate::{ts_row_to_line, ChangedFile, Mutation};
 use anyhow::Result;
 use std::path::Path;
 
@@ -40,8 +40,8 @@ pub fn generate_mutations(
                         return Ok(mutations);
                     }
 
-                    let line = node.start_position().row + 1;
-                    let column = node.start_position().column + 1;
+                    let line = ts_row_to_line(node.start_position().row);
+                    let column = node.start_position().column + 1; // 1-indexed for display
                     let original =
                         String::from_utf8_lossy(&source[candidate.byte_range.clone()]).to_string();
 

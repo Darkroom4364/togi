@@ -1,6 +1,6 @@
 // Map changed lines to AST nodes
 
-use crate::LineRange;
+use crate::{ts_row_to_line, LineRange};
 
 /// Node kinds that are relevant for mutation testing.
 const MUTABLE_NODE_KINDS: &[&str] = &[
@@ -39,9 +39,8 @@ fn collect_mutable_nodes<'a>(
 ) {
     let _ = source; // available for future use
 
-    // Convert 0-indexed rows to 1-indexed lines
-    let node_start = node.start_position().row + 1;
-    let node_end = node.end_position().row + 1;
+    let node_start = ts_row_to_line(node.start_position().row);
+    let node_end = ts_row_to_line(node.end_position().row);
 
     // Check if this node overlaps any changed line range
     if !overlaps(node_start, node_end, changed_lines) {
