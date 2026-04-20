@@ -13,3 +13,11 @@ pub trait LanguageSupport: Send + Sync {
     fn return_statement_node(&self) -> &str;
     fn operator_field(&self) -> &str;
 }
+
+/// Returns instances of all supported languages.
+pub fn all() -> Vec<Box<dyn LanguageSupport>> {
+    vec![
+        Box::new(go::Go),
+        Box::new(rust_lang::Rust),
+    ]
+}
