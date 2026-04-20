@@ -121,7 +121,8 @@ impl Config {
         match config_path {
             Some(p) => {
                 let content = std::fs::read_to_string(&p)?;
-                let config: Config = toml::from_str(&content)?;
+                let config: Config = toml::from_str(&content)
+                    .map_err(|e| anyhow::anyhow!("Invalid togi.toml at {}: {e}", p.display()))?;
                 Ok(config)
             }
             None => Ok(Config::default()),
