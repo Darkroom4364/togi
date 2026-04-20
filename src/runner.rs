@@ -261,6 +261,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn empty_replacement_splices_correctly() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("test.txt");
+        std::fs::write(&file, b"hello world").unwrap();
+
+        // Replace "hello" with "" (empty), making the file shorter
+        let mutation = Mutation {
+            id: 1,
+            file: file.clone(),
+            line: 1,
+            column: 1,
+            operator: "removal".into(),
+            description: "remove text".into(),
+            original: "hello".into(),
+            replacement: "".into(),
+            byte_range: 0..5,
+        };
+
+        let result = run_single_mutation(
+            &["true".to_string()],
+            Duration::from_secs(5),
+            &dir.path().to_path_buf(),
+            &mutation,
+        )
+        .await;
+
+        assert_eq!(result, MutationResult::Survived);
+        // File should be restored to original
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "hello world");
+    }
+
+    #[tokio::test]
+    async fn command_not_found_returns_build_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("test.txt");
+        std::fs::write(&file, b"hello world").unwrap();
+
+        let mutation = make_test_mutation(&file);
+
+        let result = run_single_mutation(
+            &["nonexistent_binary_xyz_12345".to_string()],
+            Duration::from_secs(5),
+            &dir.path().to_path_buf(),
+            &mutation,
+        )
+        .await;
+
+        assert_eq!(result, MutationResult::BuildError);
+        // File should be restored
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "hello world");
+    }
+
+    #[tokio::test]
     async fn command_timeout_returns_timeout() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("test.txt");
