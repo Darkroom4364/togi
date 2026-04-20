@@ -1,20 +1,7 @@
 // Unified diff parsing → Vec<ChangedFile>
 
+use crate::{ChangedFile, LineRange};
 use std::path::PathBuf;
-
-/// A file that was changed in a diff, with the specific line ranges modified.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ChangedFile {
-    pub path: PathBuf,
-    pub hunks: Vec<LineRange>,
-}
-
-/// An inclusive line range [start, end].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct LineRange {
-    pub start: usize,
-    pub end: usize,
-}
 
 /// Parse unified diff output (from `git diff`) into a list of changed files
 /// with their modified line ranges. Only tracks added/modified lines.
