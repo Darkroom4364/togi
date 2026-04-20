@@ -14,7 +14,7 @@ categories = ["development-tools::testing", "command-line-utilities"]
 clap = { version = "4", features = ["derive"] }
 
 # Async runtime
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["rt-multi-thread", "process", "time", "sync", "macros"] }
 
 # Parsing
 tree-sitter = "0.26"
