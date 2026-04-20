@@ -72,20 +72,11 @@ async fn run_check(
     }
 
     // 4. Parse diff into ChangedFiles
-    let diff_files = togi::diff::parse_diff(&diff_output);
-    if diff_files.is_empty() {
+    let changed_files = togi::diff::parse_diff(&diff_output);
+    if changed_files.is_empty() {
         println!("No added/modified lines found. Nothing to mutate.");
         return Ok(());
     }
-
-    // Convert diff::ChangedFile → lib ChangedFile
-    let changed_files: Vec<togi::ChangedFile> = diff_files
-        .into_iter()
-        .map(|f| togi::ChangedFile {
-            path: f.path,
-            hunks: f.hunks.into_iter().map(|h| togi::LineRange { start: h.start, end: h.end }).collect(),
-        })
-        .collect();
 
     // 5. Generate mutations
     let mutations = togi::mutator::generate_mutations(

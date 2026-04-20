@@ -21,7 +21,7 @@ pub struct ChangedFile {
 }
 
 /// A range of changed lines (1-indexed, inclusive)
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LineRange {
     pub start: usize,
     pub end: usize,
