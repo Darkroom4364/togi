@@ -3,8 +3,11 @@ name = "togi"
 version = "0.1.0"
 edition = "2024"
 description = "Fast, diff-targeted, language-agnostic mutation testing"
-license = "Apache-2.0"
+license = "MIT OR Apache-2.0"
 repository = "https://github.com/Darkroom4364/togi"
+readme = "README.md"
+keywords = ["mutation-testing", "testing", "diff", "tree-sitter", "code-quality"]
+categories = ["development-tools::testing", "command-line-utilities"]
 
 [dependencies]
 # CLI
