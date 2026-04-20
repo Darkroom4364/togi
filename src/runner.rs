@@ -2,6 +2,7 @@
 
 use crate::{Mutation, MutationReport, MutationResult};
 use std::collections::HashMap;
+use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -73,6 +74,14 @@ impl TestRunner {
                             mutation.line,
                             mutation.operator
                         );
+                    } else {
+                        let is_tty = std::io::stderr().is_terminal();
+                        if is_tty {
+                            eprint!("\r  [{}/{}] testing mutations...", n, total);
+                            let _ = std::io::stderr().flush();
+                        } else if n == total || (total >= 4 && n.is_multiple_of(total / 4)) {
+                            eprintln!("  [{}/{}] testing mutations...", n, total);
+                        }
                     }
                     results.push((mutation, result));
                 }
@@ -86,6 +95,12 @@ impl TestRunner {
             if let Ok(results) = handle.await {
                 all_results.extend(results);
             }
+        }
+
+        // Clear progress line on TTY
+        if !verbose && std::io::stderr().is_terminal() {
+            eprint!("\r                                        \r");
+            let _ = std::io::stderr().flush();
         }
 
         let duration = start.elapsed();
