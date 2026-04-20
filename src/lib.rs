@@ -13,6 +13,16 @@ use std::fmt;
 use std::path::PathBuf;
 use std::time::Duration;
 
+/// Convert a 0-indexed tree-sitter row to a 1-indexed source line number.
+///
+/// Unified diffs and user-facing output use 1-indexed lines; tree-sitter uses
+/// 0-indexed rows. This function is the single conversion point between the two
+/// systems, preventing scattered `+ 1` arithmetic and off-by-one bugs.
+#[inline]
+pub fn ts_row_to_line(row: usize) -> usize {
+    row + 1
+}
+
 /// A file with changed line ranges from a diff
 #[derive(Debug, Clone)]
 pub struct ChangedFile {
@@ -20,7 +30,11 @@ pub struct ChangedFile {
     pub hunks: Vec<LineRange>,
 }
 
-/// A range of changed lines (1-indexed, inclusive)
+/// A range of changed lines (1-indexed, inclusive).
+///
+/// All line numbers in togi are 1-indexed to match unified diff format and
+/// user-facing output. Tree-sitter 0-indexed rows must be converted via
+/// [`ts_row_to_line`] before comparison with these ranges.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LineRange {
     pub start: usize,
