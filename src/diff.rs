@@ -74,6 +74,16 @@ pub fn parse_diff(input: &str) -> Vec<ChangedFile> {
         }
     }
 
+    // Warn if diff is very large
+    let total_changed: usize = files.iter().flat_map(|f| &f.hunks).map(|h| h.end - h.start + 1).sum();
+    if total_changed > 1000 {
+        eprintln!(
+            "warning: diff contains {} changed lines across {} files; mutations will be capped by max_per_run",
+            total_changed,
+            files.len()
+        );
+    }
+
     files
 }
 
@@ -161,6 +171,39 @@ index 1111111..2222222 100644
         let files = parse_diff(diff);
         // No added lines → no hunks → file not included
         assert!(files.is_empty());
+    }
+
+    #[test]
+    fn skips_binary_files() {
+        let diff = r#"diff --git a/image.png b/image.png
+Binary files a/image.png and b/image.png differ
+diff --git a/src/main.rs b/src/main.rs
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -1,3 +1,4 @@
+ fn main() {
++    println!("hi");
+ }
+"#;
+        let files = parse_diff(diff);
+        // Binary file has no `+++ b/...` line, so it is skipped
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, PathBuf::from("src/main.rs"));
+    }
+
+    #[test]
+    fn deleted_file_produces_no_mutations() {
+        let diff = r#"diff --git a/removed.rs b/removed.rs
+--- a/removed.rs
++++ b/removed.rs
+@@ -1,4 +1,0 @@
+-fn old() {
+-    // deleted
+-    println!("gone");
+-}
+"#;
+        let files = parse_diff(diff);
+        assert!(files.is_empty(), "deleted-only file should produce no hunks");
     }
 
     #[test]

@@ -117,6 +117,19 @@ mod tests {
     }
 
     #[test]
+    fn skips_nonexistent_files() {
+        let tmp = TempDir::new().unwrap();
+        // Reference a file that doesn't exist on disk
+        let changed = vec![ChangedFile {
+            path: PathBuf::from("ghost/missing.go"),
+            hunks: vec![LineRange { start: 1, end: 5 }],
+        }];
+
+        let mutations = generate_mutations(&changed, tmp.path(), 100).unwrap();
+        assert!(mutations.is_empty());
+    }
+
+    #[test]
     fn skips_unsupported_file_types() {
         let tmp = TempDir::new().unwrap();
         let rel = write_go_file(tmp.path(), "notes.txt", "hello world");
