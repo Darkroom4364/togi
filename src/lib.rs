@@ -2,6 +2,7 @@ pub mod cli;
 pub mod config;
 pub mod diff;
 pub mod languages;
+pub mod lock;
 pub mod mapper;
 pub mod mutator;
 pub mod operators;
