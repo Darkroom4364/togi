@@ -71,8 +71,7 @@ pub fn detect_test_command(project_root: &Path) -> Vec<String> {
     if project_root.join("pom.xml").exists() {
         detected.push(("pom.xml", vec!["mvn".into(), "test".into()]));
     }
-    if project_root.join("build.gradle").exists()
-        || project_root.join("build.gradle.kts").exists()
+    if project_root.join("build.gradle").exists() || project_root.join("build.gradle.kts").exists()
     {
         detected.push(("build.gradle", vec!["./gradlew".into(), "test".into()]));
     }
