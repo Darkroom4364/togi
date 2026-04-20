@@ -42,10 +42,8 @@ pub fn generate_mutations(
 
                     let line = node.start_position().row + 1;
                     let column = node.start_position().column + 1;
-                    let original = String::from_utf8_lossy(
-                        &source[candidate.byte_range.clone()],
-                    )
-                    .to_string();
+                    let original =
+                        String::from_utf8_lossy(&source[candidate.byte_range.clone()]).to_string();
 
                     mutations.push(Mutation {
                         id: next_id,
@@ -97,8 +95,16 @@ mod tests {
         assert!(!mutations.is_empty());
 
         let operators: Vec<&str> = mutations.iter().map(|m| m.operator.as_str()).collect();
-        assert!(operators.contains(&"lt_to_lte"), "expected lt_to_lte, got: {:?}", operators);
-        assert!(operators.contains(&"true_to_false"), "expected true_to_false, got: {:?}", operators);
+        assert!(
+            operators.contains(&"lt_to_lte"),
+            "expected lt_to_lte, got: {:?}",
+            operators
+        );
+        assert!(
+            operators.contains(&"true_to_false"),
+            "expected true_to_false, got: {:?}",
+            operators
+        );
     }
 
     #[test]

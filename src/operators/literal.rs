@@ -1,5 +1,5 @@
-use crate::MutationCandidate;
 use super::MutationOperator;
+use crate::MutationCandidate;
 
 const TRUE_KINDS: &[&str] = &["true", "True", "TRUE"];
 const FALSE_KINDS: &[&str] = &["false", "False", "FALSE"];
@@ -8,8 +8,12 @@ const INT_LITERAL_KINDS: &[&str] = &["integer_literal", "int_literal", "number",
 pub struct TrueToFalse;
 
 impl MutationOperator for TrueToFalse {
-    fn id(&self) -> &str { "true_to_false" }
-    fn description(&self) -> &str { "Replace true with false" }
+    fn id(&self) -> &str {
+        "true_to_false"
+    }
+    fn description(&self) -> &str {
+        "Replace true with false"
+    }
     fn apply(&self, node: &tree_sitter::Node, source: &[u8]) -> Vec<MutationCandidate> {
         if TRUE_KINDS.contains(&node.kind()) {
             let text = std::str::from_utf8(&source[node.byte_range()]).unwrap_or("");
@@ -29,8 +33,12 @@ impl MutationOperator for TrueToFalse {
 pub struct FalseToTrue;
 
 impl MutationOperator for FalseToTrue {
-    fn id(&self) -> &str { "false_to_true" }
-    fn description(&self) -> &str { "Replace false with true" }
+    fn id(&self) -> &str {
+        "false_to_true"
+    }
+    fn description(&self) -> &str {
+        "Replace false with true"
+    }
     fn apply(&self, node: &tree_sitter::Node, source: &[u8]) -> Vec<MutationCandidate> {
         if FALSE_KINDS.contains(&node.kind()) {
             let text = std::str::from_utf8(&source[node.byte_range()]).unwrap_or("");
@@ -50,8 +58,12 @@ impl MutationOperator for FalseToTrue {
 pub struct ZeroToOne;
 
 impl MutationOperator for ZeroToOne {
-    fn id(&self) -> &str { "zero_to_one" }
-    fn description(&self) -> &str { "Replace 0 with 1" }
+    fn id(&self) -> &str {
+        "zero_to_one"
+    }
+    fn description(&self) -> &str {
+        "Replace 0 with 1"
+    }
     fn apply(&self, node: &tree_sitter::Node, source: &[u8]) -> Vec<MutationCandidate> {
         if INT_LITERAL_KINDS.contains(&node.kind()) {
             let text = std::str::from_utf8(&source[node.byte_range()]).unwrap_or("");
@@ -122,8 +134,7 @@ mod tests {
     fn test_false_to_true() {
         let src = "package main\nfunc f() bool { return false }";
         let tree = parse_go(src);
-        let node =
-            find_node_by_kind(tree.root_node(), "false").expect("should find false node");
+        let node = find_node_by_kind(tree.root_node(), "false").expect("should find false node");
         let candidates = FalseToTrue.apply(&node, src.as_bytes());
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].replacement, "true");
@@ -155,7 +166,12 @@ mod tests {
         let src = "package main\nvar trueValue = 1";
         let tree = parse_go(src);
         let mut candidates = vec![];
-        collect_all_candidates(tree.root_node(), src.as_bytes(), &TrueToFalse, &mut candidates);
+        collect_all_candidates(
+            tree.root_node(),
+            src.as_bytes(),
+            &TrueToFalse,
+            &mut candidates,
+        );
         assert!(candidates.is_empty());
     }
 }

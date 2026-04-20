@@ -1,19 +1,24 @@
-use crate::MutationCandidate;
 use super::MutationOperator;
+use crate::MutationCandidate;
 
 const IF_STMT_KINDS: &[&str] = &["if_statement", "if_expression", "if_expr"];
 
 pub struct RemoveIfBody;
 
 impl MutationOperator for RemoveIfBody {
-    fn id(&self) -> &str { "remove_if_body" }
-    fn description(&self) -> &str { "Replace if body with empty block" }
+    fn id(&self) -> &str {
+        "remove_if_body"
+    }
+    fn description(&self) -> &str {
+        "Replace if body with empty block"
+    }
     fn apply(&self, node: &tree_sitter::Node, _source: &[u8]) -> Vec<MutationCandidate> {
         if !IF_STMT_KINDS.contains(&node.kind()) {
             return vec![];
         }
         // Look for "consequence" or "body" field
-        let body = node.child_by_field_name("consequence")
+        let body = node
+            .child_by_field_name("consequence")
             .or_else(|| node.child_by_field_name("body"));
         if let Some(body_node) = body {
             vec![MutationCandidate {
@@ -31,14 +36,19 @@ impl MutationOperator for RemoveIfBody {
 pub struct RemoveElse;
 
 impl MutationOperator for RemoveElse {
-    fn id(&self) -> &str { "remove_else" }
-    fn description(&self) -> &str { "Remove else clause" }
+    fn id(&self) -> &str {
+        "remove_else"
+    }
+    fn description(&self) -> &str {
+        "Remove else clause"
+    }
     fn apply(&self, node: &tree_sitter::Node, _source: &[u8]) -> Vec<MutationCandidate> {
         if !IF_STMT_KINDS.contains(&node.kind()) {
             return vec![];
         }
         // Look for "alternative" or "else" field
-        let else_clause = node.child_by_field_name("alternative")
+        let else_clause = node
+            .child_by_field_name("alternative")
             .or_else(|| node.child_by_field_name("else"));
         if let Some(else_node) = else_clause {
             // Find the "else" keyword before the clause to remove it too
@@ -79,7 +89,10 @@ mod tests {
         parser.parse(src, None).unwrap()
     }
 
-    fn find_first_kind<'a>(node: tree_sitter::Node<'a>, kind: &str) -> Option<tree_sitter::Node<'a>> {
+    fn find_first_kind<'a>(
+        node: tree_sitter::Node<'a>,
+        kind: &str,
+    ) -> Option<tree_sitter::Node<'a>> {
         if node.kind() == kind {
             return Some(node);
         }

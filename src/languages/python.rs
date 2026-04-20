@@ -80,7 +80,11 @@ mod tests {
             }
         }
         walk(&mut cursor, py.binary_expression_node(), &mut found);
-        assert!(found, "Expected to find '{}' node in Python AST", py.binary_expression_node());
+        assert!(
+            found,
+            "Expected to find '{}' node in Python AST",
+            py.binary_expression_node()
+        );
     }
 
     #[test]
@@ -111,7 +115,11 @@ mod tests {
             }
         }
         walk(&mut cursor, py.if_statement_node(), &mut found);
-        assert!(found, "Expected to find '{}' node in Python AST", py.if_statement_node());
+        assert!(
+            found,
+            "Expected to find '{}' node in Python AST",
+            py.if_statement_node()
+        );
     }
 
     #[test]
@@ -128,10 +136,20 @@ mod tests {
         let mut found_return = false;
         let mut found_binary = false;
         let mut cursor = root.walk();
-        fn walk(cursor: &mut tree_sitter::TreeCursor, ret: &str, bin: &str, fr: &mut bool, fb: &mut bool) {
+        fn walk(
+            cursor: &mut tree_sitter::TreeCursor,
+            ret: &str,
+            bin: &str,
+            fr: &mut bool,
+            fb: &mut bool,
+        ) {
             let kind = cursor.node().kind();
-            if kind == ret { *fr = true; }
-            if kind == bin { *fb = true; }
+            if kind == ret {
+                *fr = true;
+            }
+            if kind == bin {
+                *fb = true;
+            }
             if cursor.goto_first_child() {
                 loop {
                     walk(cursor, ret, bin, fr, fb);
@@ -142,7 +160,13 @@ mod tests {
                 cursor.goto_parent();
             }
         }
-        walk(&mut cursor, py.return_statement_node(), py.binary_expression_node(), &mut found_return, &mut found_binary);
+        walk(
+            &mut cursor,
+            py.return_statement_node(),
+            py.binary_expression_node(),
+            &mut found_return,
+            &mut found_binary,
+        );
         assert!(found_return, "Expected return_statement node");
         assert!(found_binary, "Expected binary_operator node");
     }

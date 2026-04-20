@@ -87,8 +87,12 @@ pub fn format_report_plain(report: &MutationReport) -> String {
 
         match result {
             MutationResult::Killed => {
-                writeln!(out, "  ✓ KILLED    {}:{} — {}: {}", file, line, operator, desc)
-                    .unwrap();
+                writeln!(
+                    out,
+                    "  ✓ KILLED    {}:{} — {}: {}",
+                    file, line, operator, desc
+                )
+                .unwrap();
             }
             MutationResult::Survived => {
                 writeln!(
@@ -100,8 +104,12 @@ pub fn format_report_plain(report: &MutationReport) -> String {
                 writeln!(out, "              Your tests don't catch this mutation.").unwrap();
             }
             MutationResult::Timeout => {
-                writeln!(out, "  ⏱ TIMEOUT   {}:{} — {}: {}", file, line, operator, desc)
-                    .unwrap();
+                writeln!(
+                    out,
+                    "  ⏱ TIMEOUT   {}:{} — {}: {}",
+                    file, line, operator, desc
+                )
+                .unwrap();
             }
             MutationResult::BuildError => {
                 writeln!(

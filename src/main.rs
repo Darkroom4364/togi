@@ -46,6 +46,7 @@ async fn main() {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_check(
     base: String,
     config_path: Option<PathBuf>,
@@ -105,7 +106,9 @@ async fn run_check(
     )?;
 
     if mutations.is_empty() {
-        println!("No mutations generated. This can happen if the changed files are in an unsupported language.\nSupported: Go (.go), Rust (.rs), Python (.py), TypeScript (.ts/.tsx)");
+        println!(
+            "No mutations generated. This can happen if the changed files are in an unsupported language.\nSupported: Go (.go), Rust (.rs), Python (.py), TypeScript (.ts/.tsx)"
+        );
         return Ok(());
     }
 
