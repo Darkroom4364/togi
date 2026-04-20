@@ -17,8 +17,12 @@ const RETURN_KINDS: &[&str] = &["return_statement", "return_expression"];
 pub struct NegateCondition;
 
 impl MutationOperator for NegateCondition {
-    fn id(&self) -> &str { "negate_condition" }
-    fn description(&self) -> &str { "Negate condition expression" }
+    fn id(&self) -> &str {
+        "negate_condition"
+    }
+    fn description(&self) -> &str {
+        "Negate condition expression"
+    }
     fn apply(&self, node: &tree_sitter::Node, source: &[u8]) -> Vec<crate::MutationCandidate> {
         if !IF_STMT_KINDS.contains(&node.kind()) {
             return vec![];
@@ -27,7 +31,10 @@ impl MutationOperator for NegateCondition {
         if let Some(cond_node) = cond {
             let text = std::str::from_utf8(&source[cond_node.byte_range()]).unwrap_or("");
             let replacement = if text.starts_with('!') {
-                text[1..].trim_start_matches('(').trim_end_matches(')').to_string()
+                text[1..]
+                    .trim_start_matches('(')
+                    .trim_end_matches(')')
+                    .to_string()
             } else {
                 format!("!({})", text)
             };
@@ -47,8 +54,12 @@ impl MutationOperator for NegateCondition {
 pub struct ReturnEmpty;
 
 impl MutationOperator for ReturnEmpty {
-    fn id(&self) -> &str { "return_empty" }
-    fn description(&self) -> &str { "Replace return value with default" }
+    fn id(&self) -> &str {
+        "return_empty"
+    }
+    fn description(&self) -> &str {
+        "Replace return value with default"
+    }
     fn apply(&self, node: &tree_sitter::Node, source: &[u8]) -> Vec<crate::MutationCandidate> {
         if !RETURN_KINDS.contains(&node.kind()) {
             return vec![];
@@ -100,4 +111,101 @@ pub fn all_operators() -> Vec<Box<dyn MutationOperator>> {
         Box::new(NegateCondition),
         Box::new(ReturnEmpty),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn find_node_by_kind<'a>(
+        node: tree_sitter::Node<'a>,
+        kind: &str,
+    ) -> Option<tree_sitter::Node<'a>> {
+        if node.kind() == kind {
+            return Some(node);
+        }
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            if let Some(found) = find_node_by_kind(child, kind) {
+                return Some(found);
+            }
+        }
+        None
+    }
+
+    fn parse_go(source: &str) -> tree_sitter::Tree {
+        let mut parser = tree_sitter::Parser::new();
+        let lang = tree_sitter_go::LANGUAGE;
+        parser.set_language(&lang.into()).unwrap();
+        parser.parse(source, None).unwrap()
+    }
+
+    #[test]
+    fn test_negate_simple_condition() {
+        let src = "package main\nfunc f(x int) { if x > 0 { return } }";
+        let tree = parse_go(src);
+        let if_node = find_node_by_kind(tree.root_node(), "if_statement").unwrap();
+        let candidates = NegateCondition.apply(&if_node, src.as_bytes());
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].replacement, "!(x > 0)");
+    }
+
+    #[test]
+    fn test_negate_already_negated() {
+        let src = "package main\nfunc f(x bool) { if !x { return } }";
+        let tree = parse_go(src);
+        let if_node = find_node_by_kind(tree.root_node(), "if_statement").unwrap();
+        let candidates = NegateCondition.apply(&if_node, src.as_bytes());
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].replacement, "x");
+    }
+
+    #[test]
+    fn test_negate_no_match_on_non_if() {
+        let src = "package main\nfunc f() int { return 42 }";
+        let tree = parse_go(src);
+        let ret_node = find_node_by_kind(tree.root_node(), "return_statement").unwrap();
+        let candidates = NegateCondition.apply(&ret_node, src.as_bytes());
+        assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn test_return_empty_numeric() {
+        let src = "package main\nfunc f() int { return 42 }";
+        let tree = parse_go(src);
+        let ret_node = find_node_by_kind(tree.root_node(), "return_statement").unwrap();
+        let candidates = ReturnEmpty.apply(&ret_node, src.as_bytes());
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].replacement, "0");
+    }
+
+    #[test]
+    fn test_return_empty_string() {
+        let src = r#"package main
+func f() string { return "hello" }"#;
+        let tree = parse_go(src);
+        let ret_node = find_node_by_kind(tree.root_node(), "return_statement").unwrap();
+        let candidates = ReturnEmpty.apply(&ret_node, src.as_bytes());
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].replacement, r#""""#);
+    }
+
+    #[test]
+    fn test_return_empty_bool() {
+        let src = "package main\nfunc f() bool { return true }";
+        let tree = parse_go(src);
+        let ret_node = find_node_by_kind(tree.root_node(), "return_statement").unwrap();
+        let candidates = ReturnEmpty.apply(&ret_node, src.as_bytes());
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].replacement, "false");
+    }
+
+    #[test]
+    fn test_return_empty_bare_return() {
+        let src = "package main\nfunc f() { return }";
+        let tree = parse_go(src);
+        let ret_node = find_node_by_kind(tree.root_node(), "return_statement").unwrap();
+        let candidates = ReturnEmpty.apply(&ret_node, src.as_bytes());
+        assert!(candidates.is_empty());
+    }
 }
