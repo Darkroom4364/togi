@@ -16,10 +16,11 @@ async fn main() {
             timeout,
             dry_run,
             verbose,
+            show_output,
             test_cmd,
         } => {
             if let Err(e) = run_check(
-                base, config, format, jobs, timeout, dry_run, verbose, test_cmd,
+                base, config, format, jobs, timeout, dry_run, verbose, show_output, test_cmd,
             )
             .await
             {
@@ -55,6 +56,7 @@ async fn run_check(
     timeout: Option<u64>,
     dry_run: bool,
     verbose: bool,
+    show_output: bool,
     test_cmd: Option<String>,
 ) -> anyhow::Result<()> {
     // 1. Load config
@@ -141,6 +143,7 @@ async fn run_check(
         parallelism: config.test.jobs,
         project_root,
         verbose,
+        show_output,
     };
 
     let report = runner.run(mutations).await;
