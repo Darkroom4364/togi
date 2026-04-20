@@ -50,7 +50,7 @@ mod tests {
 
     #[test]
     fn detect_unknown_extension() {
-        let result = detect_language(&PathBuf::from("script.py"));
+        let result = detect_language(&PathBuf::from("script.rb"));
         assert!(result.is_err());
     }
 

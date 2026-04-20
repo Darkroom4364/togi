@@ -16,6 +16,7 @@ tokio = { version = "1", features = ["full"] }
 # Parsing
 tree-sitter = "0.26"
 tree-sitter-go = "0.25"
+tree-sitter-python = "0.25"
 tree-sitter-rust = "0.24"
 
 # Diff parsing
