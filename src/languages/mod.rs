@@ -1,6 +1,7 @@
 pub mod go;
 pub mod python;
 pub mod rust_lang;
+pub mod typescript;
 
 /// Language-specific configuration for tree-sitter parsing and node identification
 pub trait LanguageSupport: Send + Sync {
@@ -21,5 +22,6 @@ pub fn all() -> Vec<Box<dyn LanguageSupport>> {
         Box::new(go::Go),
         Box::new(python::Python),
         Box::new(rust_lang::Rust),
+        Box::new(typescript::TypeScript),
     ]
 }
