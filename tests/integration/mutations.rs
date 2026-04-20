@@ -27,27 +27,40 @@ fn generates_mutations_for_go_fixture() {
     for m in &mutations {
         println!(
             "  [{}] {}:{} — {}: '{}' → '{}'",
-            m.id, m.file.display(), m.line, m.operator, m.original, m.replacement
+            m.id,
+            m.file.display(),
+            m.line,
+            m.operator,
+            m.original,
+            m.replacement
         );
     }
 
     // Expect comparison operator mutations (>, <)
     assert!(
-        operators.iter().any(|o| o.contains("gt") || o.contains("lt")),
+        operators
+            .iter()
+            .any(|o| o.contains("gt") || o.contains("lt")),
         "expected comparison operator mutations, got: {:?}",
         operators
     );
 
     // Expect arithmetic mutations (+, -)
     assert!(
-        operators.iter().any(|o| o.contains("add") || o.contains("sub") || o.contains("plus") || o.contains("minus") || o.contains("arith")),
+        operators.iter().any(|o| o.contains("add")
+            || o.contains("sub")
+            || o.contains("plus")
+            || o.contains("minus")
+            || o.contains("arith")),
         "expected arithmetic mutations, got: {:?}",
         operators
     );
 
     // Expect boolean literal mutations
     assert!(
-        operators.iter().any(|o| o.contains("true") || o.contains("false") || o.contains("bool")),
+        operators
+            .iter()
+            .any(|o| o.contains("true") || o.contains("false") || o.contains("bool")),
         "expected boolean literal mutations, got: {:?}",
         operators
     );
@@ -74,6 +87,7 @@ async fn end_to_end_go_fixture_some_mutations_survive() {
         timeout: Duration::from_secs(30),
         parallelism: 1,
         project_root: root,
+        verbose: false,
     };
 
     let report = runner.run(mutations).await;
@@ -85,7 +99,13 @@ async fn end_to_end_go_fixture_some_mutations_survive() {
     for (m, result) in &report.results {
         println!(
             "  [{}] {}:{} {}: '{}' → '{}' = {}",
-            m.id, m.file.display(), m.line, m.operator, m.original, m.replacement, result
+            m.id,
+            m.file.display(),
+            m.line,
+            m.operator,
+            m.original,
+            m.replacement,
+            result
         );
     }
 

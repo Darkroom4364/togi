@@ -18,7 +18,11 @@ async fn main() {
             verbose,
             test_cmd,
         } => {
-            if let Err(e) = run_check(base, config, format, jobs, timeout, dry_run, verbose, test_cmd).await {
+            if let Err(e) = run_check(
+                base, config, format, jobs, timeout, dry_run, verbose, test_cmd,
+            )
+            .await
+            {
                 eprintln!("Error: {e}");
                 let msg = e.to_string();
                 if msg.contains("toml") || msg.contains("config") || msg.contains("togi.toml") {
@@ -79,7 +83,10 @@ async fn run_check(
     let diff_output = get_git_diff(&config.diff.base)?;
 
     if diff_output.is_empty() {
-        println!("No changes found in diff against `{}`. Nothing to mutate.", config.diff.base);
+        println!(
+            "No changes found in diff against `{}`. Nothing to mutate.",
+            config.diff.base
+        );
         return Ok(());
     }
 
@@ -104,7 +111,10 @@ async fn run_check(
 
     // 6. Handle dry-run
     if dry_run {
-        println!("Dry run — {} mutations would be generated:", mutations.len());
+        println!(
+            "Dry run — {} mutations would be generated:",
+            mutations.len()
+        );
         for m in &mutations {
             println!(
                 "  [{}] {}:{} — {}: {} → {}",
@@ -120,37 +130,17 @@ async fn run_check(
     }
 
     // 7. Run mutations
-    if verbose {
-        println!("Running {} mutations ({} jobs, {}s timeout)...", mutations.len(), config.test.jobs, config.test.timeout);
-    }
+    eprintln!("Running {} mutations...", mutations.len());
 
     let runner = togi::runner::TestRunner {
         command: config.test.command,
         timeout: Duration::from_secs(config.test.timeout),
         parallelism: config.test.jobs,
         project_root,
+        verbose,
     };
 
-    let total = mutations.len();
-    let report = if verbose {
-        // For verbose, print each mutation before running
-        // We still use the runner but print info first
-        for m in &mutations {
-            eprintln!(
-                "  [{}/{}] {}:{} — {}: {} → {}",
-                m.id + 1,
-                total,
-                m.file.display(),
-                m.line,
-                m.operator,
-                m.original,
-                m.replacement
-            );
-        }
-        runner.run(mutations).await
-    } else {
-        runner.run(mutations).await
-    };
+    let report = runner.run(mutations).await;
 
     // 8. Print report
     togi::report::print_report(&report, &format);

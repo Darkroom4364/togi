@@ -4,6 +4,7 @@ use crate::{Mutation, MutationReport, MutationResult};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
 
@@ -12,6 +13,7 @@ pub struct TestRunner {
     pub timeout: Duration,
     pub parallelism: usize,
     pub project_root: PathBuf,
+    pub verbose: bool,
 }
 
 struct FileGuard {
@@ -28,6 +30,9 @@ impl Drop for FileGuard {
 impl TestRunner {
     pub async fn run(&self, mutations: Vec<Mutation>) -> MutationReport {
         let start = Instant::now();
+        let total = mutations.len();
+        let counter = Arc::new(AtomicUsize::new(0));
+        let verbose = self.verbose;
 
         // Group mutations by file to serialize mutations on the same file
         let mut by_file: HashMap<PathBuf, Vec<Mutation>> = HashMap::new();
@@ -43,6 +48,7 @@ impl TestRunner {
             let command = self.command.clone();
             let timeout = self.timeout;
             let project_root = self.project_root.clone();
+            let counter = counter.clone();
 
             let handle = tokio::spawn(async move {
                 let mut results = Vec::new();
@@ -50,6 +56,24 @@ impl TestRunner {
                     let _permit = sem.acquire().await.unwrap();
                     let result =
                         run_single_mutation(&command, timeout, &project_root, &mutation).await;
+                    let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                    if verbose {
+                        let symbol = match result {
+                            MutationResult::Killed => "\u{2713} killed",
+                            MutationResult::Survived => "\u{2717} survived",
+                            MutationResult::Timeout => "⧖ timeout",
+                            MutationResult::BuildError => "⚠ build error",
+                        };
+                        eprintln!(
+                            "  [{}/{}] {}  {}:{} \u{2014} {}",
+                            n,
+                            total,
+                            symbol,
+                            mutation.file.display(),
+                            mutation.line,
+                            mutation.operator
+                        );
+                    }
                     results.push((mutation, result));
                 }
                 results
@@ -127,10 +151,8 @@ async fn run_single_mutation(
         return MutationResult::BuildError;
     }
 
-    // Run test command
-    let result = run_command(command, project_root, timeout).await;
-    // Guard will restore the file on drop
-    result
+    // Run test command; guard will restore the file on drop
+    run_command(command, project_root, timeout).await
 }
 
 async fn run_command(command: &[String], cwd: &PathBuf, timeout_dur: Duration) -> MutationResult {
