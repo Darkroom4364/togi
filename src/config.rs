@@ -1,1 +1,204 @@
-// togi.toml parsing and defaults
+use serde::Deserialize;
+use std::path::{Path, PathBuf};
+
+#[derive(Debug, Deserialize)]
+pub struct Config {
+    #[serde(default)]
+    pub test: TestConfig,
+    #[serde(default)]
+    pub diff: DiffConfig,
+    #[serde(default)]
+    pub mutations: MutationConfig,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TestConfig {
+    #[serde(default = "default_test_command")]
+    pub command: Vec<String>,
+    #[serde(default = "default_timeout")]
+    pub timeout: u64,
+    #[serde(default = "default_jobs")]
+    pub jobs: usize,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DiffConfig {
+    #[serde(default = "default_base")]
+    pub base: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MutationConfig {
+    #[serde(default = "default_max_per_run")]
+    pub max_per_run: usize,
+}
+
+fn default_test_command() -> Vec<String> {
+    vec!["cargo".into(), "test".into()]
+}
+
+fn default_timeout() -> u64 {
+    30
+}
+
+fn default_jobs() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+}
+
+fn default_base() -> String {
+    "origin/main".into()
+}
+
+fn default_max_per_run() -> usize {
+    20
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            test: TestConfig::default(),
+            diff: DiffConfig::default(),
+            mutations: MutationConfig::default(),
+        }
+    }
+}
+
+impl Default for TestConfig {
+    fn default() -> Self {
+        Self {
+            command: default_test_command(),
+            timeout: default_timeout(),
+            jobs: default_jobs(),
+        }
+    }
+}
+
+impl Default for DiffConfig {
+    fn default() -> Self {
+        Self {
+            base: default_base(),
+        }
+    }
+}
+
+impl Default for MutationConfig {
+    fn default() -> Self {
+        Self {
+            max_per_run: default_max_per_run(),
+        }
+    }
+}
+
+impl Config {
+    /// Load config from an explicit path, or search upward from the current directory.
+    /// Returns defaults if no config file is found.
+    pub fn load(path: Option<&Path>) -> anyhow::Result<Config> {
+        let config_path = match path {
+            Some(p) => Some(p.to_path_buf()),
+            None => find_config(),
+        };
+
+        match config_path {
+            Some(p) => {
+                let content = std::fs::read_to_string(&p)?;
+                let config: Config = toml::from_str(&content)?;
+                Ok(config)
+            }
+            None => Ok(Config::default()),
+        }
+    }
+
+    /// Write a template togi.toml to the given path.
+    pub fn write_template(path: &Path) -> anyhow::Result<()> {
+        let template = r#"# togi.toml — mutation testing configuration
+
+[test]
+command = ["cargo", "test"]
+timeout = 30
+# jobs = 4  # defaults to number of CPUs
+
+[diff]
+base = "origin/main"
+
+[mutations]
+max_per_run = 20
+"#;
+        std::fs::write(path, template)?;
+        Ok(())
+    }
+}
+
+/// Walk from the current directory upward looking for togi.toml.
+fn find_config() -> Option<PathBuf> {
+    let mut dir = std::env::current_dir().ok()?;
+    loop {
+        let candidate = dir.join("togi.toml");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        if !dir.pop() {
+            return None;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_valid_toml() {
+        let toml_str = r#"
+[test]
+command = ["make", "test"]
+timeout = 60
+jobs = 8
+
+[diff]
+base = "origin/develop"
+
+[mutations]
+max_per_run = 50
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.test.command, vec!["make", "test"]);
+        assert_eq!(config.test.timeout, 60);
+        assert_eq!(config.test.jobs, 8);
+        assert_eq!(config.diff.base, "origin/develop");
+        assert_eq!(config.mutations.max_per_run, 50);
+    }
+
+    #[test]
+    fn defaults_when_empty() {
+        let config: Config = toml::from_str("").unwrap();
+        assert_eq!(config.test.command, vec!["cargo", "test"]);
+        assert_eq!(config.test.timeout, 30);
+        assert!(config.test.jobs >= 1);
+        assert_eq!(config.diff.base, "origin/main");
+        assert_eq!(config.mutations.max_per_run, 20);
+    }
+
+    #[test]
+    fn partial_config() {
+        let toml_str = r#"
+[test]
+timeout = 120
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.test.timeout, 120);
+        assert_eq!(config.test.command, vec!["cargo", "test"]);
+        assert_eq!(config.diff.base, "origin/main");
+    }
+
+    #[test]
+    fn write_template_creates_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("togi.toml");
+        Config::write_template(&path).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("[test]"));
+        assert!(content.contains("command = [\"cargo\", \"test\"]"));
+    }
+}
