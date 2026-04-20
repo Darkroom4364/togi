@@ -29,11 +29,13 @@ impl Drop for FileGuard {
 }
 
 impl TestRunner {
+    #[allow(clippy::manual_is_multiple_of)]
     pub async fn run(&self, mutations: Vec<Mutation>) -> MutationReport {
         let start = Instant::now();
         let total = mutations.len();
         let counter = Arc::new(AtomicUsize::new(0));
         let verbose = self.verbose;
+        let is_tty = std::io::stderr().is_terminal();
 
         // Group mutations by file to serialize mutations on the same file
         let mut by_file: HashMap<PathBuf, Vec<Mutation>> = HashMap::new();
@@ -75,11 +77,10 @@ impl TestRunner {
                             mutation.operator
                         );
                     } else {
-                        let is_tty = std::io::stderr().is_terminal();
                         if is_tty {
                             eprint!("\r  [{}/{}] testing mutations...", n, total);
                             let _ = std::io::stderr().flush();
-                        } else if n == total || (total >= 4 && n.is_multiple_of(total / 4)) {
+                        } else if n == total || (total >= 4 && n % (total / 4) == 0) {
                             eprintln!("  [{}/{}] testing mutations...", n, total);
                         }
                     }
@@ -98,7 +99,7 @@ impl TestRunner {
         }
 
         // Clear progress line on TTY
-        if !verbose && std::io::stderr().is_terminal() {
+        if !verbose && is_tty {
             eprint!("\r                                        \r");
             let _ = std::io::stderr().flush();
         }
