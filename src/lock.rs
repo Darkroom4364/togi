@@ -54,9 +54,7 @@ pub fn acquire(project_root: &Path) -> Result<LockGuard> {
                 .with_context(|| format!("failed to write lock file: {}", path.display()))?;
             Ok(LockGuard { path })
         }
-        Err(e) => {
-            Err(e).with_context(|| format!("failed to create lock file: {}", path.display()))
-        }
+        Err(e) => Err(e).with_context(|| format!("failed to create lock file: {}", path.display())),
     }
 }
 
