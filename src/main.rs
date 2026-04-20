@@ -20,6 +20,10 @@ async fn main() {
         } => {
             if let Err(e) = run_check(base, config, format, jobs, timeout, dry_run, verbose, test_cmd).await {
                 eprintln!("Error: {e}");
+                let msg = e.to_string();
+                if msg.contains("toml") || msg.contains("config") || msg.contains("togi.toml") {
+                    eprintln!("Hint: run 'togi check --help' for usage information.");
+                }
                 process::exit(2);
             }
         }
@@ -94,7 +98,7 @@ async fn run_check(
     )?;
 
     if mutations.is_empty() {
-        println!("No mutations generated from the diff.");
+        println!("No mutations generated. This can happen if the changed files are in an unsupported language.\nSupported: Go (.go), Rust (.rs), Python (.py), TypeScript (.ts/.tsx)");
         return Ok(());
     }
 
@@ -164,7 +168,7 @@ fn get_project_root() -> anyhow::Result<PathBuf> {
         .args(["rev-parse", "--show-toplevel"])
         .output()?;
     if !output.status.success() {
-        anyhow::bail!("not a git repository");
+        anyhow::bail!("Not a git repository. Run togi from inside a git project.");
     }
     let path = String::from_utf8(output.stdout)?.trim().to_string();
     Ok(PathBuf::from(path))
@@ -175,9 +179,9 @@ fn get_git_diff(base: &str) -> anyhow::Result<String> {
         .args(["diff", base])
         .output()?;
     if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
         anyhow::bail!(
-            "git diff failed: {}",
-            String::from_utf8_lossy(&output.stderr)
+            "Could not diff against '{base}'. Is the branch up to date? Try running 'git fetch' first.\n\nDetails: {stderr}"
         );
     }
     Ok(String::from_utf8(output.stdout)?)
