@@ -71,8 +71,8 @@ impl MutationOperator for ReturnEmpty {
             return vec![];
         }
         // The return value spans from first named child to end of last named child
-        let first = children.first().unwrap();
-        let last = children.last().unwrap();
+        let first = &children[0];
+        let last = &children[children.len() - 1];
         let value_range = first.start_byte()..last.end_byte();
         let text = std::str::from_utf8(&source[value_range.clone()]).unwrap_or("");
 
