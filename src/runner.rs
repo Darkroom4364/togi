@@ -2,6 +2,7 @@
 
 use crate::{Mutation, MutationReport, MutationResult};
 use std::collections::HashMap;
+use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -31,11 +32,13 @@ impl Drop for FileGuard {
 }
 
 impl TestRunner {
+    #[allow(clippy::manual_is_multiple_of)]
     pub async fn run(&self, mutations: Vec<Mutation>) -> MutationReport {
         let start = Instant::now();
         let total = mutations.len();
         let counter = Arc::new(AtomicUsize::new(0));
         let verbose = self.verbose;
+        let is_tty = std::io::stderr().is_terminal();
 
         // Group mutations by file to serialize mutations on the same file
         let mut by_file: HashMap<PathBuf, Vec<Mutation>> = HashMap::new();
@@ -84,6 +87,13 @@ impl TestRunner {
                             mutation.line,
                             mutation.operator
                         );
+                    } else {
+                        if is_tty {
+                            eprint!("\r  [{}/{}] testing mutations...", n, total);
+                            let _ = std::io::stderr().flush();
+                        } else if n == total || (total >= 4 && n % (total / 4) == 0) {
+                            eprintln!("  [{}/{}] testing mutations...", n, total);
+                        }
                     }
                     if show_output
                         && outcome.result == MutationResult::Survived
@@ -112,6 +122,12 @@ impl TestRunner {
             if let Ok(results) = handle.await {
                 all_results.extend(results);
             }
+        }
+
+        // Clear progress line on TTY
+        if !verbose && is_tty {
+            eprint!("\r                                        \r");
+            let _ = std::io::stderr().flush();
         }
 
         let duration = start.elapsed();
