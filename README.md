@@ -1,5 +1,7 @@
 # togi
 
+togi (鍛 — Japanese for "sharpening"), hone your tests by finding the mutations they miss.
+
 Fast, diff-targeted mutation testing. Language-agnostic. No LLM. Runs on every PR in seconds.
 
 ## What it does
