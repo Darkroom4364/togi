@@ -130,9 +130,12 @@ fn check_format_json_outputs_valid_json() {
     let output = togi()
         .args([
             "check",
-            "--base", "HEAD",
-            "--format", "json",
-            "--test-cmd", "false",
+            "--base",
+            "HEAD",
+            "--format",
+            "json",
+            "--test-cmd",
+            "false",
         ])
         .current_dir(dir.path())
         .output()
