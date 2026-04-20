@@ -1,7 +1,8 @@
 //! File-based lock to prevent concurrent togi runs on the same repo.
 
 use anyhow::{Context, Result, bail};
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 const LOCK_FILE: &str = ".togi.lock";
@@ -23,26 +24,40 @@ pub fn acquire(project_root: &Path) -> Result<LockGuard> {
     let path = project_root.join(LOCK_FILE);
     let pid = std::process::id();
 
-    if path.exists() {
-        let contents = fs::read_to_string(&path).unwrap_or_default();
-        if let Ok(existing_pid) = contents.trim().parse::<u32>()
-            && process_alive(existing_pid)
-        {
-            bail!(
-                "another togi process (PID {}) is already running in this directory.\n\
-                 If this is stale, remove {} manually.",
-                existing_pid,
-                path.display()
-            );
+    match OpenOptions::new().write(true).create_new(true).open(&path) {
+        Ok(mut file) => {
+            file.write_all(pid.to_string().as_bytes())
+                .with_context(|| format!("failed to write lock file: {}", path.display()))?;
+            Ok(LockGuard { path })
         }
-        // Stale lock — previous process died without cleanup
-        fs::remove_file(&path).ok();
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            // Lock file exists — check if the holder is still alive
+            let contents = fs::read_to_string(&path).unwrap_or_default();
+            if let Ok(existing_pid) = contents.trim().parse::<u32>()
+                && process_alive(existing_pid)
+            {
+                bail!(
+                    "another togi process (PID {}) is already running in this directory.\n\
+                     If this is stale, remove {} manually.",
+                    existing_pid,
+                    path.display()
+                );
+            }
+            // Stale lock — remove and retry once
+            fs::remove_file(&path).ok();
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .with_context(|| format!("failed to create lock file: {}", path.display()))?;
+            file.write_all(pid.to_string().as_bytes())
+                .with_context(|| format!("failed to write lock file: {}", path.display()))?;
+            Ok(LockGuard { path })
+        }
+        Err(e) => {
+            Err(e).with_context(|| format!("failed to create lock file: {}", path.display()))
+        }
     }
-
-    fs::write(&path, pid.to_string())
-        .with_context(|| format!("failed to create lock file: {}", path.display()))?;
-
-    Ok(LockGuard { path })
 }
 
 fn process_alive(pid: u32) -> bool {
