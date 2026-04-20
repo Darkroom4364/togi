@@ -2,7 +2,7 @@
 name = "togi"
 version = "0.1.0"
 edition = "2024"
-description = "Fast, diff-targeted, language-agnostic mutation testing"
+description = "Fast, diff-targeted, multi-language mutation testing"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/Darkroom4364/togi"
 readme = "README.md"
