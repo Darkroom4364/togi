@@ -1,0 +1,10 @@
+[test]
+command = ["go", "test", "./..."]
+timeout = 30
+jobs = 4
+
+[diff]
+base = "origin/main"
+
+[mutations]
+max_per_run = 20
