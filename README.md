@@ -167,6 +167,26 @@ togi applies 14 targeted mutation operators:
 | 1 | Some mutations survived — test gaps found |
 | 2 | Error (config, git, parse failure) |
 
+## CI Integration
+
+Add togi to your pull request workflow:
+
+```yaml
+# .github/workflows/togi.yml
+name: Mutation Testing
+on: [pull_request]
+jobs:
+  togi:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: Darkroom4364/togi@v1
+        with:
+          base: origin/main
+```
+
 ## License
 
 Apache-2.0
