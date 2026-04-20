@@ -89,14 +89,51 @@ base = "origin/main"
 max_per_run = 20
 ```
 
+## Example: finding real test gaps
+
+The repo includes a Go fixture (`tests/fixtures/go/`) with deliberately weak tests.
+Running togi against it produces:
+
+```
+  ✓ KILLED  calc.go:5   — plus_to_minus: Replace + with -
+  ✓ KILLED  calc.go:10  — zero_to_one: Replace 0 with 1
+  ✓ KILLED  calc.go:11  — true_to_false: Replace true with false
+  ✗ SURVIVED  calc.go:13  — false_to_true: Replace false with true
+              Your tests don't catch this mutation.
+  ✗ SURVIVED  calc.go:18  — gt_to_gte: Replace > with >=
+              Your tests don't catch this mutation.
+  ✗ SURVIVED  calc.go:19  — return_empty: Replace return value with default
+              Your tests don't catch this mutation.
+  ✓ KILLED  calc.go:21  — return_empty: Replace return value with default
+  ✗ SURVIVED  calc.go:26  — zero_to_one: Replace 0 with 1
+              Your tests don't catch this mutation.
+  ✗ SURVIVED  calc.go:29  — return_empty: Replace return value with default
+              Your tests don't catch this mutation.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Results: 4/9 mutations killed (5 survived)
+Duration: 1.59s
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+Each surviving mutation reveals a concrete test gap:
+
+- **`false_to_true` at line 13** — `TestIsPositive` never checks `IsPositive(0)` or negative inputs
+- **`gt_to_gte` at line 18** — `TestMax` only tests `Max(3,5)`, never the `a > b` path
+- **`return_empty` at line 19** — same: `Max` return value never verified for first-arg-wins
+- **`zero_to_one` at line 26** — `TestAbs` is entirely missing
+- **`return_empty` at line 29** — `Abs` return value never tested
+
+Run it yourself: `cargo test -- --ignored` (requires Go).
+
 ## Supported languages
 
 | Language | Extension | Status |
 |----------|-----------|--------|
 | Go | `.go` | Supported |
 | Rust | `.rs` | Supported |
-| Python | `.py` | Planned |
-| TypeScript | `.ts/.tsx` | Planned |
+| Python | `.py` | Supported |
+| TypeScript | `.ts/.tsx` | Supported |
 
 Adding a language is ~50 lines of tree-sitter node mappings.
 
