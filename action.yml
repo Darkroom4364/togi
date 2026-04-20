@@ -1,0 +1,56 @@
+name: 'togi - Mutation Testing'
+description: 'Fast, diff-targeted mutation testing for your PRs'
+branding:
+  icon: 'shield'
+  color: 'orange'
+
+inputs:
+  base:
+    description: 'Base branch to diff against'
+    required: false
+    default: 'origin/main'
+  timeout:
+    description: 'Per-mutation timeout in seconds'
+    required: false
+    default: '30'
+  test-cmd:
+    description: 'Test command override'
+    required: false
+  format:
+    description: 'Output format (terminal or json)'
+    required: false
+    default: 'terminal'
+  version:
+    description: 'togi version to use'
+    required: false
+    default: 'latest'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Install togi
+      shell: bash
+      run: |
+        VERSION="${{ inputs.version }}"
+        if [ "$VERSION" = "latest" ]; then
+          VERSION=$(curl -s https://api.github.com/repos/Darkroom4364/togi/releases/latest | grep '"tag_name"' | sed -E 's/.*"([^"]+)".*/\1/')
+        fi
+        OS=$(uname -s | tr '[:upper:]' '[:lower:]')
+        ARCH=$(uname -m)
+        if [ "$ARCH" = "arm64" ] || [ "$ARCH" = "aarch64" ]; then
+          NAME="togi-${OS}-arm64"
+        else
+          NAME="togi-${OS}-x86_64"
+        fi
+        curl -sL "https://github.com/Darkroom4364/togi/releases/download/${VERSION}/${NAME}.tar.gz" | tar xz
+        chmod +x togi
+        sudo mv togi /usr/local/bin/
+
+    - name: Run togi
+      shell: bash
+      run: |
+        ARGS="check --base ${{ inputs.base }} --timeout ${{ inputs.timeout }} --format ${{ inputs.format }}"
+        if [ -n "${{ inputs.test-cmd }}" ]; then
+          ARGS="$ARGS --test-cmd '${{ inputs.test-cmd }}'"
+        fi
+        togi $ARGS
