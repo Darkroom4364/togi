@@ -88,7 +88,7 @@ impl MutationOperator for ReturnEmpty {
             // Boolean literals
             "true" | "false" | "boolean" => "false".to_string(),
             // Null/nil/None
-            "null" | "nil" | "none" | "None" => text.to_string(), // already a zero-value, skip
+            "null" | "nil" | "none" | "None" => return vec![], // already a zero-value, skip
             // Numeric literals
             "integer_literal" | "int_literal" | "float_literal" | "number" | "integer"
             | "float" => "0".to_string(),
