@@ -56,6 +56,23 @@ pub fn detect_test_command(project_root: &Path) -> Vec<String> {
     if project_root.join("package.json").exists() {
         detected.push(("package.json", vec!["npm".into(), "test".into()]));
     }
+    if project_root.join("pom.xml").exists() {
+        detected.push(("pom.xml", vec!["mvn".into(), "test".into()]));
+    }
+    if project_root.join("build.gradle").exists()
+        || project_root.join("build.gradle.kts").exists()
+    {
+        detected.push(("build.gradle", vec!["gradle".into(), "test".into()]));
+    }
+    if project_root.join("Gemfile").exists() {
+        detected.push((
+            "Gemfile",
+            vec!["bundle".into(), "exec".into(), "rspec".into()],
+        ));
+    }
+    if project_root.join("CMakeLists.txt").exists() {
+        detected.push(("CMakeLists.txt", vec!["ctest".into()]));
+    }
 
     if detected.len() > 1 {
         let names: Vec<&str> = detected.iter().map(|(name, _)| *name).collect();
