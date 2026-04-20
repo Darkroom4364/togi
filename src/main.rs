@@ -16,8 +16,9 @@ async fn main() {
             timeout,
             dry_run,
             verbose,
+            test_cmd,
         } => {
-            if let Err(e) = run_check(base, config, format, jobs, timeout, dry_run, verbose).await {
+            if let Err(e) = run_check(base, config, format, jobs, timeout, dry_run, verbose, test_cmd).await {
                 eprintln!("Error: {e}");
                 process::exit(2);
             }
@@ -45,6 +46,7 @@ async fn run_check(
     timeout: Option<u64>,
     dry_run: bool,
     verbose: bool,
+    test_cmd: Option<String>,
 ) -> anyhow::Result<()> {
     // 1. Load config
     let mut config = togi::config::Config::load(config_path.as_deref())?;
@@ -58,6 +60,9 @@ async fn run_check(
     }
     if let Some(t) = timeout {
         config.test.timeout = t;
+    }
+    if let Some(cmd) = test_cmd {
+        config.test.command = cmd.split_whitespace().map(String::from).collect();
     }
 
     // Find project root (git toplevel)

@@ -39,6 +39,10 @@ pub enum Commands {
         /// Show each mutation as it runs
         #[arg(long)]
         verbose: bool,
+
+        /// Override test command (e.g., 'go test ./...')
+        #[arg(long)]
+        test_cmd: Option<String>,
     },
     /// Generate a togi.toml config template
     Init,
