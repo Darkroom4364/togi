@@ -27,7 +27,13 @@ pub fn generate_mutations(
         let source = std::fs::read(&file_path)?;
         let (tree, _lang) = match crate::parser::parse_file(&changed_file.path, &source) {
             Ok(result) => result,
-            Err(_) => continue, // Skip unsupported languages
+            Err(_) => {
+                eprintln!(
+                    "warning: skipping {} — unsupported language",
+                    changed_file.path.display()
+                );
+                continue;
+            }
         };
 
         let nodes = find_mutable_nodes(&tree, &source, &changed_file.hunks);
