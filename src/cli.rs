@@ -40,6 +40,10 @@ pub enum Commands {
         #[arg(long)]
         verbose: bool,
 
+        /// Show test output for survived mutations
+        #[arg(long)]
+        show_output: bool,
+
         /// Override test command (e.g., 'go test ./...')
         #[arg(long)]
         test_cmd: Option<String>,
