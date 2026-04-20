@@ -34,7 +34,25 @@ pub struct MutationConfig {
 }
 
 fn default_test_command() -> Vec<String> {
-    vec!["cargo".into(), "test".into()]
+    vec![]
+}
+
+/// Auto-detect the test command based on project files in the given root.
+pub fn detect_test_command(project_root: &Path) -> Vec<String> {
+    if project_root.join("Cargo.toml").exists() {
+        vec!["cargo".into(), "test".into()]
+    } else if project_root.join("go.mod").exists() {
+        vec!["go".into(), "test".into(), "./...".into()]
+    } else if project_root.join("pyproject.toml").exists()
+        || project_root.join("setup.py").exists()
+        || project_root.join("setup.cfg").exists()
+    {
+        vec!["pytest".into()]
+    } else if project_root.join("package.json").exists() {
+        vec!["npm".into(), "test".into()]
+    } else {
+        vec!["make".into(), "test".into()]
+    }
 }
 
 fn default_timeout() -> u64 {
@@ -110,6 +128,13 @@ impl Config {
         }
     }
 
+    /// If no test command was explicitly set in togi.toml, auto-detect from project files.
+    pub fn resolve_test_command(&mut self, project_root: &Path) {
+        if self.test.command.is_empty() {
+            self.test.command = detect_test_command(project_root);
+        }
+    }
+
     /// Write a template togi.toml to the given path.
     pub fn write_template(path: &Path) -> anyhow::Result<()> {
         let template = r#"# togi.toml — mutation testing configuration
@@ -173,7 +198,8 @@ max_per_run = 50
     #[test]
     fn defaults_when_empty() {
         let config: Config = toml::from_str("").unwrap();
-        assert_eq!(config.test.command, vec!["cargo", "test"]);
+        // Command is empty sentinel when not explicitly configured
+        assert!(config.test.command.is_empty());
         assert_eq!(config.test.timeout, 30);
         assert!(config.test.jobs >= 1);
         assert_eq!(config.diff.base, "origin/main");
@@ -188,7 +214,8 @@ timeout = 120
 "#;
         let config: Config = toml::from_str(toml_str).unwrap();
         assert_eq!(config.test.timeout, 120);
-        assert_eq!(config.test.command, vec!["cargo", "test"]);
+        // Command is empty when not explicitly set
+        assert!(config.test.command.is_empty());
         assert_eq!(config.diff.base, "origin/main");
     }
 
@@ -200,5 +227,32 @@ timeout = 120
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(content.contains("[test]"));
         assert!(content.contains("command = [\"cargo\", \"test\"]"));
+    }
+
+    #[test]
+    fn detect_cargo_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "").unwrap();
+        assert_eq!(detect_test_command(dir.path()), vec!["cargo", "test"]);
+    }
+
+    #[test]
+    fn detect_go_mod() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("go.mod"), "").unwrap();
+        assert_eq!(detect_test_command(dir.path()), vec!["go", "test", "./..."]);
+    }
+
+    #[test]
+    fn detect_package_json() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("package.json"), "").unwrap();
+        assert_eq!(detect_test_command(dir.path()), vec!["npm", "test"]);
+    }
+
+    #[test]
+    fn detect_fallback_make_test() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(detect_test_command(dir.path()), vec!["make", "test"]);
     }
 }

@@ -68,6 +68,9 @@ async fn run_check(
     // Find project root (git toplevel)
     let project_root = get_project_root()?;
 
+    // Auto-detect test command if not explicitly configured
+    config.resolve_test_command(&project_root);
+
     // 3. Run git diff
     let diff_output = get_git_diff(&config.diff.base)?;
 
