@@ -115,6 +115,13 @@ async fn run_check(
         config.mutations.max_per_run,
     )?;
 
+    if mutations.len() >= config.mutations.max_per_run {
+        eprintln!(
+            "warning: mutation count capped at max_per_run ({}). Increase in togi.toml or use --dry-run to preview.",
+            config.mutations.max_per_run
+        );
+    }
+
     if mutations.is_empty() {
         println!(
             "No mutations generated. This can happen if the changed files are in an unsupported language.\nSupported: Go (.go), Rust (.rs), Python (.py), TypeScript (.ts/.tsx)"

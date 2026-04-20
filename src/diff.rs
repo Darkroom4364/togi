@@ -79,20 +79,6 @@ pub fn parse_diff(input: &str) -> Vec<ChangedFile> {
         });
     }
 
-    // Warn if diff is very large
-    let total_changed: usize = files
-        .iter()
-        .flat_map(|f| &f.hunks)
-        .map(|h| h.end - h.start + 1)
-        .sum();
-    if total_changed > 1000 {
-        eprintln!(
-            "warning: diff contains {} changed lines across {} files; mutations will be capped by max_per_run",
-            total_changed,
-            files.len()
-        );
-    }
-
     files
 }
 
