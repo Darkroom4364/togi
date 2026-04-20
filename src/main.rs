@@ -87,6 +87,9 @@ async fn run_check(
     // Find project root (git toplevel)
     let project_root = get_project_root()?;
 
+    // Acquire lock to prevent concurrent runs
+    let _lock = togi::lock::acquire(&project_root)?;
+
     // Auto-detect test command if not explicitly configured
     config.resolve_test_command(&project_root);
 
