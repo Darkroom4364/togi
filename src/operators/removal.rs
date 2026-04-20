@@ -67,3 +67,70 @@ impl MutationOperator for RemoveElse {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse_go(src: &str) -> tree_sitter::Tree {
+        let mut parser = tree_sitter::Parser::new();
+        let lang = tree_sitter_go::LANGUAGE;
+        parser.set_language(&lang.into()).unwrap();
+        parser.parse(src, None).unwrap()
+    }
+
+    fn find_first_kind<'a>(node: tree_sitter::Node<'a>, kind: &str) -> Option<tree_sitter::Node<'a>> {
+        if node.kind() == kind {
+            return Some(node);
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if let Some(found) = find_first_kind(child, kind) {
+                return Some(found);
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn test_remove_if_body() {
+        let src = r#"package main
+func f(x int) { if x > 0 { println("yes") } }"#;
+        let tree = parse_go(src);
+        let if_node = find_first_kind(tree.root_node(), "if_statement").unwrap();
+        let candidates = RemoveIfBody.apply(&if_node, src.as_bytes());
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].replacement, "{}");
+    }
+
+    #[test]
+    fn test_remove_else() {
+        let src = "package main\nfunc f(x int) int { if x > 0 { return 1 } else { return 0 } }";
+        let tree = parse_go(src);
+        let if_node = find_first_kind(tree.root_node(), "if_statement").unwrap();
+        let candidates = RemoveElse.apply(&if_node, src.as_bytes());
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].replacement, "");
+        // The byte range should cover the else clause
+        let removed = &src[candidates[0].byte_range.clone()];
+        assert!(removed.contains("else"));
+    }
+
+    #[test]
+    fn test_remove_if_body_no_match_on_for() {
+        let src = "package main\nfunc f() { for i := 0; i < 10; i++ { println(i) } }";
+        let tree = parse_go(src);
+        let for_node = find_first_kind(tree.root_node(), "for_statement").unwrap();
+        let candidates = RemoveIfBody.apply(&for_node, src.as_bytes());
+        assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn test_remove_else_no_else_clause() {
+        let src = "package main\nfunc f(x int) { if x > 0 { println(x) } }";
+        let tree = parse_go(src);
+        let if_node = find_first_kind(tree.root_node(), "if_statement").unwrap();
+        let candidates = RemoveElse.apply(&if_node, src.as_bytes());
+        assert!(candidates.is_empty());
+    }
+}
