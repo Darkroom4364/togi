@@ -39,18 +39,41 @@ fn default_test_command() -> Vec<String> {
 
 /// Auto-detect the test command based on project files in the given root.
 pub fn detect_test_command(project_root: &Path) -> Vec<String> {
+    let mut detected: Vec<(&str, Vec<String>)> = Vec::new();
+
     if project_root.join("Cargo.toml").exists() {
-        vec!["cargo".into(), "test".into()]
-    } else if project_root.join("go.mod").exists() {
-        vec!["go".into(), "test".into(), "./...".into()]
-    } else if project_root.join("pyproject.toml").exists()
+        detected.push(("Cargo.toml", vec!["cargo".into(), "test".into()]));
+    }
+    if project_root.join("go.mod").exists() {
+        detected.push(("go.mod", vec!["go".into(), "test".into(), "./...".into()]));
+    }
+    if project_root.join("pyproject.toml").exists()
         || project_root.join("setup.py").exists()
         || project_root.join("setup.cfg").exists()
     {
-        vec!["pytest".into()]
-    } else if project_root.join("package.json").exists() {
-        vec!["npm".into(), "test".into()]
+        detected.push(("pyproject.toml/setup.py", vec!["pytest".into()]));
+    }
+    if project_root.join("package.json").exists() {
+        detected.push(("package.json", vec!["npm".into(), "test".into()]));
+    }
+
+    if detected.len() > 1 {
+        let names: Vec<&str> = detected.iter().map(|(name, _)| *name).collect();
+        eprintln!(
+            "warning: multiple build systems detected ({}). Using `{}`. \
+             Set [test] command in togi.toml to override.",
+            names.join(", "),
+            detected[0].1.join(" ")
+        );
+    }
+
+    if let Some((_, cmd)) = detected.into_iter().next() {
+        cmd
     } else {
+        eprintln!(
+            "warning: no known build system found. Falling back to `make test`. \
+             Set [test] command in togi.toml to override."
+        );
         vec!["make".into(), "test".into()]
     }
 }
