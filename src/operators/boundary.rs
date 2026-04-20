@@ -1,6 +1,6 @@
-use crate::MutationCandidate;
 use super::MutationOperator;
 use super::binary::find_operator_child;
+use crate::MutationCandidate;
 
 const BINARY_EXPR_KINDS: &[&str] = &["binary_expression", "binary_expr", "comparison_expression"];
 
@@ -11,8 +11,12 @@ fn is_binary_expr(node: &tree_sitter::Node) -> bool {
 pub struct PlusToMinus;
 
 impl MutationOperator for PlusToMinus {
-    fn id(&self) -> &str { "plus_to_minus" }
-    fn description(&self) -> &str { "Replace + with -" }
+    fn id(&self) -> &str {
+        "plus_to_minus"
+    }
+    fn description(&self) -> &str {
+        "Replace + with -"
+    }
     fn apply(&self, node: &tree_sitter::Node, source: &[u8]) -> Vec<MutationCandidate> {
         if !is_binary_expr(node) {
             return vec![];
@@ -33,8 +37,12 @@ impl MutationOperator for PlusToMinus {
 pub struct MinusToPlus;
 
 impl MutationOperator for MinusToPlus {
-    fn id(&self) -> &str { "minus_to_plus" }
-    fn description(&self) -> &str { "Replace - with +" }
+    fn id(&self) -> &str {
+        "minus_to_plus"
+    }
+    fn description(&self) -> &str {
+        "Replace - with +"
+    }
     fn apply(&self, node: &tree_sitter::Node, source: &[u8]) -> Vec<MutationCandidate> {
         if !is_binary_expr(node) {
             return vec![];
@@ -63,7 +71,10 @@ mod tests {
         parser.parse(src, None).unwrap()
     }
 
-    fn find_first_kind<'a>(node: tree_sitter::Node<'a>, kind: &str) -> Option<tree_sitter::Node<'a>> {
+    fn find_first_kind<'a>(
+        node: tree_sitter::Node<'a>,
+        kind: &str,
+    ) -> Option<tree_sitter::Node<'a>> {
         if node.kind() == kind {
             return Some(node);
         }

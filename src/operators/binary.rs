@@ -1,9 +1,13 @@
-use crate::MutationCandidate;
 use super::MutationOperator;
+use crate::MutationCandidate;
 
 const BINARY_EXPR_KINDS: &[&str] = &["binary_expression", "binary_expr", "comparison_expression"];
 
-pub fn find_operator_child(node: &tree_sitter::Node, source: &[u8], target: &str) -> Option<std::ops::Range<usize>> {
+pub fn find_operator_child(
+    node: &tree_sitter::Node,
+    source: &[u8],
+    target: &str,
+) -> Option<std::ops::Range<usize>> {
     // Try field name "operator" first
     if let Some(op_node) = node.child_by_field_name("operator") {
         let text = &source[op_node.byte_range()];
@@ -33,8 +37,12 @@ macro_rules! binary_operator {
         pub struct $name;
 
         impl MutationOperator for $name {
-            fn id(&self) -> &str { $id }
-            fn description(&self) -> &str { $desc }
+            fn id(&self) -> &str {
+                $id
+            }
+            fn description(&self) -> &str {
+                $desc
+            }
             fn apply(&self, node: &tree_sitter::Node, source: &[u8]) -> Vec<MutationCandidate> {
                 if !is_binary_expr(node) {
                     return vec![];

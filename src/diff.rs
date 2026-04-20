@@ -17,23 +17,25 @@ pub fn parse_diff(input: &str) -> Vec<ChangedFile> {
     let mut range_end: usize = 0;
 
     for line in input.lines() {
-        if line.starts_with("+++ ") {
+        if let Some(path_str) = line.strip_prefix("+++ ") {
             // Flush previous hunk range
             flush_range(&mut current_hunks, &mut range_start, range_end);
             in_hunk = false;
 
             // Flush previous file
-            if let Some(path) = current_path.take() {
-                if !current_hunks.is_empty() {
-                    files.push(ChangedFile { path, hunks: current_hunks });
-                }
+            if let Some(path) = current_path.take()
+                && !current_hunks.is_empty()
+            {
+                files.push(ChangedFile {
+                    path,
+                    hunks: current_hunks,
+                });
             }
             current_hunks = Vec::new();
 
             // Extract path, stripping the `b/` prefix
-            let path_str = &line[4..];
-            let path = if path_str.starts_with("b/") {
-                PathBuf::from(&path_str[2..])
+            let path = if let Some(stripped) = path_str.strip_prefix("b/") {
+                PathBuf::from(stripped)
             } else {
                 PathBuf::from(path_str)
             };
@@ -68,14 +70,21 @@ pub fn parse_diff(input: &str) -> Vec<ChangedFile> {
 
     // Flush final state
     flush_range(&mut current_hunks, &mut range_start, range_end);
-    if let Some(path) = current_path.take() {
-        if !current_hunks.is_empty() {
-            files.push(ChangedFile { path, hunks: current_hunks });
-        }
+    if let Some(path) = current_path.take()
+        && !current_hunks.is_empty()
+    {
+        files.push(ChangedFile {
+            path,
+            hunks: current_hunks,
+        });
     }
 
     // Warn if diff is very large
-    let total_changed: usize = files.iter().flat_map(|f| &f.hunks).map(|h| h.end - h.start + 1).sum();
+    let total_changed: usize = files
+        .iter()
+        .flat_map(|f| &f.hunks)
+        .map(|h| h.end - h.start + 1)
+        .sum();
     if total_changed > 1000 {
         eprintln!(
             "warning: diff contains {} changed lines across {} files; mutations will be capped by max_per_run",
@@ -203,7 +212,10 @@ diff --git a/src/main.rs b/src/main.rs
 -}
 "#;
         let files = parse_diff(diff);
-        assert!(files.is_empty(), "deleted-only file should produce no hunks");
+        assert!(
+            files.is_empty(),
+            "deleted-only file should produce no hunks"
+        );
     }
 
     #[test]

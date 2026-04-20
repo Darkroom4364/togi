@@ -1,7 +1,7 @@
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 pub struct Config {
     #[serde(default)]
     pub test: TestConfig,
@@ -71,16 +71,6 @@ fn default_base() -> String {
 
 fn default_max_per_run() -> usize {
     20
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            test: TestConfig::default(),
-            diff: DiffConfig::default(),
-            mutations: MutationConfig::default(),
-        }
-    }
 }
 
 impl Default for TestConfig {

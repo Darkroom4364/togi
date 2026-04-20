@@ -30,8 +30,8 @@ impl MutationOperator for NegateCondition {
         let cond = node.child_by_field_name("condition");
         if let Some(cond_node) = cond {
             let text = std::str::from_utf8(&source[cond_node.byte_range()]).unwrap_or("");
-            let replacement = if text.starts_with('!') {
-                text[1..]
+            let replacement = if let Some(stripped) = text.strip_prefix('!') {
+                stripped
                     .trim_start_matches('(')
                     .trim_end_matches(')')
                     .to_string()

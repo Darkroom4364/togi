@@ -1,11 +1,14 @@
 use std::path::Path;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 
 use crate::languages::{self, LanguageSupport};
 
 /// Parse a source file with tree-sitter, auto-detecting language from extension.
-pub fn parse_file(path: &Path, source: &[u8]) -> Result<(tree_sitter::Tree, Box<dyn LanguageSupport>)> {
+pub fn parse_file(
+    path: &Path,
+    source: &[u8],
+) -> Result<(tree_sitter::Tree, Box<dyn LanguageSupport>)> {
     let lang = detect_language(path)?;
     let mut parser = tree_sitter::Parser::new();
     parser.set_language(&lang.tree_sitter_language())?;
