@@ -103,7 +103,7 @@ async fn run_check(
             println!("No supported source files found. Nothing to mutate.");
             return Ok(());
         }
-        eprintln!("Scanning all {} supported files...", files.len());
+        println!("Scanning all {} supported files...", files.len());
         files
     } else {
         let diff_output = get_git_diff(&config.diff.base)?;

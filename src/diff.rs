@@ -4,7 +4,7 @@ use crate::{ChangedFile, LineRange};
 use std::path::{Path, PathBuf};
 
 /// Build ChangedFile entries for every supported file in the project tree.
-/// Each file gets a single hunk covering all lines.
+/// Respects `.gitignore` rules. Skips test files.
 pub fn collect_all_supported_files(project_root: &Path) -> anyhow::Result<Vec<ChangedFile>> {
     use crate::languages;
 
@@ -16,28 +16,13 @@ pub fn collect_all_supported_files(project_root: &Path) -> anyhow::Result<Vec<Ch
 
     let mut files = Vec::new();
 
-    for entry in walkdir::WalkDir::new(project_root)
-        .into_iter()
-        .filter_entry(|e| {
-            let name = e.file_name().to_string_lossy();
-            if e.file_type().is_dir() {
-                return !name.starts_with('.')
-                    && !matches!(
-                        name.as_ref(),
-                        "target"
-                            | "node_modules"
-                            | "vendor"
-                            | "build"
-                            | "dist"
-                            | "__pycache__"
-                            | "venv"
-                    );
-            }
-            true
-        })
+    for entry in ignore::WalkBuilder::new(project_root)
+        .hidden(true)
+        .git_ignore(true)
+        .build()
     {
         let entry = entry?;
-        if !entry.file_type().is_file() {
+        if !entry.file_type().map_or(false, |ft| ft.is_file()) {
             continue;
         }
         let path = entry.path();
@@ -46,6 +31,9 @@ pub fn collect_all_supported_files(project_root: &Path) -> anyhow::Result<Vec<Ch
             None => continue,
         };
         if !supported_extensions.contains(&ext) {
+            continue;
+        }
+        if is_test_file(path) {
             continue;
         }
 
@@ -75,6 +63,30 @@ pub fn collect_all_supported_files(project_root: &Path) -> anyhow::Result<Vec<Ch
     }
 
     Ok(files)
+}
+
+/// Returns true for files that look like test files across supported languages.
+fn is_test_file(path: &Path) -> bool {
+    let name = match path.file_stem().and_then(|s| s.to_str()) {
+        Some(n) => n,
+        None => return false,
+    };
+    // Go: *_test.go
+    // Python: test_*.py / *_test.py
+    // Ruby: *_test.rb / test_*.rb / *_spec.rb
+    // Java/C#: *Test.java / *Tests.java / *Test.cs
+    // JS/TS: *.test.ts / *.spec.ts (stem after first dot)
+    if name.ends_with("_test") || name.starts_with("test_") || name.ends_with("_spec") {
+        return true;
+    }
+    if name.ends_with("Test") || name.ends_with("Tests") || name.ends_with("Spec") {
+        return true;
+    }
+    // *.test.ts, *.spec.ts — file_stem gives "foo.test"
+    if name.ends_with(".test") || name.ends_with(".spec") {
+        return true;
+    }
+    false
 }
 
 /// Parse unified diff output (from `git diff`) into a list of changed files
@@ -293,9 +305,12 @@ diff --git a/src/main.rs b/src/main.rs
     }
 
     #[test]
-    fn collect_all_finds_supported_files_and_skips_excluded_dirs() {
+    fn collect_all_finds_supported_files_and_respects_gitignore() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
+
+        // Init a git repo so .gitignore is respected
+        std::fs::create_dir(root.join(".git")).unwrap();
 
         // Supported file
         let src = root.join("src");
@@ -310,20 +325,33 @@ diff --git a/src/main.rs b/src/main.rs
         std::fs::create_dir_all(&hidden).unwrap();
         std::fs::write(hidden.join("secret.rs"), "fn x() {}\n").unwrap();
 
-        // node_modules (should be skipped)
-        let nm = root.join("node_modules");
-        std::fs::create_dir_all(&nm).unwrap();
-        std::fs::write(nm.join("dep.js"), "var x = 1;\n").unwrap();
+        // Gitignored dir
+        std::fs::write(root.join(".gitignore"), "generated/\n").unwrap();
+        let generated = root.join("generated");
+        std::fs::create_dir_all(&generated).unwrap();
+        std::fs::write(generated.join("out.rs"), "fn gen() {}\n").unwrap();
 
-        // build dir (should be skipped)
-        let build = root.join("build");
-        std::fs::create_dir_all(&build).unwrap();
-        std::fs::write(build.join("out.go"), "package main\n").unwrap();
+        // Test file (should be skipped)
+        std::fs::write(src.join("main_test.go"), "package main\n").unwrap();
 
         let files = collect_all_supported_files(root).unwrap();
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].path, PathBuf::from("src/main.rs"));
         assert_eq!(files[0].hunks.len(), 1);
         assert_eq!(files[0].hunks[0], LineRange { start: 1, end: 1 });
+    }
+
+    #[test]
+    fn is_test_file_detects_common_patterns() {
+        assert!(is_test_file(Path::new("foo_test.go")));
+        assert!(is_test_file(Path::new("test_utils.py")));
+        assert!(is_test_file(Path::new("UserTest.java")));
+        assert!(is_test_file(Path::new("UserTests.cs")));
+        assert!(is_test_file(Path::new("app.test.ts")));
+        assert!(is_test_file(Path::new("app.spec.tsx")));
+        assert!(is_test_file(Path::new("widget_spec.rb")));
+        assert!(!is_test_file(Path::new("main.rs")));
+        assert!(!is_test_file(Path::new("utils.py")));
+        assert!(!is_test_file(Path::new("contest.go")));
     }
 }
