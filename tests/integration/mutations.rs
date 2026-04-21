@@ -88,6 +88,8 @@ async fn end_to_end_go_fixture_some_mutations_survive() {
         parallelism: 1,
         project_root: root,
         verbose: false,
+        build_command: vec![],
+        max_tested: None,
         show_output: false,
     };
 
