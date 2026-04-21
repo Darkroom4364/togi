@@ -19,6 +19,7 @@ async fn main() {
             verbose,
             show_output,
             test_cmd,
+            coverage_file,
         } => {
             if let Err(e) = run_check(
                 all,
@@ -31,6 +32,7 @@ async fn main() {
                 verbose,
                 show_output,
                 test_cmd,
+                coverage_file,
             )
             .await
             {
@@ -69,6 +71,7 @@ async fn run_check(
     verbose: bool,
     show_output: bool,
     test_cmd: Option<String>,
+    coverage_file: Option<PathBuf>,
 ) -> anyhow::Result<()> {
     // 1. Load config
     let mut config = togi::config::Config::load(config_path.as_deref())?;
@@ -85,6 +88,9 @@ async fn run_check(
     }
     if let Some(cmd) = test_cmd {
         config.test.command = cmd.split_whitespace().map(String::from).collect();
+    }
+    if let Some(path) = coverage_file {
+        config.mutations.coverage_file = Some(path);
     }
 
     // Find project root (git toplevel)
@@ -128,6 +134,26 @@ async fn run_check(
         &project_root,
         config.mutations.max_per_run,
     )?;
+
+    // Filter by coverage if a coverage file was provided
+    let mutations = if let Some(ref cov_path) = config.mutations.coverage_file {
+        let cov_content = std::fs::read_to_string(cov_path).map_err(|e| {
+            anyhow::anyhow!("Could not read coverage file {}: {e}", cov_path.display())
+        })?;
+        let coverage = togi::coverage::parse_lcov(&cov_content, &project_root);
+        let before = mutations.len();
+        let filtered = togi::coverage::filter_by_coverage(mutations, &coverage, &project_root);
+        if before > filtered.len() {
+            eprintln!(
+                "Coverage filter: {} of {} mutations on covered lines",
+                filtered.len(),
+                before
+            );
+        }
+        filtered
+    } else {
+        mutations
+    };
 
     if mutations.len() >= config.mutations.max_per_run {
         eprintln!(

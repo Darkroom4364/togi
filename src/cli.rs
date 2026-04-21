@@ -51,6 +51,10 @@ pub enum Commands {
         /// Override test command (e.g., 'go test ./...')
         #[arg(long)]
         test_cmd: Option<String>,
+
+        /// LCOV coverage file \u2014 only mutate lines with test coverage
+        #[arg(long)]
+        coverage_file: Option<PathBuf>,
     },
     /// Generate a togi.toml config template
     Init,

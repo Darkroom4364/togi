@@ -31,6 +31,7 @@ pub struct DiffConfig {
 pub struct MutationConfig {
     #[serde(default = "default_max_per_run")]
     pub max_per_run: usize,
+    pub coverage_file: Option<PathBuf>,
 }
 
 fn default_test_command() -> Vec<String> {
@@ -149,6 +150,7 @@ impl Default for MutationConfig {
     fn default() -> Self {
         Self {
             max_per_run: default_max_per_run(),
+            coverage_file: None,
         }
     }
 }
@@ -299,5 +301,24 @@ timeout = 120
     fn detect_fallback_make_test() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(detect_test_command(dir.path()), vec!["make", "test"]);
+    }
+
+    #[test]
+    fn parse_coverage_file_option() {
+        let toml_str = r#"
+[mutations]
+coverage_file = "coverage.lcov"
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            config.mutations.coverage_file,
+            Some(PathBuf::from("coverage.lcov"))
+        );
+    }
+
+    #[test]
+    fn coverage_file_defaults_to_none() {
+        let config: Config = toml::from_str("").unwrap();
+        assert!(config.mutations.coverage_file.is_none());
     }
 }

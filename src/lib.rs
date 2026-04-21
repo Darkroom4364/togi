@@ -1,5 +1,6 @@
 pub mod cli;
 pub mod config;
+pub mod coverage;
 pub mod diff;
 pub mod languages;
 pub mod lock;
