@@ -20,12 +20,18 @@ pub fn collect_all_supported_files(project_root: &Path) -> anyhow::Result<Vec<Ch
         .into_iter()
         .filter_entry(|e| {
             let name = e.file_name().to_string_lossy();
-            // Skip hidden dirs, target/, node_modules/, vendor/
             if e.file_type().is_dir() {
                 return !name.starts_with('.')
-                    && name != "target"
-                    && name != "node_modules"
-                    && name != "vendor";
+                    && !matches!(
+                        name.as_ref(),
+                        "target"
+                            | "node_modules"
+                            | "vendor"
+                            | "build"
+                            | "dist"
+                            | "__pycache__"
+                            | "venv"
+                    );
             }
             true
         })
@@ -43,9 +49,13 @@ pub fn collect_all_supported_files(project_root: &Path) -> anyhow::Result<Vec<Ch
             continue;
         }
 
-        let line_count = std::fs::read_to_string(path)
-            .map(|s| s.lines().count())
-            .unwrap_or(0);
+        let line_count = std::io::BufRead::lines(std::io::BufReader::new(
+            match std::fs::File::open(path) {
+                Ok(f) => f,
+                Err(_) => continue,
+            },
+        ))
+        .count();
         if line_count == 0 {
             continue;
         }
@@ -280,5 +290,40 @@ diff --git a/src/main.rs b/src/main.rs
 "#;
         let files = parse_diff(diff);
         assert_eq!(files[0].path, PathBuf::from("path/to/file.rs"));
+    }
+
+    #[test]
+    fn collect_all_finds_supported_files_and_skips_excluded_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        // Supported file
+        let src = root.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("main.rs"), "fn main() {}\n").unwrap();
+
+        // Unsupported extension
+        std::fs::write(root.join("readme.txt"), "hi\n").unwrap();
+
+        // Hidden dir (should be skipped)
+        let hidden = root.join(".hidden");
+        std::fs::create_dir_all(&hidden).unwrap();
+        std::fs::write(hidden.join("secret.rs"), "fn x() {}\n").unwrap();
+
+        // node_modules (should be skipped)
+        let nm = root.join("node_modules");
+        std::fs::create_dir_all(&nm).unwrap();
+        std::fs::write(nm.join("dep.js"), "var x = 1;\n").unwrap();
+
+        // build dir (should be skipped)
+        let build = root.join("build");
+        std::fs::create_dir_all(&build).unwrap();
+        std::fs::write(build.join("out.go"), "package main\n").unwrap();
+
+        let files = collect_all_supported_files(root).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, PathBuf::from("src/main.rs"));
+        assert_eq!(files[0].hunks.len(), 1);
+        assert_eq!(files[0].hunks[0], LineRange { start: 1, end: 1 });
     }
 }
