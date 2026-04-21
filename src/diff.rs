@@ -16,15 +16,16 @@ pub fn collect_all_supported_files(project_root: &Path) -> anyhow::Result<Vec<Ch
 
     let mut files = Vec::new();
 
-    for entry in ignore::WalkBuilder::new(project_root)
+    let mut entries: Vec<_> = ignore::WalkBuilder::new(project_root)
         .hidden(true)
         .git_ignore(true)
         .build()
-    {
-        let entry = entry?;
-        if !entry.file_type().is_some_and(|ft| ft.is_file()) {
-            continue;
-        }
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_some_and(|ft| ft.is_file()))
+        .collect();
+    entries.sort_by(|a, b| a.path().cmp(b.path()));
+
+    for entry in &entries {
         let path = entry.path();
         let ext = match path.extension().and_then(|e| e.to_str()) {
             Some(e) => e,
@@ -40,7 +41,10 @@ pub fn collect_all_supported_files(project_root: &Path) -> anyhow::Result<Vec<Ch
         let line_count =
             std::io::BufRead::lines(std::io::BufReader::new(match std::fs::File::open(path) {
                 Ok(f) => f,
-                Err(_) => continue,
+                Err(e) => {
+                    eprintln!("warning: could not read {}: {e}", path.display());
+                    continue;
+                }
             }))
             .count();
         if line_count == 0 {
@@ -66,6 +70,16 @@ pub fn collect_all_supported_files(project_root: &Path) -> anyhow::Result<Vec<Ch
 
 /// Returns true for files that look like test files across supported languages.
 fn is_test_file(path: &Path) -> bool {
+    // Check if any ancestor directory is a known test directory
+    for component in path.components() {
+        let s = component.as_os_str().to_str().unwrap_or("");
+        if matches!(
+            s,
+            "tests" | "test" | "__tests__" | "__test__" | "spec" | "specs"
+        ) {
+            return true;
+        }
+    }
     let name = match path.file_stem().and_then(|s| s.to_str()) {
         Some(n) => n,
         None => return false,
@@ -333,6 +347,11 @@ diff --git a/src/main.rs b/src/main.rs
         // Test file (should be skipped)
         std::fs::write(src.join("main_test.go"), "package main\n").unwrap();
 
+        // File inside tests/ directory (should be skipped)
+        let tests_dir = root.join("tests");
+        std::fs::create_dir_all(&tests_dir).unwrap();
+        std::fs::write(tests_dir.join("helper.rs"), "fn help() {}\n").unwrap();
+
         let files = collect_all_supported_files(root).unwrap();
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].path, PathBuf::from("src/main.rs"));
@@ -352,5 +371,9 @@ diff --git a/src/main.rs b/src/main.rs
         assert!(!is_test_file(Path::new("main.rs")));
         assert!(!is_test_file(Path::new("utils.py")));
         assert!(!is_test_file(Path::new("contest.go")));
+        // Directory-based detection
+        assert!(is_test_file(Path::new("tests/helper.rs")));
+        assert!(is_test_file(Path::new("__tests__/utils.ts")));
+        assert!(is_test_file(Path::new("src/test/java/Foo.java")));
     }
 }
