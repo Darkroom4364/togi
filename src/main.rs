@@ -96,6 +96,11 @@ async fn run_check(
     // Auto-detect test command if not explicitly configured
     config.resolve_test_command(&project_root);
 
+    // Warn about unrecognized language keys in [test.languages]
+    let all_langs = togi::languages::all();
+    let known: Vec<&str> = all_langs.iter().map(|l| l.name()).collect();
+    config.warn_unknown_languages(&known);
+
     // 3. Build list of files to mutate
     let changed_files = if all {
         let files = togi::diff::collect_all_supported_files(&project_root)?;

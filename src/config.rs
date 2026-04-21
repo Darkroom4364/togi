@@ -192,6 +192,20 @@ impl Config {
         }
     }
 
+    /// Warn if any configured language keys don't match known language names.
+    pub fn warn_unknown_languages(&self, known: &[&str]) {
+        for key in self.test.languages.keys() {
+            if !known.contains(&key.as_str()) {
+                eprintln!(
+                    "warning: unknown language '{}' in [test.languages]. \
+                     Known languages: {}",
+                    key,
+                    known.join(", ")
+                );
+            }
+        }
+    }
+
     /// If no test command was explicitly set in togi.toml, auto-detect from project files.
     pub fn resolve_test_command(&mut self, project_root: &Path) {
         if self.test.command.is_empty() {

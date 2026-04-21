@@ -449,4 +449,30 @@ mod tests {
         assert_eq!(outcome.result, MutationResult::Timeout);
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "hello world");
     }
+
+    #[tokio::test]
+    async fn language_commands_override_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("test.txt");
+        std::fs::write(&file, b"hello world").unwrap();
+
+        let mut mutation = make_test_mutation(&file);
+        mutation.language = "go".into();
+
+        let mut lang_cmds = HashMap::new();
+        lang_cmds.insert("go".into(), vec!["false".into()]); // "false" = always fails = killed
+
+        let runner = TestRunner {
+            command: vec!["true".into()], // default would survive
+            language_commands: lang_cmds,
+            timeout: Duration::from_secs(5),
+            parallelism: 1,
+            project_root: dir.path().to_path_buf(),
+            verbose: false,
+            show_output: false,
+        };
+
+        let report = runner.run(vec![mutation]).await;
+        assert_eq!(report.killed, 1, "should use language-specific command");
+    }
 }
