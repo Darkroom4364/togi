@@ -335,8 +335,12 @@ diff --git a/src/main.rs b/src/main.rs
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
 
-        // Init a git repo so .gitignore is respected
-        std::fs::create_dir(root.join(".git")).unwrap();
+        // Init a real git repo so the ignore crate respects .gitignore
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(root)
+            .status()
+            .expect("git init failed");
 
         // Supported file
         let src = root.join("src");
