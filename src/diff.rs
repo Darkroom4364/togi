@@ -37,13 +37,12 @@ pub fn collect_all_supported_files(project_root: &Path) -> anyhow::Result<Vec<Ch
             continue;
         }
 
-        let line_count = std::io::BufRead::lines(std::io::BufReader::new(
-            match std::fs::File::open(path) {
+        let line_count =
+            std::io::BufRead::lines(std::io::BufReader::new(match std::fs::File::open(path) {
                 Ok(f) => f,
                 Err(_) => continue,
-            },
-        ))
-        .count();
+            }))
+            .count();
         if line_count == 0 {
             continue;
         }
