@@ -9,6 +9,7 @@ async fn main() {
 
     match cli.command {
         togi::cli::Commands::Check {
+            all,
             base,
             config,
             format,
@@ -20,6 +21,7 @@ async fn main() {
             test_cmd,
         } => {
             if let Err(e) = run_check(
+                all,
                 base,
                 config,
                 format,
@@ -57,6 +59,7 @@ async fn main() {
 
 #[allow(clippy::too_many_arguments)]
 async fn run_check(
+    all: bool,
     base: String,
     config_path: Option<PathBuf>,
     format: String,
@@ -93,23 +96,31 @@ async fn run_check(
     // Auto-detect test command if not explicitly configured
     config.resolve_test_command(&project_root);
 
-    // 3. Run git diff
-    let diff_output = get_git_diff(&config.diff.base)?;
-
-    if diff_output.is_empty() {
-        println!(
-            "No changes found in diff against `{}`. Nothing to mutate.",
-            config.diff.base
-        );
-        return Ok(());
-    }
-
-    // 4. Parse diff into ChangedFiles
-    let changed_files = togi::diff::parse_diff(&diff_output);
-    if changed_files.is_empty() {
-        println!("No added/modified lines found. Nothing to mutate.");
-        return Ok(());
-    }
+    // 3. Build list of files to mutate
+    let changed_files = if all {
+        let files = togi::diff::collect_all_supported_files(&project_root)?;
+        if files.is_empty() {
+            println!("No supported source files found. Nothing to mutate.");
+            return Ok(());
+        }
+        eprintln!("Scanning all {} supported files...", files.len());
+        files
+    } else {
+        let diff_output = get_git_diff(&config.diff.base)?;
+        if diff_output.is_empty() {
+            println!(
+                "No changes found in diff against `{}`. Nothing to mutate.",
+                config.diff.base
+            );
+            return Ok(());
+        }
+        let files = togi::diff::parse_diff(&diff_output);
+        if files.is_empty() {
+            println!("No added/modified lines found. Nothing to mutate.");
+            return Ok(());
+        }
+        files
+    };
 
     // 5. Generate mutations
     let mutations = togi::mutator::generate_mutations(

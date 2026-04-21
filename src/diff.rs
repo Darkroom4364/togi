@@ -1,7 +1,71 @@
 // Unified diff parsing → Vec<ChangedFile>
 
 use crate::{ChangedFile, LineRange};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+/// Build ChangedFile entries for every supported file in the project tree.
+/// Each file gets a single hunk covering all lines.
+pub fn collect_all_supported_files(project_root: &Path) -> anyhow::Result<Vec<ChangedFile>> {
+    use crate::languages;
+
+    let langs = languages::all();
+    let supported_extensions: Vec<&str> = langs
+        .iter()
+        .flat_map(|lang| lang.extensions().to_vec())
+        .collect();
+
+    let mut files = Vec::new();
+
+    for entry in walkdir::WalkDir::new(project_root)
+        .into_iter()
+        .filter_entry(|e| {
+            let name = e.file_name().to_string_lossy();
+            // Skip hidden dirs, target/, node_modules/, vendor/
+            if e.file_type().is_dir() {
+                return !name.starts_with('.')
+                    && name != "target"
+                    && name != "node_modules"
+                    && name != "vendor";
+            }
+            true
+        })
+    {
+        let entry = entry?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let path = entry.path();
+        let ext = match path.extension().and_then(|e| e.to_str()) {
+            Some(e) => e,
+            None => continue,
+        };
+        if !supported_extensions.contains(&ext) {
+            continue;
+        }
+
+        let line_count = std::fs::read_to_string(path)
+            .map(|s| s.lines().count())
+            .unwrap_or(0);
+        if line_count == 0 {
+            continue;
+        }
+
+        let rel_path = path
+            .strip_prefix(project_root)
+            .unwrap_or(path)
+            .to_path_buf();
+
+        files.push(ChangedFile {
+            path: rel_path,
+            hunks: vec![LineRange {
+                start: 1,
+                end: line_count,
+            }],
+        });
+    }
+
+    Ok(files)
+}
 
 /// Parse unified diff output (from `git diff`) into a list of changed files
 /// with their modified line ranges. Only tracks added/modified lines.
