@@ -22,7 +22,7 @@ pub fn collect_all_supported_files(project_root: &Path) -> anyhow::Result<Vec<Ch
         .build()
     {
         let entry = entry?;
-        if !entry.file_type().map_or(false, |ft| ft.is_file()) {
+        if !entry.file_type().is_some_and(|ft| ft.is_file()) {
             continue;
         }
         let path = entry.path();
