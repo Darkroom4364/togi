@@ -75,7 +75,13 @@ fn is_test_file(path: &Path) -> bool {
         let s = component.as_os_str().to_str().unwrap_or("");
         if matches!(
             s,
-            "tests" | "test" | "__tests__" | "__test__" | "spec" | "specs" | "testdata"
+            "tests"
+                | "test"
+                | "__tests__"
+                | "__test__"
+                | "spec"
+                | "specs"
+                | "testdata"
                 | "fixtures"
         ) {
             return true;
