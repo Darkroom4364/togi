@@ -84,6 +84,7 @@ async fn end_to_end_go_fixture_some_mutations_survive() {
 
     let runner = togi::runner::TestRunner {
         command: vec!["go".into(), "test".into(), "./...".into()],
+        language_commands: std::collections::HashMap::new(),
         timeout: Duration::from_secs(30),
         parallelism: 1,
         project_root: root,

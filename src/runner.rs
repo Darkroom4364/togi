@@ -11,6 +11,7 @@ use tokio::sync::Semaphore;
 
 pub struct TestRunner {
     pub command: Vec<String>,
+    pub language_commands: HashMap<String, Vec<String>>,
     pub timeout: Duration,
     pub parallelism: usize,
     pub project_root: PathBuf,
@@ -51,7 +52,15 @@ impl TestRunner {
 
         for (_file, file_mutations) in by_file {
             let sem = semaphore.clone();
-            let command = self.command.clone();
+            let language = file_mutations
+                .first()
+                .map(|m| m.language.as_str())
+                .unwrap_or("");
+            let command = self
+                .language_commands
+                .get(language)
+                .unwrap_or(&self.command)
+                .clone();
             let timeout = self.timeout;
             let project_root = self.project_root.clone();
             let counter = counter.clone();
@@ -311,6 +320,7 @@ mod tests {
         Mutation {
             id: 1,
             file: file.to_path_buf(),
+            language: String::new(),
             line: 1,
             column: 1,
             operator: "test".into(),
@@ -373,6 +383,7 @@ mod tests {
         let mutation = Mutation {
             id: 1,
             file: file.clone(),
+            language: String::new(),
             line: 1,
             column: 1,
             operator: "removal".into(),

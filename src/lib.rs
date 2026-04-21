@@ -47,6 +47,7 @@ pub struct LineRange {
 pub struct Mutation {
     pub id: u32,
     pub file: PathBuf,
+    pub language: String,
     pub line: usize,
     pub column: usize,
     pub operator: String,

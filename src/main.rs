@@ -166,8 +166,16 @@ async fn run_check(
     // 7. Run mutations
     eprintln!("Running {} mutations...", mutations.len());
 
+    let language_commands: std::collections::HashMap<String, Vec<String>> = config
+        .test
+        .languages
+        .iter()
+        .map(|(k, v)| (k.clone(), v.command.clone()))
+        .collect();
+
     let runner = togi::runner::TestRunner {
         command: config.test.command,
+        language_commands,
         timeout: Duration::from_secs(config.test.timeout),
         parallelism: config.test.jobs,
         project_root,
