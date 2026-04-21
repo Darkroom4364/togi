@@ -80,17 +80,18 @@ fn is_test_file(path: &Path) -> bool {
         let s = component.as_os_str().to_str().unwrap_or("");
         if matches!(
             s,
-            "tests"
-                | "test"
-                | "__tests__"
-                | "__test__"
-                | "spec"
-                | "specs"
-                | "testdata"
-                | "fixtures"
+            "tests" | "__tests__" | "__test__" | "spec" | "specs" | "testdata" | "fixtures"
         ) {
             return true;
         }
+    }
+    // Java/Kotlin/Gradle: src/test/... — match "test" only when preceded by "src"
+    let comps: Vec<_> = path.components().collect();
+    if comps
+        .windows(2)
+        .any(|w| w[0].as_os_str() == "src" && w[1].as_os_str() == "test")
+    {
+        return true;
     }
     let name = match path.file_stem().and_then(|s| s.to_str()) {
         Some(n) => n,
@@ -387,6 +388,9 @@ diff --git a/src/main.rs b/src/main.rs
         assert!(is_test_file(Path::new("tests/helper.rs")));
         assert!(is_test_file(Path::new("__tests__/utils.ts")));
         assert!(is_test_file(Path::new("src/test/java/Foo.java")));
+        assert!(is_test_file(Path::new("module/src/test/kotlin/Bar.kt")));
+        assert!(!is_test_file(Path::new("test/integration/main.go")));
+        assert!(!is_test_file(Path::new("cmd/test/server.go")));
         assert!(is_test_file(Path::new("testdata/input.go")));
         assert!(is_test_file(Path::new("fixtures/setup.py")));
     }
