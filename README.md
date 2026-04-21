@@ -65,6 +65,9 @@ togi check --dry-run
 # JSON output for CI
 togi check --format json
 
+# Mutate all supported files (not just the diff)
+togi check --all
+
 # Adjust parallelism and timeout
 togi check --jobs 8 --timeout 60
 
