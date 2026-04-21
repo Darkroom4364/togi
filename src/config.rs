@@ -1,4 +1,5 @@
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Default, Deserialize)]
@@ -11,6 +12,11 @@ pub struct Config {
     pub mutations: MutationConfig,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct LanguageTestConfig {
+    pub command: Vec<String>,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct TestConfig {
     #[serde(default = "default_test_command")]
@@ -19,6 +25,8 @@ pub struct TestConfig {
     pub timeout: u64,
     #[serde(default = "default_jobs")]
     pub jobs: usize,
+    #[serde(flatten, default)]
+    pub languages: HashMap<String, LanguageTestConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -133,6 +141,7 @@ impl Default for TestConfig {
             command: default_test_command(),
             timeout: default_timeout(),
             jobs: default_jobs(),
+            languages: HashMap::new(),
         }
     }
 }
@@ -171,6 +180,14 @@ impl Config {
             }
             None => Ok(Config::default()),
         }
+    }
+
+    /// Look up a per-language test command from `[test.<language>]` sections.
+    pub fn test_command_for_language(&self, language: &str) -> Option<&[String]> {
+        self.test
+            .languages
+            .get(language)
+            .map(|c| c.command.as_slice())
     }
 
     /// If no test command was explicitly set in togi.toml, auto-detect from project files.
@@ -368,5 +385,37 @@ timeout = 120
     #[test]
     fn default_timeout_is_30() {
         assert_eq!(default_timeout(), 30);
+    }
+
+    #[test]
+    fn parse_per_language_test_commands() {
+        let toml_str = r#"
+[test]
+command = ["make", "test"]
+
+[test.rust]
+command = ["cargo", "test"]
+
+[test.python]
+command = ["pytest", "-x"]
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.test.command, vec!["make", "test"]);
+        assert_eq!(
+            config.test_command_for_language("rust"),
+            Some(vec!["cargo".to_string(), "test".to_string()].as_slice())
+        );
+        assert_eq!(
+            config.test_command_for_language("python"),
+            Some(vec!["pytest".to_string(), "-x".to_string()].as_slice())
+        );
+        assert_eq!(config.test_command_for_language("go"), None);
+    }
+
+    #[test]
+    fn no_language_overrides_by_default() {
+        let config: Config = toml::from_str("").unwrap();
+        assert!(config.test.languages.is_empty());
+        assert_eq!(config.test_command_for_language("rust"), None);
     }
 }
