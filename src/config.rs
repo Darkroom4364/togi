@@ -334,4 +334,73 @@ timeout = 120
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(detect_test_command(dir.path()), vec!["make", "test"]);
     }
+
+    #[test]
+    fn has_file_with_ext_returns_false_when_no_match() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("foo.txt"), "").unwrap();
+        assert!(!has_file_with_ext(dir.path(), "rs"));
+    }
+
+    #[test]
+    fn has_file_with_ext_returns_false_for_nonexistent_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let bad = dir.path().join("nonexistent");
+        assert!(!has_file_with_ext(&bad, "rs"));
+    }
+
+    #[test]
+    fn detect_gradle_kts_only() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("build.gradle.kts"), "").unwrap();
+        assert_eq!(detect_test_command(dir.path()), vec!["./gradlew", "test"]);
+    }
+
+    #[test]
+    fn detect_gemfile() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Gemfile"), "").unwrap();
+        assert_eq!(
+            detect_test_command(dir.path()),
+            vec!["bundle", "exec", "rspec"]
+        );
+    }
+
+    #[test]
+    fn detect_cmake() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("CMakeLists.txt"), "").unwrap();
+        assert_eq!(detect_test_command(dir.path()), vec!["ctest"]);
+    }
+
+    #[test]
+    fn detect_csproj_only() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("MyApp.csproj"), "").unwrap();
+        assert_eq!(detect_test_command(dir.path()), vec!["dotnet", "test"]);
+    }
+
+    #[test]
+    fn detect_sln_only() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("MyApp.sln"), "").unwrap();
+        assert_eq!(detect_test_command(dir.path()), vec!["dotnet", "test"]);
+    }
+
+    #[test]
+    fn detect_pom_xml() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("pom.xml"), "").unwrap();
+        assert_eq!(detect_test_command(dir.path()), vec!["mvn", "test"]);
+    }
+
+    #[test]
+    fn default_max_per_run_is_20() {
+        assert_eq!(default_max_per_run(), 20);
+    }
+
+    #[test]
+    fn default_timeout_is_30() {
+        assert_eq!(default_timeout(), 30);
+    }
 }
