@@ -20,7 +20,13 @@ pub fn collect_all_supported_files(project_root: &Path) -> anyhow::Result<Vec<Ch
         .hidden(true)
         .git_ignore(true)
         .build()
-        .filter_map(|e| e.ok())
+        .filter_map(|e| match e {
+            Ok(entry) => Some(entry),
+            Err(err) => {
+                eprintln!("warning: skipping path during walk: {err}");
+                None
+            }
+        })
         .filter(|e| e.file_type().is_some_and(|ft| ft.is_file()))
         .collect();
     entries.sort_by(|a, b| a.path().cmp(b.path()));
@@ -34,7 +40,11 @@ pub fn collect_all_supported_files(project_root: &Path) -> anyhow::Result<Vec<Ch
         if !supported_extensions.contains(&ext) {
             continue;
         }
-        if is_test_file(path) {
+        let rel_path = path
+            .strip_prefix(project_root)
+            .unwrap_or(path)
+            .to_path_buf();
+        if is_test_file(&rel_path) {
             continue;
         }
 
@@ -50,11 +60,6 @@ pub fn collect_all_supported_files(project_root: &Path) -> anyhow::Result<Vec<Ch
         if line_count == 0 {
             continue;
         }
-
-        let rel_path = path
-            .strip_prefix(project_root)
-            .unwrap_or(path)
-            .to_path_buf();
 
         files.push(ChangedFile {
             path: rel_path,
