@@ -6,7 +6,7 @@ Fast, diff-targeted, multi-language mutation testing engine.
 
 Single Rust binary. Pipeline: diff → parse → map → mutate → run → report.
 
-- `src/diff.rs` — parse unified diff into changed file/line ranges
+- `src/diff.rs` — parse unified diff into changed file/line ranges; `--all` mode file collection
 - `src/parser.rs` — tree-sitter language detection and AST parsing
 - `src/mapper.rs` — map changed lines to mutable AST nodes
 - `src/mutator.rs` — combine mapper + operators to generate mutations

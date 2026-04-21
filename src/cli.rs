@@ -12,6 +12,10 @@ pub struct Cli {
 pub enum Commands {
     /// Run mutation testing on the current diff
     Check {
+        /// Mutate all supported files instead of just the diff
+        #[arg(long, conflicts_with = "base")]
+        all: bool,
+
         /// Base branch to diff against
         #[arg(long, default_value = "origin/main")]
         base: String,
