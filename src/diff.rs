@@ -73,6 +73,43 @@ pub fn collect_all_supported_files(project_root: &Path) -> anyhow::Result<Vec<Ch
     Ok(files)
 }
 
+/// Collect changed files and line ranges since a given git ref or date.
+///
+/// `since` can be a commit SHA, branch name, tag, or a date string that
+/// `git log --since` understands (e.g. "2024-01-01", "3 days ago").
+///
+/// Returns the same `Vec<ChangedFile>` format as `parse_diff`, filtering
+/// out test files and files with no added lines.
+pub fn collect_changed_since(project_root: &Path, since: &str) -> anyhow::Result<Vec<ChangedFile>> {
+    use std::process::Command;
+
+    // Try as a commit ref first (SHA, branch, tag).
+    let output = Command::new("git")
+        .args(["diff", &format!("{since}...HEAD")])
+        .current_dir(project_root)
+        .output()?;
+
+    let diff_output = if output.status.success() {
+        String::from_utf8(output.stdout)?
+    } else {
+        // Fall back to date-based: git log --since=<date> -p
+        let output = Command::new("git")
+            .args(["log", &format!("--since={since}"), "-p", "--reverse"])
+            .current_dir(project_root)
+            .output()?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "git log --since failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        String::from_utf8(output.stdout)?
+    };
+
+    let all = parse_diff(&diff_output);
+    Ok(all.into_iter().filter(|f| !is_test_file(&f.path)).collect())
+}
+
 /// Returns true for files that look like test files across supported languages.
 fn is_test_file(path: &Path) -> bool {
     // Check if any ancestor directory is a known test directory
@@ -393,5 +430,83 @@ diff --git a/src/main.rs b/src/main.rs
         assert!(!is_test_file(Path::new("cmd/test/server.go")));
         assert!(is_test_file(Path::new("testdata/input.go")));
         assert!(is_test_file(Path::new("fixtures/setup.py")));
+    }
+
+    #[test]
+    fn collect_changed_since_ref() {
+        use std::process::Command;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        let run = |args: &[&str]| {
+            Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .env("GIT_AUTHOR_NAME", "test")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "test")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .unwrap()
+        };
+
+        run(&["init"]);
+        std::fs::write(root.join("main.rs"), "fn main() {}\n").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-m", "initial"]);
+
+        let out = run(&["rev-parse", "HEAD"]);
+        let base = String::from_utf8(out.stdout).unwrap().trim().to_string();
+
+        std::fs::write(
+            root.join("main.rs"),
+            "fn main() {\n    println!(\"hi\");\n}\n",
+        )
+        .unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-m", "add print"]);
+
+        let files = collect_changed_since(root, &base).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, PathBuf::from("main.rs"));
+        assert!(!files[0].hunks.is_empty());
+    }
+
+    #[test]
+    fn collect_changed_since_filters_test_files() {
+        use std::process::Command;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        let run = |args: &[&str]| {
+            Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .env("GIT_AUTHOR_NAME", "test")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "test")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .unwrap()
+        };
+
+        run(&["init"]);
+        std::fs::write(root.join("lib.rs"), "pub fn x() {}\n").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-m", "initial"]);
+
+        let out = run(&["rev-parse", "HEAD"]);
+        let base = String::from_utf8(out.stdout).unwrap().trim().to_string();
+
+        std::fs::write(root.join("lib.rs"), "pub fn x() { 1 }\n").unwrap();
+        std::fs::write(root.join("lib_test.rs"), "fn test() {}\n").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-m", "add changes"]);
+
+        let files = collect_changed_since(root, &base).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, PathBuf::from("lib.rs"));
     }
 }
