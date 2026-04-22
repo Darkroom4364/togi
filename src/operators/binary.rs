@@ -82,7 +82,8 @@ mod tests {
         let src = "package main\nfunc f() bool { return x < y }";
         let tree = parse_go(src);
         let root = tree.root_node();
-        let bin = find_node_by_kind(root, "binary_expression").expect("should find binary_expression");
+        let bin = find_node_by_kind(root, "binary_expression")
+            .expect("should find binary_expression");
         let candidates = LtToLte.apply(&bin, src.as_bytes());
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].replacement, "<=");
@@ -93,7 +94,8 @@ mod tests {
         let src = "package main\nfunc f() bool { return x > y }";
         let tree = parse_go(src);
         let root = tree.root_node();
-        let bin = find_node_by_kind(root, "binary_expression").expect("should find binary_expression");
+        let bin = find_node_by_kind(root, "binary_expression")
+            .expect("should find binary_expression");
         let candidates = GtToGte.apply(&bin, src.as_bytes());
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].replacement, ">=");
@@ -104,7 +106,8 @@ mod tests {
         let src = "package main\nfunc f() bool { return x == y }";
         let tree = parse_go(src);
         let root = tree.root_node();
-        let bin = find_node_by_kind(root, "binary_expression").expect("should find binary_expression");
+        let bin = find_node_by_kind(root, "binary_expression")
+            .expect("should find binary_expression");
         let candidates = EqToNeq.apply(&bin, src.as_bytes());
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].replacement, "!=");
@@ -115,7 +118,8 @@ mod tests {
         let src = "package main\nfunc f() bool { return x && y }";
         let tree = parse_go(src);
         let root = tree.root_node();
-        let bin = find_node_by_kind(root, "binary_expression").expect("should find binary_expression");
+        let bin = find_node_by_kind(root, "binary_expression")
+            .expect("should find binary_expression");
         let candidates = AndToOr.apply(&bin, src.as_bytes());
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].replacement, "||");
@@ -126,7 +130,8 @@ mod tests {
         let src = "package main\nfunc f() bool { return x || y }";
         let tree = parse_go(src);
         let root = tree.root_node();
-        let bin = find_node_by_kind(root, "binary_expression").expect("should find binary_expression");
+        let bin = find_node_by_kind(root, "binary_expression")
+            .expect("should find binary_expression");
         let candidates = OrToAnd.apply(&bin, src.as_bytes());
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].replacement, "&&");
@@ -137,7 +142,8 @@ mod tests {
         let src = "package main\nfunc f() bool { return x + y }";
         let tree = parse_go(src);
         let root = tree.root_node();
-        let bin = find_node_by_kind(root, "binary_expression").expect("should find binary_expression");
+        let bin = find_node_by_kind(root, "binary_expression")
+            .expect("should find binary_expression");
         let candidates = LtToLte.apply(&bin, src.as_bytes());
         assert!(candidates.is_empty());
     }
