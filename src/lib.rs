@@ -1,3 +1,6 @@
+pub mod baseline;
+pub mod build_check;
+pub mod cache;
 pub mod cli;
 pub mod config;
 pub mod diff;
@@ -47,6 +50,7 @@ pub struct LineRange {
 pub struct Mutation {
     pub id: u32,
     pub file: PathBuf,
+    pub language: String,
     pub line: usize,
     pub column: usize,
     pub operator: String,

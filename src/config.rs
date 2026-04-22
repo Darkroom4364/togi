@@ -1,4 +1,5 @@
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Default, Deserialize)]
@@ -11,14 +12,23 @@ pub struct Config {
     pub mutations: MutationConfig,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct LanguageTestConfig {
+    pub command: Vec<String>,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct TestConfig {
     #[serde(default = "default_test_command")]
     pub command: Vec<String>,
+    #[serde(default)]
+    pub build_command: Vec<String>,
     #[serde(default = "default_timeout")]
     pub timeout: u64,
     #[serde(default = "default_jobs")]
     pub jobs: usize,
+    #[serde(default)]
+    pub languages: HashMap<String, LanguageTestConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -109,6 +119,29 @@ pub fn detect_test_command(project_root: &Path) -> Vec<String> {
     }
 }
 
+pub fn detect_build_command(project_root: &Path) -> Vec<String> {
+    if project_root.join("Cargo.toml").exists() {
+        return vec!["cargo".into(), "check".into()];
+    }
+    if project_root.join("go.mod").exists() {
+        return vec!["go".into(), "build".into(), "./...".into()];
+    }
+    if project_root.join("tsconfig.json").exists() {
+        return vec!["npx".into(), "tsc".into(), "--noEmit".into()];
+    }
+    if project_root.join("pom.xml").exists() {
+        return vec!["mvn".into(), "compile".into(), "-q".into()];
+    }
+    if project_root.join("build.gradle").exists() || project_root.join("build.gradle.kts").exists()
+    {
+        return vec!["./gradlew".into(), "compileJava".into()];
+    }
+    if has_file_with_ext(project_root, "sln") || has_file_with_ext(project_root, "csproj") {
+        return vec!["dotnet".into(), "build".into(), "--no-restore".into()];
+    }
+    vec![]
+}
+
 fn default_timeout() -> u64 {
     30
 }
@@ -127,12 +160,24 @@ fn default_max_per_run() -> usize {
     20
 }
 
+impl TestConfig {
+    pub fn command_for_language(&self, language: &str) -> &[String] {
+        if let Some(lang_config) = self.languages.get(language) {
+            &lang_config.command
+        } else {
+            &self.command
+        }
+    }
+}
+
 impl Default for TestConfig {
     fn default() -> Self {
         Self {
             command: default_test_command(),
+            build_command: vec![],
             timeout: default_timeout(),
             jobs: default_jobs(),
+            languages: HashMap::new(),
         }
     }
 }
@@ -173,10 +218,31 @@ impl Config {
         }
     }
 
+    /// Warn if any configured language keys don't match known language names.
+    pub fn warn_unknown_languages(&self, known: &[&str]) {
+        for key in self.test.languages.keys() {
+            if !known.contains(&key.as_str()) {
+                eprintln!(
+                    "warning: unknown language '{}' in [test.languages]. \
+                     Known languages: {}",
+                    key,
+                    known.join(", ")
+                );
+            }
+        }
+    }
+
     /// If no test command was explicitly set in togi.toml, auto-detect from project files.
     pub fn resolve_test_command(&mut self, project_root: &Path) {
         if self.test.command.is_empty() {
             self.test.command = detect_test_command(project_root);
+        }
+    }
+
+    /// If no build command was explicitly set in togi.toml, auto-detect from project files.
+    pub fn resolve_build_command(&mut self, project_root: &Path) {
+        if self.test.build_command.is_empty() {
+            self.test.build_command = detect_build_command(project_root);
         }
     }
 
@@ -186,8 +252,13 @@ impl Config {
 
 [test]
 command = ["cargo", "test"]
+# build_command = ["cargo", "check"]  # auto-detected; compile check before running tests
 timeout = 30
 # jobs = 4  # defaults to number of CPUs
+
+# Per-language test commands (key = language name, e.g. typescript, python, go)
+# [test.languages.typescript]
+# command = ["npx", "jest"]
 
 [diff]
 base = "origin/main"
@@ -299,5 +370,125 @@ timeout = 120
     fn detect_fallback_make_test() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(detect_test_command(dir.path()), vec!["make", "test"]);
+    }
+
+    #[test]
+    fn has_file_with_ext_returns_false_when_no_match() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("foo.txt"), "").unwrap();
+        assert!(!has_file_with_ext(dir.path(), "rs"));
+    }
+
+    #[test]
+    fn has_file_with_ext_returns_false_for_nonexistent_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let bad = dir.path().join("nonexistent");
+        assert!(!has_file_with_ext(&bad, "rs"));
+    }
+
+    #[test]
+    fn detect_gradle_kts_only() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("build.gradle.kts"), "").unwrap();
+        assert_eq!(detect_test_command(dir.path()), vec!["./gradlew", "test"]);
+    }
+
+    #[test]
+    fn detect_gemfile() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Gemfile"), "").unwrap();
+        assert_eq!(
+            detect_test_command(dir.path()),
+            vec!["bundle", "exec", "rspec"]
+        );
+    }
+
+    #[test]
+    fn detect_cmake() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("CMakeLists.txt"), "").unwrap();
+        assert_eq!(detect_test_command(dir.path()), vec!["ctest"]);
+    }
+
+    #[test]
+    fn detect_csproj_only() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("MyApp.csproj"), "").unwrap();
+        assert_eq!(detect_test_command(dir.path()), vec!["dotnet", "test"]);
+    }
+
+    #[test]
+    fn detect_sln_only() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("MyApp.sln"), "").unwrap();
+        assert_eq!(detect_test_command(dir.path()), vec!["dotnet", "test"]);
+    }
+
+    #[test]
+    fn detect_pom_xml() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("pom.xml"), "").unwrap();
+        assert_eq!(detect_test_command(dir.path()), vec!["mvn", "test"]);
+    }
+
+    #[test]
+    fn default_max_per_run_is_20() {
+        assert_eq!(default_max_per_run(), 20);
+    }
+
+    #[test]
+    fn default_timeout_is_30() {
+        assert_eq!(default_timeout(), 30);
+    }
+
+    #[test]
+    fn parse_per_language_commands() {
+        let toml_str = r#"
+[test]
+command = ["cargo", "test"]
+
+[test.languages.typescript]
+command = ["npx", "jest"]
+
+[test.languages.python]
+command = ["pytest"]
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            config.test.languages["typescript"].command,
+            vec!["npx", "jest"]
+        );
+        assert_eq!(config.test.languages["python"].command, vec!["pytest"]);
+    }
+
+    #[test]
+    fn command_for_language_resolution() {
+        let toml_str = r#"
+[test]
+command = ["cargo", "test"]
+
+[test.languages.typescript]
+command = ["npx", "jest"]
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            config.test.command_for_language("typescript"),
+            &["npx", "jest"]
+        );
+        assert_eq!(config.test.command_for_language("go"), &["cargo", "test"]);
+    }
+
+    #[test]
+    fn empty_languages_backward_compat() {
+        let toml_str = r#"
+[test]
+command = ["make", "test"]
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert!(config.test.languages.is_empty());
+        assert_eq!(
+            config.test.command_for_language("anything"),
+            &["make", "test"]
+        );
     }
 }

@@ -19,6 +19,7 @@ async fn main() {
             verbose,
             show_output,
             test_cmd,
+            build_cmd,
         } => {
             if let Err(e) = run_check(
                 all,
@@ -31,6 +32,7 @@ async fn main() {
                 verbose,
                 show_output,
                 test_cmd,
+                build_cmd,
             )
             .await
             {
@@ -69,6 +71,7 @@ async fn run_check(
     verbose: bool,
     show_output: bool,
     test_cmd: Option<String>,
+    build_cmd: Option<String>,
 ) -> anyhow::Result<()> {
     // 1. Load config
     let mut config = togi::config::Config::load(config_path.as_deref())?;
@@ -86,6 +89,9 @@ async fn run_check(
     if let Some(cmd) = test_cmd {
         config.test.command = cmd.split_whitespace().map(String::from).collect();
     }
+    if let Some(cmd) = build_cmd {
+        config.test.build_command = cmd.split_whitespace().map(String::from).collect();
+    }
 
     // Find project root (git toplevel)
     let project_root = get_project_root()?;
@@ -95,6 +101,12 @@ async fn run_check(
 
     // Auto-detect test command if not explicitly configured
     config.resolve_test_command(&project_root);
+    config.resolve_build_command(&project_root);
+
+    // Warn about unrecognized language keys in [test.languages]
+    let all_langs = togi::languages::all();
+    let known: Vec<&str> = all_langs.iter().map(|l| l.name()).collect();
+    config.warn_unknown_languages(&known);
 
     // 3. Build list of files to mutate
     let changed_files = if all {
@@ -122,12 +134,14 @@ async fn run_check(
         files
     };
 
-    // 5. Generate mutations
-    let mutations = togi::mutator::generate_mutations(
-        &changed_files,
-        &project_root,
-        config.mutations.max_per_run,
-    )?;
+    // 5. Generate mutations (over-generate when build check active to compensate for filtered mutations)
+    let generation_limit = if config.test.build_command.is_empty() {
+        config.mutations.max_per_run
+    } else {
+        config.mutations.max_per_run * 2
+    };
+    let mutations =
+        togi::mutator::generate_mutations(&changed_files, &project_root, generation_limit)?;
 
     if mutations.len() >= config.mutations.max_per_run {
         eprintln!(
@@ -166,13 +180,23 @@ async fn run_check(
     // 7. Run mutations
     eprintln!("Running {} mutations...", mutations.len());
 
+    let language_commands: std::collections::HashMap<String, Vec<String>> = config
+        .test
+        .languages
+        .iter()
+        .map(|(k, v)| (k.clone(), v.command.clone()))
+        .collect();
+
     let runner = togi::runner::TestRunner {
         command: config.test.command,
+        language_commands,
+        build_command: config.test.build_command,
         timeout: Duration::from_secs(config.test.timeout),
         parallelism: config.test.jobs,
         project_root,
         verbose,
         show_output,
+        max_tested: Some(config.mutations.max_per_run),
     };
 
     let report = runner.run(mutations).await;

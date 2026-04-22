@@ -66,10 +66,17 @@ pub fn print_report(report: &MutationReport) {
 
     let separator = "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━";
     println!("{}", separator);
+    let tested = report.total - report.build_errors;
     println!(
         "Results: {}/{} mutations killed ({} survived)",
-        report.killed, report.total, report.survived
+        report.killed, tested, report.survived
     );
+    if report.build_errors > 0 {
+        println!(
+            "Build errors: {} (filtered, not counted in score)",
+            report.build_errors
+        );
+    }
     println!("Duration: {:.2}s", report.duration.as_secs_f64());
     println!("{}", separator);
 }
@@ -124,12 +131,21 @@ pub fn format_report_plain(report: &MutationReport) -> String {
 
     let separator = "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━";
     writeln!(out, "{}", separator).unwrap();
+    let tested = report.total - report.build_errors;
     writeln!(
         out,
         "Results: {}/{} mutations killed ({} survived)",
-        report.killed, report.total, report.survived
+        report.killed, tested, report.survived
     )
     .unwrap();
+    if report.build_errors > 0 {
+        writeln!(
+            out,
+            "Build errors: {} (filtered, not counted in score)",
+            report.build_errors
+        )
+        .unwrap();
+    }
     writeln!(out, "Duration: {:.2}s", report.duration.as_secs_f64()).unwrap();
     writeln!(out, "{}", separator).unwrap();
 
@@ -150,6 +166,7 @@ mod tests {
                     Mutation {
                         id: 1,
                         file: PathBuf::from("src/auth.rs"),
+                        language: String::new(),
                         line: 47,
                         column: 10,
                         operator: "binary/lt_to_lte".to_string(),
@@ -164,6 +181,7 @@ mod tests {
                     Mutation {
                         id: 2,
                         file: PathBuf::from("src/handler.rs"),
+                        language: String::new(),
                         line: 15,
                         column: 5,
                         operator: "binary/eq_to_neq".to_string(),
