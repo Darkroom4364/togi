@@ -17,7 +17,7 @@ impl MutationOperator for RemoveUnaryNot {
             return vec![];
         }
         let text = std::str::from_utf8(&source[node.byte_range()]).unwrap_or("");
-        if let Some(inner) = text.strip_prefix('!') {
+        if let Some(inner) = text.strip_prefix('!').or_else(|| text.strip_prefix("not ")) {
             vec![MutationCandidate {
                 byte_range: node.byte_range(),
                 replacement: inner.to_string(),
@@ -103,6 +103,19 @@ mod tests {
         let candidates = RemoveUnaryNeg.apply(&node, src.as_bytes());
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].replacement, "x");
+    }
+
+    #[test]
+    fn test_remove_unary_not_python() {
+        let src = "x = not y";
+        let mut parser = tree_sitter::Parser::new();
+        let lang = tree_sitter_python::LANGUAGE;
+        parser.set_language(&lang.into()).unwrap();
+        let tree = parser.parse(src, None).unwrap();
+        let node = find_first_kind(tree.root_node(), "not_operator").unwrap();
+        let candidates = RemoveUnaryNot.apply(&node, src.as_bytes());
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].replacement, "y");
     }
 
     #[test]
