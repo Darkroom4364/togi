@@ -62,34 +62,13 @@ impl MutationOperator for RemoveUnaryNeg {
 mod tests {
     use super::*;
 
-    fn parse_go(src: &str) -> tree_sitter::Tree {
-        let mut parser = tree_sitter::Parser::new();
-        let lang = tree_sitter_go::LANGUAGE;
-        parser.set_language(&lang.into()).unwrap();
-        parser.parse(src, None).unwrap()
-    }
-
-    fn find_first_kind<'a>(
-        node: tree_sitter::Node<'a>,
-        kind: &str,
-    ) -> Option<tree_sitter::Node<'a>> {
-        if node.kind() == kind {
-            return Some(node);
-        }
-        let mut cursor = node.walk();
-        for child in node.children(&mut cursor) {
-            if let Some(found) = find_first_kind(child, kind) {
-                return Some(found);
-            }
-        }
-        None
-    }
+    use crate::test_helpers::{find_node_by_kind, parse_go};
 
     #[test]
     fn test_remove_unary_not() {
         let src = "package main\nfunc f(x bool) bool { return !x }";
         let tree = parse_go(src);
-        let node = find_first_kind(tree.root_node(), "unary_expression").unwrap();
+        let node = find_node_by_kind(tree.root_node(), "unary_expression").unwrap();
         let candidates = RemoveUnaryNot.apply(&node, src.as_bytes());
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].replacement, "x");
@@ -99,7 +78,7 @@ mod tests {
     fn test_remove_unary_neg() {
         let src = "package main\nfunc f(x int) int { return -x }";
         let tree = parse_go(src);
-        let node = find_first_kind(tree.root_node(), "unary_expression").unwrap();
+        let node = find_node_by_kind(tree.root_node(), "unary_expression").unwrap();
         let candidates = RemoveUnaryNeg.apply(&node, src.as_bytes());
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].replacement, "x");
@@ -112,7 +91,7 @@ mod tests {
         let lang = tree_sitter_python::LANGUAGE;
         parser.set_language(&lang.into()).unwrap();
         let tree = parser.parse(src, None).unwrap();
-        let node = find_first_kind(tree.root_node(), "not_operator").unwrap();
+        let node = find_node_by_kind(tree.root_node(), "not_operator").unwrap();
         let candidates = RemoveUnaryNot.apply(&node, src.as_bytes());
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].replacement, "y");
@@ -122,7 +101,7 @@ mod tests {
     fn test_unary_not_no_match_on_neg() {
         let src = "package main\nfunc f(x int) int { return -x }";
         let tree = parse_go(src);
-        let node = find_first_kind(tree.root_node(), "unary_expression").unwrap();
+        let node = find_node_by_kind(tree.root_node(), "unary_expression").unwrap();
         let candidates = RemoveUnaryNot.apply(&node, src.as_bytes());
         assert!(candidates.is_empty());
     }
