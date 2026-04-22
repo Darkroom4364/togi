@@ -51,7 +51,6 @@ shell-words = "1"
 
 # Error handling
 anyhow = "1"
-thiserror = "2"
 
 # Hashing
 siphasher = "1"

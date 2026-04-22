@@ -20,9 +20,10 @@ pub struct Baseline {
 }
 
 /// Persist a baseline snapshot to `.togi-baseline` inside `dir`.
-pub fn save_baseline(baseline: &Baseline, dir: &Path) -> std::io::Result<()> {
-    let json = serde_json::to_string_pretty(baseline).map_err(std::io::Error::other)?;
-    std::fs::write(dir.join(BASELINE_FILE), json)
+pub fn save_baseline(baseline: &Baseline, dir: &Path) -> anyhow::Result<()> {
+    let json = serde_json::to_string_pretty(baseline)?;
+    std::fs::write(dir.join(BASELINE_FILE), json)?;
+    Ok(())
 }
 
 /// Load a previously saved baseline from `dir`, returning `None` if the file doesn't exist.

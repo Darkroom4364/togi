@@ -54,10 +54,7 @@ async fn main() {
                 build_cmd,
             };
             if let Err(e) = run_check(cfg).await {
-                eprintln!("Error: {e}");
-                if e.downcast_ref::<togi::config::ConfigError>().is_some() {
-                    eprintln!("Hint: run 'togi check --help' for usage information.");
-                }
+                eprintln!("Error: {e:#}");
                 process::exit(2);
             }
         }
