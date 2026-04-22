@@ -81,7 +81,15 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    fn make_mutation(dir: &std::path::Path, filename: &str, content: &str, line: usize, column: usize, original: &str, replacement: &str) -> Mutation {
+    fn make_mutation(
+        dir: &std::path::Path,
+        filename: &str,
+        content: &str,
+        line: usize,
+        column: usize,
+        original: &str,
+        replacement: &str,
+    ) -> Mutation {
         let path = dir.join(filename);
         std::fs::write(&path, content).unwrap();
         Mutation {
@@ -104,8 +112,14 @@ mod tests {
         let content = "package main\n\nfunc f() bool {\n\treturn true\n}\n";
         let m = make_mutation(tmp.path(), "main.go", content, 4, 9, "true", "false");
         let diff = mutation_diff(&m).unwrap();
-        assert!(diff.contains("-\treturn true"), "diff should show original line: {diff}");
-        assert!(diff.contains("+\treturn false"), "diff should show mutated line: {diff}");
+        assert!(
+            diff.contains("-\treturn true"),
+            "diff should show original line: {diff}"
+        );
+        assert!(
+            diff.contains("+\treturn false"),
+            "diff should show mutated line: {diff}"
+        );
     }
 
     #[test]
@@ -114,7 +128,10 @@ mod tests {
         let content = "x = 1 + 2\ny = 3\n";
         let m = make_mutation(tmp.path(), "test.py", content, 1, 7, "+ 2", "");
         let diff = mutation_diff(&m).unwrap();
-        assert!(diff.contains("-x = 1 + 2"), "diff should show original: {diff}");
+        assert!(
+            diff.contains("-x = 1 + 2"),
+            "diff should show original: {diff}"
+        );
         assert!(diff.contains("+x = 1"), "diff should show removal: {diff}");
     }
 

@@ -196,8 +196,7 @@ mod tests {
 
     #[test]
     fn finds_assignment_on_changed_line() {
-        let source =
-            b"package main\n\nfunc f() {\n\tx := 1\n\tx = x + 2\n}\n";
+        let source = b"package main\n\nfunc f() {\n\tx := 1\n\tx = x + 2\n}\n";
         // Lines: 1=package, 2=empty, 3=func, 4=x:=1, 5=x=x+2, 6=}
         let tree = parse_go(source);
         let changed = vec![LineRange { start: 5, end: 5 }];
@@ -239,7 +238,8 @@ mod tests {
 
     #[test]
     fn binary_expression_inside_function_call() {
-        let source = b"package main\n\nimport \"fmt\"\n\nfunc f(a, b int) {\n\tfmt.Println(a + b)\n}\n";
+        let source =
+            b"package main\n\nimport \"fmt\"\n\nfunc f(a, b int) {\n\tfmt.Println(a + b)\n}\n";
         // Lines: 1=package, 2=empty, 3=import, 4=empty, 5=func, 6=fmt.Println(a+b), 7=}
         let tree = parse_go(source);
         let changed = vec![LineRange { start: 6, end: 6 }];
@@ -308,7 +308,9 @@ mod tests {
         assert!(!nodes.is_empty());
         let kinds: Vec<&str> = nodes.iter().map(|n| n.kind()).collect();
         assert!(
-            kinds.contains(&"binary_expression") || kinds.contains(&"return_expression") || kinds.contains(&"integer_literal"),
+            kinds.contains(&"binary_expression")
+                || kinds.contains(&"return_expression")
+                || kinds.contains(&"integer_literal"),
             "Expected mutable node from Rust return line, got: {:?}",
             kinds
         );

@@ -164,7 +164,8 @@ mod tests {
         ];
 
         let mutations = generate_mutations(&changed, tmp.path(), 100).unwrap();
-        let files: std::collections::HashSet<_> = mutations.iter().map(|m| m.file.clone()).collect();
+        let files: std::collections::HashSet<_> =
+            mutations.iter().map(|m| m.file.clone()).collect();
         assert!(
             files.len() >= 2,
             "expected mutations from both files, got files: {:?}",
