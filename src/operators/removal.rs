@@ -78,6 +78,74 @@ impl MutationOperator for RemoveElse {
     }
 }
 
+const EXPR_STMT_KINDS: &[&str] = &["expression_statement", "expression_stmt"];
+const CALL_EXPR_KINDS: &[&str] = &[
+    "call_expression",
+    "call",
+    "method_invocation",
+    "invocation_expression",
+];
+
+pub struct RemoveCallStatement;
+
+impl MutationOperator for RemoveCallStatement {
+    fn id(&self) -> &str {
+        "remove_call_statement"
+    }
+    fn description(&self) -> &str {
+        "Remove void method/function call"
+    }
+    fn apply(&self, node: &tree_sitter::Node, _source: &[u8]) -> Vec<MutationCandidate> {
+        if !EXPR_STMT_KINDS.contains(&node.kind()) {
+            return vec![];
+        }
+        let mut cursor = node.walk();
+        let has_call = node
+            .named_children(&mut cursor)
+            .any(|child| CALL_EXPR_KINDS.contains(&child.kind()));
+        if has_call {
+            vec![MutationCandidate {
+                byte_range: node.byte_range(),
+                replacement: String::new(),
+                operator_id: self.id().to_string(),
+                description: self.description().to_string(),
+            }]
+        } else {
+            vec![]
+        }
+    }
+}
+
+const ASSIGNMENT_KINDS: &[&str] = &[
+    "assignment_statement",
+    "assignment_expression",
+    "assignment",
+    "augmented_assignment",
+    "augmented_assignment_expression",
+];
+
+pub struct RemoveAssignment;
+
+impl MutationOperator for RemoveAssignment {
+    fn id(&self) -> &str {
+        "remove_assignment"
+    }
+    fn description(&self) -> &str {
+        "Remove assignment statement"
+    }
+    fn apply(&self, node: &tree_sitter::Node, _source: &[u8]) -> Vec<MutationCandidate> {
+        if !ASSIGNMENT_KINDS.contains(&node.kind()) {
+            return vec![];
+        }
+        vec![MutationCandidate {
+            byte_range: node.byte_range(),
+            replacement: String::new(),
+            operator_id: self.id().to_string(),
+            description: self.description().to_string(),
+        }]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
