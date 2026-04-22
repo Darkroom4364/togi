@@ -111,31 +111,31 @@ impl TestRunner {
                     let cache_key = file_content
                         .as_ref()
                         .map(|content| CacheKey::new(content, &mutation.description, &cmd_str));
-                    if let Some(ref key) = cache_key {
-                        if let Some(cached) = cache::lookup(&project_root, key) {
-                            let result = from_cached(cached);
-                            if result != MutationResult::BuildError {
-                                tested_counter.fetch_add(1, Ordering::Relaxed);
-                            }
-                            let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                            if verbose {
-                                eprintln!(
-                                    "  [{}/{}] \u{21bb} cached  {}:{} \u{2014} {}",
-                                    n,
-                                    total,
-                                    mutation.file.display(),
-                                    mutation.line,
-                                    mutation.operator
-                                );
-                            } else if is_tty {
-                                eprint!("\r  [{}/{}] testing mutations...", n, total);
-                                let _ = std::io::stderr().flush();
-                            } else if n == total || (total >= 4 && n % (total / 4) == 0) {
-                                eprintln!("  [{}/{}] testing mutations...", n, total);
-                            }
-                            results.push((mutation, result));
-                            continue;
+                    if let Some(ref key) = cache_key
+                        && let Some(cached) = cache::lookup(&project_root, key)
+                    {
+                        let result = from_cached(cached);
+                        if result != MutationResult::BuildError {
+                            tested_counter.fetch_add(1, Ordering::Relaxed);
                         }
+                        let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                        if verbose {
+                            eprintln!(
+                                "  [{}/{}] \u{21bb} cached  {}:{} \u{2014} {}",
+                                n,
+                                total,
+                                mutation.file.display(),
+                                mutation.line,
+                                mutation.operator
+                            );
+                        } else if is_tty {
+                            eprint!("\r  [{}/{}] testing mutations...", n, total);
+                            let _ = std::io::stderr().flush();
+                        } else if n == total || (total >= 4 && n % (total / 4) == 0) {
+                            eprintln!("  [{}/{}] testing mutations...", n, total);
+                        }
+                        results.push((mutation, result));
+                        continue;
                     }
 
                     // Semaphore is never closed, so acquire cannot fail
