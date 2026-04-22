@@ -100,7 +100,7 @@ pub fn generate_report(report: &MutationReport) -> Result<String> {
             html,
             "<li><a href=\"#{}\" class=\"{}\"><code>{}</code> \
              <span class=\"badge\">{}/{}</span></a></li>",
-            html_escape(path),
+            slug(path),
             class,
             html_escape(path),
             stats.killed,
@@ -122,7 +122,7 @@ pub fn generate_report(report: &MutationReport) -> Result<String> {
             html,
             "<section id=\"{}\"><h3><code>{}</code> \
              <span class=\"score-inline {}\">({:.0}%)</span></h3>",
-            html_escape(path),
+            slug(path),
             html_escape(path),
             score_class(file_pct),
             file_pct
@@ -189,6 +189,12 @@ fn html_escape(s: &str) -> String {
         .replace('"', "&quot;")
 }
 
+fn slug(path: &str) -> String {
+    path.chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect()
+}
+
 const CSS: &str = r#"
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:system-ui,-apple-system,sans-serif;background:#1a1a2e;color:#e0e0e0;line-height:1.5}
@@ -238,6 +244,7 @@ mod tests {
                     Mutation {
                         id: 1,
                         file: PathBuf::from("src/auth.rs"),
+                        language: "rust".to_string(),
                         line: 47,
                         column: 10,
                         operator: "binary/lt_to_lte".to_string(),
@@ -252,6 +259,7 @@ mod tests {
                     Mutation {
                         id: 2,
                         file: PathBuf::from("src/handler.rs"),
+                        language: "rust".to_string(),
                         line: 15,
                         column: 5,
                         operator: "binary/eq_to_neq".to_string(),
@@ -308,6 +316,7 @@ mod tests {
                 Mutation {
                     id: 1,
                     file: PathBuf::from("src/test.rs"),
+                    language: "rust".to_string(),
                     line: 1,
                     column: 1,
                     operator: "test".to_string(),
