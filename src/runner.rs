@@ -364,13 +364,18 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn command_succeeds_returns_survived() {
+    /// Creates a tempdir with a "test.txt" containing "hello world" and a matching mutation.
+    fn make_test_setup() -> (tempfile::TempDir, PathBuf, Mutation) {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("test.txt");
         std::fs::write(&file, b"hello world").unwrap();
-
         let mutation = make_test_mutation(&file);
+        (dir, file, mutation)
+    }
+
+    #[tokio::test]
+    async fn command_succeeds_returns_survived() {
+        let (dir, file, mutation) = make_test_setup();
 
         let outcome = run_single_mutation(
             &["true".to_string()],
@@ -388,11 +393,7 @@ mod tests {
 
     #[tokio::test]
     async fn command_fails_returns_killed() {
-        let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("test.txt");
-        std::fs::write(&file, b"hello world").unwrap();
-
-        let mutation = make_test_mutation(&file);
+        let (dir, file, mutation) = make_test_setup();
 
         let outcome = run_single_mutation(
             &["false".to_string()],
@@ -445,11 +446,7 @@ mod tests {
 
     #[tokio::test]
     async fn command_not_found_returns_build_error() {
-        let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("test.txt");
-        std::fs::write(&file, b"hello world").unwrap();
-
-        let mutation = make_test_mutation(&file);
+        let (dir, file, mutation) = make_test_setup();
 
         let outcome = run_single_mutation(
             &["nonexistent_binary_xyz_12345".to_string()],
@@ -468,11 +465,7 @@ mod tests {
 
     #[tokio::test]
     async fn command_timeout_returns_timeout() {
-        let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("test.txt");
-        std::fs::write(&file, b"hello world").unwrap();
-
-        let mutation = make_test_mutation(&file);
+        let (dir, file, mutation) = make_test_setup();
 
         let outcome = run_single_mutation(
             &["sleep".to_string(), "10".to_string()],
@@ -486,6 +479,185 @@ mod tests {
 
         assert_eq!(outcome.result, MutationResult::Timeout);
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "hello world");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn build_check_failure_skips_test() {
+        let (dir, file, mutation) = make_test_setup();
+
+        let marker = dir.path().join("test_ran.marker");
+        // Build fails → should return BuildError without running test
+        let outcome = run_single_mutation(
+            &[
+                "sh".to_string(),
+                "-c".to_string(),
+                format!("touch {}", marker.display()),
+            ],
+            &["false".to_string()], // build fails
+            Duration::from_secs(5),
+            &dir.path().to_path_buf(),
+            &mutation,
+            false,
+        )
+        .await;
+
+        assert_eq!(outcome.result, MutationResult::BuildError);
+        assert!(!marker.exists(), "test command should not have run");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "hello world");
+    }
+
+    #[tokio::test]
+    async fn build_check_success_runs_test() {
+        let (dir, _file, mutation) = make_test_setup();
+
+        // Build succeeds → test runs and fails → Killed
+        let outcome = run_single_mutation(
+            &["false".to_string()], // test fails = killed
+            &["true".to_string()],  // build succeeds
+            Duration::from_secs(5),
+            &dir.path().to_path_buf(),
+            &mutation,
+            false,
+        )
+        .await;
+
+        assert_eq!(outcome.result, MutationResult::Killed);
+    }
+
+    #[tokio::test]
+    async fn out_of_range_byte_range_returns_build_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("test.txt");
+        std::fs::write(&file, b"hi").unwrap();
+
+        let mut mutation = make_test_mutation(&file);
+        mutation.byte_range = 0..100; // way past end
+
+        let outcome = run_single_mutation(
+            &["true".to_string()],
+            &[],
+            Duration::from_secs(5),
+            &dir.path().to_path_buf(),
+            &mutation,
+            false,
+        )
+        .await;
+
+        assert_eq!(outcome.result, MutationResult::BuildError);
+    }
+
+    #[tokio::test]
+    async fn missing_file_returns_build_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let mutation = make_test_mutation(&dir.path().join("nonexistent.txt"));
+
+        let outcome = run_single_mutation(
+            &["true".to_string()],
+            &[],
+            Duration::from_secs(5),
+            &dir.path().to_path_buf(),
+            &mutation,
+            false,
+        )
+        .await;
+
+        assert_eq!(outcome.result, MutationResult::BuildError);
+    }
+
+    #[tokio::test]
+    async fn empty_command_returns_build_error() {
+        let outcome = run_command(&[], &PathBuf::from("."), Duration::from_secs(5), false).await;
+
+        assert_eq!(outcome.result, MutationResult::BuildError);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn capture_output_collects_stdout_stderr() {
+        let outcome = run_command(
+            &[
+                "sh".to_string(),
+                "-c".to_string(),
+                "echo out; echo err >&2".to_string(),
+            ],
+            &PathBuf::from("."),
+            Duration::from_secs(5),
+            true,
+        )
+        .await;
+
+        assert_eq!(outcome.result, MutationResult::Survived);
+        let output = outcome.test_output.unwrap();
+        assert!(output.contains("out"), "should capture stdout");
+        assert!(output.contains("err"), "should capture stderr");
+    }
+
+    #[tokio::test]
+    async fn max_tested_limits_mutations() {
+        let (dir, file, _) = make_test_setup();
+
+        let mutations: Vec<Mutation> = (0..5)
+            .map(|i| {
+                let mut m = make_test_mutation(&file);
+                m.id = i;
+                m
+            })
+            .collect();
+
+        let runner = TestRunner {
+            command: vec!["true".into()],
+            language_commands: HashMap::new(),
+            build_command: vec![],
+            timeout: Duration::from_secs(5),
+            parallelism: 1,
+            project_root: dir.path().to_path_buf(),
+            verbose: false,
+            show_output: false,
+            max_tested: Some(2),
+        };
+
+        let report = runner.run(mutations).await;
+        assert_eq!(report.total, 2, "should stop after max_tested");
+    }
+
+    #[tokio::test]
+    async fn report_aggregates_results_correctly() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let survived_file = dir.path().join("survived.txt");
+        std::fs::write(&survived_file, b"hello world").unwrap();
+        let mut m_survived = make_test_mutation(&survived_file);
+        m_survived.language = "survived_lang".into();
+
+        let killed_file = dir.path().join("killed.txt");
+        std::fs::write(&killed_file, b"hello world").unwrap();
+        let mut m_killed = make_test_mutation(&killed_file);
+        m_killed.id = 2;
+        m_killed.language = "killed_lang".into();
+
+        let mut lang_cmds = HashMap::new();
+        lang_cmds.insert("survived_lang".into(), vec!["true".into()]);
+        lang_cmds.insert("killed_lang".into(), vec!["false".into()]);
+
+        let runner = TestRunner {
+            command: vec!["true".into()],
+            language_commands: lang_cmds,
+            build_command: vec![],
+            timeout: Duration::from_secs(5),
+            parallelism: 2,
+            project_root: dir.path().to_path_buf(),
+            verbose: false,
+            show_output: false,
+            max_tested: None,
+        };
+
+        let report = runner.run(vec![m_survived, m_killed]).await;
+        assert_eq!(report.total, 2);
+        assert_eq!(report.killed, 1);
+        assert_eq!(report.survived, 1);
+        assert_eq!(report.timeout, 0);
+        assert_eq!(report.build_errors, 0);
     }
 
     #[tokio::test]
