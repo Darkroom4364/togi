@@ -19,21 +19,26 @@ pub struct Baseline {
     pub total: usize,
 }
 
-/// Persist a baseline snapshot to `.togi-baseline`.
-pub fn save_baseline(baseline: &Baseline) -> std::io::Result<()> {
-    let json = serde_json::to_string_pretty(baseline)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-    std::fs::write(BASELINE_FILE, json)
+/// Persist a baseline snapshot to `.togi-baseline` inside `dir`.
+pub fn save_baseline(baseline: &Baseline, dir: &Path) -> std::io::Result<()> {
+    let json = serde_json::to_string_pretty(baseline).map_err(std::io::Error::other)?;
+    std::fs::write(dir.join(BASELINE_FILE), json)
 }
 
-/// Load a previously saved baseline, returning `None` if the file doesn't exist.
-pub fn load_baseline() -> Option<Baseline> {
-    let path = Path::new(BASELINE_FILE);
+/// Load a previously saved baseline from `dir`, returning `None` if the file doesn't exist.
+pub fn load_baseline(dir: &Path) -> Option<Baseline> {
+    let path = dir.join(BASELINE_FILE);
     if !path.exists() {
         return None;
     }
-    let data = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str(&data).ok()
+    let data = std::fs::read_to_string(&path).ok()?;
+    match serde_json::from_str(&data) {
+        Ok(b) => Some(b),
+        Err(e) => {
+            eprintln!("warning: failed to parse {}: {}", path.display(), e);
+            None
+        }
+    }
 }
 
 /// Returns `true` if the current overall score is a regression compared to the baseline.
@@ -99,8 +104,6 @@ mod tests {
     #[test]
     fn save_and_load_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
-        let prev = std::env::current_dir().unwrap();
-        std::env::set_current_dir(dir.path()).unwrap();
 
         let mut files = HashMap::new();
         files.insert(
@@ -116,24 +119,17 @@ mod tests {
             total: 5,
         };
 
-        save_baseline(&baseline).unwrap();
-        let loaded = load_baseline().unwrap();
+        save_baseline(&baseline, dir.path()).unwrap();
+        let loaded = load_baseline(dir.path()).unwrap();
 
         assert_eq!(loaded.killed, 3);
         assert_eq!(loaded.total, 5);
         assert_eq!(loaded.files["src/main.rs"].killed, 3);
-
-        std::env::set_current_dir(prev).unwrap();
     }
 
     #[test]
     fn load_returns_none_when_missing() {
         let dir = tempfile::tempdir().unwrap();
-        let prev = std::env::current_dir().unwrap();
-        std::env::set_current_dir(dir.path()).unwrap();
-
-        assert!(load_baseline().is_none());
-
-        std::env::set_current_dir(prev).unwrap();
+        assert!(load_baseline(dir.path()).is_none());
     }
 }
