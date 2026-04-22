@@ -40,11 +40,13 @@ pub struct LanguageTestConfig {
 pub struct TestConfig {
     #[serde(default = "default_test_command")]
     pub command: Vec<String>,
+    #[serde(default)]
+    pub build_command: Vec<String>,
     #[serde(default = "default_timeout")]
     pub timeout: u64,
     #[serde(default = "default_jobs")]
     pub jobs: usize,
-    #[serde(flatten, default)]
+    #[serde(default)]
     pub languages: HashMap<String, LanguageTestConfig>,
 }
 
@@ -136,6 +138,29 @@ pub fn detect_test_command(project_root: &Path) -> Vec<String> {
     }
 }
 
+pub fn detect_build_command(project_root: &Path) -> Vec<String> {
+    if project_root.join("Cargo.toml").exists() {
+        return vec!["cargo".into(), "check".into()];
+    }
+    if project_root.join("go.mod").exists() {
+        return vec!["go".into(), "build".into(), "./...".into()];
+    }
+    if project_root.join("tsconfig.json").exists() {
+        return vec!["npx".into(), "tsc".into(), "--noEmit".into()];
+    }
+    if project_root.join("pom.xml").exists() {
+        return vec!["mvn".into(), "compile".into(), "-q".into()];
+    }
+    if project_root.join("build.gradle").exists() || project_root.join("build.gradle.kts").exists()
+    {
+        return vec!["./gradlew".into(), "compileJava".into()];
+    }
+    if has_file_with_ext(project_root, "sln") || has_file_with_ext(project_root, "csproj") {
+        return vec!["dotnet".into(), "build".into(), "--no-restore".into()];
+    }
+    vec![]
+}
+
 fn default_timeout() -> u64 {
     30
 }
@@ -154,10 +179,21 @@ fn default_max_per_run() -> usize {
     20
 }
 
+impl TestConfig {
+    pub fn command_for_language(&self, language: &str) -> &[String] {
+        if let Some(lang_config) = self.languages.get(language) {
+            &lang_config.command
+        } else {
+            &self.command
+        }
+    }
+}
+
 impl Default for TestConfig {
     fn default() -> Self {
         Self {
             command: default_test_command(),
+            build_command: vec![],
             timeout: default_timeout(),
             jobs: default_jobs(),
             languages: HashMap::new(),
@@ -211,12 +247,18 @@ impl Config {
             .map(|(name, proj)| (name.as_str(), proj))
     }
 
-    /// Look up a per-language test command from `[test.<language>]` sections.
-    pub fn test_command_for_language(&self, language: &str) -> Option<&[String]> {
-        self.test
-            .languages
-            .get(language)
-            .map(|c| c.command.as_slice())
+    /// Warn if any configured language keys don't match known language names.
+    pub fn warn_unknown_languages(&self, known: &[&str]) {
+        for key in self.test.languages.keys() {
+            if !known.contains(&key.as_str()) {
+                eprintln!(
+                    "warning: unknown language '{}' in [test.languages]. \
+                     Known languages: {}",
+                    key,
+                    known.join(", ")
+                );
+            }
+        }
     }
 
     /// If no test command was explicitly set in togi.toml, auto-detect from project files.
@@ -226,14 +268,26 @@ impl Config {
         }
     }
 
+    /// If no build command was explicitly set in togi.toml, auto-detect from project files.
+    pub fn resolve_build_command(&mut self, project_root: &Path) {
+        if self.test.build_command.is_empty() {
+            self.test.build_command = detect_build_command(project_root);
+        }
+    }
+
     /// Write a template togi.toml to the given path.
     pub fn write_template(path: &Path) -> anyhow::Result<()> {
         let template = r#"# togi.toml — mutation testing configuration
 
 [test]
 command = ["cargo", "test"]
+# build_command = ["cargo", "check"]  # auto-detected; compile check before running tests
 timeout = 30
 # jobs = 4  # defaults to number of CPUs
+
+# Per-language test commands (key = language name, e.g. typescript, python, go)
+# [test.languages.typescript]
+# command = ["npx", "jest"]
 
 [diff]
 base = "origin/main"
@@ -417,35 +471,54 @@ timeout = 120
     }
 
     #[test]
-    fn parse_per_language_test_commands() {
+    fn parse_per_language_commands() {
         let toml_str = r#"
 [test]
-command = ["make", "test"]
-
-[test.rust]
 command = ["cargo", "test"]
 
-[test.python]
-command = ["pytest", "-x"]
+[test.languages.typescript]
+command = ["npx", "jest"]
+
+[test.languages.python]
+command = ["pytest"]
 "#;
         let config: Config = toml::from_str(toml_str).unwrap();
-        assert_eq!(config.test.command, vec!["make", "test"]);
         assert_eq!(
-            config.test_command_for_language("rust"),
-            Some(vec!["cargo".to_string(), "test".to_string()].as_slice())
+            config.test.languages["typescript"].command,
+            vec!["npx", "jest"]
         );
-        assert_eq!(
-            config.test_command_for_language("python"),
-            Some(vec!["pytest".to_string(), "-x".to_string()].as_slice())
-        );
-        assert_eq!(config.test_command_for_language("go"), None);
+        assert_eq!(config.test.languages["python"].command, vec!["pytest"]);
     }
 
     #[test]
-    fn no_language_overrides_by_default() {
-        let config: Config = toml::from_str("").unwrap();
+    fn command_for_language_resolution() {
+        let toml_str = r#"
+[test]
+command = ["cargo", "test"]
+
+[test.languages.typescript]
+command = ["npx", "jest"]
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            config.test.command_for_language("typescript"),
+            &["npx", "jest"]
+        );
+        assert_eq!(config.test.command_for_language("go"), &["cargo", "test"]);
+    }
+
+    #[test]
+    fn empty_languages_backward_compat() {
+        let toml_str = r#"
+[test]
+command = ["make", "test"]
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
         assert!(config.test.languages.is_empty());
-        assert_eq!(config.test_command_for_language("rust"), None);
+        assert_eq!(
+            config.test.command_for_language("anything"),
+            &["make", "test"]
+        );
     }
 
     #[test]

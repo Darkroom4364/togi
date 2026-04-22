@@ -67,6 +67,9 @@ binary_operator!(GtToGte, "gt_to_gte", "Replace > with >=", ">", ">=");
 binary_operator!(EqToNeq, "eq_to_neq", "Replace == with !=", "==", "!=");
 binary_operator!(AndToOr, "and_to_or", "Replace && with ||", "&&", "||");
 binary_operator!(OrToAnd, "or_to_and", "Replace || with &&", "||", "&&");
+binary_operator!(MulToDiv, "mul_to_div", "Replace * with /", "*", "/");
+binary_operator!(DivToMul, "div_to_mul", "Replace / with *", "/", "*");
+binary_operator!(ModToMul, "mod_to_mul", "Replace % with *", "%", "*");
 
 #[cfg(test)]
 mod tests {
