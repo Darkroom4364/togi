@@ -1,15 +1,20 @@
 //! File-based lock to prevent concurrent togi runs on the same repo.
 
 use anyhow::{Context, Result, bail};
-use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+
+#[cfg(unix)]
+use std::os::unix::io::AsRawFd;
 
 const LOCK_FILE: &str = ".togi.lock";
 
 /// RAII lock guard. Removes the lock file on drop.
+/// Holds the open file to keep the `flock` advisory lock active.
 pub struct LockGuard {
     path: PathBuf,
+    _file: File,
 }
 
 impl Drop for LockGuard {
@@ -18,61 +23,88 @@ impl Drop for LockGuard {
     }
 }
 
+/// Try to acquire an exclusive non-blocking flock. Returns true on success.
+#[cfg(unix)]
+fn try_flock(file: &File) -> bool {
+    unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0 }
+}
+
+#[cfg(not(unix))]
+fn try_flock(_file: &File) -> bool {
+    true
+}
+
 /// Acquire a lock for the given project root directory.
 /// Returns an error if another togi process is already running.
 pub fn acquire(project_root: &Path) -> Result<LockGuard> {
     let path = project_root.join(LOCK_FILE);
     let pid = std::process::id();
 
-    match OpenOptions::new().write(true).create_new(true).open(&path) {
-        Ok(mut file) => {
-            file.write_all(pid.to_string().as_bytes())
-                .with_context(|| format!("failed to write lock file: {}", path.display()))?;
-            Ok(LockGuard { path })
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            // Lock file exists — check if the holder is still alive
-            let contents = fs::read_to_string(&path).unwrap_or_default();
-            if let Ok(existing_pid) = contents.trim().parse::<u32>()
-                && process_alive(existing_pid)
-            {
-                bail!(
-                    "another togi process (PID {}) is already running in this directory.\n\
-                     If this is stale, remove {} manually.",
-                    existing_pid,
-                    path.display()
-                );
-            }
-            // Stale lock — remove and retry once
-            fs::remove_file(&path).ok();
-            let mut file = OpenOptions::new()
+    // Try create_new first (fast path), fall back to open if file exists.
+    // Retry once on NotFound to handle the race where the holder drops
+    // between our create_new and open.
+    let mut file = 'acquire: {
+        for _ in 0..2 {
+            match OpenOptions::new()
+                .read(true)
                 .write(true)
                 .create_new(true)
                 .open(&path)
-                .with_context(|| format!("failed to create lock file: {}", path.display()))?;
-            file.write_all(pid.to_string().as_bytes())
-                .with_context(|| format!("failed to write lock file: {}", path.display()))?;
-            Ok(LockGuard { path })
-        }
-        Err(e) => Err(e).with_context(|| format!("failed to create lock file: {}", path.display())),
-    }
-}
+            {
+                Ok(mut f) => {
+                    if !try_flock(&f) {
+                        let _ = fs::remove_file(&path);
+                        bail!(
+                            "failed to acquire advisory lock on new file {}; \
+                             possible NFS or resource issue",
+                            path.display()
+                        );
+                    }
+                    f.write_all(pid.to_string().as_bytes()).with_context(|| {
+                        format!("failed to write lock file: {}", path.display())
+                    })?;
+                    return Ok(LockGuard { path, _file: f });
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(e) => {
+                    return Err(e).with_context(|| {
+                        format!("failed to create lock file: {}", path.display())
+                    });
+                }
+            }
 
-fn process_alive(pid: u32) -> bool {
-    // PID 0 and overflow values are not valid process IDs
-    if pid == 0 || pid > i32::MAX as u32 {
-        return false;
+            match OpenOptions::new().read(true).write(true).open(&path) {
+                Ok(f) => break 'acquire f,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => {
+                    return Err(e)
+                        .with_context(|| format!("failed to open lock file: {}", path.display()));
+                }
+            }
+        }
+        bail!(
+            "failed to acquire lock file after retries: {}",
+            path.display()
+        );
+    };
+
+    if !try_flock(&file) {
+        bail!(
+            "another togi process is already running in this directory.\n\
+             If this is stale, remove {} manually.",
+            path.display()
+        );
     }
-    // On Unix, signal 0 checks if process exists without sending a signal
-    #[cfg(unix)]
-    {
-        unsafe { libc::kill(pid as i32, 0) == 0 }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = pid;
-        false
-    }
+
+    // We hold the flock — previous holder is gone. Overwrite with our PID.
+    file.set_len(0)
+        .with_context(|| format!("failed to truncate lock file: {}", path.display()))?;
+    file.seek(SeekFrom::Start(0))
+        .with_context(|| format!("failed to seek lock file: {}", path.display()))?;
+    file.write_all(pid.to_string().as_bytes())
+        .with_context(|| format!("failed to write lock file: {}", path.display()))?;
+
+    Ok(LockGuard { path, _file: file })
 }
 
 #[cfg(test)]
@@ -103,12 +135,12 @@ mod tests {
     }
 
     #[test]
-    fn cleans_stale_lock() {
+    fn acquires_lock_on_orphaned_file() {
         let dir = TempDir::new().unwrap();
         let lock_path = dir.path().join(LOCK_FILE);
 
-        // Write a lock with a PID that (almost certainly) doesn't exist
-        fs::write(&lock_path, "4294967295").unwrap();
+        // Simulate an orphaned lock file with no active flock holder
+        fs::write(&lock_path, "0").unwrap();
 
         let _guard = acquire(dir.path()).unwrap();
         assert!(lock_path.exists());
