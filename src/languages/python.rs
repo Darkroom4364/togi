@@ -43,6 +43,7 @@ impl LanguageSupport for Python {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_helpers::{walk_for_kind, walk_for_two_kinds};
 
     #[test]
     fn test_python_extension_detection() {
@@ -61,25 +62,9 @@ mod tests {
         let tree = parser.parse(code, None).unwrap();
         let root = tree.root_node();
 
-        // Walk tree to find binary_operator node
         let mut found = false;
         let mut cursor = root.walk();
-        fn walk(cursor: &mut tree_sitter::TreeCursor, target: &str, found: &mut bool) {
-            if cursor.node().kind() == target {
-                *found = true;
-                return;
-            }
-            if cursor.goto_first_child() {
-                loop {
-                    walk(cursor, target, found);
-                    if *found || !cursor.goto_next_sibling() {
-                        break;
-                    }
-                }
-                cursor.goto_parent();
-            }
-        }
-        walk(&mut cursor, py.binary_expression_node(), &mut found);
+        walk_for_kind(&mut cursor, py.binary_expression_node(), &mut found);
         assert!(
             found,
             "Expected to find '{}' node in Python AST",
@@ -99,22 +84,7 @@ mod tests {
 
         let mut found = false;
         let mut cursor = root.walk();
-        fn walk(cursor: &mut tree_sitter::TreeCursor, target: &str, found: &mut bool) {
-            if cursor.node().kind() == target {
-                *found = true;
-                return;
-            }
-            if cursor.goto_first_child() {
-                loop {
-                    walk(cursor, target, found);
-                    if *found || !cursor.goto_next_sibling() {
-                        break;
-                    }
-                }
-                cursor.goto_parent();
-            }
-        }
-        walk(&mut cursor, py.if_statement_node(), &mut found);
+        walk_for_kind(&mut cursor, py.if_statement_node(), &mut found);
         assert!(
             found,
             "Expected to find '{}' node in Python AST",
@@ -132,35 +102,10 @@ mod tests {
         let tree = parser.parse(code, None).unwrap();
         let root = tree.root_node();
 
-        // Verify we can find return_statement and binary_operator
         let mut found_return = false;
         let mut found_binary = false;
         let mut cursor = root.walk();
-        fn walk(
-            cursor: &mut tree_sitter::TreeCursor,
-            ret: &str,
-            bin: &str,
-            fr: &mut bool,
-            fb: &mut bool,
-        ) {
-            let kind = cursor.node().kind();
-            if kind == ret {
-                *fr = true;
-            }
-            if kind == bin {
-                *fb = true;
-            }
-            if cursor.goto_first_child() {
-                loop {
-                    walk(cursor, ret, bin, fr, fb);
-                    if (*fr && *fb) || !cursor.goto_next_sibling() {
-                        break;
-                    }
-                }
-                cursor.goto_parent();
-            }
-        }
-        walk(
+        walk_for_two_kinds(
             &mut cursor,
             py.return_statement_node(),
             py.binary_expression_node(),

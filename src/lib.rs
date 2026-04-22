@@ -14,6 +14,9 @@ pub mod parser;
 pub mod report;
 pub mod runner;
 
+#[cfg(test)]
+pub mod test_helpers;
+
 use std::fmt;
 use std::path::PathBuf;
 use std::time::Duration;
