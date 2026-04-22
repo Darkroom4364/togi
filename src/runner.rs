@@ -3,7 +3,7 @@
 use crate::{Mutation, MutationReport, MutationResult};
 use std::collections::HashMap;
 use std::io::{IsTerminal, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -51,6 +51,8 @@ impl TestRunner {
         }
 
         let semaphore = Arc::new(Semaphore::new(self.parallelism));
+        let project_root = Arc::new(self.project_root.clone());
+        let build_command = Arc::new(self.build_command.clone());
         let mut handles = Vec::new();
 
         for (_file, file_mutations) in by_file {
@@ -65,8 +67,8 @@ impl TestRunner {
                 .unwrap_or(&self.command)
                 .clone();
             let timeout = self.timeout;
-            let project_root = self.project_root.clone();
-            let build_command = self.build_command.clone();
+            let project_root = project_root.clone();
+            let build_command = build_command.clone();
             let counter = counter.clone();
             let tested_counter = tested_counter.clone();
             let max_tested = self.max_tested;
@@ -195,7 +197,7 @@ async fn run_single_mutation(
     command: &[String],
     build_command: &[String],
     timeout: Duration,
-    project_root: &PathBuf,
+    project_root: &Path,
     mutation: &Mutation,
     capture_output: bool,
 ) -> MutationOutcome {
@@ -253,7 +255,7 @@ async fn run_single_mutation(
 
 async fn run_command(
     command: &[String],
-    cwd: &PathBuf,
+    cwd: &Path,
     timeout_dur: Duration,
     capture_output: bool,
 ) -> MutationOutcome {
