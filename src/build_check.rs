@@ -21,7 +21,7 @@ use std::path::Path;
 /// * `mutation`      – the mutation to verify
 /// * `project_root`  – root directory of the project under test
 /// * `check_command` – shell tokens for the compile-check command
-///                     (e.g. `["cargo", "check", "--quiet"]`)
+///   (e.g. `["cargo", "check", "--quiet"]`)
 pub fn check_builds(mutation: &Mutation, project_root: &Path, check_command: &[String]) -> bool {
     if check_command.is_empty() {
         // No check command configured – assume buildable.
