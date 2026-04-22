@@ -10,6 +10,25 @@ pub struct Config {
     pub diff: DiffConfig,
     #[serde(default)]
     pub mutations: MutationConfig,
+    #[serde(default)]
+    pub projects: HashMap<String, ProjectConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProjectConfig {
+    pub path: PathBuf,
+    #[serde(default)]
+    pub language: Option<String>,
+    #[serde(default)]
+    pub test: Option<ProjectTestConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProjectTestConfig {
+    #[serde(default)]
+    pub command: Option<Vec<String>>,
+    #[serde(default)]
+    pub timeout: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -218,6 +237,16 @@ impl Config {
             }
             None => Ok(Config::default()),
         }
+    }
+
+    /// Find the project config whose `path` is a prefix of `file_path`.
+    /// Longest match wins when projects are nested.
+    pub fn project_for_path(&self, file_path: &Path) -> Option<(&str, &ProjectConfig)> {
+        self.projects
+            .iter()
+            .filter(|(_, proj)| file_path.starts_with(&proj.path))
+            .max_by_key(|(_, proj)| proj.path.components().count())
+            .map(|(name, proj)| (name.as_str(), proj))
     }
 
     /// Warn if any configured language keys don't match known language names.
@@ -511,5 +540,107 @@ command = ["make", "test"]
             config.test.command_for_language("anything"),
             &["make", "test"]
         );
+    }
+
+    #[test]
+    fn parse_projects_config() {
+        let toml_str = r#"
+[projects.api]
+path = "services/api"
+language = "rust"
+
+[projects.api.test]
+command = ["cargo", "test"]
+timeout = 60
+
+[projects.web]
+path = "services/web"
+
+[projects.web.test]
+command = ["npm", "test"]
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.projects.len(), 2);
+
+        let api = &config.projects["api"];
+        assert_eq!(api.path, PathBuf::from("services/api"));
+        assert_eq!(api.language.as_deref(), Some("rust"));
+        let api_test = api.test.as_ref().unwrap();
+        assert_eq!(
+            api_test.command.as_deref(),
+            Some(vec!["cargo".into(), "test".into()].as_slice())
+        );
+        assert_eq!(api_test.timeout, Some(60));
+
+        let web = &config.projects["web"];
+        assert_eq!(web.path, PathBuf::from("services/web"));
+        assert!(web.language.is_none());
+    }
+
+    #[test]
+    fn project_for_path_matches_prefix() {
+        let toml_str = r#"
+[projects.api]
+path = "services/api"
+
+[projects.web]
+path = "services/web"
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        let (name, _) = config
+            .project_for_path(Path::new("services/api/src/main.rs"))
+            .unwrap();
+        assert_eq!(name, "api");
+
+        let (name, _) = config
+            .project_for_path(Path::new("services/web/index.js"))
+            .unwrap();
+        assert_eq!(name, "web");
+
+        assert!(
+            config
+                .project_for_path(Path::new("other/file.rs"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn project_for_path_longest_match_wins() {
+        let toml_str = r#"
+[projects.services]
+path = "services"
+
+[projects.api]
+path = "services/api"
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        let (name, _) = config
+            .project_for_path(Path::new("services/api/src/lib.rs"))
+            .unwrap();
+        assert_eq!(name, "api");
+
+        let (name, _) = config
+            .project_for_path(Path::new("services/web/app.js"))
+            .unwrap();
+        assert_eq!(name, "services");
+    }
+
+    #[test]
+    fn no_projects_by_default() {
+        let config: Config = toml::from_str("").unwrap();
+        assert!(config.projects.is_empty());
+    }
+
+    #[test]
+    fn project_without_test_override() {
+        let toml_str = r#"
+[projects.lib]
+path = "lib"
+language = "go"
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        let lib = &config.projects["lib"];
+        assert!(lib.test.is_none());
+        assert_eq!(lib.language.as_deref(), Some("go"));
     }
 }
