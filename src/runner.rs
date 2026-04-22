@@ -1,5 +1,6 @@
 // Parallel test execution with timeouts
 
+use crate::cache::{self, CacheKey, CachedResult};
 use crate::{Mutation, MutationReport, MutationResult};
 use std::collections::HashMap;
 use std::io::{IsTerminal, Write};
@@ -8,6 +9,24 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
+
+fn to_cached(r: MutationResult) -> CachedResult {
+    match r {
+        MutationResult::Killed => CachedResult::Killed,
+        MutationResult::Survived => CachedResult::Survived,
+        MutationResult::Timeout => CachedResult::Timeout,
+        MutationResult::BuildError => CachedResult::BuildError,
+    }
+}
+
+fn from_cached(r: CachedResult) -> MutationResult {
+    match r {
+        CachedResult::Killed => MutationResult::Killed,
+        CachedResult::Survived => MutationResult::Survived,
+        CachedResult::Timeout => MutationResult::Timeout,
+        CachedResult::BuildError => MutationResult::BuildError,
+    }
+}
 
 pub struct TestRunner {
     pub command: Vec<String>,
@@ -74,6 +93,8 @@ impl TestRunner {
             let max_tested = self.max_tested;
             let show_output = self.show_output;
 
+            let cmd_str = command.join(" ");
+
             let handle = tokio::spawn(async move {
                 let mut results = Vec::new();
                 for mutation in file_mutations {
@@ -83,6 +104,36 @@ impl TestRunner {
                     {
                         break;
                     }
+
+                    // Check cache before running
+                    let file_path = project_root.join(&mutation.file);
+                    let file_content = std::fs::read(&file_path).ok();
+                    let cache_key = file_content.as_ref().map(|content| {
+                        CacheKey::new(content, &mutation.description, &cmd_str)
+                    });
+                    if let Some(ref key) = cache_key {
+                        if let Some(cached) = cache::lookup(&project_root, key) {
+                            let result = from_cached(cached);
+                            if result != MutationResult::BuildError {
+                                tested_counter.fetch_add(1, Ordering::Relaxed);
+                            }
+                            let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                            if verbose {
+                                eprintln!(
+                                    "  [{}/{}] \u{21bb} cached  {}:{} \u{2014} {}",
+                                    n, total, mutation.file.display(), mutation.line, mutation.operator
+                                );
+                            } else if is_tty {
+                                eprint!("\r  [{}/{}] testing mutations...", n, total);
+                                let _ = std::io::stderr().flush();
+                            } else if n == total || (total >= 4 && n % (total / 4) == 0) {
+                                eprintln!("  [{}/{}] testing mutations...", n, total);
+                            }
+                            results.push((mutation, result));
+                            continue;
+                        }
+                    }
+
                     // Semaphore is never closed, so acquire cannot fail
                     let _permit = sem.acquire().await.unwrap();
                     let outcome = run_single_mutation(
@@ -94,6 +145,12 @@ impl TestRunner {
                         show_output,
                     )
                     .await;
+
+                    // Store result in cache
+                    if let Some(ref key) = cache_key {
+                        cache::store(&project_root, key, to_cached(outcome.result));
+                    }
+
                     if outcome.result != MutationResult::BuildError {
                         tested_counter.fetch_add(1, Ordering::Relaxed);
                     }
