@@ -7,7 +7,7 @@ use togi::{ChangedFile, Mutation, MutationReport};
 
 struct CheckConfig {
     all: bool,
-    base: String,
+    base: Option<String>,
     config_path: Option<PathBuf>,
     output_format: String,
     jobs: Option<usize>,
@@ -131,8 +131,8 @@ async fn run_check(cfg: CheckConfig) -> anyhow::Result<()> {
 fn resolve_config(cfg: CheckConfig) -> anyhow::Result<togi::config::Config> {
     let mut config = togi::config::Config::load(cfg.config_path.as_deref())?;
 
-    if cfg.base != "origin/main" {
-        config.diff.base = cfg.base;
+    if let Some(b) = cfg.base {
+        config.diff.base = b;
     }
     if let Some(j) = cfg.jobs {
         config.test.jobs = j;
@@ -141,13 +141,15 @@ fn resolve_config(cfg: CheckConfig) -> anyhow::Result<togi::config::Config> {
         config.test.timeout = t;
     }
     if let Some(cmd) = cfg.test_cmd {
-        config.test.command = cmd.split_whitespace().map(String::from).collect();
+        config.test.command =
+            shell_words::split(&cmd).map_err(|e| anyhow::anyhow!("bad --test-cmd: {e}"))?;
     }
     if let Some(path) = cfg.coverage_file {
         config.mutations.coverage_file = Some(path);
     }
     if let Some(cmd) = cfg.build_cmd {
-        config.test.build_command = cmd.split_whitespace().map(String::from).collect();
+        config.test.build_command =
+            shell_words::split(&cmd).map_err(|e| anyhow::anyhow!("bad --build-cmd: {e}"))?;
     }
 
     Ok(config)
