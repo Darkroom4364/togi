@@ -56,8 +56,8 @@ impl CacheKey {
 /// Look up a previously cached result.
 ///
 /// Returns `None` on cache miss or any I/O / deserialization error.
-pub fn lookup(key: &CacheKey) -> Option<CachedResult> {
-    let path = entry_path(key);
+pub fn lookup(project_root: &Path, key: &CacheKey) -> Option<CachedResult> {
+    let path = entry_path(project_root, key);
     let data = fs::read_to_string(path).ok()?;
     serde_json::from_str(&data).ok()
 }
@@ -66,8 +66,8 @@ pub fn lookup(key: &CacheKey) -> Option<CachedResult> {
 ///
 /// Creates the cache directory if it doesn't exist. Silently ignores
 /// write errors so cache failures never break the main pipeline.
-pub fn store(key: &CacheKey, result: CachedResult) {
-    let path = entry_path(key);
+pub fn store(project_root: &Path, key: &CacheKey, result: CachedResult) {
+    let path = entry_path(project_root, key);
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
@@ -75,21 +75,21 @@ pub fn store(key: &CacheKey, result: CachedResult) {
 }
 
 /// Delete all cached results.
-pub fn clear() {
-    let dir = cache_dir();
+pub fn clear(project_root: &Path) {
+    let dir = cache_dir(project_root);
     if dir.exists() {
         let _ = fs::remove_dir_all(&dir);
     }
 }
 
-/// Return the cache directory path (relative to cwd).
-fn cache_dir() -> PathBuf {
-    PathBuf::from(CACHE_DIR)
+/// Return the cache directory path under the given project root.
+fn cache_dir(project_root: &Path) -> PathBuf {
+    project_root.join(CACHE_DIR)
 }
 
 /// Return the file path for a given cache key.
-fn entry_path(key: &CacheKey) -> PathBuf {
-    cache_dir().join(key.digest())
+fn entry_path(project_root: &Path, key: &CacheKey) -> PathBuf {
+    cache_dir(project_root).join(key.digest())
 }
 
 fn hash_bytes(data: &[u8]) -> u64 {
@@ -107,75 +107,59 @@ fn hash_str(s: &str) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::env;
-
-    /// Run a test body inside a temporary directory so cache files don't
-    /// pollute the repo.
-    fn in_temp_dir(f: impl FnOnce()) {
-        let tmp = tempfile::tempdir().expect("create tempdir");
-        let prev = env::current_dir().expect("cwd");
-        env::set_current_dir(tmp.path()).expect("chdir");
-        f();
-        env::set_current_dir(prev).expect("restore cwd");
-    }
 
     #[test]
     fn store_and_lookup() {
-        in_temp_dir(|| {
-            let key = CacheKey::new(b"fn main() {}", "replace + with -", "cargo test");
-            store(&key, CachedResult::Killed);
-            assert_eq!(lookup(&key), Some(CachedResult::Killed));
-        });
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let key = CacheKey::new(b"fn main() {}", "replace + with -", "cargo test");
+        store(tmp.path(), &key, CachedResult::Killed);
+        assert_eq!(lookup(tmp.path(), &key), Some(CachedResult::Killed));
     }
 
     #[test]
     fn lookup_miss_returns_none() {
-        in_temp_dir(|| {
-            let key = CacheKey::new(b"code", "desc", "cmd");
-            assert_eq!(lookup(&key), None);
-        });
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let key = CacheKey::new(b"code", "desc", "cmd");
+        assert_eq!(lookup(tmp.path(), &key), None);
     }
 
     #[test]
     fn different_content_different_key() {
-        in_temp_dir(|| {
-            let k1 = CacheKey::new(b"v1", "desc", "cmd");
-            let k2 = CacheKey::new(b"v2", "desc", "cmd");
-            store(&k1, CachedResult::Survived);
-            store(&k2, CachedResult::Killed);
-            assert_eq!(lookup(&k1), Some(CachedResult::Survived));
-            assert_eq!(lookup(&k2), Some(CachedResult::Killed));
-        });
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let k1 = CacheKey::new(b"v1", "desc", "cmd");
+        let k2 = CacheKey::new(b"v2", "desc", "cmd");
+        store(tmp.path(), &k1, CachedResult::Survived);
+        store(tmp.path(), &k2, CachedResult::Killed);
+        assert_eq!(lookup(tmp.path(), &k1), Some(CachedResult::Survived));
+        assert_eq!(lookup(tmp.path(), &k2), Some(CachedResult::Killed));
     }
 
     #[test]
     fn clear_removes_cache() {
-        in_temp_dir(|| {
-            let key = CacheKey::new(b"code", "desc", "cmd");
-            store(&key, CachedResult::Timeout);
-            assert!(cache_dir().exists());
-            clear();
-            assert!(!cache_dir().exists());
-            assert_eq!(lookup(&key), None);
-        });
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let key = CacheKey::new(b"code", "desc", "cmd");
+        store(tmp.path(), &key, CachedResult::Timeout);
+        assert!(cache_dir(tmp.path()).exists());
+        clear(tmp.path());
+        assert!(!cache_dir(tmp.path()).exists());
+        assert_eq!(lookup(tmp.path(), &key), None);
     }
 
     #[test]
     fn all_result_variants_roundtrip() {
-        in_temp_dir(|| {
-            for (i, result) in [
-                CachedResult::Killed,
-                CachedResult::Survived,
-                CachedResult::Timeout,
-                CachedResult::BuildError,
-            ]
-            .iter()
-            .enumerate()
-            {
-                let key = CacheKey::new(format!("file{i}").as_bytes(), "desc", "cmd");
-                store(&key, *result);
-                assert_eq!(lookup(&key), Some(*result));
-            }
-        });
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        for (i, result) in [
+            CachedResult::Killed,
+            CachedResult::Survived,
+            CachedResult::Timeout,
+            CachedResult::BuildError,
+        ]
+        .iter()
+        .enumerate()
+        {
+            let key = CacheKey::new(format!("file{i}").as_bytes(), "desc", "cmd");
+            store(tmp.path(), &key, *result);
+            assert_eq!(lookup(tmp.path(), &key), Some(*result));
+        }
     }
 }

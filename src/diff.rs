@@ -105,18 +105,8 @@ pub fn collect_changed_since(project_root: &Path, since: &str) -> anyhow::Result
         let base = String::from_utf8(rev_output.stdout)?.trim().to_string();
         if base.is_empty() {
             // No commit before that date — diff the entire history
-            // against the empty tree.
-            let empty_tree = Command::new("git")
-                .args(["hash-object", "-t", "tree", "/dev/null"])
-                .current_dir(project_root)
-                .output()?;
-            if !empty_tree.status.success() {
-                anyhow::bail!(
-                    "git hash-object failed: {}",
-                    String::from_utf8_lossy(&empty_tree.stderr)
-                );
-            }
-            let tree_sha = String::from_utf8(empty_tree.stdout)?.trim().to_string();
+            // against the well-known empty tree SHA.
+            let tree_sha = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
             let out = Command::new("git")
                 .args(["diff", &format!("{tree_sha}..HEAD")])
                 .current_dir(project_root)
