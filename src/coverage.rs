@@ -114,6 +114,7 @@ end_of_record
             crate::Mutation {
                 id: 0,
                 file: root.join("src/main.go"),
+                language: "go".into(),
                 line: 10,
                 column: 1,
                 operator: "lt_to_lte".into(),
@@ -125,6 +126,7 @@ end_of_record
             crate::Mutation {
                 id: 1,
                 file: root.join("src/main.go"),
+                language: "go".into(),
                 line: 20,
                 column: 1,
                 operator: "lt_to_lte".into(),

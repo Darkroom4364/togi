@@ -55,6 +55,10 @@ pub enum Commands {
         /// LCOV coverage file \u2014 only mutate lines with test coverage
         #[arg(long)]
         coverage_file: Option<PathBuf>,
+
+        /// Override build check command (e.g., 'cargo check')
+        #[arg(long)]
+        build_cmd: Option<String>,
     },
     /// Generate a togi.toml config template
     Init,

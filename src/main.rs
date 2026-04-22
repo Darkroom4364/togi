@@ -20,6 +20,7 @@ async fn main() {
             show_output,
             test_cmd,
             coverage_file,
+            build_cmd,
         } => {
             if let Err(e) = run_check(
                 all,
@@ -33,6 +34,7 @@ async fn main() {
                 show_output,
                 test_cmd,
                 coverage_file,
+                build_cmd,
             )
             .await
             {
@@ -72,6 +74,7 @@ async fn run_check(
     show_output: bool,
     test_cmd: Option<String>,
     coverage_file: Option<PathBuf>,
+    build_cmd: Option<String>,
 ) -> anyhow::Result<()> {
     // 1. Load config
     let mut config = togi::config::Config::load(config_path.as_deref())?;
@@ -92,6 +95,9 @@ async fn run_check(
     if let Some(path) = coverage_file {
         config.mutations.coverage_file = Some(path);
     }
+    if let Some(cmd) = build_cmd {
+        config.test.build_command = cmd.split_whitespace().map(String::from).collect();
+    }
 
     // Find project root (git toplevel)
     let project_root = get_project_root()?;
@@ -101,6 +107,12 @@ async fn run_check(
 
     // Auto-detect test command if not explicitly configured
     config.resolve_test_command(&project_root);
+    config.resolve_build_command(&project_root);
+
+    // Warn about unrecognized language keys in [test.languages]
+    let all_langs = togi::languages::all();
+    let known: Vec<&str> = all_langs.iter().map(|l| l.name()).collect();
+    config.warn_unknown_languages(&known);
 
     // 3. Build list of files to mutate
     let changed_files = if all {
@@ -128,17 +140,26 @@ async fn run_check(
         files
     };
 
-    // 5. Generate mutations
-    let mutations = togi::mutator::generate_mutations(
-        &changed_files,
-        &project_root,
-        config.mutations.max_per_run,
-    )?;
+    // 5. Generate mutations (over-generate when coverage or build check active)
+    let generation_limit = if config.mutations.coverage_file.is_some() {
+        usize::MAX
+    } else if !config.test.build_command.is_empty() {
+        config.mutations.max_per_run * 2
+    } else {
+        config.mutations.max_per_run
+    };
+    let mutations =
+        togi::mutator::generate_mutations(&changed_files, &project_root, generation_limit)?;
 
     // Filter by coverage if a coverage file was provided
-    let mutations = if let Some(ref cov_path) = config.mutations.coverage_file {
-        let cov_content = std::fs::read_to_string(cov_path).map_err(|e| {
-            anyhow::anyhow!("Could not read coverage file {}: {e}", cov_path.display())
+    let mut mutations = if let Some(ref cov_path) = config.mutations.coverage_file {
+        let resolved_cov_path = if std::path::Path::new(cov_path).is_relative() {
+            project_root.join(cov_path)
+        } else {
+            PathBuf::from(cov_path)
+        };
+        let cov_content = std::fs::read_to_string(&resolved_cov_path).map_err(|e| {
+            anyhow::anyhow!("Could not read coverage file {}: {e}", resolved_cov_path.display())
         })?;
         let coverage = togi::coverage::parse_lcov(&cov_content, &project_root);
         let before = mutations.len();
@@ -154,6 +175,7 @@ async fn run_check(
     } else {
         mutations
     };
+    mutations.truncate(config.mutations.max_per_run);
 
     if mutations.len() >= config.mutations.max_per_run {
         eprintln!(
@@ -192,13 +214,23 @@ async fn run_check(
     // 7. Run mutations
     eprintln!("Running {} mutations...", mutations.len());
 
+    let language_commands: std::collections::HashMap<String, Vec<String>> = config
+        .test
+        .languages
+        .iter()
+        .map(|(k, v)| (k.clone(), v.command.clone()))
+        .collect();
+
     let runner = togi::runner::TestRunner {
         command: config.test.command,
+        language_commands,
+        build_command: config.test.build_command,
         timeout: Duration::from_secs(config.test.timeout),
         parallelism: config.test.jobs,
         project_root,
         verbose,
         show_output,
+        max_tested: Some(config.mutations.max_per_run),
     };
 
     let report = runner.run(mutations).await;
