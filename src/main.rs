@@ -39,8 +39,7 @@ async fn main() {
             .await
             {
                 eprintln!("Error: {e}");
-                let msg = e.to_string();
-                if msg.contains("toml") || msg.contains("config") || msg.contains("togi.toml") {
+                if e.downcast_ref::<togi::config::ConfigError>().is_some() {
                     eprintln!("Hint: run 'togi check --help' for usage information.");
                 }
                 process::exit(2);
