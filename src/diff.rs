@@ -48,15 +48,21 @@ pub fn collect_all_supported_files(project_root: &Path) -> anyhow::Result<Vec<Ch
             continue;
         }
 
-        let line_count =
-            std::io::BufRead::lines(std::io::BufReader::new(match std::fs::File::open(path) {
-                Ok(f) => f,
-                Err(e) => {
-                    eprintln!("warning: could not read {}: {e}", path.display());
-                    continue;
-                }
-            }))
-            .count();
+        let bytes = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("warning: could not read {}: {e}", path.display());
+                continue;
+            }
+        };
+        let newlines = bytecount::count(&bytes, b'\n');
+        let line_count = if bytes.is_empty() {
+            0
+        } else if bytes.last() == Some(&b'\n') {
+            newlines
+        } else {
+            newlines + 1
+        };
         if line_count == 0 {
             continue;
         }
