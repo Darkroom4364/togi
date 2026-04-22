@@ -104,3 +104,72 @@ pub struct MutationReport {
     pub timeout: usize,
     pub build_errors: usize,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ts_row_to_line_converts_zero_indexed() {
+        assert_eq!(ts_row_to_line(0), 1);
+        assert_eq!(ts_row_to_line(9), 10);
+        assert_eq!(ts_row_to_line(99), 100);
+    }
+
+    #[test]
+    fn mutation_result_display() {
+        assert_eq!(MutationResult::Killed.to_string(), "killed");
+        assert_eq!(MutationResult::Survived.to_string(), "survived");
+        assert_eq!(MutationResult::Timeout.to_string(), "timeout");
+        assert_eq!(MutationResult::BuildError.to_string(), "build error");
+    }
+
+    #[test]
+    fn line_range_construction() {
+        let r = LineRange { start: 5, end: 10 };
+        assert_eq!(r.start, 5);
+        assert_eq!(r.end, 10);
+    }
+
+    #[test]
+    fn line_range_equality() {
+        let a = LineRange { start: 1, end: 3 };
+        let b = LineRange { start: 1, end: 3 };
+        let c = LineRange { start: 1, end: 4 };
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn changed_file_construction() {
+        let cf = ChangedFile {
+            path: PathBuf::from("src/main.go"),
+            hunks: vec![
+                LineRange { start: 1, end: 5 },
+                LineRange { start: 10, end: 15 },
+            ],
+        };
+        assert_eq!(cf.path, PathBuf::from("src/main.go"));
+        assert_eq!(cf.hunks.len(), 2);
+    }
+
+    #[test]
+    fn mutation_construction() {
+        let m = Mutation {
+            id: 0,
+            file: PathBuf::from("test.go"),
+            language: "go".into(),
+            line: 5,
+            column: 3,
+            operator: "lt_to_lte".into(),
+            description: "replace < with <=".into(),
+            original: "<".into(),
+            replacement: "<=".into(),
+            byte_range: 10..11,
+        };
+        assert_eq!(m.id, 0);
+        assert_eq!(m.line, 5);
+        assert_eq!(m.original, "<");
+        assert_eq!(m.replacement, "<=");
+    }
+}
