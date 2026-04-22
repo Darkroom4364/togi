@@ -15,7 +15,7 @@ pub struct Config {
 pub struct TestConfig {
     #[serde(default = "default_test_command")]
     pub command: Vec<String>,
-    #[serde(default = "default_test_command")]
+    #[serde(default)]
     pub build_command: Vec<String>,
     #[serde(default = "default_timeout")]
     pub timeout: u64,
@@ -156,7 +156,7 @@ impl Default for TestConfig {
     fn default() -> Self {
         Self {
             command: default_test_command(),
-            build_command: default_test_command(),
+            build_command: vec![],
             timeout: default_timeout(),
             jobs: default_jobs(),
         }
