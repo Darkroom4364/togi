@@ -121,6 +121,7 @@ async fn run_check(cfg: CheckConfig) -> anyhow::Result<()> {
     togi::report::print_report(&report, &output_format)?;
 
     if report.survived > 0 {
+        drop(_lock);
         process::exit(1);
     }
 
@@ -236,13 +237,12 @@ fn filter_mutations(
     } else {
         mutations
     };
-    mutations.truncate(config.mutations.max_per_run);
-
-    if mutations.len() >= config.mutations.max_per_run {
+    if mutations.len() > config.mutations.max_per_run {
         eprintln!(
             "warning: mutation count capped at max_per_run ({}). Increase in togi.toml or use --dry-run to preview.",
             config.mutations.max_per_run
         );
+        mutations.truncate(config.mutations.max_per_run);
     }
 
     Ok(mutations)
