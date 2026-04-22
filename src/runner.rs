@@ -204,7 +204,8 @@ async fn run_single_mutation(
     // Read original content
     let original = match std::fs::read(&file_path) {
         Ok(content) => content,
-        Err(_) => {
+        Err(e) => {
+            eprintln!("warning: could not read {}: {e}", file_path.display());
             return MutationOutcome {
                 result: MutationResult::BuildError,
                 test_output: None,
@@ -229,7 +230,8 @@ async fn run_single_mutation(
     }
     mutated.splice(range, mutation.replacement.as_bytes().iter().copied());
 
-    if std::fs::write(&file_path, &mutated).is_err() {
+    if let Err(e) = std::fs::write(&file_path, &mutated) {
+        eprintln!("warning: could not write {}: {e}", file_path.display());
         return MutationOutcome {
             result: MutationResult::BuildError,
             test_output: None,
@@ -277,7 +279,8 @@ async fn run_command(
 
     let child = match cmd.spawn() {
         Ok(c) => c,
-        Err(_) => {
+        Err(e) => {
+            eprintln!("warning: could not spawn command {:?}: {e}", &command[0]);
             return MutationOutcome {
                 result: MutationResult::BuildError,
                 test_output: None,
