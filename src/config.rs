@@ -60,6 +60,7 @@ pub struct DiffConfig {
 pub struct MutationConfig {
     #[serde(default = "default_max_per_run")]
     pub max_per_run: usize,
+    pub coverage_file: Option<PathBuf>,
 }
 
 fn default_test_command() -> Vec<String> {
@@ -213,6 +214,7 @@ impl Default for MutationConfig {
     fn default() -> Self {
         Self {
             max_per_run: default_max_per_run(),
+            coverage_file: None,
         }
     }
 }
@@ -402,6 +404,19 @@ timeout = 120
     }
 
     #[test]
+    fn parse_coverage_file_option() {
+        let toml_str = r#"
+[mutations]
+coverage_file = "coverage.lcov"
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            config.mutations.coverage_file,
+            Some(PathBuf::from("coverage.lcov"))
+        );
+    }
+
+    #[test]
     fn has_file_with_ext_returns_false_when_no_match() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("foo.txt"), "").unwrap();
@@ -430,6 +445,12 @@ timeout = 120
             detect_test_command(dir.path()),
             vec!["bundle", "exec", "rspec"]
         );
+    }
+
+    #[test]
+    fn coverage_file_defaults_to_none() {
+        let config: Config = toml::from_str("").unwrap();
+        assert!(config.mutations.coverage_file.is_none());
     }
 
     #[test]
