@@ -40,34 +40,52 @@ pub fn acquire(project_root: &Path) -> Result<LockGuard> {
     let path = project_root.join(LOCK_FILE);
     let pid = std::process::id();
 
-    // Fast path: no contention — create_new ensures atomicity
-    match OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create_new(true)
-        .open(&path)
-    {
-        Ok(mut file) => {
-            if !try_flock(&file) {
-                bail!("failed to acquire advisory lock on {}", path.display());
+    // Try create_new first (fast path), fall back to open if file exists.
+    // Retry once on NotFound to handle the race where the holder drops
+    // between our create_new and open.
+    let mut file = 'acquire: {
+        for _ in 0..2 {
+            match OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(mut f) => {
+                    if !try_flock(&f) {
+                        let _ = fs::remove_file(&path);
+                        bail!(
+                            "failed to acquire advisory lock on new file {}; \
+                             possible NFS or resource issue",
+                            path.display()
+                        );
+                    }
+                    f.write_all(pid.to_string().as_bytes())
+                        .with_context(|| {
+                            format!("failed to write lock file: {}", path.display())
+                        })?;
+                    return Ok(LockGuard { path, _file: f });
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(e) => {
+                    return Err(e).with_context(|| {
+                        format!("failed to create lock file: {}", path.display())
+                    });
+                }
             }
-            file.write_all(pid.to_string().as_bytes())
-                .with_context(|| format!("failed to write lock file: {}", path.display()))?;
-            return Ok(LockGuard { path, _file: file });
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(e) => {
-            return Err(e)
-                .with_context(|| format!("failed to create lock file: {}", path.display()));
-        }
-    }
 
-    // Lock file exists — open and try to acquire flock
-    let mut file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&path)
-        .with_context(|| format!("failed to open lock file: {}", path.display()))?;
+            match OpenOptions::new().read(true).write(true).open(&path) {
+                Ok(f) => break 'acquire f,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => {
+                    return Err(e).with_context(|| {
+                        format!("failed to open lock file: {}", path.display())
+                    });
+                }
+            }
+        }
+        bail!("failed to acquire lock file after retries: {}", path.display());
+    };
 
     if !try_flock(&file) {
         bail!(
@@ -116,12 +134,12 @@ mod tests {
     }
 
     #[test]
-    fn cleans_stale_lock() {
+    fn acquires_lock_on_orphaned_file() {
         let dir = TempDir::new().unwrap();
         let lock_path = dir.path().join(LOCK_FILE);
 
-        // Write a lock with a PID that (almost certainly) doesn't exist
-        fs::write(&lock_path, "4294967295").unwrap();
+        // Simulate an orphaned lock file with no active flock holder
+        fs::write(&lock_path, "0").unwrap();
 
         let _guard = acquire(dir.path()).unwrap();
         assert!(lock_path.exists());
