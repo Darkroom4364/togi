@@ -481,13 +481,19 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "hello world");
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn build_check_failure_skips_test() {
         let (dir, file, mutation) = make_test_setup();
 
+        let marker = dir.path().join("test_ran.marker");
         // Build fails → should return BuildError without running test
         let outcome = run_single_mutation(
-            &["true".to_string()],  // test would survive
+            &[
+                "sh".to_string(),
+                "-c".to_string(),
+                format!("touch {}", marker.display()),
+            ],
             &["false".to_string()], // build fails
             Duration::from_secs(5),
             &dir.path().to_path_buf(),
@@ -497,6 +503,7 @@ mod tests {
         .await;
 
         assert_eq!(outcome.result, MutationResult::BuildError);
+        assert!(!marker.exists(), "test command should not have run");
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "hello world");
     }
 
@@ -565,6 +572,7 @@ mod tests {
         assert_eq!(outcome.result, MutationResult::BuildError);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn capture_output_collects_stdout_stderr() {
         let outcome = run_command(
