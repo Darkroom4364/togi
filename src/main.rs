@@ -159,7 +159,10 @@ async fn run_check(
             PathBuf::from(cov_path)
         };
         let cov_content = std::fs::read_to_string(&resolved_cov_path).map_err(|e| {
-            anyhow::anyhow!("Could not read coverage file {}: {e}", resolved_cov_path.display())
+            anyhow::anyhow!(
+                "Could not read coverage file {}: {e}",
+                resolved_cov_path.display()
+            )
         })?;
         let coverage = togi::coverage::parse_lcov(&cov_content, &project_root);
         let before = mutations.len();
