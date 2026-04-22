@@ -2,6 +2,7 @@
 
 use crate::{ChangedFile, LineRange};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 /// Build ChangedFile entries for every supported file in the project tree.
 /// Respects `.gitignore` rules. Skips test files.
@@ -87,29 +88,52 @@ pub fn collect_all_supported_files(project_root: &Path) -> anyhow::Result<Vec<Ch
 /// Returns the same `Vec<ChangedFile>` format as `parse_diff`, filtering
 /// out test files and files with no added lines.
 pub fn collect_changed_since(project_root: &Path, since: &str) -> anyhow::Result<Vec<ChangedFile>> {
-    use std::process::Command;
-
     // Try as a commit ref first (SHA, branch, tag).
     let output = Command::new("git")
-        .args(["diff", &format!("{since}...HEAD")])
+        .args(["diff", &format!("{since}..HEAD")])
         .current_dir(project_root)
         .output()?;
 
     let diff_output = if output.status.success() {
         String::from_utf8(output.stdout)?
     } else {
-        // Fall back to date-based: git log --since=<date> -p
-        let output = Command::new("git")
-            .args(["log", &format!("--since={since}"), "-p", "--reverse"])
+        // Fall back to date-based: resolve to a baseline commit, then diff.
+        let rev_output = Command::new("git")
+            .args(["rev-list", "-1", &format!("--before={since}"), "HEAD"])
             .current_dir(project_root)
             .output()?;
-        if !output.status.success() {
+        if !rev_output.status.success() {
             anyhow::bail!(
-                "git log --since failed: {}",
-                String::from_utf8_lossy(&output.stderr)
+                "git rev-list --before failed: {}",
+                String::from_utf8_lossy(&rev_output.stderr)
             );
         }
-        String::from_utf8(output.stdout)?
+        let base = String::from_utf8(rev_output.stdout)?.trim().to_string();
+        if base.is_empty() {
+            // No commit before that date — diff the entire history
+            // against the well-known empty tree SHA.
+            let tree_sha = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+            let out = Command::new("git")
+                .args(["diff", &format!("{tree_sha}..HEAD")])
+                .current_dir(project_root)
+                .output()?;
+            if !out.status.success() {
+                anyhow::bail!(
+                    "git diff (empty tree) failed: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            }
+            String::from_utf8(out.stdout)?
+        } else {
+            let out = Command::new("git")
+                .args(["diff", &format!("{base}..HEAD")])
+                .current_dir(project_root)
+                .output()?;
+            if !out.status.success() {
+                anyhow::bail!("git diff failed: {}", String::from_utf8_lossy(&out.stderr));
+            }
+            String::from_utf8(out.stdout)?
+        }
     };
 
     let all = parse_diff(&diff_output);
@@ -444,13 +468,11 @@ diff --git a/src/main.rs b/src/main.rs
 
     #[test]
     fn collect_changed_since_ref() {
-        use std::process::Command;
-
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
 
         let run = |args: &[&str]| {
-            Command::new("git")
+            let out = Command::new("git")
                 .args(args)
                 .current_dir(root)
                 .env("GIT_AUTHOR_NAME", "test")
@@ -458,7 +480,14 @@ diff --git a/src/main.rs b/src/main.rs
                 .env("GIT_COMMITTER_NAME", "test")
                 .env("GIT_COMMITTER_EMAIL", "t@t")
                 .output()
-                .unwrap()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+            out
         };
 
         run(&["init"]);
@@ -485,13 +514,11 @@ diff --git a/src/main.rs b/src/main.rs
 
     #[test]
     fn collect_changed_since_filters_test_files() {
-        use std::process::Command;
-
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
 
         let run = |args: &[&str]| {
-            Command::new("git")
+            let out = Command::new("git")
                 .args(args)
                 .current_dir(root)
                 .env("GIT_AUTHOR_NAME", "test")
@@ -499,7 +526,14 @@ diff --git a/src/main.rs b/src/main.rs
                 .env("GIT_COMMITTER_NAME", "test")
                 .env("GIT_COMMITTER_EMAIL", "t@t")
                 .output()
-                .unwrap()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+            out
         };
 
         run(&["init"]);
@@ -518,5 +552,89 @@ diff --git a/src/main.rs b/src/main.rs
         let files = collect_changed_since(root, &base).unwrap();
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].path, PathBuf::from("lib.rs"));
+    }
+
+    #[test]
+    fn collect_changed_since_date_fallback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        let run = |args: &[&str], date: &str| {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .env("GIT_AUTHOR_NAME", "test")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "test")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .env("GIT_AUTHOR_DATE", date)
+                .env("GIT_COMMITTER_DATE", date)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+            out
+        };
+
+        run(&["init"], "2024-01-01T00:00:00Z");
+        std::fs::write(root.join("main.rs"), "fn main() {}\n").unwrap();
+        run(&["add", "."], "2024-01-01T00:00:00Z");
+        run(&["commit", "-m", "initial"], "2024-01-01T00:00:00Z");
+
+        std::fs::write(
+            root.join("main.rs"),
+            "fn main() {\n    println!(\"hi\");\n}\n",
+        )
+        .unwrap();
+        run(&["add", "."], "2024-06-15T00:00:00Z");
+        run(&["commit", "-m", "add print"], "2024-06-15T00:00:00Z");
+
+        // Use a date between the two commits — should pick up the second commit.
+        let files = collect_changed_since(root, "2024-03-01").unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, PathBuf::from("main.rs"));
+        assert!(!files[0].hunks.is_empty());
+    }
+
+    #[test]
+    fn collect_changed_since_root_fallback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        let run = |args: &[&str], date: &str| {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .env("GIT_AUTHOR_NAME", "test")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "test")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .env("GIT_AUTHOR_DATE", date)
+                .env("GIT_COMMITTER_DATE", date)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+            out
+        };
+
+        run(&["init"], "2024-06-01T00:00:00Z");
+        std::fs::write(root.join("main.rs"), "fn main() {}\n").unwrap();
+        run(&["add", "."], "2024-06-01T00:00:00Z");
+        run(&["commit", "-m", "initial"], "2024-06-01T00:00:00Z");
+
+        // Date before any commit — triggers empty-tree SHA fallback.
+        let files = collect_changed_since(root, "2024-01-01").unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, PathBuf::from("main.rs"));
+        assert!(!files[0].hunks.is_empty());
     }
 }

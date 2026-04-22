@@ -1,5 +1,6 @@
 pub mod baseline;
 pub mod build_check;
+pub mod cache;
 pub mod cli;
 pub mod config;
 pub mod diff;

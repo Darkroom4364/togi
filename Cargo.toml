@@ -50,6 +50,9 @@ bytecount = "0.6"
 anyhow = "1"
 thiserror = "2"
 
+# Hashing
+siphasher = "1"
+
 # Platform
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
