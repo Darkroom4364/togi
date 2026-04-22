@@ -26,11 +26,7 @@ pub fn mutation_diff(mutation: &Mutation) -> Option<String> {
 
     let original_line = lines[line_idx];
     let col_idx = mutation.column.saturating_sub(1);
-    let byte_start = original_line
-        .char_indices()
-        .nth(col_idx)
-        .map(|(i, _)| i)
-        .unwrap_or(col_idx.min(original_line.len()));
+    let byte_start = col_idx.min(original_line.len());
     let byte_end = byte_start + mutation.original.len();
     if byte_end > original_line.len() {
         return None;
