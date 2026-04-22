@@ -2,6 +2,7 @@ pub mod binary;
 pub mod boundary;
 pub mod literal;
 pub mod removal;
+pub mod unary;
 
 /// A mutation operator that generates candidate mutations from AST nodes
 pub trait MutationOperator: Send + Sync {
@@ -115,7 +116,7 @@ impl MutationOperator for ReturnEmpty {
     }
 }
 
-/// Returns all 14 mutation operators
+/// Returns all mutation operators
 pub fn all_operators() -> Vec<Box<dyn MutationOperator>> {
     vec![
         Box::new(binary::LtToLte),
@@ -123,13 +124,23 @@ pub fn all_operators() -> Vec<Box<dyn MutationOperator>> {
         Box::new(binary::EqToNeq),
         Box::new(binary::AndToOr),
         Box::new(binary::OrToAnd),
+        Box::new(binary::MulToDiv),
+        Box::new(binary::DivToMul),
+        Box::new(binary::ModToMul),
         Box::new(literal::TrueToFalse),
         Box::new(literal::FalseToTrue),
         Box::new(literal::ZeroToOne),
+        Box::new(literal::StringToEmpty),
+        Box::new(literal::IncrementNumeric),
+        Box::new(literal::DecrementNumeric),
         Box::new(boundary::PlusToMinus),
         Box::new(boundary::MinusToPlus),
         Box::new(removal::RemoveIfBody),
         Box::new(removal::RemoveElse),
+        Box::new(removal::RemoveCallStatement),
+        Box::new(removal::RemoveAssignment),
+        Box::new(unary::RemoveUnaryNot),
+        Box::new(unary::RemoveUnaryNeg),
         Box::new(NegateCondition),
         Box::new(ReturnEmpty),
     ]

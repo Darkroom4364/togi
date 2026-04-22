@@ -25,7 +25,7 @@ pub fn generate_mutations(
         }
 
         let source = std::fs::read(&file_path)?;
-        let (tree, _lang) = match crate::parser::parse_file(&changed_file.path, &source) {
+        let (tree, lang) = match crate::parser::parse_file(&changed_file.path, &source) {
             Ok(result) => result,
             Err(_) => {
                 eprintln!(
@@ -35,6 +35,7 @@ pub fn generate_mutations(
                 continue;
             }
         };
+        let language_name = lang.name().to_string();
 
         let nodes = find_mutable_nodes(&tree, &source, &changed_file.hunks);
 
@@ -54,6 +55,7 @@ pub fn generate_mutations(
                     mutations.push(Mutation {
                         id: next_id,
                         file: file_path.clone(),
+                        language: language_name.clone(),
                         line,
                         column,
                         operator: candidate.operator_id,

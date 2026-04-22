@@ -2,6 +2,7 @@
 
 use crate::{ChangedFile, LineRange};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 /// Build ChangedFile entries for every supported file in the project tree.
 /// Respects `.gitignore` rules. Skips test files.
@@ -48,15 +49,21 @@ pub fn collect_all_supported_files(project_root: &Path) -> anyhow::Result<Vec<Ch
             continue;
         }
 
-        let line_count =
-            std::io::BufRead::lines(std::io::BufReader::new(match std::fs::File::open(path) {
-                Ok(f) => f,
-                Err(e) => {
-                    eprintln!("warning: could not read {}: {e}", path.display());
-                    continue;
-                }
-            }))
-            .count();
+        let bytes = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("warning: could not read {}: {e}", path.display());
+                continue;
+            }
+        };
+        let newlines = bytecount::count(&bytes, b'\n');
+        let line_count = if bytes.is_empty() {
+            0
+        } else if bytes.last() == Some(&b'\n') {
+            newlines
+        } else {
+            newlines + 1
+        };
         if line_count == 0 {
             continue;
         }
@@ -71,6 +78,66 @@ pub fn collect_all_supported_files(project_root: &Path) -> anyhow::Result<Vec<Ch
     }
 
     Ok(files)
+}
+
+/// Collect changed files and line ranges since a given git ref or date.
+///
+/// `since` can be a commit SHA, branch name, tag, or a date string that
+/// `git log --since` understands (e.g. "2024-01-01", "3 days ago").
+///
+/// Returns the same `Vec<ChangedFile>` format as `parse_diff`, filtering
+/// out test files and files with no added lines.
+pub fn collect_changed_since(project_root: &Path, since: &str) -> anyhow::Result<Vec<ChangedFile>> {
+    // Try as a commit ref first (SHA, branch, tag).
+    let output = Command::new("git")
+        .args(["diff", &format!("{since}..HEAD")])
+        .current_dir(project_root)
+        .output()?;
+
+    let diff_output = if output.status.success() {
+        String::from_utf8(output.stdout)?
+    } else {
+        // Fall back to date-based: resolve to a baseline commit, then diff.
+        let rev_output = Command::new("git")
+            .args(["rev-list", "-1", &format!("--before={since}"), "HEAD"])
+            .current_dir(project_root)
+            .output()?;
+        if !rev_output.status.success() {
+            anyhow::bail!(
+                "git rev-list --before failed: {}",
+                String::from_utf8_lossy(&rev_output.stderr)
+            );
+        }
+        let base = String::from_utf8(rev_output.stdout)?.trim().to_string();
+        if base.is_empty() {
+            // No commit before that date — diff the entire history
+            // against the well-known empty tree SHA.
+            let tree_sha = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+            let out = Command::new("git")
+                .args(["diff", &format!("{tree_sha}..HEAD")])
+                .current_dir(project_root)
+                .output()?;
+            if !out.status.success() {
+                anyhow::bail!(
+                    "git diff (empty tree) failed: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            }
+            String::from_utf8(out.stdout)?
+        } else {
+            let out = Command::new("git")
+                .args(["diff", &format!("{base}..HEAD")])
+                .current_dir(project_root)
+                .output()?;
+            if !out.status.success() {
+                anyhow::bail!("git diff failed: {}", String::from_utf8_lossy(&out.stderr));
+            }
+            String::from_utf8(out.stdout)?
+        }
+    };
+
+    let all = parse_diff(&diff_output);
+    Ok(all.into_iter().filter(|f| !is_test_file(&f.path)).collect())
 }
 
 /// Returns true for files that look like test files across supported languages.
@@ -335,8 +402,12 @@ diff --git a/src/main.rs b/src/main.rs
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
 
-        // Init a git repo so .gitignore is respected
-        std::fs::create_dir(root.join(".git")).unwrap();
+        // Init a real git repo so the ignore crate respects .gitignore
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(root)
+            .status()
+            .expect("git init failed");
 
         // Supported file
         let src = root.join("src");
@@ -393,5 +464,177 @@ diff --git a/src/main.rs b/src/main.rs
         assert!(!is_test_file(Path::new("cmd/test/server.go")));
         assert!(is_test_file(Path::new("testdata/input.go")));
         assert!(is_test_file(Path::new("fixtures/setup.py")));
+    }
+
+    #[test]
+    fn collect_changed_since_ref() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        let run = |args: &[&str]| {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .env("GIT_AUTHOR_NAME", "test")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "test")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+            out
+        };
+
+        run(&["init"]);
+        std::fs::write(root.join("main.rs"), "fn main() {}\n").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-m", "initial"]);
+
+        let out = run(&["rev-parse", "HEAD"]);
+        let base = String::from_utf8(out.stdout).unwrap().trim().to_string();
+
+        std::fs::write(
+            root.join("main.rs"),
+            "fn main() {\n    println!(\"hi\");\n}\n",
+        )
+        .unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-m", "add print"]);
+
+        let files = collect_changed_since(root, &base).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, PathBuf::from("main.rs"));
+        assert!(!files[0].hunks.is_empty());
+    }
+
+    #[test]
+    fn collect_changed_since_filters_test_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        let run = |args: &[&str]| {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .env("GIT_AUTHOR_NAME", "test")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "test")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+            out
+        };
+
+        run(&["init"]);
+        std::fs::write(root.join("lib.rs"), "pub fn x() {}\n").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-m", "initial"]);
+
+        let out = run(&["rev-parse", "HEAD"]);
+        let base = String::from_utf8(out.stdout).unwrap().trim().to_string();
+
+        std::fs::write(root.join("lib.rs"), "pub fn x() { 1 }\n").unwrap();
+        std::fs::write(root.join("lib_test.rs"), "fn test() {}\n").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-m", "add changes"]);
+
+        let files = collect_changed_since(root, &base).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, PathBuf::from("lib.rs"));
+    }
+
+    #[test]
+    fn collect_changed_since_date_fallback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        let run = |args: &[&str], date: &str| {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .env("GIT_AUTHOR_NAME", "test")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "test")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .env("GIT_AUTHOR_DATE", date)
+                .env("GIT_COMMITTER_DATE", date)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+            out
+        };
+
+        run(&["init"], "2024-01-01T00:00:00Z");
+        std::fs::write(root.join("main.rs"), "fn main() {}\n").unwrap();
+        run(&["add", "."], "2024-01-01T00:00:00Z");
+        run(&["commit", "-m", "initial"], "2024-01-01T00:00:00Z");
+
+        std::fs::write(
+            root.join("main.rs"),
+            "fn main() {\n    println!(\"hi\");\n}\n",
+        )
+        .unwrap();
+        run(&["add", "."], "2024-06-15T00:00:00Z");
+        run(&["commit", "-m", "add print"], "2024-06-15T00:00:00Z");
+
+        // Use a date between the two commits — should pick up the second commit.
+        let files = collect_changed_since(root, "2024-03-01").unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, PathBuf::from("main.rs"));
+        assert!(!files[0].hunks.is_empty());
+    }
+
+    #[test]
+    fn collect_changed_since_root_fallback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        let run = |args: &[&str], date: &str| {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .env("GIT_AUTHOR_NAME", "test")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "test")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .env("GIT_AUTHOR_DATE", date)
+                .env("GIT_COMMITTER_DATE", date)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+            out
+        };
+
+        run(&["init"], "2024-06-01T00:00:00Z");
+        std::fs::write(root.join("main.rs"), "fn main() {}\n").unwrap();
+        run(&["add", "."], "2024-06-01T00:00:00Z");
+        run(&["commit", "-m", "initial"], "2024-06-01T00:00:00Z");
+
+        // Date before any commit — triggers empty-tree SHA fallback.
+        let files = collect_changed_since(root, "2024-01-01").unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, PathBuf::from("main.rs"));
+        assert!(!files[0].hunks.is_empty());
     }
 }
