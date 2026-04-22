@@ -48,15 +48,21 @@ pub fn collect_all_supported_files(project_root: &Path) -> anyhow::Result<Vec<Ch
             continue;
         }
 
-        let line_count =
-            std::io::BufRead::lines(std::io::BufReader::new(match std::fs::File::open(path) {
-                Ok(f) => f,
-                Err(e) => {
-                    eprintln!("warning: could not read {}: {e}", path.display());
-                    continue;
-                }
-            }))
-            .count();
+        let bytes = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("warning: could not read {}: {e}", path.display());
+                continue;
+            }
+        };
+        let newlines = bytecount::count(&bytes, b'\n');
+        let line_count = if bytes.is_empty() {
+            0
+        } else if bytes.last() == Some(&b'\n') {
+            newlines
+        } else {
+            newlines + 1
+        };
         if line_count == 0 {
             continue;
         }
@@ -372,8 +378,12 @@ diff --git a/src/main.rs b/src/main.rs
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
 
-        // Init a git repo so .gitignore is respected
-        std::fs::create_dir(root.join(".git")).unwrap();
+        // Init a real git repo so the ignore crate respects .gitignore
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(root)
+            .status()
+            .expect("git init failed");
 
         // Supported file
         let src = root.join("src");
