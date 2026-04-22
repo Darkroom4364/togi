@@ -217,6 +217,7 @@ mod tests {
         }];
 
         let mutations = generate_mutations(&changed, tmp.path(), 100).unwrap();
+        assert!(!mutations.is_empty(), "expected at least one mutation");
         for (i, m) in mutations.iter().enumerate() {
             assert_eq!(m.id, i as u32, "mutation ids should be sequential");
         }
