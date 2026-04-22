@@ -2,6 +2,11 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+/// Error type for configuration loading failures.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct ConfigError(pub String);
+
 #[derive(Debug, Default, Deserialize)]
 pub struct Config {
     #[serde(default)]
@@ -230,9 +235,11 @@ impl Config {
 
         match config_path {
             Some(p) => {
-                let content = std::fs::read_to_string(&p)?;
-                let config: Config = toml::from_str(&content)
-                    .map_err(|e| anyhow::anyhow!("Invalid togi.toml at {}: {e}", p.display()))?;
+                let content = std::fs::read_to_string(&p)
+                    .map_err(|e| ConfigError(format!("Could not read {}: {e}", p.display())))?;
+                let config: Config = toml::from_str(&content).map_err(|e| {
+                    ConfigError(format!("Invalid togi.toml at {}: {e}", p.display()))
+                })?;
                 Ok(config)
             }
             None => Ok(Config::default()),
