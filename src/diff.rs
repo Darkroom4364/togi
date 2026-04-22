@@ -621,7 +621,7 @@ diff --git a/src/main.rs b/src/main.rs
         run(&["add", "."], "2024-06-01T00:00:00Z");
         run(&["commit", "-m", "initial"], "2024-06-01T00:00:00Z");
 
-        // Date before any commit — triggers git diff --root HEAD fallback.
+        // Date before any commit — triggers empty-tree SHA fallback.
         let files = collect_changed_since(root, "2024-01-01").unwrap();
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].path, PathBuf::from("main.rs"));

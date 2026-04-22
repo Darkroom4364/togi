@@ -4,10 +4,11 @@
 //! description, test command hash) so unchanged mutations can be skipped
 //! on subsequent runs. Results are stored as JSON files in `.togi-cache/`.
 
-use std::collections::hash_map::DefaultHasher;
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
+
+use siphasher::sip::SipHasher;
 
 use serde::{Deserialize, Serialize};
 
@@ -45,7 +46,7 @@ impl CacheKey {
 
     /// Compute the hex digest used as the cache filename.
     fn digest(&self) -> String {
-        let mut h = DefaultHasher::new();
+        let mut h = SipHasher::new();
         self.file_content_hash.hash(&mut h);
         self.mutation_description.hash(&mut h);
         self.test_command_hash.hash(&mut h);
@@ -93,13 +94,13 @@ fn entry_path(project_root: &Path, key: &CacheKey) -> PathBuf {
 }
 
 fn hash_bytes(data: &[u8]) -> u64 {
-    let mut h = DefaultHasher::new();
+    let mut h = SipHasher::new();
     data.hash(&mut h);
     h.finish()
 }
 
 fn hash_str(s: &str) -> u64 {
-    let mut h = DefaultHasher::new();
+    let mut h = SipHasher::new();
     s.hash(&mut h);
     h.finish()
 }
