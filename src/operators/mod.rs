@@ -149,29 +149,7 @@ pub fn all_operators() -> Vec<Box<dyn MutationOperator>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn find_node_by_kind<'a>(
-        node: tree_sitter::Node<'a>,
-        kind: &str,
-    ) -> Option<tree_sitter::Node<'a>> {
-        if node.kind() == kind {
-            return Some(node);
-        }
-        let mut cursor = node.walk();
-        for child in node.named_children(&mut cursor) {
-            if let Some(found) = find_node_by_kind(child, kind) {
-                return Some(found);
-            }
-        }
-        None
-    }
-
-    fn parse_go(source: &str) -> tree_sitter::Tree {
-        let mut parser = tree_sitter::Parser::new();
-        let lang = tree_sitter_go::LANGUAGE;
-        parser.set_language(&lang.into()).unwrap();
-        parser.parse(source, None).unwrap()
-    }
+    use crate::test_helpers::{find_node_by_kind, parse_go};
 
     #[test]
     fn test_negate_simple_condition() {

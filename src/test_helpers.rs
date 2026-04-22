@@ -1,4 +1,5 @@
 /// Shared test utilities for tree-sitter parsing and node lookup.
+/// Used across operator and language tests to avoid duplication.
 
 /// Parse Go source code into a tree-sitter tree.
 pub fn parse_go(src: &str) -> tree_sitter::Tree {
@@ -9,6 +10,7 @@ pub fn parse_go(src: &str) -> tree_sitter::Tree {
 }
 
 /// Recursively find the first node matching `kind` in the tree.
+/// Visits all children (named and anonymous).
 pub fn find_node_by_kind<'a>(
     node: tree_sitter::Node<'a>,
     kind: &str,
@@ -25,7 +27,7 @@ pub fn find_node_by_kind<'a>(
     None
 }
 
-/// Walk a tree cursor looking for a node of the given kind.
+/// Walk a tree cursor looking for a node of the given kind, setting `found` to true.
 pub fn walk_for_kind(cursor: &mut tree_sitter::TreeCursor, target: &str, found: &mut bool) {
     if cursor.node().kind() == target {
         *found = true;
