@@ -3,3 +3,5 @@
 *.swo
 .DS_Store
 .togi.lock
+.claude/
+togi.toml
