@@ -75,3 +75,82 @@ pub fn mutation_diff(mutation: &Mutation) -> Option<String> {
 
     Some(diff.to_string())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn make_mutation(dir: &std::path::Path, filename: &str, content: &str, line: usize, column: usize, original: &str, replacement: &str) -> Mutation {
+        let path = dir.join(filename);
+        std::fs::write(&path, content).unwrap();
+        Mutation {
+            id: 0,
+            file: path,
+            language: "go".into(),
+            line,
+            column,
+            operator: "test_op".into(),
+            description: "test".into(),
+            original: original.into(),
+            replacement: replacement.into(),
+            byte_range: 0..0,
+        }
+    }
+
+    #[test]
+    fn mutation_diff_basic() {
+        let tmp = TempDir::new().unwrap();
+        let content = "package main\n\nfunc f() bool {\n\treturn true\n}\n";
+        let m = make_mutation(tmp.path(), "main.go", content, 4, 9, "true", "false");
+        let diff = mutation_diff(&m).unwrap();
+        assert!(diff.contains("-\treturn true"), "diff should show original line: {diff}");
+        assert!(diff.contains("+\treturn false"), "diff should show mutated line: {diff}");
+    }
+
+    #[test]
+    fn mutation_diff_empty_replacement() {
+        let tmp = TempDir::new().unwrap();
+        let content = "x = 1 + 2\ny = 3\n";
+        let m = make_mutation(tmp.path(), "test.py", content, 1, 7, "+ 2", "");
+        let diff = mutation_diff(&m).unwrap();
+        assert!(diff.contains("-x = 1 + 2"), "diff should show original: {diff}");
+        assert!(diff.contains("+x = 1"), "diff should show removal: {diff}");
+    }
+
+    #[test]
+    fn mutation_diff_replacement_at_start() {
+        let tmp = TempDir::new().unwrap();
+        let content = "true\n";
+        let m = make_mutation(tmp.path(), "t.go", content, 1, 1, "true", "false");
+        let diff = mutation_diff(&m).unwrap();
+        assert!(diff.contains("-true"), "{diff}");
+        assert!(diff.contains("+false"), "{diff}");
+    }
+
+    #[test]
+    fn mutation_diff_replacement_at_end() {
+        let tmp = TempDir::new().unwrap();
+        let content = "a = true\n";
+        let m = make_mutation(tmp.path(), "t.py", content, 1, 5, "true", "false");
+        let diff = mutation_diff(&m).unwrap();
+        assert!(diff.contains("-a = true"), "{diff}");
+        assert!(diff.contains("+a = false"), "{diff}");
+    }
+
+    #[test]
+    fn mutation_diff_invalid_line_returns_none() {
+        let tmp = TempDir::new().unwrap();
+        let content = "one line\n";
+        let m = make_mutation(tmp.path(), "t.go", content, 99, 1, "x", "y");
+        assert!(mutation_diff(&m).is_none());
+    }
+
+    #[test]
+    fn mutation_diff_line_zero_returns_none() {
+        let tmp = TempDir::new().unwrap();
+        let content = "hello\n";
+        let m = make_mutation(tmp.path(), "t.go", content, 0, 1, "h", "H");
+        assert!(mutation_diff(&m).is_none());
+    }
+}

@@ -151,4 +151,184 @@ mod tests {
             kinds
         );
     }
+
+    #[test]
+    fn multiple_overlapping_ranges() {
+        let source = b"package main\n\nfunc f(a, b int) int {\n\tif a > 0 {\n\t\treturn a + b\n\t}\n\treturn a - b\n}\n";
+        // Lines: 1=package, 2=empty, 3=func, 4=if a>0, 5=return a+b, 6=}, 7=return a-b, 8=}
+        let tree = parse_go(source);
+        // Two ranges that both touch the function body
+        let changed = vec![
+            LineRange { start: 4, end: 5 },
+            LineRange { start: 5, end: 7 },
+        ];
+
+        let nodes = find_mutable_nodes(&tree, source, &changed);
+
+        let kinds: Vec<&str> = nodes.iter().map(|n| n.kind()).collect();
+        // Should find binary expressions from both return statements
+        let binary_count = kinds.iter().filter(|k| **k == "binary_expression").count();
+        assert!(
+            binary_count >= 2,
+            "Expected at least 2 binary_expression nodes from overlapping ranges, got: {:?}",
+            kinds
+        );
+    }
+
+    #[test]
+    fn finds_return_statement_on_changed_line() {
+        let source = b"package main\n\nfunc f() int {\n\treturn 42\n}\n";
+        // Lines: 1=package, 2=empty, 3=func, 4=return 42, 5=}
+        let tree = parse_go(source);
+        let changed = vec![LineRange { start: 4, end: 4 }];
+
+        let nodes = find_mutable_nodes(&tree, source, &changed);
+
+        assert!(!nodes.is_empty());
+        let kinds: Vec<&str> = nodes.iter().map(|n| n.kind()).collect();
+        // Deepest mutable node inside `return 42` is the int_literal
+        assert!(
+            kinds.contains(&"int_literal") || kinds.contains(&"return_statement"),
+            "Expected return_statement or int_literal, got: {:?}",
+            kinds
+        );
+    }
+
+    #[test]
+    fn finds_assignment_on_changed_line() {
+        let source =
+            b"package main\n\nfunc f() {\n\tx := 1\n\tx = x + 2\n}\n";
+        // Lines: 1=package, 2=empty, 3=func, 4=x:=1, 5=x=x+2, 6=}
+        let tree = parse_go(source);
+        let changed = vec![LineRange { start: 5, end: 5 }];
+
+        let nodes = find_mutable_nodes(&tree, source, &changed);
+
+        assert!(!nodes.is_empty());
+        let kinds: Vec<&str> = nodes.iter().map(|n| n.kind()).collect();
+        // Should find the binary_expression (deepest) or assignment-related node
+        assert!(
+            kinds.contains(&"binary_expression")
+                || kinds.contains(&"assignment_statement")
+                || kinds.contains(&"expression_statement")
+                || kinds.contains(&"int_literal"),
+            "Expected mutable node on assignment line, got: {:?}",
+            kinds
+        );
+    }
+
+    #[test]
+    fn nested_if_inside_if() {
+        let source = b"package main\n\nfunc f(a, b int) int {\n\tif a > 0 {\n\t\tif b > 0 {\n\t\t\treturn a + b\n\t\t}\n\t}\n\treturn 0\n}\n";
+        // Lines: 1=package, 2=empty, 3=func, 4=if a>0, 5=if b>0, 6=return a+b, 7=}, 8=}, 9=return 0, 10=}
+        let tree = parse_go(source);
+        // Only the inner if line is changed
+        let changed = vec![LineRange { start: 5, end: 6 }];
+
+        let nodes = find_mutable_nodes(&tree, source, &changed);
+
+        assert!(!nodes.is_empty());
+        let kinds: Vec<&str> = nodes.iter().map(|n| n.kind()).collect();
+        // Should find deepest mutable nodes (binary_expression, int_literal) not outer if
+        assert!(
+            kinds.contains(&"binary_expression") || kinds.contains(&"int_literal"),
+            "Expected deepest nested nodes, got: {:?}",
+            kinds
+        );
+    }
+
+    #[test]
+    fn binary_expression_inside_function_call() {
+        let source = b"package main\n\nimport \"fmt\"\n\nfunc f(a, b int) {\n\tfmt.Println(a + b)\n}\n";
+        // Lines: 1=package, 2=empty, 3=import, 4=empty, 5=func, 6=fmt.Println(a+b), 7=}
+        let tree = parse_go(source);
+        let changed = vec![LineRange { start: 6, end: 6 }];
+
+        let nodes = find_mutable_nodes(&tree, source, &changed);
+
+        assert!(!nodes.is_empty());
+        let kinds: Vec<&str> = nodes.iter().map(|n| n.kind()).collect();
+        // Should find the binary_expression nested inside the call
+        assert!(
+            kinds.contains(&"binary_expression"),
+            "Expected binary_expression inside call, got: {:?}",
+            kinds
+        );
+    }
+
+    #[test]
+    fn comment_only_lines_return_no_mutable_nodes() {
+        let source = b"package main\n\n// this is a comment\n// another comment\nfunc f() {}\n";
+        // Lines: 1=package, 2=empty, 3=comment, 4=comment, 5=func
+        let tree = parse_go(source);
+        let changed = vec![LineRange { start: 3, end: 4 }];
+
+        let nodes = find_mutable_nodes(&tree, source, &changed);
+
+        assert!(
+            nodes.is_empty(),
+            "Comments should not produce mutable nodes, got: {:?}",
+            nodes.iter().map(|n| n.kind()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn package_declaration_returns_no_mutable_nodes() {
+        let source = b"package main\n\nfunc f() {\n\treturn\n}\n";
+        // Lines: 1=package, 2=empty, 3=func, 4=return, 5=}
+        let tree = parse_go(source);
+        // Only the package line is changed
+        let changed = vec![LineRange { start: 1, end: 1 }];
+
+        let nodes = find_mutable_nodes(&tree, source, &changed);
+
+        assert!(
+            nodes.is_empty(),
+            "Package declaration should not produce mutable nodes, got: {:?}",
+            nodes.iter().map(|n| n.kind()).collect::<Vec<_>>()
+        );
+    }
+
+    fn parse_rust(source: &[u8]) -> tree_sitter::Tree {
+        let mut parser = tree_sitter::Parser::new();
+        let lang = tree_sitter_rust::LANGUAGE;
+        parser.set_language(&lang.into()).unwrap();
+        parser.parse(source, None).unwrap()
+    }
+
+    #[test]
+    fn rust_return_expression_on_changed_line() {
+        let source = b"fn add(a: i32, b: i32) -> i32 {\n    return a + b;\n}\n";
+        // Lines: 1=fn, 2=return a+b, 3=}
+        let tree = parse_rust(source);
+        let changed = vec![LineRange { start: 2, end: 2 }];
+
+        let nodes = find_mutable_nodes(&tree, source, &changed);
+
+        assert!(!nodes.is_empty());
+        let kinds: Vec<&str> = nodes.iter().map(|n| n.kind()).collect();
+        assert!(
+            kinds.contains(&"binary_expression") || kinds.contains(&"return_expression") || kinds.contains(&"integer_literal"),
+            "Expected mutable node from Rust return line, got: {:?}",
+            kinds
+        );
+    }
+
+    #[test]
+    fn rust_nested_if_expression() {
+        let source = b"fn f(a: i32, b: i32) -> i32 {\n    if a > 0 {\n        if b > 0 {\n            return a + b;\n        }\n    }\n    0\n}\n";
+        // Lines: 1=fn, 2=if a>0, 3=if b>0, 4=return a+b, 5=}, 6=}, 7=0, 8=}
+        let tree = parse_rust(source);
+        let changed = vec![LineRange { start: 3, end: 4 }];
+
+        let nodes = find_mutable_nodes(&tree, source, &changed);
+
+        assert!(!nodes.is_empty());
+        let kinds: Vec<&str> = nodes.iter().map(|n| n.kind()).collect();
+        assert!(
+            kinds.contains(&"binary_expression") || kinds.contains(&"integer_literal"),
+            "Expected deepest nodes from nested Rust if, got: {:?}",
+            kinds
+        );
+    }
 }
