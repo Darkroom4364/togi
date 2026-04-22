@@ -4,6 +4,14 @@ use crate::MutationCandidate;
 const TRUE_KINDS: &[&str] = &["true", "True", "TRUE"];
 const FALSE_KINDS: &[&str] = &["false", "False", "FALSE"];
 const INT_LITERAL_KINDS: &[&str] = &["integer_literal", "int_literal", "number", "number_literal"];
+const STRING_LITERAL_KINDS: &[&str] = &[
+    "interpreted_string_literal",
+    "raw_string_literal",
+    "string",
+    "string_literal",
+    "string_content",
+    "template_string",
+];
 
 pub struct TrueToFalse;
 
@@ -77,6 +85,93 @@ impl MutationOperator for ZeroToOne {
             }
         }
         vec![]
+    }
+}
+
+pub struct StringToEmpty;
+
+impl MutationOperator for StringToEmpty {
+    fn id(&self) -> &str {
+        "string_to_empty"
+    }
+    fn description(&self) -> &str {
+        "Replace string literal with empty string"
+    }
+    fn apply(&self, node: &tree_sitter::Node, source: &[u8]) -> Vec<MutationCandidate> {
+        if STRING_LITERAL_KINDS.contains(&node.kind()) {
+            let text = std::str::from_utf8(&source[node.byte_range()]).unwrap_or("");
+            if text == "\"\"" || text == "''" || text == "``" {
+                return vec![];
+            }
+            let replacement = if text.starts_with('`') {
+                "``".to_string()
+            } else if text.starts_with('\'') {
+                "''".to_string()
+            } else {
+                "\"\"".to_string()
+            };
+            return vec![MutationCandidate {
+                byte_range: node.byte_range(),
+                replacement,
+                operator_id: self.id().to_string(),
+                description: self.description().to_string(),
+            }];
+        }
+        vec![]
+    }
+}
+
+pub struct IncrementNumeric;
+
+impl MutationOperator for IncrementNumeric {
+    fn id(&self) -> &str {
+        "increment_numeric"
+    }
+    fn description(&self) -> &str {
+        "Replace n with n+1"
+    }
+    fn apply(&self, node: &tree_sitter::Node, source: &[u8]) -> Vec<MutationCandidate> {
+        if !INT_LITERAL_KINDS.contains(&node.kind()) {
+            return vec![];
+        }
+        let text = std::str::from_utf8(&source[node.byte_range()]).unwrap_or("");
+        if let Ok(n) = text.parse::<i64>() {
+            vec![MutationCandidate {
+                byte_range: node.byte_range(),
+                replacement: (n + 1).to_string(),
+                operator_id: self.id().to_string(),
+                description: self.description().to_string(),
+            }]
+        } else {
+            vec![]
+        }
+    }
+}
+
+pub struct DecrementNumeric;
+
+impl MutationOperator for DecrementNumeric {
+    fn id(&self) -> &str {
+        "decrement_numeric"
+    }
+    fn description(&self) -> &str {
+        "Replace n with n-1"
+    }
+    fn apply(&self, node: &tree_sitter::Node, source: &[u8]) -> Vec<MutationCandidate> {
+        if !INT_LITERAL_KINDS.contains(&node.kind()) {
+            return vec![];
+        }
+        let text = std::str::from_utf8(&source[node.byte_range()]).unwrap_or("");
+        if let Ok(n) = text.parse::<i64>() {
+            vec![MutationCandidate {
+                byte_range: node.byte_range(),
+                replacement: (n - 1).to_string(),
+                operator_id: self.id().to_string(),
+                description: self.description().to_string(),
+            }]
+        } else {
+            vec![]
+        }
     }
 }
 
