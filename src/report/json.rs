@@ -5,6 +5,7 @@ use serde::Serialize;
 #[derive(Serialize)]
 struct JsonReport {
     total: usize,
+    tested: usize,
     killed: usize,
     survived: usize,
     timeout: usize,
@@ -49,6 +50,7 @@ pub fn to_json_string(report: &MutationReport) -> Result<String> {
 
     let json_report = JsonReport {
         total: report.total,
+        tested: report.total - report.build_errors,
         killed: report.killed,
         survived: report.survived,
         timeout: report.timeout,

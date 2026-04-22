@@ -51,6 +51,10 @@ pub enum Commands {
         /// Override test command (e.g., 'go test ./...')
         #[arg(long)]
         test_cmd: Option<String>,
+
+        /// Override build check command (e.g., 'cargo check')
+        #[arg(long)]
+        build_cmd: Option<String>,
     },
     /// Generate a togi.toml config template
     Init,

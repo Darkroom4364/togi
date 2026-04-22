@@ -12,11 +12,13 @@ use tokio::sync::Semaphore;
 pub struct TestRunner {
     pub command: Vec<String>,
     pub language_commands: HashMap<String, Vec<String>>,
+    pub build_command: Vec<String>,
     pub timeout: Duration,
     pub parallelism: usize,
     pub project_root: PathBuf,
     pub verbose: bool,
     pub show_output: bool,
+    pub max_tested: Option<usize>,
 }
 
 struct FileGuard {
@@ -38,6 +40,7 @@ impl TestRunner {
         let start = Instant::now();
         let total = mutations.len();
         let counter = Arc::new(AtomicUsize::new(0));
+        let tested_counter = Arc::new(AtomicUsize::new(0));
         let verbose = self.verbose;
         let is_tty = std::io::stderr().is_terminal();
 
@@ -63,22 +66,35 @@ impl TestRunner {
                 .clone();
             let timeout = self.timeout;
             let project_root = self.project_root.clone();
+            let build_command = self.build_command.clone();
             let counter = counter.clone();
+            let tested_counter = tested_counter.clone();
+            let max_tested = self.max_tested;
             let show_output = self.show_output;
 
             let handle = tokio::spawn(async move {
                 let mut results = Vec::new();
                 for mutation in file_mutations {
+                    // Stop if enough mutations have been tested
+                    if let Some(max) = max_tested
+                        && tested_counter.load(Ordering::Relaxed) >= max
+                    {
+                        break;
+                    }
                     // Semaphore is never closed, so acquire cannot fail
                     let _permit = sem.acquire().await.unwrap();
                     let outcome = run_single_mutation(
                         &command,
+                        &build_command,
                         timeout,
                         &project_root,
                         &mutation,
                         show_output,
                     )
                     .await;
+                    if outcome.result != MutationResult::BuildError {
+                        tested_counter.fetch_add(1, Ordering::Relaxed);
+                    }
                     let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
                     if verbose {
                         let symbol = match outcome.result {
@@ -177,6 +193,7 @@ struct MutationOutcome {
 
 async fn run_single_mutation(
     command: &[String],
+    build_command: &[String],
     timeout: Duration,
     project_root: &PathBuf,
     mutation: &Mutation,
@@ -217,6 +234,17 @@ async fn run_single_mutation(
             result: MutationResult::BuildError,
             test_output: None,
         };
+    }
+
+    // Build check: skip expensive test if mutation doesn't compile
+    if !build_command.is_empty() {
+        let build_outcome = run_command(build_command, project_root, timeout, false).await;
+        if build_outcome.result != MutationResult::Survived {
+            return MutationOutcome {
+                result: MutationResult::BuildError,
+                test_output: None,
+            };
+        }
     }
 
     // Run test command; guard will restore the file on drop
@@ -341,6 +369,7 @@ mod tests {
 
         let outcome = run_single_mutation(
             &["true".to_string()],
+            &[],
             Duration::from_secs(5),
             &dir.path().to_path_buf(),
             &mutation,
@@ -362,6 +391,7 @@ mod tests {
 
         let outcome = run_single_mutation(
             &["false".to_string()],
+            &[],
             Duration::from_secs(5),
             &dir.path().to_path_buf(),
             &mutation,
@@ -395,6 +425,7 @@ mod tests {
 
         let outcome = run_single_mutation(
             &["true".to_string()],
+            &[],
             Duration::from_secs(5),
             &dir.path().to_path_buf(),
             &mutation,
@@ -417,6 +448,7 @@ mod tests {
 
         let outcome = run_single_mutation(
             &["nonexistent_binary_xyz_12345".to_string()],
+            &[],
             Duration::from_secs(5),
             &dir.path().to_path_buf(),
             &mutation,
@@ -439,6 +471,7 @@ mod tests {
 
         let outcome = run_single_mutation(
             &["sleep".to_string(), "10".to_string()],
+            &[],
             Duration::from_millis(100),
             &dir.path().to_path_buf(),
             &mutation,
@@ -465,11 +498,13 @@ mod tests {
         let runner = TestRunner {
             command: vec!["true".into()], // default would survive
             language_commands: lang_cmds,
+            build_command: vec![],
             timeout: Duration::from_secs(5),
             parallelism: 1,
             project_root: dir.path().to_path_buf(),
             verbose: false,
             show_output: false,
+            max_tested: None,
         };
 
         let report = runner.run(vec![mutation]).await;

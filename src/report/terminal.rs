@@ -66,10 +66,17 @@ pub fn print_report(report: &MutationReport) {
 
     let separator = "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━";
     println!("{}", separator);
+    let tested = report.total - report.build_errors;
     println!(
         "Results: {}/{} mutations killed ({} survived)",
-        report.killed, report.total, report.survived
+        report.killed, tested, report.survived
     );
+    if report.build_errors > 0 {
+        println!(
+            "Build errors: {} (filtered, not counted in score)",
+            report.build_errors
+        );
+    }
     println!("Duration: {:.2}s", report.duration.as_secs_f64());
     println!("{}", separator);
 }
@@ -124,12 +131,21 @@ pub fn format_report_plain(report: &MutationReport) -> String {
 
     let separator = "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━";
     writeln!(out, "{}", separator).unwrap();
+    let tested = report.total - report.build_errors;
     writeln!(
         out,
         "Results: {}/{} mutations killed ({} survived)",
-        report.killed, report.total, report.survived
+        report.killed, tested, report.survived
     )
     .unwrap();
+    if report.build_errors > 0 {
+        writeln!(
+            out,
+            "Build errors: {} (filtered, not counted in score)",
+            report.build_errors
+        )
+        .unwrap();
+    }
     writeln!(out, "Duration: {:.2}s", report.duration.as_secs_f64()).unwrap();
     writeln!(out, "{}", separator).unwrap();
 
