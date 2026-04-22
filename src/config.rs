@@ -1,4 +1,5 @@
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Default, Deserialize)]
@@ -11,6 +12,11 @@ pub struct Config {
     pub mutations: MutationConfig,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct LanguageTestConfig {
+    pub command: Vec<String>,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct TestConfig {
     #[serde(default = "default_test_command")]
@@ -21,6 +27,8 @@ pub struct TestConfig {
     pub timeout: u64,
     #[serde(default = "default_jobs")]
     pub jobs: usize,
+    #[serde(default)]
+    pub languages: HashMap<String, LanguageTestConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -152,6 +160,16 @@ fn default_max_per_run() -> usize {
     20
 }
 
+impl TestConfig {
+    pub fn command_for_language(&self, language: &str) -> &[String] {
+        if let Some(lang_config) = self.languages.get(language) {
+            &lang_config.command
+        } else {
+            &self.command
+        }
+    }
+}
+
 impl Default for TestConfig {
     fn default() -> Self {
         Self {
@@ -159,6 +177,7 @@ impl Default for TestConfig {
             build_command: vec![],
             timeout: default_timeout(),
             jobs: default_jobs(),
+            languages: HashMap::new(),
         }
     }
 }
@@ -199,6 +218,20 @@ impl Config {
         }
     }
 
+    /// Warn if any configured language keys don't match known language names.
+    pub fn warn_unknown_languages(&self, known: &[&str]) {
+        for key in self.test.languages.keys() {
+            if !known.contains(&key.as_str()) {
+                eprintln!(
+                    "warning: unknown language '{}' in [test.languages]. \
+                     Known languages: {}",
+                    key,
+                    known.join(", ")
+                );
+            }
+        }
+    }
+
     /// If no test command was explicitly set in togi.toml, auto-detect from project files.
     pub fn resolve_test_command(&mut self, project_root: &Path) {
         if self.test.command.is_empty() {
@@ -222,6 +255,10 @@ command = ["cargo", "test"]
 # build_command = ["cargo", "check"]  # auto-detected; compile check before running tests
 timeout = 30
 # jobs = 4  # defaults to number of CPUs
+
+# Per-language test commands (key = language name, e.g. typescript, python, go)
+# [test.languages.typescript]
+# command = ["npx", "jest"]
 
 [diff]
 base = "origin/main"
@@ -402,5 +439,56 @@ timeout = 120
     #[test]
     fn default_timeout_is_30() {
         assert_eq!(default_timeout(), 30);
+    }
+
+    #[test]
+    fn parse_per_language_commands() {
+        let toml_str = r#"
+[test]
+command = ["cargo", "test"]
+
+[test.languages.typescript]
+command = ["npx", "jest"]
+
+[test.languages.python]
+command = ["pytest"]
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            config.test.languages["typescript"].command,
+            vec!["npx", "jest"]
+        );
+        assert_eq!(config.test.languages["python"].command, vec!["pytest"]);
+    }
+
+    #[test]
+    fn command_for_language_resolution() {
+        let toml_str = r#"
+[test]
+command = ["cargo", "test"]
+
+[test.languages.typescript]
+command = ["npx", "jest"]
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            config.test.command_for_language("typescript"),
+            &["npx", "jest"]
+        );
+        assert_eq!(config.test.command_for_language("go"), &["cargo", "test"]);
+    }
+
+    #[test]
+    fn empty_languages_backward_compat() {
+        let toml_str = r#"
+[test]
+command = ["make", "test"]
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert!(config.test.languages.is_empty());
+        assert_eq!(
+            config.test.command_for_language("anything"),
+            &["make", "test"]
+        );
     }
 }

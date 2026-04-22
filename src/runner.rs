@@ -11,6 +11,7 @@ use tokio::sync::Semaphore;
 
 pub struct TestRunner {
     pub command: Vec<String>,
+    pub language_commands: HashMap<String, Vec<String>>,
     pub build_command: Vec<String>,
     pub timeout: Duration,
     pub parallelism: usize,
@@ -54,7 +55,15 @@ impl TestRunner {
 
         for (_file, file_mutations) in by_file {
             let sem = semaphore.clone();
-            let command = self.command.clone();
+            let language = file_mutations
+                .first()
+                .map(|m| m.language.as_str())
+                .unwrap_or("");
+            let command = self
+                .language_commands
+                .get(language)
+                .unwrap_or(&self.command)
+                .clone();
             let timeout = self.timeout;
             let project_root = self.project_root.clone();
             let build_command = self.build_command.clone();
@@ -339,6 +348,7 @@ mod tests {
         Mutation {
             id: 1,
             file: file.to_path_buf(),
+            language: String::new(),
             line: 1,
             column: 1,
             operator: "test".into(),
@@ -403,6 +413,7 @@ mod tests {
         let mutation = Mutation {
             id: 1,
             file: file.clone(),
+            language: String::new(),
             line: 1,
             column: 1,
             operator: "removal".into(),
@@ -470,5 +481,33 @@ mod tests {
 
         assert_eq!(outcome.result, MutationResult::Timeout);
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "hello world");
+    }
+
+    #[tokio::test]
+    async fn language_commands_override_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("test.txt");
+        std::fs::write(&file, b"hello world").unwrap();
+
+        let mut mutation = make_test_mutation(&file);
+        mutation.language = "go".into();
+
+        let mut lang_cmds = HashMap::new();
+        lang_cmds.insert("go".into(), vec!["false".into()]); // "false" = always fails = killed
+
+        let runner = TestRunner {
+            command: vec!["true".into()], // default would survive
+            language_commands: lang_cmds,
+            build_command: vec![],
+            timeout: Duration::from_secs(5),
+            parallelism: 1,
+            project_root: dir.path().to_path_buf(),
+            verbose: false,
+            show_output: false,
+            max_tested: None,
+        };
+
+        let report = runner.run(vec![mutation]).await;
+        assert_eq!(report.killed, 1, "should use language-specific command");
     }
 }

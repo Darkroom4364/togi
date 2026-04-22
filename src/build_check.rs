@@ -88,6 +88,7 @@ mod tests {
             original: original.into(),
             replacement: replacement.into(),
             byte_range: start..end,
+            language: String::new(),
         }
     }
 

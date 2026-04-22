@@ -103,6 +103,11 @@ async fn run_check(
     config.resolve_test_command(&project_root);
     config.resolve_build_command(&project_root);
 
+    // Warn about unrecognized language keys in [test.languages]
+    let all_langs = togi::languages::all();
+    let known: Vec<&str> = all_langs.iter().map(|l| l.name()).collect();
+    config.warn_unknown_languages(&known);
+
     // 3. Build list of files to mutate
     let changed_files = if all {
         let files = togi::diff::collect_all_supported_files(&project_root)?;
@@ -175,8 +180,16 @@ async fn run_check(
     // 7. Run mutations
     eprintln!("Running {} mutations...", mutations.len());
 
+    let language_commands: std::collections::HashMap<String, Vec<String>> = config
+        .test
+        .languages
+        .iter()
+        .map(|(k, v)| (k.clone(), v.command.clone()))
+        .collect();
+
     let runner = togi::runner::TestRunner {
         command: config.test.command,
+        language_commands,
         build_command: config.test.build_command,
         timeout: Duration::from_secs(config.test.timeout),
         parallelism: config.test.jobs,
