@@ -60,10 +60,9 @@ pub fn acquire(project_root: &Path) -> Result<LockGuard> {
                             path.display()
                         );
                     }
-                    f.write_all(pid.to_string().as_bytes())
-                        .with_context(|| {
-                            format!("failed to write lock file: {}", path.display())
-                        })?;
+                    f.write_all(pid.to_string().as_bytes()).with_context(|| {
+                        format!("failed to write lock file: {}", path.display())
+                    })?;
                     return Ok(LockGuard { path, _file: f });
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
@@ -78,13 +77,15 @@ pub fn acquire(project_root: &Path) -> Result<LockGuard> {
                 Ok(f) => break 'acquire f,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(e) => {
-                    return Err(e).with_context(|| {
-                        format!("failed to open lock file: {}", path.display())
-                    });
+                    return Err(e)
+                        .with_context(|| format!("failed to open lock file: {}", path.display()));
                 }
             }
         }
-        bail!("failed to acquire lock file after retries: {}", path.display());
+        bail!(
+            "failed to acquire lock file after retries: {}",
+            path.display()
+        );
     };
 
     if !try_flock(&file) {
