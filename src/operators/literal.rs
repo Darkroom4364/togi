@@ -179,28 +179,7 @@ impl MutationOperator for DecrementNumeric {
 mod tests {
     use super::*;
 
-    fn parse_go(src: &str) -> tree_sitter::Tree {
-        let mut parser = tree_sitter::Parser::new();
-        let lang = tree_sitter_go::LANGUAGE;
-        parser.set_language(&lang.into()).unwrap();
-        parser.parse(src, None).unwrap()
-    }
-
-    fn find_node_by_kind<'a>(
-        node: tree_sitter::Node<'a>,
-        kind: &str,
-    ) -> Option<tree_sitter::Node<'a>> {
-        if node.kind() == kind {
-            return Some(node);
-        }
-        let mut cursor = node.walk();
-        for child in node.children(&mut cursor) {
-            if let Some(found) = find_node_by_kind(child, kind) {
-                return Some(found);
-            }
-        }
-        None
-    }
+    use crate::test_helpers::{find_node_by_kind, parse_go};
 
     fn collect_all_candidates(
         node: tree_sitter::Node,
