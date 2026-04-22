@@ -17,8 +17,8 @@ pub enum Commands {
         all: bool,
 
         /// Base branch to diff against
-        #[arg(long, default_value = "origin/main")]
-        base: String,
+        #[arg(long)]
+        base: Option<String>,
 
         /// Path to config file
         #[arg(short, long)]
