@@ -108,9 +108,9 @@ impl TestRunner {
                     // Check cache before running
                     let file_path = project_root.join(&mutation.file);
                     let file_content = std::fs::read(&file_path).ok();
-                    let cache_key = file_content.as_ref().map(|content| {
-                        CacheKey::new(content, &mutation.description, &cmd_str)
-                    });
+                    let cache_key = file_content
+                        .as_ref()
+                        .map(|content| CacheKey::new(content, &mutation.description, &cmd_str));
                     if let Some(ref key) = cache_key {
                         if let Some(cached) = cache::lookup(&project_root, key) {
                             let result = from_cached(cached);
@@ -121,7 +121,11 @@ impl TestRunner {
                             if verbose {
                                 eprintln!(
                                     "  [{}/{}] \u{21bb} cached  {}:{} \u{2014} {}",
-                                    n, total, mutation.file.display(), mutation.line, mutation.operator
+                                    n,
+                                    total,
+                                    mutation.file.display(),
+                                    mutation.line,
+                                    mutation.operator
                                 );
                             } else if is_tty {
                                 eprint!("\r  [{}/{}] testing mutations...", n, total);
