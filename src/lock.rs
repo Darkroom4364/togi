@@ -1,15 +1,20 @@
 //! File-based lock to prevent concurrent togi runs on the same repo.
 
 use anyhow::{Context, Result, bail};
-use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+
+#[cfg(unix)]
+use std::os::unix::io::AsRawFd;
 
 const LOCK_FILE: &str = ".togi.lock";
 
 /// RAII lock guard. Removes the lock file on drop.
+/// Holds the open file to keep the `flock` advisory lock active.
 pub struct LockGuard {
     path: PathBuf,
+    _file: File,
 }
 
 impl Drop for LockGuard {
@@ -18,61 +23,69 @@ impl Drop for LockGuard {
     }
 }
 
+/// Try to acquire an exclusive non-blocking flock. Returns true on success.
+#[cfg(unix)]
+fn try_flock(file: &File) -> bool {
+    unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0 }
+}
+
+#[cfg(not(unix))]
+fn try_flock(_file: &File) -> bool {
+    true
+}
+
 /// Acquire a lock for the given project root directory.
 /// Returns an error if another togi process is already running.
 pub fn acquire(project_root: &Path) -> Result<LockGuard> {
     let path = project_root.join(LOCK_FILE);
     let pid = std::process::id();
 
-    match OpenOptions::new().write(true).create_new(true).open(&path) {
+    // Fast path: no contention — create_new ensures atomicity
+    match OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&path)
+    {
         Ok(mut file) => {
-            file.write_all(pid.to_string().as_bytes())
-                .with_context(|| format!("failed to write lock file: {}", path.display()))?;
-            Ok(LockGuard { path })
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            // Lock file exists — check if the holder is still alive
-            let contents = fs::read_to_string(&path).unwrap_or_default();
-            if let Ok(existing_pid) = contents.trim().parse::<u32>()
-                && process_alive(existing_pid)
-            {
-                bail!(
-                    "another togi process (PID {}) is already running in this directory.\n\
-                     If this is stale, remove {} manually.",
-                    existing_pid,
-                    path.display()
-                );
+            if !try_flock(&file) {
+                bail!("failed to acquire advisory lock on {}", path.display());
             }
-            // Stale lock — remove and retry once
-            fs::remove_file(&path).ok();
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)
-                .with_context(|| format!("failed to create lock file: {}", path.display()))?;
             file.write_all(pid.to_string().as_bytes())
                 .with_context(|| format!("failed to write lock file: {}", path.display()))?;
-            Ok(LockGuard { path })
+            return Ok(LockGuard { path, _file: file });
         }
-        Err(e) => Err(e).with_context(|| format!("failed to create lock file: {}", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => {
+            return Err(e)
+                .with_context(|| format!("failed to create lock file: {}", path.display()));
+        }
     }
-}
 
-fn process_alive(pid: u32) -> bool {
-    // PID 0 and overflow values are not valid process IDs
-    if pid == 0 || pid > i32::MAX as u32 {
-        return false;
+    // Lock file exists — open and try to acquire flock
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("failed to open lock file: {}", path.display()))?;
+
+    if !try_flock(&file) {
+        bail!(
+            "another togi process is already running in this directory.\n\
+             If this is stale, remove {} manually.",
+            path.display()
+        );
     }
-    // On Unix, signal 0 checks if process exists without sending a signal
-    #[cfg(unix)]
-    {
-        unsafe { libc::kill(pid as i32, 0) == 0 }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = pid;
-        false
-    }
+
+    // We hold the flock — previous holder is gone. Overwrite with our PID.
+    file.set_len(0)
+        .with_context(|| format!("failed to truncate lock file: {}", path.display()))?;
+    file.seek(SeekFrom::Start(0))
+        .with_context(|| format!("failed to seek lock file: {}", path.display()))?;
+    file.write_all(pid.to_string().as_bytes())
+        .with_context(|| format!("failed to write lock file: {}", path.display()))?;
+
+    Ok(LockGuard { path, _file: file })
 }
 
 #[cfg(test)]
