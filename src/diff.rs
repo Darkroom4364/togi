@@ -84,7 +84,7 @@ pub fn collect_all_supported_files(project_root: &Path) -> anyhow::Result<Vec<Ch
 pub fn collect_changed_since(project_root: &Path, since: &str) -> anyhow::Result<Vec<ChangedFile>> {
     // Try as a commit ref first (SHA, branch, tag).
     let output = Command::new("git")
-        .args(["diff", &format!("{since}...HEAD")])
+        .args(["diff", &format!("{since}..HEAD")])
         .current_dir(project_root)
         .output()?;
 
@@ -104,21 +104,33 @@ pub fn collect_changed_since(project_root: &Path, since: &str) -> anyhow::Result
         }
         let base = String::from_utf8(rev_output.stdout)?.trim().to_string();
         if base.is_empty() {
-            // No commit before that date — diff the entire history.
+            // No commit before that date — diff the entire history
+            // against the empty tree.
+            let empty_tree = Command::new("git")
+                .args(["hash-object", "-t", "tree", "/dev/null"])
+                .current_dir(project_root)
+                .output()?;
+            if !empty_tree.status.success() {
+                anyhow::bail!(
+                    "git hash-object failed: {}",
+                    String::from_utf8_lossy(&empty_tree.stderr)
+                );
+            }
+            let tree_sha = String::from_utf8(empty_tree.stdout)?.trim().to_string();
             let out = Command::new("git")
-                .args(["diff", "--root", "HEAD"])
+                .args(["diff", &format!("{tree_sha}..HEAD")])
                 .current_dir(project_root)
                 .output()?;
             if !out.status.success() {
                 anyhow::bail!(
-                    "git diff --root failed: {}",
+                    "git diff (empty tree) failed: {}",
                     String::from_utf8_lossy(&out.stderr)
                 );
             }
             String::from_utf8(out.stdout)?
         } else {
             let out = Command::new("git")
-                .args(["diff", &format!("{base}...HEAD")])
+                .args(["diff", &format!("{base}..HEAD")])
                 .current_dir(project_root)
                 .output()?;
             if !out.status.success() {
@@ -583,6 +595,44 @@ diff --git a/src/main.rs b/src/main.rs
 
         // Use a date between the two commits — should pick up the second commit.
         let files = collect_changed_since(root, "2024-03-01").unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, PathBuf::from("main.rs"));
+        assert!(!files[0].hunks.is_empty());
+    }
+
+    #[test]
+    fn collect_changed_since_root_fallback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        let run = |args: &[&str], date: &str| {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .env("GIT_AUTHOR_NAME", "test")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "test")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .env("GIT_AUTHOR_DATE", date)
+                .env("GIT_COMMITTER_DATE", date)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+            out
+        };
+
+        run(&["init"], "2024-06-01T00:00:00Z");
+        std::fs::write(root.join("main.rs"), "fn main() {}\n").unwrap();
+        run(&["add", "."], "2024-06-01T00:00:00Z");
+        run(&["commit", "-m", "initial"], "2024-06-01T00:00:00Z");
+
+        // Date before any commit — triggers git diff --root HEAD fallback.
+        let files = collect_changed_since(root, "2024-01-01").unwrap();
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].path, PathBuf::from("main.rs"));
         assert!(!files[0].hunks.is_empty());
