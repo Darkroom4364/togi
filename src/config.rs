@@ -15,6 +15,8 @@ pub struct Config {
 pub struct TestConfig {
     #[serde(default = "default_test_command")]
     pub command: Vec<String>,
+    #[serde(default)]
+    pub build_command: Vec<String>,
     #[serde(default = "default_timeout")]
     pub timeout: u64,
     #[serde(default = "default_jobs")]
@@ -109,6 +111,29 @@ pub fn detect_test_command(project_root: &Path) -> Vec<String> {
     }
 }
 
+pub fn detect_build_command(project_root: &Path) -> Vec<String> {
+    if project_root.join("Cargo.toml").exists() {
+        return vec!["cargo".into(), "check".into()];
+    }
+    if project_root.join("go.mod").exists() {
+        return vec!["go".into(), "build".into(), "./...".into()];
+    }
+    if project_root.join("tsconfig.json").exists() {
+        return vec!["npx".into(), "tsc".into(), "--noEmit".into()];
+    }
+    if project_root.join("pom.xml").exists() {
+        return vec!["mvn".into(), "compile".into(), "-q".into()];
+    }
+    if project_root.join("build.gradle").exists() || project_root.join("build.gradle.kts").exists()
+    {
+        return vec!["./gradlew".into(), "compileJava".into()];
+    }
+    if has_file_with_ext(project_root, "sln") || has_file_with_ext(project_root, "csproj") {
+        return vec!["dotnet".into(), "build".into(), "--no-restore".into()];
+    }
+    vec![]
+}
+
 fn default_timeout() -> u64 {
     30
 }
@@ -131,6 +156,7 @@ impl Default for TestConfig {
     fn default() -> Self {
         Self {
             command: default_test_command(),
+            build_command: vec![],
             timeout: default_timeout(),
             jobs: default_jobs(),
         }
@@ -180,12 +206,20 @@ impl Config {
         }
     }
 
+    /// If no build command was explicitly set in togi.toml, auto-detect from project files.
+    pub fn resolve_build_command(&mut self, project_root: &Path) {
+        if self.test.build_command.is_empty() {
+            self.test.build_command = detect_build_command(project_root);
+        }
+    }
+
     /// Write a template togi.toml to the given path.
     pub fn write_template(path: &Path) -> anyhow::Result<()> {
         let template = r#"# togi.toml — mutation testing configuration
 
 [test]
 command = ["cargo", "test"]
+# build_command = ["cargo", "check"]  # auto-detected; compile check before running tests
 timeout = 30
 # jobs = 4  # defaults to number of CPUs
 
