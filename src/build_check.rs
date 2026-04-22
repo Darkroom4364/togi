@@ -2,19 +2,19 @@
 //
 // Applying a mutation that causes a syntax or type error wastes a full
 // test-suite run only to get an obvious "killed" result.  This module
-// applies each mutation to a temporary copy of the file, runs a fast
-// compile-check command, and reports whether the mutation produces
-// valid code.
+// applies each mutation to the file in-place, runs a fast
+// compile-check command, restores the original, and reports whether
+// the mutation produces valid code.
 
 use crate::Mutation;
 use std::path::Path;
 
 /// Check whether a mutation still compiles.
 ///
-/// Applies the mutation's byte-range replacement to the file, writes
-/// the result to a temporary copy, and runs `check_command` (e.g.
-/// `cargo check`).  Returns `true` when the mutated code compiles
-/// successfully.
+/// Applies the mutation's byte-range replacement to the file in-place,
+/// runs `check_command` (e.g. `cargo check`), and restores the
+/// original.  Returns `true` when the mutated code compiles
+/// successfully and the original file is restored.
 ///
 /// # Arguments
 ///
@@ -38,7 +38,7 @@ pub fn check_builds(mutation: &Mutation, project_root: &Path, check_command: &[S
 
     // Apply the mutation via byte-range splice (same logic as runner).
     let range = mutation.byte_range.clone();
-    if range.end > original.len() {
+    if range.start > range.end || range.end > original.len() {
         return false;
     }
     let mut mutated = original.clone();
@@ -51,10 +51,10 @@ pub fn check_builds(mutation: &Mutation, project_root: &Path, check_command: &[S
 
     let result = run_check(check_command, project_root);
 
-    // Restore original file – best effort.
-    let _ = std::fs::write(&file_path, &original);
+    // Restore original file – propagate failure.
+    let restored = std::fs::write(&file_path, &original).is_ok();
 
-    result
+    result && restored
 }
 
 /// Run the check command synchronously and return `true` on exit-code 0.
