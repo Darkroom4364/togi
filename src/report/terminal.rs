@@ -37,6 +37,17 @@ pub fn print_report(report: &MutationReport) {
                     "              {}",
                     "Your tests don't catch this mutation.".red()
                 );
+                if let Some(diff) = super::mutation_diff(mutation) {
+                    for diff_line in diff.lines() {
+                        if diff_line.starts_with('-') {
+                            println!("              {}", diff_line.red());
+                        } else if diff_line.starts_with('+') {
+                            println!("              {}", diff_line.green());
+                        } else {
+                            println!("              {}", diff_line.dimmed());
+                        }
+                    }
+                }
             }
             MutationResult::Timeout => {
                 println!(
@@ -109,6 +120,11 @@ pub fn format_report_plain(report: &MutationReport) -> String {
                 )
                 .unwrap();
                 writeln!(out, "              Your tests don't catch this mutation.").unwrap();
+                if let Some(diff) = super::mutation_diff(mutation) {
+                    for diff_line in diff.lines() {
+                        writeln!(out, "              {}", diff_line).unwrap();
+                    }
+                }
             }
             MutationResult::Timeout => {
                 writeln!(
