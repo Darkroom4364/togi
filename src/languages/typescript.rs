@@ -38,6 +38,15 @@ impl LanguageSupport for TypeScript {
     fn operator_field(&self) -> &str {
         "operator"
     }
+
+    fn skip_subtree_kinds(&self) -> &[&str] {
+        &[
+            "import_statement",
+            "type_annotation",
+            "type_alias_declaration",
+            "decorator",
+        ]
+    }
 }
 
 #[cfg(test)]

@@ -19,6 +19,12 @@ pub trait LanguageSupport: Send + Sync {
     fn boolean_false_literals(&self) -> &[&str];
     fn return_statement_node(&self) -> &str;
     fn operator_field(&self) -> &str;
+
+    /// AST node kinds that should suppress mutation of any descendant.
+    /// Nodes whose ancestor matches any of these kinds will be skipped.
+    fn skip_subtree_kinds(&self) -> &[&str] {
+        &[]
+    }
 }
 
 /// Returns instances of all supported languages.

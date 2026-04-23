@@ -38,6 +38,10 @@ impl LanguageSupport for CSharp {
     fn operator_field(&self) -> &str {
         "operator"
     }
+
+    fn skip_subtree_kinds(&self) -> &[&str] {
+        &["using_directive", "attribute", "type_parameter_list"]
+    }
 }
 
 #[cfg(test)]

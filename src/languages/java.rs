@@ -38,6 +38,10 @@ impl LanguageSupport for Java {
     fn operator_field(&self) -> &str {
         "operator"
     }
+
+    fn skip_subtree_kinds(&self) -> &[&str] {
+        &["import_declaration", "annotation", "type_parameters"]
+    }
 }
 
 #[cfg(test)]
