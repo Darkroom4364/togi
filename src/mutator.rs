@@ -37,7 +37,12 @@ pub fn generate_mutations(
         };
         let language_name = lang.name().to_string();
 
-        let nodes = find_mutable_nodes(&tree, &source, &changed_file.hunks);
+        let nodes = find_mutable_nodes(
+            &tree,
+            &source,
+            &changed_file.hunks,
+            lang.skip_ancestor_kinds(),
+        );
 
         for node in &nodes {
             for op in &operators {

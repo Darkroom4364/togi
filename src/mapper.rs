@@ -39,10 +39,11 @@ pub fn find_mutable_nodes<'a>(
     tree: &'a tree_sitter::Tree,
     source: &'a [u8],
     changed_lines: &[LineRange],
+    skip_ancestor_kinds: &[&str],
 ) -> Vec<tree_sitter::Node<'a>> {
     let mut nodes = Vec::new();
     let root = tree.root_node();
-    collect_mutable_nodes(root, source, changed_lines, &mut nodes);
+    collect_mutable_nodes(root, source, changed_lines, skip_ancestor_kinds, &mut nodes);
     nodes
 }
 
@@ -52,6 +53,7 @@ fn collect_mutable_nodes<'a>(
     node: tree_sitter::Node<'a>,
     source: &'a [u8],
     changed_lines: &[LineRange],
+    skip_ancestor_kinds: &[&str],
     results: &mut Vec<tree_sitter::Node<'a>>,
 ) {
     let _ = source; // available for future use
@@ -64,13 +66,18 @@ fn collect_mutable_nodes<'a>(
         return;
     }
 
+    // Skip nodes inside contexts that produce non-compilable mutations
+    if !skip_ancestor_kinds.is_empty() && skip_ancestor_kinds.contains(&node.kind()) {
+        return;
+    }
+
     // Try to find relevant children first (prefer deepest nodes)
     let mut found_child = false;
     let child_count = node.child_count() as u32;
     for i in 0..child_count {
         if let Some(child) = node.child(i) {
             let before = results.len();
-            collect_mutable_nodes(child, source, changed_lines, results);
+            collect_mutable_nodes(child, source, changed_lines, skip_ancestor_kinds, results);
             if results.len() > before {
                 found_child = true;
             }
@@ -113,7 +120,7 @@ mod tests {
         let tree = parse_go(source);
         let changed = vec![LineRange { start: 3, end: 4 }];
 
-        let nodes = find_mutable_nodes(&tree, source, &changed);
+        let nodes = find_mutable_nodes(&tree, source, &changed, &[]);
 
         assert!(!nodes.is_empty());
         let kinds: Vec<&str> = nodes.iter().map(|n| n.kind()).collect();
@@ -126,7 +133,7 @@ mod tests {
         let tree = parse_go(source);
         let changed: Vec<LineRange> = vec![];
 
-        let nodes = find_mutable_nodes(&tree, source, &changed);
+        let nodes = find_mutable_nodes(&tree, source, &changed, &[]);
 
         assert!(nodes.is_empty());
     }
@@ -138,7 +145,7 @@ mod tests {
         let tree = parse_go(source);
         let changed = vec![LineRange { start: 4, end: 4 }];
 
-        let nodes = find_mutable_nodes(&tree, source, &changed);
+        let nodes = find_mutable_nodes(&tree, source, &changed, &[]);
 
         assert!(!nodes.is_empty());
         let kinds: Vec<&str> = nodes.iter().map(|n| n.kind()).collect();
@@ -163,7 +170,7 @@ mod tests {
             LineRange { start: 5, end: 7 },
         ];
 
-        let nodes = find_mutable_nodes(&tree, source, &changed);
+        let nodes = find_mutable_nodes(&tree, source, &changed, &[]);
 
         let kinds: Vec<&str> = nodes.iter().map(|n| n.kind()).collect();
         // Should find binary expressions from both return statements
@@ -182,7 +189,7 @@ mod tests {
         let tree = parse_go(source);
         let changed = vec![LineRange { start: 4, end: 4 }];
 
-        let nodes = find_mutable_nodes(&tree, source, &changed);
+        let nodes = find_mutable_nodes(&tree, source, &changed, &[]);
 
         assert!(!nodes.is_empty());
         let kinds: Vec<&str> = nodes.iter().map(|n| n.kind()).collect();
@@ -201,7 +208,7 @@ mod tests {
         let tree = parse_go(source);
         let changed = vec![LineRange { start: 5, end: 5 }];
 
-        let nodes = find_mutable_nodes(&tree, source, &changed);
+        let nodes = find_mutable_nodes(&tree, source, &changed, &[]);
 
         assert!(!nodes.is_empty());
         let kinds: Vec<&str> = nodes.iter().map(|n| n.kind()).collect();
@@ -224,7 +231,7 @@ mod tests {
         // Only the inner if line is changed
         let changed = vec![LineRange { start: 5, end: 6 }];
 
-        let nodes = find_mutable_nodes(&tree, source, &changed);
+        let nodes = find_mutable_nodes(&tree, source, &changed, &[]);
 
         assert!(!nodes.is_empty());
         let kinds: Vec<&str> = nodes.iter().map(|n| n.kind()).collect();
@@ -244,7 +251,7 @@ mod tests {
         let tree = parse_go(source);
         let changed = vec![LineRange { start: 6, end: 6 }];
 
-        let nodes = find_mutable_nodes(&tree, source, &changed);
+        let nodes = find_mutable_nodes(&tree, source, &changed, &[]);
 
         assert!(!nodes.is_empty());
         let kinds: Vec<&str> = nodes.iter().map(|n| n.kind()).collect();
@@ -263,7 +270,7 @@ mod tests {
         let tree = parse_go(source);
         let changed = vec![LineRange { start: 3, end: 4 }];
 
-        let nodes = find_mutable_nodes(&tree, source, &changed);
+        let nodes = find_mutable_nodes(&tree, source, &changed, &[]);
 
         assert!(
             nodes.is_empty(),
@@ -280,7 +287,7 @@ mod tests {
         // Only the package line is changed
         let changed = vec![LineRange { start: 1, end: 1 }];
 
-        let nodes = find_mutable_nodes(&tree, source, &changed);
+        let nodes = find_mutable_nodes(&tree, source, &changed, &[]);
 
         assert!(
             nodes.is_empty(),
@@ -303,7 +310,7 @@ mod tests {
         let tree = parse_rust(source);
         let changed = vec![LineRange { start: 2, end: 2 }];
 
-        let nodes = find_mutable_nodes(&tree, source, &changed);
+        let nodes = find_mutable_nodes(&tree, source, &changed, &[]);
 
         assert!(!nodes.is_empty());
         let kinds: Vec<&str> = nodes.iter().map(|n| n.kind()).collect();
@@ -317,13 +324,75 @@ mod tests {
     }
 
     #[test]
+    fn rust_use_declaration_skipped() {
+        let source = b"use std::collections::HashMap;\nfn f() -> bool { true }\n";
+        let tree = parse_rust(source);
+        let changed = vec![LineRange { start: 1, end: 2 }];
+
+        let skip = &["use_declaration"];
+        let nodes = find_mutable_nodes(&tree, source, &changed, skip);
+
+        // Should find `true` in the function but nothing from the use declaration
+        let kinds: Vec<&str> = nodes.iter().map(|n| n.kind()).collect();
+        assert!(
+            !kinds.contains(&"string_literal") && !kinds.contains(&"identifier"),
+            "Use declaration should be skipped, got: {:?}",
+            kinds
+        );
+        assert!(
+            kinds.contains(&"true"),
+            "Should still find mutable nodes outside skipped ancestors, got: {:?}",
+            kinds
+        );
+    }
+
+    #[test]
+    fn rust_macro_invocation_skipped() {
+        let source = b"fn f() {\n    println!(\"hello\");\n    let x = true;\n}\n";
+        let tree = parse_rust(source);
+        let changed = vec![LineRange { start: 1, end: 4 }];
+
+        let skip = &["macro_invocation"];
+        let nodes = find_mutable_nodes(&tree, source, &changed, skip);
+
+        let kinds: Vec<&str> = nodes.iter().map(|n| n.kind()).collect();
+        assert!(
+            !kinds.contains(&"string_literal") && !kinds.contains(&"string_content"),
+            "Macro string should be skipped, got: {:?}",
+            kinds
+        );
+        assert!(
+            kinds.contains(&"true"),
+            "Should still find `true` outside macro, got: {:?}",
+            kinds
+        );
+    }
+
+    #[test]
+    fn go_import_skipped() {
+        let source = b"package main\n\nimport \"fmt\"\n\nfunc f() bool {\n\treturn true\n}\n";
+        let tree = parse_go(source);
+        let changed = vec![LineRange { start: 1, end: 7 }];
+
+        let skip = &["import_spec"];
+        let nodes = find_mutable_nodes(&tree, source, &changed, skip);
+
+        let kinds: Vec<&str> = nodes.iter().map(|n| n.kind()).collect();
+        assert!(
+            !kinds.contains(&"interpreted_string_literal"),
+            "Import string should be skipped, got: {:?}",
+            kinds
+        );
+    }
+
+    #[test]
     fn rust_nested_if_expression() {
         let source = b"fn f(a: i32, b: i32) -> i32 {\n    if a > 0 {\n        if b > 0 {\n            return a + b;\n        }\n    }\n    0\n}\n";
         // Lines: 1=fn, 2=if a>0, 3=if b>0, 4=return a+b, 5=}, 6=}, 7=0, 8=}
         let tree = parse_rust(source);
         let changed = vec![LineRange { start: 3, end: 4 }];
 
-        let nodes = find_mutable_nodes(&tree, source, &changed);
+        let nodes = find_mutable_nodes(&tree, source, &changed, &[]);
 
         assert!(!nodes.is_empty());
         let kinds: Vec<&str> = nodes.iter().map(|n| n.kind()).collect();

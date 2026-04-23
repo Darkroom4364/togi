@@ -38,6 +38,10 @@ impl LanguageSupport for Go {
     fn operator_field(&self) -> &str {
         "operator"
     }
+
+    fn skip_ancestor_kinds(&self) -> &[&str] {
+        &["import_spec", "import_spec_list", "type_spec"]
+    }
 }
 
 #[cfg(test)]

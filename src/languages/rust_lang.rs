@@ -38,6 +38,16 @@ impl LanguageSupport for Rust {
     fn operator_field(&self) -> &str {
         "operator"
     }
+
+    fn skip_ancestor_kinds(&self) -> &[&str] {
+        &[
+            "use_declaration",
+            "macro_invocation",
+            "attribute_item",
+            "type_parameters",
+            "where_clause",
+        ]
+    }
 }
 
 #[cfg(test)]
