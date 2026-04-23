@@ -22,7 +22,7 @@ pub trait LanguageSupport: Send + Sync {
 
     /// AST node kinds that should suppress mutation of any descendant.
     /// Nodes whose ancestor matches any of these kinds will be skipped.
-    fn skip_ancestor_kinds(&self) -> &[&str] {
+    fn skip_subtree_kinds(&self) -> &[&str] {
         &[]
     }
 }

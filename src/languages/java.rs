@@ -39,7 +39,7 @@ impl LanguageSupport for Java {
         "operator"
     }
 
-    fn skip_ancestor_kinds(&self) -> &[&str] {
+    fn skip_subtree_kinds(&self) -> &[&str] {
         &["import_declaration", "annotation", "type_parameters"]
     }
 }

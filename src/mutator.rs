@@ -37,10 +37,10 @@ fn should_skip_return_empty(node: &tree_sitter::Node, source: &[u8], language: &
             let ret_type = func_node.child_by_field_name("return_type");
             match ret_type {
                 None => false, // no return type annotation (-> ()), don't skip
-                Some(rt) => {
-                    let text = std::str::from_utf8(&source[rt.byte_range()]).unwrap_or("");
-                    !RUST_PRIMITIVE_RETURNS.contains(&text)
-                }
+                Some(rt) => match std::str::from_utf8(&source[rt.byte_range()]) {
+                    Ok(text) => !RUST_PRIMITIVE_RETURNS.contains(&text),
+                    Err(_) => false, // can't decode return type, don't skip
+                },
             }
         }
         "go" => {
@@ -103,7 +103,7 @@ pub fn generate_mutations(
             &tree,
             &source,
             &changed_file.hunks,
-            lang.skip_ancestor_kinds(),
+            lang.skip_subtree_kinds(),
         );
 
         for node in &nodes {

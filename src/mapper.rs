@@ -39,11 +39,11 @@ pub fn find_mutable_nodes<'a>(
     tree: &'a tree_sitter::Tree,
     source: &'a [u8],
     changed_lines: &[LineRange],
-    skip_ancestor_kinds: &[&str],
+    skip_subtree_kinds: &[&str],
 ) -> Vec<tree_sitter::Node<'a>> {
     let mut nodes = Vec::new();
     let root = tree.root_node();
-    collect_mutable_nodes(root, source, changed_lines, skip_ancestor_kinds, &mut nodes);
+    collect_mutable_nodes(root, source, changed_lines, skip_subtree_kinds, &mut nodes);
     nodes
 }
 
@@ -53,7 +53,7 @@ fn collect_mutable_nodes<'a>(
     node: tree_sitter::Node<'a>,
     source: &'a [u8],
     changed_lines: &[LineRange],
-    skip_ancestor_kinds: &[&str],
+    skip_subtree_kinds: &[&str],
     results: &mut Vec<tree_sitter::Node<'a>>,
 ) {
     let _ = source; // available for future use
@@ -66,8 +66,8 @@ fn collect_mutable_nodes<'a>(
         return;
     }
 
-    // Skip nodes inside contexts that produce non-compilable mutations
-    if !skip_ancestor_kinds.is_empty() && skip_ancestor_kinds.contains(&node.kind()) {
+    // Skip subtrees that produce non-compilable mutations (imports, macros, etc.)
+    if skip_subtree_kinds.contains(&node.kind()) {
         return;
     }
 
@@ -77,7 +77,7 @@ fn collect_mutable_nodes<'a>(
     for i in 0..child_count {
         if let Some(child) = node.child(i) {
             let before = results.len();
-            collect_mutable_nodes(child, source, changed_lines, skip_ancestor_kinds, results);
+            collect_mutable_nodes(child, source, changed_lines, skip_subtree_kinds, results);
             if results.len() > before {
                 found_child = true;
             }

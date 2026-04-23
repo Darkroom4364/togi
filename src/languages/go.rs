@@ -39,7 +39,7 @@ impl LanguageSupport for Go {
         "operator"
     }
 
-    fn skip_ancestor_kinds(&self) -> &[&str] {
+    fn skip_subtree_kinds(&self) -> &[&str] {
         &["import_spec", "import_spec_list", "type_spec"]
     }
 }

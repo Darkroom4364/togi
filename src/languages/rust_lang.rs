@@ -39,7 +39,7 @@ impl LanguageSupport for Rust {
         "operator"
     }
 
-    fn skip_ancestor_kinds(&self) -> &[&str] {
+    fn skip_subtree_kinds(&self) -> &[&str] {
         &[
             "use_declaration",
             "macro_invocation",

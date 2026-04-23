@@ -39,7 +39,7 @@ impl LanguageSupport for CSharp {
         "operator"
     }
 
-    fn skip_ancestor_kinds(&self) -> &[&str] {
+    fn skip_subtree_kinds(&self) -> &[&str] {
         &["using_directive", "attribute", "type_parameter_list"]
     }
 }
