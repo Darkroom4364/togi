@@ -49,13 +49,15 @@ pub fn find_mutable_nodes<'a>(
 
 /// Recursively walk the tree, collecting the deepest mutation-relevant nodes
 /// that overlap with changed lines.
+/// Returns `true` if a skipped subtree was encountered, preventing the parent
+/// from being added as a fallback mutable node.
 fn collect_mutable_nodes<'a>(
     node: tree_sitter::Node<'a>,
     source: &'a [u8],
     changed_lines: &[LineRange],
     skip_subtree_kinds: &[&str],
     results: &mut Vec<tree_sitter::Node<'a>>,
-) {
+) -> bool {
     let _ = source; // available for future use
 
     let node_start = ts_row_to_line(node.start_position().row);
@@ -63,31 +65,35 @@ fn collect_mutable_nodes<'a>(
 
     // Check if this node overlaps any changed line range
     if !overlaps(node_start, node_end, changed_lines) {
-        return;
+        return false;
     }
 
     // Skip subtrees that produce non-compilable mutations (imports, macros, etc.)
     if skip_subtree_kinds.contains(&node.kind()) {
-        return;
+        return true;
     }
 
     // Try to find relevant children first (prefer deepest nodes)
     let mut found_child = false;
+    let mut skipped_child = false;
     let child_count = node.child_count() as u32;
     for i in 0..child_count {
         if let Some(child) = node.child(i) {
             let before = results.len();
-            collect_mutable_nodes(child, source, changed_lines, skip_subtree_kinds, results);
+            skipped_child |=
+                collect_mutable_nodes(child, source, changed_lines, skip_subtree_kinds, results);
             if results.len() > before {
                 found_child = true;
             }
         }
     }
 
-    // Only add this node if no relevant children were found and it's a mutable kind
-    if !found_child && is_mutable_kind(node.kind()) {
+    // Only add this node if no relevant children were found, no children were
+    // skipped, and it's a mutable kind
+    if !found_child && !skipped_child && is_mutable_kind(node.kind()) {
         results.push(node);
     }
+    false
 }
 
 /// Check if a node's line range overlaps with any changed line range.
@@ -359,6 +365,11 @@ mod tests {
         assert!(
             !kinds.contains(&"string_literal") && !kinds.contains(&"string_content"),
             "Macro string should be skipped, got: {:?}",
+            kinds
+        );
+        assert!(
+            !kinds.contains(&"expression_statement"),
+            "Parent expression_statement of skipped macro should not leak, got: {:?}",
             kinds
         );
         assert!(
