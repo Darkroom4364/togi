@@ -385,6 +385,100 @@ mod tests {
         );
     }
 
+    fn parse_typescript(source: &[u8]) -> tree_sitter::Tree {
+        let mut parser = tree_sitter::Parser::new();
+        let lang = tree_sitter_typescript::LANGUAGE_TYPESCRIPT;
+        parser.set_language(&lang.into()).unwrap();
+        parser.parse(source, None).unwrap()
+    }
+
+    fn parse_java(source: &[u8]) -> tree_sitter::Tree {
+        let mut parser = tree_sitter::Parser::new();
+        let lang = tree_sitter_java::LANGUAGE;
+        parser.set_language(&lang.into()).unwrap();
+        parser.parse(source, None).unwrap()
+    }
+
+    fn parse_csharp(source: &[u8]) -> tree_sitter::Tree {
+        let mut parser = tree_sitter::Parser::new();
+        let lang = tree_sitter_c_sharp::LANGUAGE;
+        parser.set_language(&lang.into()).unwrap();
+        parser.parse(source, None).unwrap()
+    }
+
+    #[test]
+    fn typescript_import_skipped() {
+        let source = b"import { foo } from 'bar';\nconst x = true;\n";
+        let tree = parse_typescript(source);
+        let changed = vec![LineRange { start: 1, end: 2 }];
+
+        let skip = &["import_statement"];
+        let nodes = find_mutable_nodes(&tree, source, &changed, skip);
+
+        let kinds: Vec<&str> = nodes.iter().map(|n| n.kind()).collect();
+        assert!(
+            !kinds.contains(&"string") && !kinds.contains(&"string_literal"),
+            "Import string should be skipped, got: {:?}",
+            kinds
+        );
+        assert!(
+            kinds.contains(&"true"),
+            "Should still find `true` outside import, got: {:?}",
+            kinds
+        );
+    }
+
+    #[test]
+    fn typescript_type_annotation_skipped() {
+        let source = b"function f(x: string): boolean { return true; }\n";
+        let tree = parse_typescript(source);
+        let changed = vec![LineRange { start: 1, end: 1 }];
+
+        let skip = &["type_annotation"];
+        let nodes = find_mutable_nodes(&tree, source, &changed, skip);
+
+        let kinds: Vec<&str> = nodes.iter().map(|n| n.kind()).collect();
+        assert!(
+            kinds.contains(&"true"),
+            "Should still find `true` in function body, got: {:?}",
+            kinds
+        );
+    }
+
+    #[test]
+    fn java_import_skipped() {
+        let source = b"import java.util.List;\nclass T { boolean f() { return true; } }\n";
+        let tree = parse_java(source);
+        let changed = vec![LineRange { start: 1, end: 2 }];
+
+        let skip = &["import_declaration"];
+        let nodes = find_mutable_nodes(&tree, source, &changed, skip);
+
+        let kinds: Vec<&str> = nodes.iter().map(|n| n.kind()).collect();
+        assert!(
+            kinds.contains(&"true"),
+            "Should still find `true` outside import, got: {:?}",
+            kinds
+        );
+    }
+
+    #[test]
+    fn csharp_using_skipped() {
+        let source = b"using System.Collections;\nclass T { bool F() { return true; } }\n";
+        let tree = parse_csharp(source);
+        let changed = vec![LineRange { start: 1, end: 2 }];
+
+        let skip = &["using_directive"];
+        let nodes = find_mutable_nodes(&tree, source, &changed, skip);
+
+        let kinds: Vec<&str> = nodes.iter().map(|n| n.kind()).collect();
+        assert!(
+            kinds.contains(&"true") || kinds.contains(&"boolean_literal"),
+            "Should still find boolean outside using, got: {:?}",
+            kinds
+        );
+    }
+
     #[test]
     fn rust_nested_if_expression() {
         let source = b"fn f(a: i32, b: i32) -> i32 {\n    if a > 0 {\n        if b > 0 {\n            return a + b;\n        }\n    }\n    0\n}\n";
