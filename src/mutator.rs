@@ -2,9 +2,71 @@
 
 use crate::mapper::find_mutable_nodes;
 use crate::operators::{self};
-use crate::{ChangedFile, Mutation, ts_row_to_line};
+use crate::{ChangedFile, Mutation, MutationCandidate, ts_row_to_line};
 use anyhow::Result;
 use std::path::Path;
+
+const FUNC_NODE_KINDS: &[&str] = &[
+    "function_item",        // Rust
+    "function_declaration", // Go, TypeScript, C/C++
+    "method_declaration",   // Java, C#
+    "function_definition",  // Python, C/C++
+    "method",               // Ruby
+];
+
+const RUST_PRIMITIVE_RETURNS: &[&str] = &[
+    "bool", "i8", "i16", "i32", "i64", "i128", "isize", "u8", "u16", "u32", "u64", "u128", "usize",
+    "f32", "f64", "String", "&str", "char", "()",
+];
+
+/// Check if a return_empty mutation should be skipped because the return type
+/// is too complex for a simple literal replacement.
+fn should_skip_return_empty(node: &tree_sitter::Node, source: &[u8], language: &str) -> bool {
+    // Walk up to find the enclosing function
+    let mut parent = node.parent();
+    let func_node = loop {
+        match parent {
+            Some(p) if FUNC_NODE_KINDS.contains(&p.kind()) => break p,
+            Some(p) => parent = p.parent(),
+            None => return false, // no enclosing function found, don't skip
+        }
+    };
+
+    match language {
+        "rust" => {
+            let ret_type = func_node.child_by_field_name("return_type");
+            match ret_type {
+                None => false, // no return type annotation (-> ()), don't skip
+                Some(rt) => {
+                    let text = std::str::from_utf8(&source[rt.byte_range()]).unwrap_or("");
+                    !RUST_PRIMITIVE_RETURNS.contains(&text)
+                }
+            }
+        }
+        "go" => {
+            // Go: skip if function has a parameter_list as result (multiple returns)
+            if let Some(result) = func_node.child_by_field_name("result") {
+                result.kind() == "parameter_list"
+            } else {
+                false
+            }
+        }
+        _ => false,
+    }
+}
+
+/// Check if a mutation candidate should be filtered out for the given language.
+fn should_filter(
+    candidate: &MutationCandidate,
+    node: &tree_sitter::Node,
+    source: &[u8],
+    language: &str,
+) -> bool {
+    if candidate.operator_id == "return_empty" {
+        return should_skip_return_empty(node, source, language);
+    }
+    false
+}
 
 /// Generate mutations for all changed files.
 /// Reads each file, parses it, finds mutable nodes in changed regions,
@@ -50,6 +112,10 @@ pub fn generate_mutations(
                 for candidate in candidates {
                     if mutations.len() >= max_mutations {
                         return Ok(mutations);
+                    }
+
+                    if should_filter(&candidate, node, &source, &language_name) {
+                        continue;
                     }
 
                     let line = ts_row_to_line(node.start_position().row);
@@ -226,6 +292,68 @@ mod tests {
         for (i, m) in mutations.iter().enumerate() {
             assert_eq!(m.id, i as u32, "mutation ids should be sequential");
         }
+    }
+
+    #[test]
+    fn rust_return_empty_skipped_for_result_type() {
+        let tmp = TempDir::new().unwrap();
+        let src = "fn f() -> Result<i32, String> {\n    return Ok(42);\n}\n";
+        let rel = write_go_file(tmp.path(), "lib.rs", src);
+
+        let changed = vec![ChangedFile {
+            path: rel,
+            hunks: vec![LineRange { start: 1, end: 3 }],
+        }];
+
+        let mutations = generate_mutations(&changed, tmp.path(), 100).unwrap();
+        let has_return_empty = mutations.iter().any(|m| m.operator == "return_empty");
+        assert!(
+            !has_return_empty,
+            "return_empty should be skipped for Result return type, got: {:?}",
+            mutations.iter().map(|m| &m.operator).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn rust_return_empty_allowed_for_primitive() {
+        let tmp = TempDir::new().unwrap();
+        // Use a function call as return value — call_expression is not in MUTABLE_NODE_KINDS,
+        // so the mapper yields the return_expression itself.
+        let src = "fn f() -> i32 {\n    return compute();\n}\n";
+        let rel = write_go_file(tmp.path(), "lib.rs", src);
+
+        let changed = vec![ChangedFile {
+            path: rel,
+            hunks: vec![LineRange { start: 1, end: 3 }],
+        }];
+
+        let mutations = generate_mutations(&changed, tmp.path(), 100).unwrap();
+        let has_return_empty = mutations.iter().any(|m| m.operator == "return_empty");
+        assert!(
+            has_return_empty,
+            "return_empty should be allowed for i32 return type, got: {:?}",
+            mutations.iter().map(|m| &m.operator).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn go_return_empty_skipped_for_multi_return() {
+        let tmp = TempDir::new().unwrap();
+        let src = "package main\n\nfunc f() (int, error) {\n\treturn 0, nil\n}\n";
+        let rel = write_go_file(tmp.path(), "main.go", src);
+
+        let changed = vec![ChangedFile {
+            path: rel,
+            hunks: vec![LineRange { start: 1, end: 5 }],
+        }];
+
+        let mutations = generate_mutations(&changed, tmp.path(), 100).unwrap();
+        let has_return_empty = mutations.iter().any(|m| m.operator == "return_empty");
+        assert!(
+            !has_return_empty,
+            "return_empty should be skipped for multi-return Go func, got: {:?}",
+            mutations.iter().map(|m| &m.operator).collect::<Vec<_>>()
+        );
     }
 
     #[test]
