@@ -14,14 +14,20 @@ const FUNC_NODE_KINDS: &[&str] = &[
     "method",               // Ruby
 ];
 
-const RUST_PRIMITIVE_RETURNS: &[&str] = &[
-    "bool", "i8", "i16", "i32", "i64", "i128", "isize", "u8", "u16", "u32", "u64", "u128", "usize",
-    "f32", "f64", "String", "&str", "char", "()",
+/// Return type node kinds where a literal replacement (0, false, "") is valid.
+const SIMPLE_RETURN_TYPE_KINDS: &[&str] = &[
+    "primitive_type",      // Rust: i32, bool, f64, char, etc.
+    "type_identifier",     // Rust: String, custom newtypes wrapping primitives
+    "predefined_type",     // TypeScript: number, string, boolean
+    "boolean_type",        // TypeScript: boolean
+    "void_type",           // C#, Java
+    "integral_type",       // C#: int, long, byte
+    "floating_point_type", // C#, Java: float, double
 ];
 
 /// Check if a return_empty mutation should be skipped because the return type
 /// is too complex for a simple literal replacement.
-fn should_skip_return_empty(node: &tree_sitter::Node, source: &[u8], language: &str) -> bool {
+fn should_skip_return_empty(node: &tree_sitter::Node, language: &str) -> bool {
     // Walk up to find the enclosing function
     let mut parent = node.parent();
     let func_node = loop {
@@ -32,38 +38,28 @@ fn should_skip_return_empty(node: &tree_sitter::Node, source: &[u8], language: &
         }
     };
 
-    match language {
-        "rust" => {
-            let ret_type = func_node.child_by_field_name("return_type");
-            match ret_type {
-                None => false, // no return type annotation (-> ()), don't skip
-                Some(rt) => match std::str::from_utf8(&source[rt.byte_range()]) {
-                    Ok(text) => !RUST_PRIMITIVE_RETURNS.contains(&text),
-                    Err(_) => false, // can't decode return type, don't skip
-                },
+    // Check the return type field — field name varies by language
+    let ret_type = func_node
+        .child_by_field_name("return_type")
+        .or_else(|| func_node.child_by_field_name("type"))
+        .or_else(|| func_node.child_by_field_name("result"));
+
+    match ret_type {
+        None => false, // no return type annotation, don't skip
+        Some(rt) => {
+            if language == "go" && rt.kind() == "parameter_list" {
+                // Go multi-return: (int, error)
+                return true;
             }
+            !SIMPLE_RETURN_TYPE_KINDS.contains(&rt.kind())
         }
-        "go" => {
-            // Go: skip if function has a parameter_list as result (multiple returns)
-            if let Some(result) = func_node.child_by_field_name("result") {
-                result.kind() == "parameter_list"
-            } else {
-                false
-            }
-        }
-        _ => false,
     }
 }
 
 /// Check if a mutation candidate should be filtered out for the given language.
-fn should_filter(
-    candidate: &MutationCandidate,
-    node: &tree_sitter::Node,
-    source: &[u8],
-    language: &str,
-) -> bool {
+fn should_filter(candidate: &MutationCandidate, node: &tree_sitter::Node, language: &str) -> bool {
     if candidate.operator_id == "return_empty" {
-        return should_skip_return_empty(node, source, language);
+        return should_skip_return_empty(node, language);
     }
     false
 }
@@ -114,7 +110,7 @@ pub fn generate_mutations(
                         return Ok(mutations);
                     }
 
-                    if should_filter(&candidate, node, &source, &language_name) {
+                    if should_filter(&candidate, node, &language_name) {
                         continue;
                     }
 
