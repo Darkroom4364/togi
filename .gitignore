@@ -3,5 +3,6 @@
 *.swo
 .DS_Store
 .togi.lock
+.togi-cache/
 .claude/
 togi.toml
