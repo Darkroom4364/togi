@@ -140,6 +140,21 @@ pub fn detect_test_command(project_root: &Path) -> Vec<String> {
     }
 }
 
+/// Returns failfast args to append to a test command, based on the test runner.
+pub fn failfast_args(command: &[String]) -> Vec<String> {
+    match command.first().map(|s| s.as_str()) {
+        Some("go") => vec!["-failfast".into()],
+        Some("pytest") => vec!["-x".into()],
+        Some("npx") => vec!["--bail".into()],
+        Some("npm") => vec!["--".into(), "--bail".into()],
+        Some("mvn") => vec!["--fail-fast".into()],
+        Some("./gradlew") | Some("gradlew") => vec!["--fail-fast".into()],
+        Some("bundle") => vec!["--fail-fast".into()],
+        Some("dotnet") => vec!["--".into(), "--fail-fast".into()],
+        _ => vec![],
+    }
+}
+
 pub fn detect_build_command(project_root: &Path) -> Vec<String> {
     if project_root.join("Cargo.toml").exists() {
         return vec!["cargo".into(), "check".into()];

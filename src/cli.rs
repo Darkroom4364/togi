@@ -59,6 +59,10 @@ pub enum Commands {
         /// Override build check command (e.g., 'cargo check')
         #[arg(long)]
         build_cmd: Option<String>,
+
+        /// Stop test suite on first failure per mutation (faster kills)
+        #[arg(long)]
+        fail_fast: bool,
     },
     /// Generate a togi.toml config template
     Init,

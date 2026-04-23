@@ -18,6 +18,7 @@ struct CheckConfig {
     test_cmd: Option<String>,
     coverage_file: Option<PathBuf>,
     build_cmd: Option<String>,
+    fail_fast: bool,
 }
 
 #[tokio::main]
@@ -38,6 +39,7 @@ async fn main() {
             test_cmd,
             coverage_file,
             build_cmd,
+            fail_fast,
         } => {
             let cfg = CheckConfig {
                 all,
@@ -52,6 +54,7 @@ async fn main() {
                 test_cmd,
                 coverage_file,
                 build_cmd,
+                fail_fast,
             };
             if let Err(e) = run_check(cfg).await {
                 eprintln!("Error: {e:#}");
@@ -80,12 +83,21 @@ async fn run_check(cfg: CheckConfig) -> anyhow::Result<()> {
     let show_output = cfg.show_output;
     let output_format = cfg.output_format.clone();
 
-    let mut config = resolve_config(cfg)?;
+    let (mut config, fail_fast) = resolve_config(cfg)?;
     let project_root = get_project_root()?;
     let _lock = togi::lock::acquire(&project_root)?;
 
     config.resolve_test_command(&project_root);
     config.resolve_build_command(&project_root);
+
+    if fail_fast {
+        let args = togi::config::failfast_args(&config.test.command);
+        config.test.command.extend(args);
+        for lang_config in config.test.languages.values_mut() {
+            let args = togi::config::failfast_args(&lang_config.command);
+            lang_config.command.extend(args);
+        }
+    }
 
     let all_langs = togi::languages::all();
     let known: Vec<&str> = all_langs.iter().map(|l| l.name()).collect();
@@ -125,8 +137,9 @@ async fn run_check(cfg: CheckConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn resolve_config(cfg: CheckConfig) -> anyhow::Result<togi::config::Config> {
+fn resolve_config(cfg: CheckConfig) -> anyhow::Result<(togi::config::Config, bool)> {
     let mut config = togi::config::Config::load(cfg.config_path.as_deref())?;
+    let has_custom_test_cmd = cfg.test_cmd.is_some();
 
     if let Some(b) = cfg.base {
         config.diff.base = b;
@@ -149,7 +162,8 @@ fn resolve_config(cfg: CheckConfig) -> anyhow::Result<togi::config::Config> {
             shell_words::split(&cmd).map_err(|e| anyhow::anyhow!("bad --build-cmd: {e}"))?;
     }
 
-    Ok(config)
+    let fail_fast = cfg.fail_fast && !has_custom_test_cmd;
+    Ok((config, fail_fast))
 }
 
 /// Collects files to mutate. Returns an empty vec with user-facing messages
