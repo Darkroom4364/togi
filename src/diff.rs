@@ -158,8 +158,8 @@ pub fn collect_changed_since(
 
 /// Returns true if the path matches any user-provided exclude glob pattern.
 pub fn matches_user_excludes(path: &Path, globs: &[String]) -> bool {
-    let path_str = path.to_str().unwrap_or("");
-    globs.iter().any(|pattern| glob_match(pattern, path_str))
+    let path_str = path.to_string_lossy().replace('\\', "/");
+    globs.iter().any(|pattern| glob_match(pattern, &path_str))
 }
 
 /// Simple glob matching: supports `*` (any chars except `/`) and `**` (any path).
