@@ -83,7 +83,7 @@ async fn run_check(cfg: CheckConfig) -> anyhow::Result<()> {
     let show_output = cfg.show_output;
     let output_format = cfg.output_format.clone();
 
-    let (mut config, fail_fast) = resolve_config(cfg)?;
+    let (mut config, fail_fast, has_explicit_build_cmd) = resolve_config(cfg)?;
     let project_root = get_project_root()?;
     let _lock = togi::lock::acquire(&project_root)?;
 
@@ -125,7 +125,15 @@ async fn run_check(cfg: CheckConfig) -> anyhow::Result<()> {
 
     eprintln!("Running {} mutations...", mutations.len());
 
-    let report = execute(mutations, config, project_root, verbose, show_output).await;
+    let report = execute(
+        mutations,
+        config,
+        project_root,
+        verbose,
+        show_output,
+        has_explicit_build_cmd,
+    )
+    .await;
 
     togi::report::print_report(&report, &output_format)?;
 
@@ -137,9 +145,10 @@ async fn run_check(cfg: CheckConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn resolve_config(cfg: CheckConfig) -> anyhow::Result<(togi::config::Config, bool)> {
+fn resolve_config(cfg: CheckConfig) -> anyhow::Result<(togi::config::Config, bool, bool)> {
     let mut config = togi::config::Config::load(cfg.config_path.as_deref())?;
     let has_custom_test_cmd = cfg.test_cmd.is_some();
+    let has_cli_build_cmd = cfg.build_cmd.is_some();
 
     if let Some(b) = cfg.base {
         config.diff.base = b;
@@ -162,8 +171,9 @@ fn resolve_config(cfg: CheckConfig) -> anyhow::Result<(togi::config::Config, boo
             shell_words::split(&cmd).map_err(|e| anyhow::anyhow!("bad --build-cmd: {e}"))?;
     }
 
+    let has_explicit_build_cmd = has_cli_build_cmd || !config.test.build_command.is_empty();
     let fail_fast = cfg.fail_fast && !has_custom_test_cmd;
-    Ok((config, fail_fast))
+    Ok((config, fail_fast, has_explicit_build_cmd))
 }
 
 /// Collects files to mutate. Returns an empty vec with user-facing messages
@@ -285,6 +295,7 @@ async fn execute(
     project_root: PathBuf,
     verbose: bool,
     show_output: bool,
+    build_command_explicit: bool,
 ) -> MutationReport {
     let language_commands: std::collections::HashMap<String, Vec<String>> = config
         .test
@@ -297,6 +308,7 @@ async fn execute(
         command: config.test.command,
         language_commands,
         build_command: config.test.build_command,
+        build_command_explicit,
         timeout: Duration::from_secs(config.test.timeout),
         parallelism: config.test.jobs,
         project_root,

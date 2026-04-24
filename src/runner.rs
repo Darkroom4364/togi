@@ -35,6 +35,7 @@ pub struct TestRunner {
     pub command: Vec<String>,
     pub language_commands: HashMap<String, Vec<String>>,
     pub build_command: Vec<String>,
+    pub build_command_explicit: bool,
     pub timeout: Duration,
     pub parallelism: usize,
     pub project_root: PathBuf,
@@ -90,11 +91,12 @@ impl TestRunner {
                 .clone();
             let timeout = self.timeout;
             let project_root = project_root.clone();
-            let build_command = if INTERPRETED_LANGUAGES.contains(&language) {
-                Arc::new(vec![])
-            } else {
-                build_command.clone()
-            };
+            let build_command =
+                if !self.build_command_explicit && INTERPRETED_LANGUAGES.contains(&language) {
+                    Arc::new(vec![])
+                } else {
+                    build_command.clone()
+                };
             let counter = counter.clone();
             let tested_counter = tested_counter.clone();
             let max_tested = self.max_tested;
@@ -677,6 +679,7 @@ mod tests {
             command: vec!["true".into()],
             language_commands: HashMap::new(),
             build_command: vec![],
+            build_command_explicit: false,
             timeout: Duration::from_secs(5),
             parallelism: 1,
             project_root: dir.path().to_path_buf(),
@@ -712,6 +715,7 @@ mod tests {
             command: vec!["true".into()],
             language_commands: lang_cmds,
             build_command: vec![],
+            build_command_explicit: false,
             timeout: Duration::from_secs(5),
             parallelism: 2,
             project_root: dir.path().to_path_buf(),
@@ -744,6 +748,7 @@ mod tests {
             command: vec!["true".into()], // default would survive
             language_commands: lang_cmds,
             build_command: vec![],
+            build_command_explicit: false,
             timeout: Duration::from_secs(5),
             parallelism: 1,
             project_root: dir.path().to_path_buf(),
