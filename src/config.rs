@@ -62,6 +62,8 @@ pub struct MutationConfig {
     #[serde(default = "default_max_per_run")]
     pub max_per_run: usize,
     pub coverage_file: Option<PathBuf>,
+    #[serde(default = "default_max_per_file")]
+    pub max_per_file: usize,
     #[serde(default)]
     pub exclude_paths: Vec<String>,
     #[serde(default = "default_true")]
@@ -204,6 +206,10 @@ fn default_max_per_run() -> usize {
     20
 }
 
+fn default_max_per_file() -> usize {
+    20
+}
+
 impl TestConfig {
     pub fn command_for_language(&self, language: &str) -> &[String] {
         if let Some(lang_config) = self.languages.get(language) {
@@ -238,6 +244,7 @@ impl Default for MutationConfig {
     fn default() -> Self {
         Self {
             max_per_run: default_max_per_run(),
+            max_per_file: default_max_per_file(),
             coverage_file: None,
             exclude_paths: vec![],
             skip_noisy_files: true,
@@ -323,6 +330,7 @@ base = "origin/main"
 
 [mutations]
 max_per_run = 20
+# max_per_file = 20  # cap mutations per source file (0 = unlimited)
 "#;
         std::fs::write(path, template)?;
         Ok(())
@@ -691,5 +699,31 @@ skip_noisy_files = false
         let config: Config = toml::from_str("").unwrap();
         assert!(config.mutations.skip_noisy_files);
         assert!(config.mutations.exclude_paths.is_empty());
+    }
+
+    #[test]
+    fn max_per_file_defaults_to_20() {
+        let config: Config = toml::from_str("").unwrap();
+        assert_eq!(config.mutations.max_per_file, 20);
+    }
+
+    #[test]
+    fn parse_max_per_file() {
+        let toml_str = r#"
+[mutations]
+max_per_file = 50
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.mutations.max_per_file, 50);
+    }
+
+    #[test]
+    fn max_per_file_zero_means_unlimited() {
+        let toml_str = r#"
+[mutations]
+max_per_file = 0
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.mutations.max_per_file, 0);
     }
 }

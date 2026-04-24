@@ -16,7 +16,7 @@ fn generates_mutations_for_go_fixture() {
         hunks: vec![LineRange { start: 1, end: 32 }],
     }];
 
-    let mutations = togi::mutator::generate_mutations(&changed, &root, 200).unwrap();
+    let mutations = togi::mutator::generate_mutations(&changed, &root, 200, 0).unwrap();
     assert!(
         !mutations.is_empty(),
         "expected mutations to be generated for calc.go"
@@ -79,7 +79,7 @@ async fn end_to_end_go_fixture_some_mutations_survive() {
         hunks: vec![LineRange { start: 1, end: 32 }],
     }];
 
-    let mutations = togi::mutator::generate_mutations(&changed, &root, 200).unwrap();
+    let mutations = togi::mutator::generate_mutations(&changed, &root, 200, 0).unwrap();
     assert!(!mutations.is_empty());
 
     let runner = togi::runner::TestRunner {
