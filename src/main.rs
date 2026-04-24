@@ -241,7 +241,12 @@ fn generate_mutations(
     } else {
         config.mutations.max_per_run
     };
-    togi::mutator::generate_mutations(changed_files, project_root, generation_limit)
+    togi::mutator::generate_mutations(
+        changed_files,
+        project_root,
+        generation_limit,
+        config.mutations.max_per_file,
+    )
 }
 
 fn filter_mutations(

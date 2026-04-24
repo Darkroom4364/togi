@@ -71,6 +71,7 @@ pub fn generate_mutations(
     changed_files: &[ChangedFile],
     project_root: &Path,
     max_mutations: usize,
+    max_per_file: usize,
 ) -> Result<Vec<Mutation>> {
     let operators = operators::all_operators();
     let mut mutations = Vec::new();
@@ -102,25 +103,23 @@ pub fn generate_mutations(
             lang.skip_subtree_kinds(),
         );
 
+        let mut file_mutations = Vec::new();
+
         for node in &nodes {
             for op in &operators {
                 let candidates = op.apply(node, &source);
                 for candidate in candidates {
-                    if mutations.len() >= max_mutations {
-                        return Ok(mutations);
-                    }
-
                     if should_filter(&candidate, node, &language_name) {
                         continue;
                     }
 
                     let line = ts_row_to_line(node.start_position().row);
-                    let column = node.start_position().column + 1; // 1-indexed for display
+                    let column = node.start_position().column + 1;
                     let original =
                         String::from_utf8_lossy(&source[candidate.byte_range.clone()]).to_string();
 
-                    mutations.push(Mutation {
-                        id: next_id,
+                    file_mutations.push(Mutation {
+                        id: 0,
                         file: file_path.clone(),
                         language: language_name.clone(),
                         line,
@@ -131,13 +130,91 @@ pub fn generate_mutations(
                         replacement: candidate.replacement,
                         byte_range: candidate.byte_range,
                     });
-                    next_id += 1;
                 }
             }
+        }
+
+        if max_per_file > 0 && file_mutations.len() > max_per_file {
+            file_mutations = sample_diverse(file_mutations, max_per_file);
+        }
+
+        for mut m in file_mutations {
+            if mutations.len() >= max_mutations {
+                return Ok(mutations);
+            }
+            m.id = next_id;
+            next_id += 1;
+            mutations.push(m);
         }
     }
 
     Ok(mutations)
+}
+
+/// Sample up to `cap` mutations with operator diversity via deterministic round-robin.
+/// Groups by operator name (sorted for reproducibility), shuffles within each group
+/// to avoid positional bias, then round-robins across groups.
+fn sample_diverse(mutations: Vec<Mutation>, cap: usize) -> Vec<Mutation> {
+    use std::collections::BTreeMap;
+
+    let mut by_operator: BTreeMap<String, Vec<Mutation>> = BTreeMap::new();
+    for m in mutations {
+        by_operator.entry(m.operator.clone()).or_default().push(m);
+    }
+
+    // Shuffle within each group: interleave from front and back
+    // to break positional clustering (deterministic, no RNG needed).
+    for group in by_operator.values_mut() {
+        if group.len() > 2 {
+            let mut front: Vec<Mutation> = Vec::new();
+            let mut back: Vec<Mutation> = Vec::new();
+            let mid = group.len() / 2;
+            let taken = std::mem::take(group);
+            for (i, m) in taken.into_iter().enumerate() {
+                if i < mid {
+                    front.push(m);
+                } else {
+                    back.push(m);
+                }
+            }
+            back.reverse();
+            let mut shuffled = Vec::with_capacity(front.len() + back.len());
+            let mut fi = front.into_iter();
+            let mut bi = back.into_iter();
+            loop {
+                match (fi.next(), bi.next()) {
+                    (Some(a), Some(b)) => {
+                        shuffled.push(a);
+                        shuffled.push(b);
+                    }
+                    (Some(a), None) => shuffled.push(a),
+                    (None, Some(b)) => shuffled.push(b),
+                    (None, None) => break,
+                }
+            }
+            *group = shuffled;
+        }
+    }
+
+    let mut result = Vec::with_capacity(cap);
+    let mut iters: Vec<std::vec::IntoIter<Mutation>> =
+        by_operator.into_values().map(|v| v.into_iter()).collect();
+
+    while result.len() < cap && !iters.is_empty() {
+        iters.retain_mut(|iter| {
+            if result.len() >= cap {
+                return false;
+            }
+            if let Some(m) = iter.next() {
+                result.push(m);
+                true
+            } else {
+                false
+            }
+        });
+    }
+
+    result
 }
 
 #[cfg(test)]
@@ -166,7 +243,7 @@ mod tests {
             hunks: vec![LineRange { start: 4, end: 5 }],
         }];
 
-        let mutations = generate_mutations(&changed, tmp.path(), 100).unwrap();
+        let mutations = generate_mutations(&changed, tmp.path(), 100, 0).unwrap();
         assert!(!mutations.is_empty());
 
         let operators: Vec<&str> = mutations.iter().map(|m| m.operator.as_str()).collect();
@@ -193,7 +270,7 @@ mod tests {
             hunks: vec![LineRange { start: 1, end: 8 }],
         }];
 
-        let mutations = generate_mutations(&changed, tmp.path(), 2).unwrap();
+        let mutations = generate_mutations(&changed, tmp.path(), 2, 0).unwrap();
         assert_eq!(mutations.len(), 2);
     }
 
@@ -206,7 +283,7 @@ mod tests {
             hunks: vec![LineRange { start: 1, end: 5 }],
         }];
 
-        let mutations = generate_mutations(&changed, tmp.path(), 100).unwrap();
+        let mutations = generate_mutations(&changed, tmp.path(), 100, 0).unwrap();
         assert!(mutations.is_empty());
     }
 
@@ -230,7 +307,7 @@ mod tests {
             },
         ];
 
-        let mutations = generate_mutations(&changed, tmp.path(), 100).unwrap();
+        let mutations = generate_mutations(&changed, tmp.path(), 100, 0).unwrap();
         let files: std::collections::HashSet<_> =
             mutations.iter().map(|m| m.file.clone()).collect();
         assert!(
@@ -251,7 +328,7 @@ mod tests {
             hunks: vec![LineRange { start: 1, end: 2 }],
         }];
 
-        let mutations = generate_mutations(&changed, tmp.path(), 100).unwrap();
+        let mutations = generate_mutations(&changed, tmp.path(), 100, 0).unwrap();
         assert!(!mutations.is_empty(), "expected mutations for Python file");
         assert_eq!(mutations[0].language, "python");
     }
@@ -267,7 +344,7 @@ mod tests {
             hunks: vec![LineRange { start: 1, end: 3 }],
         }];
 
-        let mutations = generate_mutations(&changed, tmp.path(), 100).unwrap();
+        let mutations = generate_mutations(&changed, tmp.path(), 100, 0).unwrap();
         assert!(!mutations.is_empty(), "expected mutations for Rust file");
         assert_eq!(mutations[0].language, "rust");
     }
@@ -283,7 +360,7 @@ mod tests {
             hunks: vec![LineRange { start: 1, end: 8 }],
         }];
 
-        let mutations = generate_mutations(&changed, tmp.path(), 100).unwrap();
+        let mutations = generate_mutations(&changed, tmp.path(), 100, 0).unwrap();
         assert!(!mutations.is_empty(), "expected at least one mutation");
         for (i, m) in mutations.iter().enumerate() {
             assert_eq!(m.id, i as u32, "mutation ids should be sequential");
@@ -301,7 +378,7 @@ mod tests {
             hunks: vec![LineRange { start: 1, end: 3 }],
         }];
 
-        let mutations = generate_mutations(&changed, tmp.path(), 100).unwrap();
+        let mutations = generate_mutations(&changed, tmp.path(), 100, 0).unwrap();
         let has_return_empty = mutations.iter().any(|m| m.operator == "return_empty");
         assert!(
             !has_return_empty,
@@ -323,7 +400,7 @@ mod tests {
             hunks: vec![LineRange { start: 1, end: 3 }],
         }];
 
-        let mutations = generate_mutations(&changed, tmp.path(), 100).unwrap();
+        let mutations = generate_mutations(&changed, tmp.path(), 100, 0).unwrap();
         let has_return_empty = mutations.iter().any(|m| m.operator == "return_empty");
         assert!(
             has_return_empty,
@@ -343,7 +420,7 @@ mod tests {
             hunks: vec![LineRange { start: 1, end: 5 }],
         }];
 
-        let mutations = generate_mutations(&changed, tmp.path(), 100).unwrap();
+        let mutations = generate_mutations(&changed, tmp.path(), 100, 0).unwrap();
         let has_return_empty = mutations.iter().any(|m| m.operator == "return_empty");
         assert!(
             !has_return_empty,
@@ -362,7 +439,96 @@ mod tests {
             hunks: vec![LineRange { start: 1, end: 1 }],
         }];
 
-        let mutations = generate_mutations(&changed, tmp.path(), 100).unwrap();
+        let mutations = generate_mutations(&changed, tmp.path(), 100, 0).unwrap();
         assert!(mutations.is_empty());
+    }
+
+    #[test]
+    fn respects_max_per_file() {
+        let tmp = TempDir::new().unwrap();
+        // File with many mutable nodes
+        let src = "package main\n\nfunc f(a, b, c, d int) bool {\n\tif a < b {\n\t\treturn true\n\t}\n\tif c < d {\n\t\treturn false\n\t}\n\treturn a > c\n}\n";
+        let rel = write_go_file(tmp.path(), "main.go", src);
+
+        let changed = vec![ChangedFile {
+            path: rel,
+            hunks: vec![LineRange { start: 1, end: 11 }],
+        }];
+
+        let uncapped = generate_mutations(&changed, tmp.path(), 1000, 0).unwrap();
+        let capped = generate_mutations(&changed, tmp.path(), 1000, 3).unwrap();
+
+        assert!(
+            uncapped.len() > 3,
+            "need more than 3 uncapped mutations to test cap, got {}",
+            uncapped.len()
+        );
+        assert_eq!(capped.len(), 3, "expected exactly 3 mutations with cap");
+    }
+
+    #[test]
+    fn sample_diverse_round_robins_operators() {
+        let make = |op: &str, line: usize| Mutation {
+            id: 0,
+            file: PathBuf::from("test.rs"),
+            language: "rust".into(),
+            line,
+            column: 1,
+            operator: op.into(),
+            description: String::new(),
+            original: "x".into(),
+            replacement: "y".into(),
+            byte_range: 0..1,
+        };
+
+        let mutations = vec![
+            make("string_to_empty", 1),
+            make("string_to_empty", 2),
+            make("string_to_empty", 3),
+            make("string_to_empty", 4),
+            make("string_to_empty", 5),
+            make("string_to_empty", 6),
+            make("string_to_empty", 7),
+            make("string_to_empty", 8),
+            make("string_to_empty", 9),
+            make("string_to_empty", 10),
+            make("true_to_false", 20),
+            make("true_to_false", 21),
+        ];
+
+        let sampled = sample_diverse(mutations, 4);
+        assert_eq!(sampled.len(), 4);
+
+        let string_count = sampled
+            .iter()
+            .filter(|m| m.operator == "string_to_empty")
+            .count();
+        let bool_count = sampled
+            .iter()
+            .filter(|m| m.operator == "true_to_false")
+            .count();
+
+        assert_eq!(bool_count, 2, "expected 2 true_to_false mutations");
+        assert_eq!(string_count, 2, "expected 2 string_to_empty mutations");
+    }
+
+    #[test]
+    fn sample_diverse_returns_all_when_under_cap() {
+        let make = |op: &str, line: usize| Mutation {
+            id: 0,
+            file: PathBuf::from("test.rs"),
+            language: "rust".into(),
+            line,
+            column: 1,
+            operator: op.into(),
+            description: String::new(),
+            original: "x".into(),
+            replacement: "y".into(),
+            byte_range: 0..1,
+        };
+
+        let mutations = vec![make("op_a", 1), make("op_b", 2)];
+        let sampled = sample_diverse(mutations, 10);
+        assert_eq!(sampled.len(), 2);
     }
 }
