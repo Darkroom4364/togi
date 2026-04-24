@@ -51,23 +51,30 @@ impl LanguageSupport for Rust {
 
     fn should_skip_node(&self, node: &tree_sitter::Node, source: &[u8]) -> bool {
         match node.kind() {
-            "mod_item" => has_test_attribute(node, source, "cfg(test)"),
-            "function_item" => has_test_attribute(node, source, "test"),
+            "mod_item" => has_attribute(node, source, |attr| attr == "#[cfg(test)]"),
+            "function_item" => has_attribute(node, source, |attr| {
+                attr == "#[test]" || attr.contains("::test]")
+            }),
             _ => false,
         }
     }
 }
 
-/// Check if a node has a preceding sibling `attribute_item` whose text contains `needle`.
-/// Walks backward through consecutive attributes to handle stacked attrs.
-fn has_test_attribute(node: &tree_sitter::Node, source: &[u8], needle: &str) -> bool {
+/// Check if a node has a preceding sibling `attribute_item` matching a predicate.
+/// Normalizes whitespace before matching. Walks backward through consecutive attributes.
+fn has_attribute(
+    node: &tree_sitter::Node,
+    source: &[u8],
+    matches: impl Fn(&str) -> bool,
+) -> bool {
     let mut sibling = node.prev_sibling();
     while let Some(sib) = sibling {
         if sib.kind() == "attribute_item" {
-            if let Ok(text) = std::str::from_utf8(&source[sib.byte_range()])
-                && text.contains(needle)
-            {
-                return true;
+            if let Ok(text) = std::str::from_utf8(&source[sib.byte_range()]) {
+                let normalized: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+                if matches(&normalized) {
+                    return true;
+                }
             }
             sibling = sib.prev_sibling();
         } else {
