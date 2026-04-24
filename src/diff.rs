@@ -5,8 +5,12 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Build ChangedFile entries for every supported file in the project tree.
-/// Respects `.gitignore` rules. Skips test files.
-pub fn collect_all_supported_files(project_root: &Path) -> anyhow::Result<Vec<ChangedFile>> {
+/// Respects `.gitignore` rules. Skips test/migration/seed files by default.
+pub fn collect_all_supported_files(
+    project_root: &Path,
+    skip_noisy: bool,
+    exclude_globs: &[String],
+) -> anyhow::Result<Vec<ChangedFile>> {
     use crate::languages;
 
     let langs = languages::all();
@@ -45,7 +49,10 @@ pub fn collect_all_supported_files(project_root: &Path) -> anyhow::Result<Vec<Ch
             .strip_prefix(project_root)
             .unwrap_or(path)
             .to_path_buf();
-        if is_test_file(&rel_path) {
+        if skip_noisy && is_noisy_file(&rel_path) {
+            continue;
+        }
+        if matches_user_excludes(&rel_path, exclude_globs) {
             continue;
         }
 
@@ -87,7 +94,12 @@ pub fn collect_all_supported_files(project_root: &Path) -> anyhow::Result<Vec<Ch
 ///
 /// Returns the same `Vec<ChangedFile>` format as `parse_diff`, filtering
 /// out test files and files with no added lines.
-pub fn collect_changed_since(project_root: &Path, since: &str) -> anyhow::Result<Vec<ChangedFile>> {
+pub fn collect_changed_since(
+    project_root: &Path,
+    since: &str,
+    skip_noisy: bool,
+    exclude_globs: &[String],
+) -> anyhow::Result<Vec<ChangedFile>> {
     // Try as a commit ref first (SHA, branch, tag).
     let output = Command::new("git")
         .args(["diff", &format!("{since}..HEAD")])
@@ -137,17 +149,59 @@ pub fn collect_changed_since(project_root: &Path, since: &str) -> anyhow::Result
     };
 
     let all = parse_diff(&diff_output);
-    Ok(all.into_iter().filter(|f| !is_test_file(&f.path)).collect())
+    Ok(all
+        .into_iter()
+        .filter(|f| !skip_noisy || !is_noisy_file(&f.path))
+        .filter(|f| !matches_user_excludes(&f.path, exclude_globs))
+        .collect())
 }
 
-/// Returns true for files that look like test files across supported languages.
-fn is_test_file(path: &Path) -> bool {
-    // Check if any ancestor directory is a known test directory
+/// Returns true if the path matches any user-provided exclude glob pattern.
+pub fn matches_user_excludes(path: &Path, globs: &[String]) -> bool {
+    let path_str = path.to_string_lossy().replace('\\', "/");
+    globs.iter().any(|pattern| glob_match(pattern, &path_str))
+}
+
+/// Glob matching via `globset`. Bare names (no `/`) are treated as directory
+/// names and match anywhere in the path tree.
+fn glob_match(pattern: &str, text: &str) -> bool {
+    let build = |pat: &str| -> bool {
+        globset::GlobBuilder::new(pat)
+            .literal_separator(true)
+            .build()
+            .map(|g| g.compile_matcher().is_match(text))
+            .unwrap_or(false)
+    };
+    if !pattern.contains('/') {
+        if pattern.contains('*') {
+            // Wildcard like "*.generated.ts" — match at any depth
+            return build(&format!("**/{pattern}"));
+        }
+        // Bare name like "vendor" — match as a directory anywhere
+        return build(&format!("**/{pattern}/**"));
+    }
+    build(pattern)
+}
+
+/// Returns true for files that should be excluded from mutation testing:
+/// test files, migrations, seeds, config files, and barrel/index re-exports.
+pub fn is_noisy_file(path: &Path) -> bool {
+    // Check if any ancestor directory is a known skip directory
     for component in path.components() {
         let s = component.as_os_str().to_str().unwrap_or("");
         if matches!(
             s,
-            "tests" | "__tests__" | "__test__" | "spec" | "specs" | "testdata" | "fixtures"
+            "tests"
+                | "__tests__"
+                | "__test__"
+                | "spec"
+                | "specs"
+                | "testdata"
+                | "fixtures"
+                | "migration"
+                | "migrations"
+                | "seeds"
+                | "examples"
         ) {
             return true;
         }
@@ -177,6 +231,10 @@ fn is_test_file(path: &Path) -> bool {
     }
     // *.test.ts, *.spec.ts — file_stem gives "foo.test"
     if name.ends_with(".test") || name.ends_with(".spec") {
+        return true;
+    }
+    // Config files: vite.config.ts, jest.config.js, quasar.config.ts, etc.
+    if name.ends_with(".config") || name.contains(".config.") {
         return true;
     }
     false
@@ -436,7 +494,7 @@ diff --git a/src/main.rs b/src/main.rs
         std::fs::create_dir_all(&tests_dir).unwrap();
         std::fs::write(tests_dir.join("helper.rs"), "fn help() {}\n").unwrap();
 
-        let files = collect_all_supported_files(root).unwrap();
+        let files = collect_all_supported_files(root, true, &[]).unwrap();
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].path, PathBuf::from("src/main.rs"));
         assert_eq!(files[0].hunks.len(), 1);
@@ -444,26 +502,93 @@ diff --git a/src/main.rs b/src/main.rs
     }
 
     #[test]
-    fn is_test_file_detects_common_patterns() {
-        assert!(is_test_file(Path::new("foo_test.go")));
-        assert!(is_test_file(Path::new("test_utils.py")));
-        assert!(is_test_file(Path::new("UserTest.java")));
-        assert!(is_test_file(Path::new("UserTests.cs")));
-        assert!(is_test_file(Path::new("app.test.ts")));
-        assert!(is_test_file(Path::new("app.spec.tsx")));
-        assert!(is_test_file(Path::new("widget_spec.rb")));
-        assert!(!is_test_file(Path::new("main.rs")));
-        assert!(!is_test_file(Path::new("utils.py")));
-        assert!(!is_test_file(Path::new("contest.go")));
+    fn is_noisy_file_detects_common_patterns() {
+        assert!(is_noisy_file(Path::new("foo_test.go")));
+        assert!(is_noisy_file(Path::new("test_utils.py")));
+        assert!(is_noisy_file(Path::new("UserTest.java")));
+        assert!(is_noisy_file(Path::new("UserTests.cs")));
+        assert!(is_noisy_file(Path::new("app.test.ts")));
+        assert!(is_noisy_file(Path::new("app.spec.tsx")));
+        assert!(is_noisy_file(Path::new("widget_spec.rb")));
+        assert!(!is_noisy_file(Path::new("main.rs")));
+        assert!(!is_noisy_file(Path::new("utils.py")));
+        assert!(!is_noisy_file(Path::new("contest.go")));
         // Directory-based detection
-        assert!(is_test_file(Path::new("tests/helper.rs")));
-        assert!(is_test_file(Path::new("__tests__/utils.ts")));
-        assert!(is_test_file(Path::new("src/test/java/Foo.java")));
-        assert!(is_test_file(Path::new("module/src/test/kotlin/Bar.kt")));
-        assert!(!is_test_file(Path::new("test/integration/main.go")));
-        assert!(!is_test_file(Path::new("cmd/test/server.go")));
-        assert!(is_test_file(Path::new("testdata/input.go")));
-        assert!(is_test_file(Path::new("fixtures/setup.py")));
+        assert!(is_noisy_file(Path::new("tests/helper.rs")));
+        assert!(is_noisy_file(Path::new("__tests__/utils.ts")));
+        assert!(is_noisy_file(Path::new("src/test/java/Foo.java")));
+        assert!(is_noisy_file(Path::new("module/src/test/kotlin/Bar.kt")));
+        assert!(!is_noisy_file(Path::new("test/integration/main.go")));
+        assert!(!is_noisy_file(Path::new("cmd/test/server.go")));
+        assert!(is_noisy_file(Path::new("testdata/input.go")));
+        assert!(is_noisy_file(Path::new("fixtures/setup.py")));
+        // Migration, seed, example directories
+        assert!(is_noisy_file(Path::new("migration/001_init.ts")));
+        assert!(is_noisy_file(Path::new("migrations/add_index.ts")));
+        assert!(is_noisy_file(Path::new(
+            "backend/migration/migrations/init.ts"
+        )));
+        assert!(is_noisy_file(Path::new("seeds/data.ts")));
+        assert!(is_noisy_file(Path::new("examples/demo.py")));
+        // Config files
+        assert!(is_noisy_file(Path::new("vite.config.ts")));
+        assert!(is_noisy_file(Path::new("jest.config.js")));
+        assert!(is_noisy_file(Path::new("quasar.config.ts")));
+        assert!(!is_noisy_file(Path::new("src/config.ts"))); // not a .config.ts file
+        assert!(is_noisy_file(Path::new("vite.config.local.ts")));
+    }
+
+    #[test]
+    fn matches_user_excludes_works() {
+        let globs = vec!["*.config.ts".into(), "seeds/**".into()];
+        assert!(matches_user_excludes(Path::new("vite.config.ts"), &globs));
+        assert!(matches_user_excludes(Path::new("seeds/data.ts"), &globs));
+        assert!(!matches_user_excludes(Path::new("src/main.ts"), &globs));
+
+        // Wildcard patterns without `/` match at any depth
+        let globs2 = vec!["*.generated.ts".into()];
+        assert!(matches_user_excludes(
+            Path::new("src/foo.generated.ts"),
+            &globs2
+        ));
+        assert!(!matches_user_excludes(Path::new("src/foo.ts"), &globs2));
+    }
+
+    #[test]
+    fn glob_match_respects_directory_boundaries() {
+        // "test/**" should match test/ but not test-utils/
+        let globs = vec!["test/**".into()];
+        assert!(matches_user_excludes(Path::new("test/unit/foo.rs"), &globs));
+        assert!(!matches_user_excludes(
+            Path::new("test-utils/foo.rs"),
+            &globs
+        ));
+
+        // Direct pattern should match whole component
+        let globs2 = vec!["vendor".into()];
+        assert!(matches_user_excludes(Path::new("vendor/lib.rs"), &globs2));
+        assert!(!matches_user_excludes(
+            Path::new("vendor-extra/lib.rs"),
+            &globs2
+        ));
+
+        // General glob patterns: **/seeds/**, src/*/gen.rs
+        let globs3 = vec!["**/seeds/**".into()];
+        assert!(matches_user_excludes(
+            Path::new("db/seeds/data.ts"),
+            &globs3
+        ));
+        assert!(!matches_user_excludes(
+            Path::new("db/other/data.ts"),
+            &globs3
+        ));
+
+        let globs4 = vec!["src/*/gen.rs".into()];
+        assert!(matches_user_excludes(Path::new("src/foo/gen.rs"), &globs4));
+        assert!(!matches_user_excludes(
+            Path::new("src/foo/bar/gen.rs"),
+            &globs4
+        ));
     }
 
     #[test]
@@ -506,7 +631,7 @@ diff --git a/src/main.rs b/src/main.rs
         run(&["add", "."]);
         run(&["commit", "-m", "add print"]);
 
-        let files = collect_changed_since(root, &base).unwrap();
+        let files = collect_changed_since(root, &base, true, &[]).unwrap();
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].path, PathBuf::from("main.rs"));
         assert!(!files[0].hunks.is_empty());
@@ -549,7 +674,7 @@ diff --git a/src/main.rs b/src/main.rs
         run(&["add", "."]);
         run(&["commit", "-m", "add changes"]);
 
-        let files = collect_changed_since(root, &base).unwrap();
+        let files = collect_changed_since(root, &base, true, &[]).unwrap();
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].path, PathBuf::from("lib.rs"));
     }
@@ -594,7 +719,7 @@ diff --git a/src/main.rs b/src/main.rs
         run(&["commit", "-m", "add print"], "2024-06-15T00:00:00Z");
 
         // Use a date between the two commits — should pick up the second commit.
-        let files = collect_changed_since(root, "2024-03-01").unwrap();
+        let files = collect_changed_since(root, "2024-03-01", true, &[]).unwrap();
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].path, PathBuf::from("main.rs"));
         assert!(!files[0].hunks.is_empty());
@@ -632,7 +757,7 @@ diff --git a/src/main.rs b/src/main.rs
         run(&["commit", "-m", "initial"], "2024-06-01T00:00:00Z");
 
         // Date before any commit — triggers empty-tree SHA fallback.
-        let files = collect_changed_since(root, "2024-01-01").unwrap();
+        let files = collect_changed_since(root, "2024-01-01", true, &[]).unwrap();
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].path, PathBuf::from("main.rs"));
         assert!(!files[0].hunks.is_empty());

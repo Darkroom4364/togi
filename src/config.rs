@@ -62,6 +62,14 @@ pub struct MutationConfig {
     #[serde(default = "default_max_per_run")]
     pub max_per_run: usize,
     pub coverage_file: Option<PathBuf>,
+    #[serde(default)]
+    pub exclude_paths: Vec<String>,
+    #[serde(default = "default_true")]
+    pub skip_noisy_files: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_test_command() -> Vec<String> {
@@ -231,6 +239,8 @@ impl Default for MutationConfig {
         Self {
             max_per_run: default_max_per_run(),
             coverage_file: None,
+            exclude_paths: vec![],
+            skip_noisy_files: true,
         }
     }
 }
@@ -659,5 +669,27 @@ language = "go"
         let lib = &config.projects["lib"];
         assert!(lib.test.is_none());
         assert_eq!(lib.language.as_deref(), Some("go"));
+    }
+
+    #[test]
+    fn parse_exclude_paths_and_skip_noisy_files() {
+        let toml_str = r#"
+[mutations]
+exclude_paths = ["vendor/**", "*.generated.ts"]
+skip_noisy_files = false
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            config.mutations.exclude_paths,
+            vec!["vendor/**", "*.generated.ts"]
+        );
+        assert!(!config.mutations.skip_noisy_files);
+    }
+
+    #[test]
+    fn skip_noisy_files_defaults_to_true() {
+        let config: Config = toml::from_str("").unwrap();
+        assert!(config.mutations.skip_noisy_files);
+        assert!(config.mutations.exclude_paths.is_empty());
     }
 }
