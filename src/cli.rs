@@ -63,6 +63,10 @@ pub enum Commands {
         /// Stop test suite on first failure per mutation (faster kills)
         #[arg(long)]
         fail_fast: bool,
+
+        /// Disable built-in exclusion of test files, migrations, seeds, etc.
+        #[arg(long)]
+        no_skip_defaults: bool,
     },
     /// Generate a togi.toml config template
     Init,

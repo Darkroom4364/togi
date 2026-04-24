@@ -62,6 +62,14 @@ pub struct MutationConfig {
     #[serde(default = "default_max_per_run")]
     pub max_per_run: usize,
     pub coverage_file: Option<PathBuf>,
+    #[serde(default)]
+    pub exclude_paths: Vec<String>,
+    #[serde(default = "default_true")]
+    pub skip_noisy_files: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_test_command() -> Vec<String> {
@@ -231,6 +239,8 @@ impl Default for MutationConfig {
         Self {
             max_per_run: default_max_per_run(),
             coverage_file: None,
+            exclude_paths: vec![],
+            skip_noisy_files: true,
         }
     }
 }

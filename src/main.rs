@@ -19,6 +19,7 @@ struct CheckConfig {
     coverage_file: Option<PathBuf>,
     build_cmd: Option<String>,
     fail_fast: bool,
+    no_skip_defaults: bool,
 }
 
 #[tokio::main]
@@ -40,6 +41,7 @@ async fn main() {
             coverage_file,
             build_cmd,
             fail_fast,
+            no_skip_defaults,
         } => {
             let cfg = CheckConfig {
                 all,
@@ -55,6 +57,7 @@ async fn main() {
                 coverage_file,
                 build_cmd,
                 fail_fast,
+                no_skip_defaults,
             };
             if let Err(e) = run_check(cfg).await {
                 eprintln!("Error: {e:#}");
@@ -171,6 +174,10 @@ fn resolve_config(cfg: CheckConfig) -> anyhow::Result<(togi::config::Config, boo
             shell_words::split(&cmd).map_err(|e| anyhow::anyhow!("bad --build-cmd: {e}"))?;
     }
 
+    if cfg.no_skip_defaults {
+        config.mutations.skip_noisy_files = false;
+    }
+
     let has_explicit_build_cmd = has_cli_build_cmd || !config.test.build_command.is_empty();
     let fail_fast = cfg.fail_fast && !has_custom_test_cmd;
     Ok((config, fail_fast, has_explicit_build_cmd))
@@ -184,8 +191,12 @@ fn collect_files(
     dry_run: bool,
     project_root: &Path,
 ) -> anyhow::Result<Vec<ChangedFile>> {
+    let skip_noisy = config.mutations.skip_noisy_files;
+    let exclude_globs = &config.mutations.exclude_paths;
+
     if all {
-        let files = togi::diff::collect_all_supported_files(project_root)?;
+        let files =
+            togi::diff::collect_all_supported_files(project_root, skip_noisy, exclude_globs)?;
         if files.is_empty() {
             println!("No supported source files found. Nothing to mutate.");
             return Ok(vec![]);
@@ -206,7 +217,11 @@ fn collect_files(
         return Ok(vec![]);
     }
 
-    let files = togi::diff::parse_diff(&diff_output);
+    let mut files = togi::diff::parse_diff(&diff_output);
+    if skip_noisy {
+        files.retain(|f| !togi::diff::is_noisy_file(&f.path));
+    }
+    files.retain(|f| !togi::diff::matches_user_excludes(&f.path, exclude_globs));
     if files.is_empty() {
         println!("No added/modified lines found. Nothing to mutate.");
         return Ok(vec![]);
