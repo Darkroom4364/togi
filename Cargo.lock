@@ -701,6 +701,7 @@ dependencies = [
  "clap",
  "colored",
  "diffy",
+ "globset",
  "ignore",
  "libc",
  "predicates",

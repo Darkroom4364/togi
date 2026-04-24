@@ -162,23 +162,21 @@ pub fn matches_user_excludes(path: &Path, globs: &[String]) -> bool {
     globs.iter().any(|pattern| glob_match(pattern, &path_str))
 }
 
-/// Simple glob matching: supports `*` (any chars except `/`) and `**` (any path).
+/// Glob matching via `globset`. Bare names (no `/`) are treated as directory
+/// names and match anywhere in the path tree.
 fn glob_match(pattern: &str, text: &str) -> bool {
-    if pattern.contains("**") {
-        let prefix = pattern.trim_end_matches("/**").trim_end_matches("**");
-        let normalized = prefix.trim_start_matches('/');
-        text.starts_with(&format!("{normalized}/"))
-            || text.contains(&format!("/{normalized}/"))
-            || text == normalized
-    } else if pattern.starts_with("*.") {
-        let suffix = &pattern[1..];
-        text.ends_with(suffix)
-    } else {
-        text.starts_with(&format!("{pattern}/"))
-            || text.contains(&format!("/{pattern}/"))
-            || text == pattern
-            || text.ends_with(&format!("/{pattern}"))
+    let build = |pat: &str| -> bool {
+        globset::GlobBuilder::new(pat)
+            .literal_separator(true)
+            .build()
+            .map(|g| g.compile_matcher().is_match(text))
+            .unwrap_or(false)
+    };
+    if !pattern.contains('/') && !pattern.contains('*') {
+        // Bare name like "vendor" — match as a path component anywhere
+        return build(&format!("**/{pattern}/**"));
     }
+    build(pattern)
 }
 
 /// Returns true for files that should be excluded from mutation testing:
@@ -232,7 +230,7 @@ pub fn is_noisy_file(path: &Path) -> bool {
         return true;
     }
     // Config files: vite.config.ts, jest.config.js, quasar.config.ts, etc.
-    if name.ends_with(".config") {
+    if name.ends_with(".config") || name.contains(".config.") {
         return true;
     }
     false
@@ -533,6 +531,7 @@ diff --git a/src/main.rs b/src/main.rs
         assert!(is_noisy_file(Path::new("jest.config.js")));
         assert!(is_noisy_file(Path::new("quasar.config.ts")));
         assert!(!is_noisy_file(Path::new("src/config.ts"))); // not a .config.ts file
+        assert!(is_noisy_file(Path::new("vite.config.local.ts")));
     }
 
     #[test]
@@ -560,6 +559,15 @@ diff --git a/src/main.rs b/src/main.rs
             Path::new("vendor-extra/lib.rs"),
             &globs2
         ));
+
+        // General glob patterns: **/seeds/**, src/*/gen.rs
+        let globs3 = vec!["**/seeds/**".into()];
+        assert!(matches_user_excludes(Path::new("db/seeds/data.ts"), &globs3));
+        assert!(!matches_user_excludes(Path::new("db/other/data.ts"), &globs3));
+
+        let globs4 = vec!["src/*/gen.rs".into()];
+        assert!(matches_user_excludes(Path::new("src/foo/gen.rs"), &globs4));
+        assert!(!matches_user_excludes(Path::new("src/foo/bar/gen.rs"), &globs4));
     }
 
     #[test]
