@@ -10,6 +10,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
 
+/// Languages that don't need a build/compile check before running tests.
+const INTERPRETED_LANGUAGES: &[&str] = &["python", "ruby", "javascript", "typescript"];
+
 fn to_cached(r: MutationResult) -> CachedResult {
     match r {
         MutationResult::Killed => CachedResult::Killed,
@@ -32,6 +35,7 @@ pub struct TestRunner {
     pub command: Vec<String>,
     pub language_commands: HashMap<String, Vec<String>>,
     pub build_command: Vec<String>,
+    pub build_command_explicit: bool,
     pub timeout: Duration,
     pub parallelism: usize,
     pub project_root: PathBuf,
@@ -87,13 +91,20 @@ impl TestRunner {
                 .clone();
             let timeout = self.timeout;
             let project_root = project_root.clone();
-            let build_command = build_command.clone();
+            let build_command =
+                if !self.build_command_explicit && INTERPRETED_LANGUAGES.contains(&language) {
+                    Arc::new(vec![])
+                } else {
+                    build_command.clone()
+                };
             let counter = counter.clone();
             let tested_counter = tested_counter.clone();
             let max_tested = self.max_tested;
             let show_output = self.show_output;
 
             let cmd_str = command.join(" ");
+            let build_str = build_command.join(" ");
+            let cache_ctx = format!("{};build={}", cmd_str, build_str);
 
             let handle = tokio::spawn(async move {
                 let mut results = Vec::new();
@@ -110,7 +121,7 @@ impl TestRunner {
                     let file_content = std::fs::read(&file_path).ok();
                     let cache_key = file_content
                         .as_ref()
-                        .map(|content| CacheKey::new(content, &mutation.description, &cmd_str));
+                        .map(|content| CacheKey::new(content, &mutation.description, &cache_ctx));
                     if let Some(ref key) = cache_key
                         && let Some(cached) = cache::lookup(&project_root, key)
                     {
@@ -670,6 +681,7 @@ mod tests {
             command: vec!["true".into()],
             language_commands: HashMap::new(),
             build_command: vec![],
+            build_command_explicit: false,
             timeout: Duration::from_secs(5),
             parallelism: 1,
             project_root: dir.path().to_path_buf(),
@@ -705,6 +717,7 @@ mod tests {
             command: vec!["true".into()],
             language_commands: lang_cmds,
             build_command: vec![],
+            build_command_explicit: false,
             timeout: Duration::from_secs(5),
             parallelism: 2,
             project_root: dir.path().to_path_buf(),
@@ -737,6 +750,7 @@ mod tests {
             command: vec!["true".into()], // default would survive
             language_commands: lang_cmds,
             build_command: vec![],
+            build_command_explicit: false,
             timeout: Duration::from_secs(5),
             parallelism: 1,
             project_root: dir.path().to_path_buf(),
