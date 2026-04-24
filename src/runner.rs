@@ -103,6 +103,8 @@ impl TestRunner {
             let show_output = self.show_output;
 
             let cmd_str = command.join(" ");
+            let build_str = build_command.join(" ");
+            let cache_ctx = format!("{};build={}", cmd_str, build_str);
 
             let handle = tokio::spawn(async move {
                 let mut results = Vec::new();
@@ -119,7 +121,7 @@ impl TestRunner {
                     let file_content = std::fs::read(&file_path).ok();
                     let cache_key = file_content
                         .as_ref()
-                        .map(|content| CacheKey::new(content, &mutation.description, &cmd_str));
+                        .map(|content| CacheKey::new(content, &mutation.description, &cache_ctx));
                     if let Some(ref key) = cache_key
                         && let Some(cached) = cache::lookup(&project_root, key)
                     {
