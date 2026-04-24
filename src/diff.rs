@@ -165,16 +165,19 @@ pub fn matches_user_excludes(path: &Path, globs: &[String]) -> bool {
 /// Simple glob matching: supports `*` (any chars except `/`) and `**` (any path).
 fn glob_match(pattern: &str, text: &str) -> bool {
     if pattern.contains("**") {
-        // "migrations/**" → check if any component matches prefix
         let prefix = pattern.trim_end_matches("/**").trim_end_matches("**");
-        text.starts_with(prefix) || text.contains(&format!("/{}", prefix.trim_start_matches('/')))
+        let normalized = prefix.trim_start_matches('/');
+        text.starts_with(&format!("{normalized}/"))
+            || text.contains(&format!("/{normalized}/"))
+            || text == normalized
     } else if pattern.starts_with("*.") {
-        // "*.config.ts" → check file name ends with suffix
-        let suffix = &pattern[1..]; // ".config.ts"
+        let suffix = &pattern[1..];
         text.ends_with(suffix)
     } else {
-        // Direct path prefix or exact match
-        text.starts_with(pattern) || text.contains(&format!("/{pattern}"))
+        text.starts_with(&format!("{pattern}/"))
+            || text.contains(&format!("/{pattern}/"))
+            || text == pattern
+            || text.ends_with(&format!("/{pattern}"))
     }
 }
 
@@ -538,6 +541,25 @@ diff --git a/src/main.rs b/src/main.rs
         assert!(matches_user_excludes(Path::new("vite.config.ts"), &globs));
         assert!(matches_user_excludes(Path::new("seeds/data.ts"), &globs));
         assert!(!matches_user_excludes(Path::new("src/main.ts"), &globs));
+    }
+
+    #[test]
+    fn glob_match_respects_directory_boundaries() {
+        // "test/**" should match test/ but not test-utils/
+        let globs = vec!["test/**".into()];
+        assert!(matches_user_excludes(Path::new("test/unit/foo.rs"), &globs));
+        assert!(!matches_user_excludes(
+            Path::new("test-utils/foo.rs"),
+            &globs
+        ));
+
+        // Direct pattern should match whole component
+        let globs2 = vec!["vendor".into()];
+        assert!(matches_user_excludes(Path::new("vendor/lib.rs"), &globs2));
+        assert!(!matches_user_excludes(
+            Path::new("vendor-extra/lib.rs"),
+            &globs2
+        ));
     }
 
     #[test]
