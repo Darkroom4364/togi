@@ -562,12 +562,21 @@ diff --git a/src/main.rs b/src/main.rs
 
         // General glob patterns: **/seeds/**, src/*/gen.rs
         let globs3 = vec!["**/seeds/**".into()];
-        assert!(matches_user_excludes(Path::new("db/seeds/data.ts"), &globs3));
-        assert!(!matches_user_excludes(Path::new("db/other/data.ts"), &globs3));
+        assert!(matches_user_excludes(
+            Path::new("db/seeds/data.ts"),
+            &globs3
+        ));
+        assert!(!matches_user_excludes(
+            Path::new("db/other/data.ts"),
+            &globs3
+        ));
 
         let globs4 = vec!["src/*/gen.rs".into()];
         assert!(matches_user_excludes(Path::new("src/foo/gen.rs"), &globs4));
-        assert!(!matches_user_excludes(Path::new("src/foo/bar/gen.rs"), &globs4));
+        assert!(!matches_user_excludes(
+            Path::new("src/foo/bar/gen.rs"),
+            &globs4
+        ));
     }
 
     #[test]
