@@ -96,12 +96,7 @@ pub fn generate_mutations(
         };
         let language_name = lang.name().to_string();
 
-        let nodes = find_mutable_nodes(
-            &tree,
-            &source,
-            &changed_file.hunks,
-            lang.skip_subtree_kinds(),
-        );
+        let nodes = find_mutable_nodes(&tree, &source, &changed_file.hunks, lang.as_ref());
 
         let mut file_mutations = Vec::new();
 

@@ -1,5 +1,6 @@
 // Map changed lines to AST nodes
 
+use crate::languages::LanguageSupport;
 use crate::{LineRange, ts_row_to_line};
 
 /// Node kinds that are relevant for mutation testing.
@@ -39,11 +40,11 @@ pub fn find_mutable_nodes<'a>(
     tree: &'a tree_sitter::Tree,
     source: &'a [u8],
     changed_lines: &[LineRange],
-    skip_subtree_kinds: &[&str],
+    lang: &dyn LanguageSupport,
 ) -> Vec<tree_sitter::Node<'a>> {
     let mut nodes = Vec::new();
     let root = tree.root_node();
-    collect_mutable_nodes(root, source, changed_lines, skip_subtree_kinds, &mut nodes);
+    collect_mutable_nodes(root, source, changed_lines, lang, &mut nodes);
     nodes
 }
 
@@ -55,11 +56,9 @@ fn collect_mutable_nodes<'a>(
     node: tree_sitter::Node<'a>,
     source: &'a [u8],
     changed_lines: &[LineRange],
-    skip_subtree_kinds: &[&str],
+    lang: &dyn LanguageSupport,
     results: &mut Vec<tree_sitter::Node<'a>>,
 ) -> bool {
-    let _ = source; // available for future use
-
     let node_start = ts_row_to_line(node.start_position().row);
     let node_end = ts_row_to_line(node.end_position().row);
 
@@ -68,8 +67,13 @@ fn collect_mutable_nodes<'a>(
         return false;
     }
 
-    // Skip subtrees that produce non-compilable mutations (imports, macros, etc.)
-    if skip_subtree_kinds.contains(&node.kind()) {
+    // Skip subtrees by kind (imports, macros, etc.)
+    if lang.skip_subtree_kinds().contains(&node.kind()) {
+        return true;
+    }
+
+    // Skip subtrees by content (test modules, test functions, etc.)
+    if lang.should_skip_node(&node, source) {
         return true;
     }
 
@@ -80,8 +84,7 @@ fn collect_mutable_nodes<'a>(
     for i in 0..child_count {
         if let Some(child) = node.child(i) {
             let before = results.len();
-            skipped_child |=
-                collect_mutable_nodes(child, source, changed_lines, skip_subtree_kinds, results);
+            skipped_child |= collect_mutable_nodes(child, source, changed_lines, lang, results);
             if results.len() > before {
                 found_child = true;
             }
@@ -112,6 +115,52 @@ fn is_mutable_kind(kind: &str) -> bool {
 mod tests {
     use super::*;
 
+    struct StubLang {
+        skip_kinds: &'static [&'static str],
+    }
+
+    impl StubLang {
+        fn new() -> Self {
+            Self { skip_kinds: &[] }
+        }
+        fn with_skip(skip_kinds: &'static [&'static str]) -> Self {
+            Self { skip_kinds }
+        }
+    }
+
+    impl LanguageSupport for StubLang {
+        fn name(&self) -> &str {
+            "stub"
+        }
+        fn extensions(&self) -> &[&str] {
+            &[]
+        }
+        fn tree_sitter_language(&self) -> tree_sitter::Language {
+            tree_sitter_go::LANGUAGE.into()
+        }
+        fn binary_expression_node(&self) -> &str {
+            "binary_expression"
+        }
+        fn if_statement_node(&self) -> &str {
+            "if_statement"
+        }
+        fn boolean_true_literals(&self) -> &[&str] {
+            &["true"]
+        }
+        fn boolean_false_literals(&self) -> &[&str] {
+            &["false"]
+        }
+        fn return_statement_node(&self) -> &str {
+            "return_statement"
+        }
+        fn operator_field(&self) -> &str {
+            "operator"
+        }
+        fn skip_subtree_kinds(&self) -> &[&str] {
+            self.skip_kinds
+        }
+    }
+
     fn parse_go(source: &[u8]) -> tree_sitter::Tree {
         let mut parser = tree_sitter::Parser::new();
         let lang = tree_sitter_go::LANGUAGE;
@@ -126,7 +175,7 @@ mod tests {
         let tree = parse_go(source);
         let changed = vec![LineRange { start: 3, end: 4 }];
 
-        let nodes = find_mutable_nodes(&tree, source, &changed, &[]);
+        let nodes = find_mutable_nodes(&tree, source, &changed, &StubLang::new());
 
         assert!(!nodes.is_empty());
         let kinds: Vec<&str> = nodes.iter().map(|n| n.kind()).collect();
@@ -139,7 +188,7 @@ mod tests {
         let tree = parse_go(source);
         let changed: Vec<LineRange> = vec![];
 
-        let nodes = find_mutable_nodes(&tree, source, &changed, &[]);
+        let nodes = find_mutable_nodes(&tree, source, &changed, &StubLang::new());
 
         assert!(nodes.is_empty());
     }
@@ -151,7 +200,7 @@ mod tests {
         let tree = parse_go(source);
         let changed = vec![LineRange { start: 4, end: 4 }];
 
-        let nodes = find_mutable_nodes(&tree, source, &changed, &[]);
+        let nodes = find_mutable_nodes(&tree, source, &changed, &StubLang::new());
 
         assert!(!nodes.is_empty());
         let kinds: Vec<&str> = nodes.iter().map(|n| n.kind()).collect();
@@ -176,7 +225,7 @@ mod tests {
             LineRange { start: 5, end: 7 },
         ];
 
-        let nodes = find_mutable_nodes(&tree, source, &changed, &[]);
+        let nodes = find_mutable_nodes(&tree, source, &changed, &StubLang::new());
 
         let kinds: Vec<&str> = nodes.iter().map(|n| n.kind()).collect();
         // Should find binary expressions from both return statements
@@ -195,7 +244,7 @@ mod tests {
         let tree = parse_go(source);
         let changed = vec![LineRange { start: 4, end: 4 }];
 
-        let nodes = find_mutable_nodes(&tree, source, &changed, &[]);
+        let nodes = find_mutable_nodes(&tree, source, &changed, &StubLang::new());
 
         assert!(!nodes.is_empty());
         let kinds: Vec<&str> = nodes.iter().map(|n| n.kind()).collect();
@@ -214,7 +263,7 @@ mod tests {
         let tree = parse_go(source);
         let changed = vec![LineRange { start: 5, end: 5 }];
 
-        let nodes = find_mutable_nodes(&tree, source, &changed, &[]);
+        let nodes = find_mutable_nodes(&tree, source, &changed, &StubLang::new());
 
         assert!(!nodes.is_empty());
         let kinds: Vec<&str> = nodes.iter().map(|n| n.kind()).collect();
@@ -237,7 +286,7 @@ mod tests {
         // Only the inner if line is changed
         let changed = vec![LineRange { start: 5, end: 6 }];
 
-        let nodes = find_mutable_nodes(&tree, source, &changed, &[]);
+        let nodes = find_mutable_nodes(&tree, source, &changed, &StubLang::new());
 
         assert!(!nodes.is_empty());
         let kinds: Vec<&str> = nodes.iter().map(|n| n.kind()).collect();
@@ -257,7 +306,7 @@ mod tests {
         let tree = parse_go(source);
         let changed = vec![LineRange { start: 6, end: 6 }];
 
-        let nodes = find_mutable_nodes(&tree, source, &changed, &[]);
+        let nodes = find_mutable_nodes(&tree, source, &changed, &StubLang::new());
 
         assert!(!nodes.is_empty());
         let kinds: Vec<&str> = nodes.iter().map(|n| n.kind()).collect();
@@ -276,7 +325,7 @@ mod tests {
         let tree = parse_go(source);
         let changed = vec![LineRange { start: 3, end: 4 }];
 
-        let nodes = find_mutable_nodes(&tree, source, &changed, &[]);
+        let nodes = find_mutable_nodes(&tree, source, &changed, &StubLang::new());
 
         assert!(
             nodes.is_empty(),
@@ -293,7 +342,7 @@ mod tests {
         // Only the package line is changed
         let changed = vec![LineRange { start: 1, end: 1 }];
 
-        let nodes = find_mutable_nodes(&tree, source, &changed, &[]);
+        let nodes = find_mutable_nodes(&tree, source, &changed, &StubLang::new());
 
         assert!(
             nodes.is_empty(),
@@ -316,7 +365,7 @@ mod tests {
         let tree = parse_rust(source);
         let changed = vec![LineRange { start: 2, end: 2 }];
 
-        let nodes = find_mutable_nodes(&tree, source, &changed, &[]);
+        let nodes = find_mutable_nodes(&tree, source, &changed, &StubLang::new());
 
         assert!(!nodes.is_empty());
         let kinds: Vec<&str> = nodes.iter().map(|n| n.kind()).collect();
@@ -335,8 +384,8 @@ mod tests {
         let tree = parse_rust(source);
         let changed = vec![LineRange { start: 1, end: 2 }];
 
-        let skip = &["use_declaration"];
-        let nodes = find_mutable_nodes(&tree, source, &changed, skip);
+        let lang = StubLang::with_skip(&["use_declaration"]);
+        let nodes = find_mutable_nodes(&tree, source, &changed, &lang);
 
         // Should find `true` in the function but nothing from the use declaration
         let kinds: Vec<&str> = nodes.iter().map(|n| n.kind()).collect();
@@ -358,8 +407,8 @@ mod tests {
         let tree = parse_rust(source);
         let changed = vec![LineRange { start: 1, end: 4 }];
 
-        let skip = &["macro_invocation"];
-        let nodes = find_mutable_nodes(&tree, source, &changed, skip);
+        let lang = StubLang::with_skip(&["macro_invocation"]);
+        let nodes = find_mutable_nodes(&tree, source, &changed, &lang);
 
         let kinds: Vec<&str> = nodes.iter().map(|n| n.kind()).collect();
         assert!(
@@ -385,8 +434,8 @@ mod tests {
         let tree = parse_go(source);
         let changed = vec![LineRange { start: 1, end: 7 }];
 
-        let skip = &["import_spec"];
-        let nodes = find_mutable_nodes(&tree, source, &changed, skip);
+        let lang = StubLang::with_skip(&["import_spec"]);
+        let nodes = find_mutable_nodes(&tree, source, &changed, &lang);
 
         let kinds: Vec<&str> = nodes.iter().map(|n| n.kind()).collect();
         assert!(
@@ -423,8 +472,8 @@ mod tests {
         let tree = parse_typescript(source);
         let changed = vec![LineRange { start: 1, end: 2 }];
 
-        let skip = &["import_statement"];
-        let nodes = find_mutable_nodes(&tree, source, &changed, skip);
+        let lang = StubLang::with_skip(&["import_statement"]);
+        let nodes = find_mutable_nodes(&tree, source, &changed, &lang);
 
         let kinds: Vec<&str> = nodes.iter().map(|n| n.kind()).collect();
         assert!(
@@ -445,8 +494,8 @@ mod tests {
         let tree = parse_typescript(source);
         let changed = vec![LineRange { start: 1, end: 1 }];
 
-        let skip = &["type_annotation"];
-        let nodes = find_mutable_nodes(&tree, source, &changed, skip);
+        let lang = StubLang::with_skip(&["type_annotation"]);
+        let nodes = find_mutable_nodes(&tree, source, &changed, &lang);
 
         let kinds: Vec<&str> = nodes.iter().map(|n| n.kind()).collect();
         assert!(
@@ -462,8 +511,8 @@ mod tests {
         let tree = parse_java(source);
         let changed = vec![LineRange { start: 1, end: 2 }];
 
-        let skip = &["import_declaration"];
-        let nodes = find_mutable_nodes(&tree, source, &changed, skip);
+        let lang = StubLang::with_skip(&["import_declaration"]);
+        let nodes = find_mutable_nodes(&tree, source, &changed, &lang);
 
         let kinds: Vec<&str> = nodes.iter().map(|n| n.kind()).collect();
         assert!(
@@ -479,8 +528,8 @@ mod tests {
         let tree = parse_csharp(source);
         let changed = vec![LineRange { start: 1, end: 2 }];
 
-        let skip = &["using_directive"];
-        let nodes = find_mutable_nodes(&tree, source, &changed, skip);
+        let lang = StubLang::with_skip(&["using_directive"]);
+        let nodes = find_mutable_nodes(&tree, source, &changed, &lang);
 
         let kinds: Vec<&str> = nodes.iter().map(|n| n.kind()).collect();
         assert!(
@@ -497,7 +546,7 @@ mod tests {
         let tree = parse_rust(source);
         let changed = vec![LineRange { start: 3, end: 4 }];
 
-        let nodes = find_mutable_nodes(&tree, source, &changed, &[]);
+        let nodes = find_mutable_nodes(&tree, source, &changed, &StubLang::new());
 
         assert!(!nodes.is_empty());
         let kinds: Vec<&str> = nodes.iter().map(|n| n.kind()).collect();
@@ -506,5 +555,54 @@ mod tests {
             "Expected deepest nodes from nested Rust if, got: {:?}",
             kinds
         );
+    }
+
+    #[test]
+    fn rust_cfg_test_module_skipped() {
+        let source = b"fn prod() -> bool { true }\n\n#[cfg(test)]\nmod tests {\n    fn test_something() -> bool { true }\n}\n";
+        let tree = parse_rust(source);
+        let changed = vec![LineRange { start: 1, end: 6 }];
+        let lang = crate::languages::rust_lang::Rust;
+        let nodes = find_mutable_nodes(&tree, source, &changed, &lang);
+        // Should find `true` in prod() but nothing from mod tests
+        let kinds: Vec<&str> = nodes.iter().map(|n| n.kind()).collect();
+        assert!(
+            kinds.contains(&"true"),
+            "Should find `true` in production code, got: {:?}",
+            kinds
+        );
+        // All nodes should be from line 1 (prod function), none from line 4+
+        for node in &nodes {
+            let line = crate::ts_row_to_line(node.start_position().row);
+            assert!(
+                line < 3,
+                "Found mutation at line {} inside #[cfg(test)] module",
+                line
+            );
+        }
+    }
+
+    #[test]
+    fn rust_test_function_skipped() {
+        let source =
+            b"fn prod() -> bool { true }\n\n#[test]\nfn test_foo() -> bool {\n    1 + 2 == 3\n}\n";
+        let tree = parse_rust(source);
+        let changed = vec![LineRange { start: 1, end: 6 }];
+        let lang = crate::languages::rust_lang::Rust;
+        let nodes = find_mutable_nodes(&tree, source, &changed, &lang);
+        let kinds: Vec<&str> = nodes.iter().map(|n| n.kind()).collect();
+        assert!(
+            kinds.contains(&"true"),
+            "Should find `true` in production code, got: {:?}",
+            kinds
+        );
+        for node in &nodes {
+            let line = crate::ts_row_to_line(node.start_position().row);
+            assert!(
+                line < 3,
+                "Found mutation at line {} inside #[test] function",
+                line
+            );
+        }
     }
 }

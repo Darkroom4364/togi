@@ -25,6 +25,12 @@ pub trait LanguageSupport: Send + Sync {
     fn skip_subtree_kinds(&self) -> &[&str] {
         &[]
     }
+
+    /// Content-aware node skip check. Called during tree walking to skip
+    /// entire subtrees (e.g., test modules, test functions).
+    fn should_skip_node(&self, _node: &tree_sitter::Node, _source: &[u8]) -> bool {
+        false
+    }
 }
 
 /// Returns instances of all supported languages.
