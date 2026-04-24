@@ -62,11 +62,7 @@ impl LanguageSupport for Rust {
 
 /// Check if a node has a preceding sibling `attribute_item` matching a predicate.
 /// Normalizes whitespace before matching. Walks backward through consecutive attributes.
-fn has_attribute(
-    node: &tree_sitter::Node,
-    source: &[u8],
-    matches: impl Fn(&str) -> bool,
-) -> bool {
+fn has_attribute(node: &tree_sitter::Node, source: &[u8], matches: impl Fn(&str) -> bool) -> bool {
     let mut sibling = node.prev_sibling();
     while let Some(sib) = sibling {
         if sib.kind() == "attribute_item" {
