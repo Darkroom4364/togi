@@ -53,7 +53,10 @@ impl LanguageSupport for Rust {
         match node.kind() {
             "mod_item" => has_attribute(node, source, |attr| attr == "#[cfg(test)]"),
             "function_item" => has_attribute(node, source, |attr| {
-                attr == "#[test]" || attr.contains("::test]")
+                attr == "#[test]"
+                    || attr.contains("::test]")
+                    || attr.contains("::test(")
+                    || attr.starts_with("#[test(")
             }),
             _ => false,
         }
