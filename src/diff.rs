@@ -172,8 +172,12 @@ fn glob_match(pattern: &str, text: &str) -> bool {
             .map(|g| g.compile_matcher().is_match(text))
             .unwrap_or(false)
     };
-    if !pattern.contains('/') && !pattern.contains('*') {
-        // Bare name like "vendor" — match as a path component anywhere
+    if !pattern.contains('/') {
+        if pattern.contains('*') {
+            // Wildcard like "*.generated.ts" — match at any depth
+            return build(&format!("**/{pattern}"));
+        }
+        // Bare name like "vendor" — match as a directory anywhere
         return build(&format!("**/{pattern}/**"));
     }
     build(pattern)
@@ -540,6 +544,14 @@ diff --git a/src/main.rs b/src/main.rs
         assert!(matches_user_excludes(Path::new("vite.config.ts"), &globs));
         assert!(matches_user_excludes(Path::new("seeds/data.ts"), &globs));
         assert!(!matches_user_excludes(Path::new("src/main.ts"), &globs));
+
+        // Wildcard patterns without `/` match at any depth
+        let globs2 = vec!["*.generated.ts".into()];
+        assert!(matches_user_excludes(
+            Path::new("src/foo.generated.ts"),
+            &globs2
+        ));
+        assert!(!matches_user_excludes(Path::new("src/foo.ts"), &globs2));
     }
 
     #[test]
