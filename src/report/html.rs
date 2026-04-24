@@ -50,8 +50,9 @@ pub fn generate_report(report: &MutationReport) -> Result<String> {
         });
     }
 
-    let score_pct = if report.total > 0 {
-        (report.killed as f64 / report.total as f64) * 100.0
+    let tested = report.total - report.build_errors;
+    let score_pct = if tested > 0 {
+        (report.killed as f64 / tested as f64) * 100.0
     } else {
         100.0
     };

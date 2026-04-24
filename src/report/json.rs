@@ -10,6 +10,7 @@ struct JsonReport {
     survived: usize,
     timeout: usize,
     build_errors: usize,
+    mutation_score: f64,
     duration_ms: u128,
     mutations: Vec<JsonMutation>,
 }
@@ -75,13 +76,20 @@ pub fn to_json_string(report: &MutationReport) -> Result<String> {
         })
         .collect();
 
+    let tested = report.total - report.build_errors;
+    let mutation_score = if tested > 0 {
+        (report.killed as f64 / tested as f64) * 100.0
+    } else {
+        100.0
+    };
     let json_report = JsonReport {
         total: report.total,
-        tested: report.total - report.build_errors,
+        tested,
         killed: report.killed,
         survived: report.survived,
         timeout: report.timeout,
         build_errors: report.build_errors,
+        mutation_score,
         duration_ms: report.duration.as_millis(),
         mutations,
     };
@@ -159,6 +167,7 @@ mod tests {
         assert_eq!(value["survived"], 1);
         assert_eq!(value["timeout"], 0);
         assert_eq!(value["build_errors"], 0);
+        assert_eq!(value["mutation_score"], 50.0);
         assert_eq!(value["duration_ms"], 1234);
 
         let mutations = value["mutations"].as_array().unwrap();

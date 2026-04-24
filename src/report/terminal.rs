@@ -77,17 +77,17 @@ pub fn print_report(report: &MutationReport) {
 
     let separator = "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━";
     println!("{}", separator);
-    let tested = report.total - report.build_errors;
     println!(
-        "Results: {}/{} mutations killed ({} survived)",
-        report.killed, tested, report.survived
+        "Results: {} killed, {} build errors, {} survived",
+        report.killed, report.build_errors, report.survived
     );
-    if report.build_errors > 0 {
-        println!(
-            "Build errors: {} (filtered, not counted in score)",
-            report.build_errors
-        );
-    }
+    let tested = report.total - report.build_errors;
+    let score = if tested > 0 {
+        (report.killed as f64 / tested as f64) * 100.0
+    } else {
+        100.0
+    };
+    println!("Mutation score (test kills only): {:.1}%", score);
     println!("Duration: {:.2}s", report.duration.as_secs_f64());
     println!("{}", separator);
 }
@@ -147,21 +147,19 @@ pub fn format_report_plain(report: &MutationReport) -> String {
 
     let separator = "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━";
     writeln!(out, "{}", separator).unwrap();
-    let tested = report.total - report.build_errors;
     writeln!(
         out,
-        "Results: {}/{} mutations killed ({} survived)",
-        report.killed, tested, report.survived
+        "Results: {} killed, {} build errors, {} survived",
+        report.killed, report.build_errors, report.survived
     )
     .unwrap();
-    if report.build_errors > 0 {
-        writeln!(
-            out,
-            "Build errors: {} (filtered, not counted in score)",
-            report.build_errors
-        )
-        .unwrap();
-    }
+    let tested = report.total - report.build_errors;
+    let score = if tested > 0 {
+        (report.killed as f64 / tested as f64) * 100.0
+    } else {
+        100.0
+    };
+    writeln!(out, "Mutation score (test kills only): {:.1}%", score).unwrap();
     writeln!(out, "Duration: {:.2}s", report.duration.as_secs_f64()).unwrap();
     writeln!(out, "{}", separator).unwrap();
 
@@ -240,7 +238,8 @@ mod tests {
     fn terminal_output_contains_summary() {
         let report = sample_report();
         let output = format_report_plain(&report);
-        assert!(output.contains("Results: 1/2 mutations killed (1 survived)"));
+        assert!(output.contains("Results: 1 killed, 0 build errors, 1 survived"));
+        assert!(output.contains("Mutation score (test kills only): 50.0%"));
         assert!(output.contains("Duration: 1.23s"));
     }
 }
