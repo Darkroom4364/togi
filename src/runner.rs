@@ -10,6 +10,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
 
+/// Languages that don't need a build/compile check before running tests.
+const INTERPRETED_LANGUAGES: &[&str] = &["python", "ruby", "javascript", "typescript"];
+
 fn to_cached(r: MutationResult) -> CachedResult {
     match r {
         MutationResult::Killed => CachedResult::Killed,
@@ -87,7 +90,11 @@ impl TestRunner {
                 .clone();
             let timeout = self.timeout;
             let project_root = project_root.clone();
-            let build_command = build_command.clone();
+            let build_command = if INTERPRETED_LANGUAGES.contains(&language) {
+                Arc::new(vec![])
+            } else {
+                build_command.clone()
+            };
             let counter = counter.clone();
             let tested_counter = tested_counter.clone();
             let max_tested = self.max_tested;
