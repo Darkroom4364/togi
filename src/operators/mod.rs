@@ -11,8 +11,17 @@ pub trait MutationOperator: Send + Sync {
     fn apply(&self, node: &tree_sitter::Node, source: &[u8]) -> Vec<crate::MutationCandidate>;
 }
 
-pub(crate) const IF_STMT_KINDS: &[&str] = &["if_statement", "if_expression", "if_expr"];
-const RETURN_KINDS: &[&str] = &["return_statement", "return_expression"];
+pub(crate) const IF_STMT_KINDS: &[&str] = &[
+    "if_statement",
+    "if_expression",
+    "if_expr",
+    "if", // Ruby
+];
+const RETURN_KINDS: &[&str] = &[
+    "return_statement",
+    "return_expression",
+    "return", // Ruby
+];
 
 /// Negate a condition: remove `!` if present, otherwise wrap with `!(...)`
 pub struct NegateCondition;
