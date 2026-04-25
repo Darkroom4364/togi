@@ -56,10 +56,45 @@ fn should_skip_return_empty(node: &tree_sitter::Node, language: &str) -> bool {
     }
 }
 
+/// Check if a string_to_empty mutation should be skipped because the string
+/// is inside a context where emptying it almost always causes a build error
+/// in compiled languages (const items, static items, match arms).
+fn should_skip_string_to_empty(node: &tree_sitter::Node, language: &str) -> bool {
+    match language {
+        "rust" | "go" | "c" | "cpp" | "c_sharp" | "java" | "typescript" => {}
+        _ => return false,
+    }
+    let mut parent = node.parent();
+    while let Some(p) = parent {
+        match p.kind() {
+            "const_item" | "const_declaration" | "static_item" => return true,
+            "match_arm" => return true,
+            // Stop walking at function boundaries
+            k if FUNC_NODE_KINDS.contains(&k) => return false,
+            _ => parent = p.parent(),
+        }
+    }
+    false
+}
+
+/// Adjust replacement text for language-specific syntax.
+fn fixup_replacement(candidate: &mut MutationCandidate, language: &str) {
+    if candidate.operator_id == "remove_if_body" && candidate.replacement == "{}" {
+        match language {
+            "python" => candidate.replacement = "pass".to_string(),
+            "ruby" => candidate.replacement = "nil".to_string(),
+            _ => {}
+        }
+    }
+}
+
 /// Check if a mutation candidate should be filtered out for the given language.
 fn should_filter(candidate: &MutationCandidate, node: &tree_sitter::Node, language: &str) -> bool {
     if candidate.operator_id == "return_empty" {
         return should_skip_return_empty(node, language);
+    }
+    if candidate.operator_id == "string_to_empty" {
+        return should_skip_string_to_empty(node, language);
     }
     false
 }
@@ -103,10 +138,11 @@ pub fn generate_mutations(
         for node in &nodes {
             for op in &operators {
                 let candidates = op.apply(node, &source);
-                for candidate in candidates {
+                for mut candidate in candidates {
                     if should_filter(&candidate, node, &language_name) {
                         continue;
                     }
+                    fixup_replacement(&mut candidate, &language_name);
 
                     if candidate.byte_range.start > candidate.byte_range.end
                         || candidate.byte_range.end > source.len()
