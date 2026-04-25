@@ -68,7 +68,7 @@ fn should_skip_string_to_empty(node: &tree_sitter::Node, language: &str) -> bool
     while let Some(p) = parent {
         match p.kind() {
             "const_item" | "const_declaration" | "static_item" => return true,
-            "match_arm" | "match_expression" => return true,
+            "match_arm" => return true,
             // Stop walking at function boundaries
             k if FUNC_NODE_KINDS.contains(&k) => return false,
             _ => parent = p.parent(),
