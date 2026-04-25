@@ -10,6 +10,23 @@ struct FileStats {
     mutations: Vec<MutationEntry>,
 }
 
+impl FileStats {
+    fn score_pct(&self) -> f64 {
+        let tested = self.total.saturating_sub(self.build_errors);
+        if tested > 0 {
+            (self.killed as f64 / tested as f64) * 100.0
+        } else if self.total == 0 {
+            100.0
+        } else {
+            0.0
+        }
+    }
+
+    fn tested(&self) -> usize {
+        self.total.saturating_sub(self.build_errors)
+    }
+}
+
 struct MutationEntry {
     line: usize,
     operator: String,
@@ -99,15 +116,7 @@ pub fn generate_report(report: &MutationReport) -> Result<String> {
     write!(html, "<h2>Files</h2><ul>")?;
 
     for (path, stats) in &files {
-        let file_tested = stats.total.saturating_sub(stats.build_errors);
-        let file_pct = if file_tested > 0 {
-            (stats.killed as f64 / file_tested as f64) * 100.0
-        } else if stats.total == 0 {
-            100.0
-        } else {
-            0.0
-        };
-        let class = score_class(file_pct);
+        let class = score_class(stats.score_pct());
         write!(
             html,
             "<li><a href=\"#{}\" class=\"{}\"><code>{}</code> \
@@ -116,7 +125,7 @@ pub fn generate_report(report: &MutationReport) -> Result<String> {
             class,
             html_escape(path),
             stats.killed,
-            file_tested
+            stats.tested()
         )?;
     }
 
@@ -124,23 +133,14 @@ pub fn generate_report(report: &MutationReport) -> Result<String> {
 
     // Per-file sections
     for (path, stats) in &files {
-        let file_tested = stats.total.saturating_sub(stats.build_errors);
-        let file_pct = if file_tested > 0 {
-            (stats.killed as f64 / file_tested as f64) * 100.0
-        } else if stats.total == 0 {
-            100.0
-        } else {
-            0.0
-        };
-
         write!(
             html,
             "<section id=\"{}\"><h3><code>{}</code> \
              <span class=\"score-inline {}\">({:.0}%)</span></h3>",
             slug(path),
             html_escape(path),
-            score_class(file_pct),
-            file_pct
+            score_class(stats.score_pct()),
+            stats.score_pct()
         )?;
 
         write!(

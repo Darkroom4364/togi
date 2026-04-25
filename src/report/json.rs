@@ -182,6 +182,54 @@ mod tests {
     }
 
     #[test]
+    fn json_score_zero_when_all_build_errors() {
+        let report = MutationReport {
+            results: vec![(
+                Mutation {
+                    id: 1,
+                    file: PathBuf::from("src/a.rs"),
+                    language: String::new(),
+                    line: 1,
+                    column: 1,
+                    operator: "op".to_string(),
+                    description: "d".to_string(),
+                    original: "x".to_string(),
+                    replacement: "y".to_string(),
+                    byte_range: 0..1,
+                },
+                MutationResult::BuildError,
+            )],
+            duration: Duration::from_millis(100),
+            total: 1,
+            killed: 0,
+            survived: 0,
+            timeout: 0,
+            build_errors: 1,
+        };
+        let json_str = to_json_string(&report).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(value["mutation_score"], 0.0);
+        assert_eq!(value["tested"], 0);
+    }
+
+    #[test]
+    fn json_score_100_when_empty_report() {
+        let report = MutationReport {
+            results: vec![],
+            duration: Duration::from_millis(0),
+            total: 0,
+            killed: 0,
+            survived: 0,
+            timeout: 0,
+            build_errors: 0,
+        };
+        let json_str = to_json_string(&report).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(value["mutation_score"], 100.0);
+        assert_eq!(value["total"], 0);
+    }
+
+    #[test]
     fn json_survived_includes_diff_fields() {
         let report = sample_report();
         let json_str = to_json_string(&report).unwrap();

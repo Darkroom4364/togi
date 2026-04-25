@@ -2,6 +2,17 @@ use crate::{MutationReport, MutationResult};
 #[allow(unused_imports)]
 use colored::Colorize;
 
+fn mutation_score(report: &MutationReport) -> f64 {
+    let tested = report.total - report.build_errors;
+    if tested > 0 {
+        (report.killed as f64 / tested as f64) * 100.0
+    } else if report.total == 0 {
+        100.0
+    } else {
+        0.0
+    }
+}
+
 pub fn print_report(report: &MutationReport) {
     println!();
 
@@ -81,15 +92,7 @@ pub fn print_report(report: &MutationReport) {
         "Results: {} killed, {} survived, {} timeout, {} build errors",
         report.killed, report.survived, report.timeout, report.build_errors
     );
-    let tested = report.total - report.build_errors;
-    let score = if tested > 0 {
-        (report.killed as f64 / tested as f64) * 100.0
-    } else if report.total == 0 {
-        100.0
-    } else {
-        0.0
-    };
-    println!("Mutation score (test kills only): {:.1}%", score);
+    println!("Mutation score (test kills only): {:.1}%", mutation_score(report));
     println!("Duration: {:.2}s", report.duration.as_secs_f64());
     println!("{}", separator);
 }
@@ -155,15 +158,7 @@ pub fn format_report_plain(report: &MutationReport) -> String {
         report.killed, report.survived, report.timeout, report.build_errors
     )
     .unwrap();
-    let tested = report.total - report.build_errors;
-    let score = if tested > 0 {
-        (report.killed as f64 / tested as f64) * 100.0
-    } else if report.total == 0 {
-        100.0
-    } else {
-        0.0
-    };
-    writeln!(out, "Mutation score (test kills only): {:.1}%", score).unwrap();
+    writeln!(out, "Mutation score (test kills only): {:.1}%", mutation_score(report)).unwrap();
     writeln!(out, "Duration: {:.2}s", report.duration.as_secs_f64()).unwrap();
     writeln!(out, "{}", separator).unwrap();
 
@@ -236,6 +231,69 @@ mod tests {
         assert!(output.contains("✗ SURVIVED"));
         assert!(output.contains("src/handler.rs:15"));
         assert!(output.contains("Your tests don't catch this mutation."));
+    }
+
+    #[test]
+    fn terminal_output_summary_with_timeout_and_build_errors() {
+        let report = MutationReport {
+            results: vec![
+                (
+                    Mutation {
+                        id: 1,
+                        file: PathBuf::from("src/a.rs"),
+                        language: String::new(),
+                        line: 1,
+                        column: 1,
+                        operator: "op".to_string(),
+                        description: "d".to_string(),
+                        original: "x".to_string(),
+                        replacement: "y".to_string(),
+                        byte_range: 0..1,
+                    },
+                    MutationResult::Killed,
+                ),
+                (
+                    Mutation {
+                        id: 2,
+                        file: PathBuf::from("src/b.rs"),
+                        language: String::new(),
+                        line: 2,
+                        column: 1,
+                        operator: "op".to_string(),
+                        description: "d".to_string(),
+                        original: "x".to_string(),
+                        replacement: "y".to_string(),
+                        byte_range: 0..1,
+                    },
+                    MutationResult::Timeout,
+                ),
+                (
+                    Mutation {
+                        id: 3,
+                        file: PathBuf::from("src/c.rs"),
+                        language: String::new(),
+                        line: 3,
+                        column: 1,
+                        operator: "op".to_string(),
+                        description: "d".to_string(),
+                        original: "x".to_string(),
+                        replacement: "y".to_string(),
+                        byte_range: 0..1,
+                    },
+                    MutationResult::BuildError,
+                ),
+            ],
+            duration: Duration::from_millis(500),
+            total: 3,
+            killed: 1,
+            survived: 0,
+            timeout: 1,
+            build_errors: 1,
+        };
+        let output = format_report_plain(&report);
+        assert!(output.contains("Results: 1 killed, 0 survived, 1 timeout, 1 build errors"));
+        // tested = 3 - 1 = 2, score = 1/2 = 50%
+        assert!(output.contains("Mutation score (test kills only): 50.0%"));
     }
 
     #[test]
