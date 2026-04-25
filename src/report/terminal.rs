@@ -92,7 +92,10 @@ pub fn print_report(report: &MutationReport) {
         "Results: {} killed, {} survived, {} timeout, {} build errors",
         report.killed, report.survived, report.timeout, report.build_errors
     );
-    println!("Mutation score (test kills only): {:.1}%", mutation_score(report));
+    println!(
+        "Mutation score (test kills only): {:.1}%",
+        mutation_score(report)
+    );
     println!("Duration: {:.2}s", report.duration.as_secs_f64());
     println!("{}", separator);
 }
@@ -158,7 +161,12 @@ pub fn format_report_plain(report: &MutationReport) -> String {
         report.killed, report.survived, report.timeout, report.build_errors
     )
     .unwrap();
-    writeln!(out, "Mutation score (test kills only): {:.1}%", mutation_score(report)).unwrap();
+    writeln!(
+        out,
+        "Mutation score (test kills only): {:.1}%",
+        mutation_score(report)
+    )
+    .unwrap();
     writeln!(out, "Duration: {:.2}s", report.duration.as_secs_f64()).unwrap();
     writeln!(out, "{}", separator).unwrap();
 
