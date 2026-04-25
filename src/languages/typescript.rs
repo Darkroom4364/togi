@@ -1,57 +1,15 @@
-use crate::languages::LanguageSupport;
-
-pub struct TypeScript;
-
-impl LanguageSupport for TypeScript {
-    fn name(&self) -> &str {
-        "typescript"
-    }
-
-    fn extensions(&self) -> &[&str] {
-        &["ts", "tsx"]
-    }
-
-    fn tree_sitter_language(&self) -> tree_sitter::Language {
-        tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()
-    }
-
-    fn binary_expression_node(&self) -> &str {
-        "binary_expression"
-    }
-
-    fn if_statement_node(&self) -> &str {
-        "if_statement"
-    }
-
-    fn boolean_true_literals(&self) -> &[&str] {
-        &["true"]
-    }
-
-    fn boolean_false_literals(&self) -> &[&str] {
-        &["false"]
-    }
-
-    fn return_statement_node(&self) -> &str {
-        "return_statement"
-    }
-
-    fn operator_field(&self) -> &str {
-        "operator"
-    }
-
-    fn skip_subtree_kinds(&self) -> &[&str] {
-        &[
-            "import_statement",
-            "type_annotation",
-            "type_alias_declaration",
-            "decorator",
-        ]
-    }
-}
+crate::languages::define_language!(
+    TypeScript,
+    name: "typescript",
+    extensions: ["ts", "tsx"],
+    ts_language: tree_sitter_typescript::LANGUAGE_TYPESCRIPT,
+    skip_subtree_kinds: ["import_statement", "type_annotation", "type_alias_declaration", "decorator"],
+);
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::languages::LanguageSupport;
     use tree_sitter::Parser;
 
     #[test]

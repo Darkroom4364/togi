@@ -1,48 +1,17 @@
-use crate::languages::LanguageSupport;
-
-pub struct Python;
-
-impl LanguageSupport for Python {
-    fn name(&self) -> &str {
-        "python"
-    }
-
-    fn extensions(&self) -> &[&str] {
-        &["py"]
-    }
-
-    fn tree_sitter_language(&self) -> tree_sitter::Language {
-        tree_sitter_python::LANGUAGE.into()
-    }
-
-    fn binary_expression_node(&self) -> &str {
-        "binary_operator"
-    }
-
-    fn if_statement_node(&self) -> &str {
-        "if_statement"
-    }
-
-    fn boolean_true_literals(&self) -> &[&str] {
-        &["True"]
-    }
-
-    fn boolean_false_literals(&self) -> &[&str] {
-        &["False"]
-    }
-
-    fn return_statement_node(&self) -> &str {
-        "return_statement"
-    }
-
-    fn operator_field(&self) -> &str {
-        "operator"
-    }
-}
+crate::languages::define_language!(
+    Python,
+    name: "python",
+    extensions: ["py"],
+    ts_language: tree_sitter_python::LANGUAGE,
+    binary_expression: "binary_operator",
+    bool_true: ["True"],
+    bool_false: ["False"],
+);
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::languages::LanguageSupport;
     use crate::test_helpers::{walk_for_kind, walk_for_two_kinds};
 
     #[test]
