@@ -219,7 +219,7 @@ mod tests {
     use std::path::PathBuf;
     use tempfile::TempDir;
 
-    fn write_go_file(dir: &Path, rel_path: &str, content: &str) -> PathBuf {
+    fn write_test_file(dir: &Path, rel_path: &str, content: &str) -> PathBuf {
         let full = dir.join(rel_path);
         std::fs::create_dir_all(full.parent().unwrap()).unwrap();
         std::fs::write(&full, content).unwrap();
@@ -231,7 +231,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         // Use `x < y` (no literal children) so the mapper returns binary_expression
         let source = "package main\n\nfunc check(x, y int) bool {\n\tif x < y {\n\t\treturn true\n\t}\n\treturn false\n}\n";
-        let rel = write_go_file(tmp.path(), "src/main.go", source);
+        let rel = write_test_file(tmp.path(), "src/main.go", source);
 
         let changed = vec![ChangedFile {
             path: rel,
@@ -258,7 +258,7 @@ mod tests {
     fn respects_max_mutations() {
         let tmp = TempDir::new().unwrap();
         let source = "package main\n\nfunc check(x int) bool {\n\tif x < 10 {\n\t\treturn true\n\t}\n\treturn false\n}\n";
-        let rel = write_go_file(tmp.path(), "main.go", source);
+        let rel = write_test_file(tmp.path(), "main.go", source);
 
         let changed = vec![ChangedFile {
             path: rel,
@@ -286,10 +286,10 @@ mod tests {
     fn generates_mutations_for_multiple_files() {
         let tmp = TempDir::new().unwrap();
         let go_src = "package main\n\nfunc f() bool {\n\treturn true\n}\n";
-        let go_rel = write_go_file(tmp.path(), "a.go", go_src);
+        let go_rel = write_test_file(tmp.path(), "a.go", go_src);
 
         let go_src2 = "package main\n\nfunc g(x, y int) bool {\n\treturn x < y\n}\n";
-        let go_rel2 = write_go_file(tmp.path(), "b.go", go_src2);
+        let go_rel2 = write_test_file(tmp.path(), "b.go", go_src2);
 
         let changed = vec![
             ChangedFile {
@@ -316,7 +316,7 @@ mod tests {
     fn generates_mutations_for_python_file() {
         let tmp = TempDir::new().unwrap();
         let py_src = "def check(x, y):\n    return x < y\n";
-        let rel = write_go_file(tmp.path(), "test.py", py_src);
+        let rel = write_test_file(tmp.path(), "test.py", py_src);
 
         let changed = vec![ChangedFile {
             path: rel,
@@ -332,7 +332,7 @@ mod tests {
     fn generates_mutations_for_rust_file() {
         let tmp = TempDir::new().unwrap();
         let rs_src = "fn check(x: i32, y: i32) -> bool {\n    x < y\n}\n";
-        let rel = write_go_file(tmp.path(), "lib.rs", rs_src);
+        let rel = write_test_file(tmp.path(), "lib.rs", rs_src);
 
         let changed = vec![ChangedFile {
             path: rel,
@@ -348,7 +348,7 @@ mod tests {
     fn mutation_ids_are_sequential() {
         let tmp = TempDir::new().unwrap();
         let src = "package main\n\nfunc f(x, y int) bool {\n\tif x < y {\n\t\treturn true\n\t}\n\treturn false\n}\n";
-        let rel = write_go_file(tmp.path(), "main.go", src);
+        let rel = write_test_file(tmp.path(), "main.go", src);
 
         let changed = vec![ChangedFile {
             path: rel,
@@ -366,7 +366,7 @@ mod tests {
     fn rust_return_empty_skipped_for_result_type() {
         let tmp = TempDir::new().unwrap();
         let src = "fn f() -> Result<i32, String> {\n    return Ok(42);\n}\n";
-        let rel = write_go_file(tmp.path(), "lib.rs", src);
+        let rel = write_test_file(tmp.path(), "lib.rs", src);
 
         let changed = vec![ChangedFile {
             path: rel,
@@ -388,7 +388,7 @@ mod tests {
         // Use a function call as return value — call_expression is not in MUTABLE_NODE_KINDS,
         // so the mapper yields the return_expression itself.
         let src = "fn f() -> i32 {\n    return compute();\n}\n";
-        let rel = write_go_file(tmp.path(), "lib.rs", src);
+        let rel = write_test_file(tmp.path(), "lib.rs", src);
 
         let changed = vec![ChangedFile {
             path: rel,
@@ -408,7 +408,7 @@ mod tests {
     fn go_return_empty_skipped_for_multi_return() {
         let tmp = TempDir::new().unwrap();
         let src = "package main\n\nfunc f() (int, error) {\n\treturn 0, nil\n}\n";
-        let rel = write_go_file(tmp.path(), "main.go", src);
+        let rel = write_test_file(tmp.path(), "main.go", src);
 
         let changed = vec![ChangedFile {
             path: rel,
@@ -427,7 +427,7 @@ mod tests {
     #[test]
     fn skips_unsupported_file_types() {
         let tmp = TempDir::new().unwrap();
-        let rel = write_go_file(tmp.path(), "notes.txt", "hello world");
+        let rel = write_test_file(tmp.path(), "notes.txt", "hello world");
 
         let changed = vec![ChangedFile {
             path: rel,
@@ -443,7 +443,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         // File with many mutable nodes
         let src = "package main\n\nfunc f(a, b, c, d int) bool {\n\tif a < b {\n\t\treturn true\n\t}\n\tif c < d {\n\t\treturn false\n\t}\n\treturn a > c\n}\n";
-        let rel = write_go_file(tmp.path(), "main.go", src);
+        let rel = write_test_file(tmp.path(), "main.go", src);
 
         let changed = vec![ChangedFile {
             path: rel,

@@ -77,13 +77,6 @@ pub fn to_json_string(report: &MutationReport) -> Result<String> {
         .collect();
 
     let tested = report.total - report.build_errors;
-    let mutation_score = if tested > 0 {
-        (report.killed as f64 / tested as f64) * 100.0
-    } else if report.total == 0 {
-        100.0
-    } else {
-        0.0
-    };
     let json_report = JsonReport {
         total: report.total,
         tested,
@@ -91,7 +84,7 @@ pub fn to_json_string(report: &MutationReport) -> Result<String> {
         survived: report.survived,
         timeout: report.timeout,
         build_errors: report.build_errors,
-        mutation_score,
+        mutation_score: super::mutation_score(report),
         duration_ms: report.duration.as_millis(),
         mutations,
     };
@@ -103,51 +96,9 @@ pub fn to_json_string(report: &MutationReport) -> Result<String> {
 mod tests {
     use super::*;
     use crate::Mutation;
+    use crate::test_helpers::sample_report;
     use std::path::PathBuf;
     use std::time::Duration;
-
-    fn sample_report() -> MutationReport {
-        MutationReport {
-            results: vec![
-                (
-                    Mutation {
-                        id: 1,
-                        file: PathBuf::from("src/auth.rs"),
-                        language: String::new(),
-                        line: 47,
-                        column: 10,
-                        operator: "binary/lt_to_lte".to_string(),
-                        description: "changed < to <=".to_string(),
-                        original: "<".to_string(),
-                        replacement: "<=".to_string(),
-                        byte_range: 0..1,
-                    },
-                    MutationResult::Killed,
-                ),
-                (
-                    Mutation {
-                        id: 2,
-                        file: PathBuf::from("src/handler.rs"),
-                        language: String::new(),
-                        line: 15,
-                        column: 5,
-                        operator: "binary/eq_to_neq".to_string(),
-                        description: "changed == to !=".to_string(),
-                        original: "==".to_string(),
-                        replacement: "!=".to_string(),
-                        byte_range: 0..2,
-                    },
-                    MutationResult::Survived,
-                ),
-            ],
-            duration: Duration::from_millis(1234),
-            total: 2,
-            killed: 1,
-            survived: 1,
-            timeout: 0,
-            build_errors: 0,
-        }
-    }
 
     #[test]
     fn json_output_is_valid_json() {

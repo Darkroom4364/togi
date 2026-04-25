@@ -74,13 +74,7 @@ pub fn generate_report(report: &MutationReport) -> Result<String> {
     }
 
     let tested = report.total - report.build_errors;
-    let score_pct = if tested > 0 {
-        (report.killed as f64 / tested as f64) * 100.0
-    } else if report.total == 0 {
-        100.0
-    } else {
-        0.0
-    };
+    let score_pct = super::mutation_score(report);
 
     let mut html = String::new();
     write!(
@@ -249,51 +243,9 @@ a.score-good,a.score-ok,a.score-bad{color:inherit}
 mod tests {
     use super::*;
     use crate::Mutation;
+    use crate::test_helpers::sample_report;
     use std::path::PathBuf;
     use std::time::Duration;
-
-    fn sample_report() -> MutationReport {
-        MutationReport {
-            results: vec![
-                (
-                    Mutation {
-                        id: 1,
-                        file: PathBuf::from("src/auth.rs"),
-                        language: "rust".to_string(),
-                        line: 47,
-                        column: 10,
-                        operator: "binary/lt_to_lte".to_string(),
-                        description: "changed < to <=".to_string(),
-                        original: "<".to_string(),
-                        replacement: "<=".to_string(),
-                        byte_range: 0..1,
-                    },
-                    MutationResult::Killed,
-                ),
-                (
-                    Mutation {
-                        id: 2,
-                        file: PathBuf::from("src/handler.rs"),
-                        language: "rust".to_string(),
-                        line: 15,
-                        column: 5,
-                        operator: "binary/eq_to_neq".to_string(),
-                        description: "changed == to !=".to_string(),
-                        original: "==".to_string(),
-                        replacement: "!=".to_string(),
-                        byte_range: 0..2,
-                    },
-                    MutationResult::Survived,
-                ),
-            ],
-            duration: Duration::from_millis(1234),
-            total: 2,
-            killed: 1,
-            survived: 1,
-            timeout: 0,
-            build_errors: 0,
-        }
-    }
 
     #[test]
     fn html_contains_doctype() {
