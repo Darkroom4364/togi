@@ -108,6 +108,12 @@ pub fn generate_mutations(
                         continue;
                     }
 
+                    if candidate.byte_range.start > candidate.byte_range.end
+                        || candidate.byte_range.end > source.len()
+                    {
+                        continue;
+                    }
+
                     let line = ts_row_to_line(node.start_position().row);
                     let column = node.start_position().column + 1;
                     let original =
