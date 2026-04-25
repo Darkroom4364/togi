@@ -1,5 +1,52 @@
-/// Shared test utilities for tree-sitter parsing and node lookup.
-/// Used across operator and language tests to avoid duplication.
+/// Shared test utilities.
+/// Used across operator, language, and report tests to avoid duplication.
+use crate::{Mutation, MutationReport, MutationResult};
+use std::path::PathBuf;
+use std::time::Duration;
+
+/// A standard two-mutation report for testing report formatters.
+pub fn sample_report() -> MutationReport {
+    MutationReport {
+        results: vec![
+            (
+                Mutation {
+                    id: 1,
+                    file: PathBuf::from("src/auth.rs"),
+                    language: String::new(),
+                    line: 47,
+                    column: 10,
+                    operator: "binary/lt_to_lte".to_string(),
+                    description: "changed < to <=".to_string(),
+                    original: "<".to_string(),
+                    replacement: "<=".to_string(),
+                    byte_range: 0..1,
+                },
+                MutationResult::Killed,
+            ),
+            (
+                Mutation {
+                    id: 2,
+                    file: PathBuf::from("src/handler.rs"),
+                    language: String::new(),
+                    line: 15,
+                    column: 5,
+                    operator: "binary/eq_to_neq".to_string(),
+                    description: "changed == to !=".to_string(),
+                    original: "==".to_string(),
+                    replacement: "!=".to_string(),
+                    byte_range: 0..2,
+                },
+                MutationResult::Survived,
+            ),
+        ],
+        duration: Duration::from_millis(1234),
+        total: 2,
+        killed: 1,
+        survived: 1,
+        timeout: 0,
+        build_errors: 0,
+    }
+}
 
 /// Parse Go source code into a tree-sitter tree.
 pub fn parse_go(src: &str) -> tree_sitter::Tree {

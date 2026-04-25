@@ -1,52 +1,15 @@
-use crate::languages::LanguageSupport;
-
-pub struct Java;
-
-impl LanguageSupport for Java {
-    fn name(&self) -> &str {
-        "java"
-    }
-
-    fn extensions(&self) -> &[&str] {
-        &["java"]
-    }
-
-    fn tree_sitter_language(&self) -> tree_sitter::Language {
-        tree_sitter_java::LANGUAGE.into()
-    }
-
-    fn binary_expression_node(&self) -> &str {
-        "binary_expression"
-    }
-
-    fn if_statement_node(&self) -> &str {
-        "if_statement"
-    }
-
-    fn boolean_true_literals(&self) -> &[&str] {
-        &["true"]
-    }
-
-    fn boolean_false_literals(&self) -> &[&str] {
-        &["false"]
-    }
-
-    fn return_statement_node(&self) -> &str {
-        "return_statement"
-    }
-
-    fn operator_field(&self) -> &str {
-        "operator"
-    }
-
-    fn skip_subtree_kinds(&self) -> &[&str] {
-        &["import_declaration", "annotation", "type_parameters"]
-    }
-}
+crate::languages::define_language!(
+    Java,
+    name: "java",
+    extensions: ["java"],
+    ts_language: tree_sitter_java::LANGUAGE,
+    skip_subtree_kinds: ["import_declaration", "annotation", "type_parameters"],
+);
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::languages::LanguageSupport;
 
     #[test]
     fn test_java_extension_detection() {

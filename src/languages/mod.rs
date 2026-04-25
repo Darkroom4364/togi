@@ -8,6 +8,71 @@ pub mod ruby;
 pub mod rust_lang;
 pub mod typescript;
 
+/// Generates a `LanguageSupport` impl from declarative config.
+///
+/// Required: struct name, language name, extensions, tree-sitter language path.
+/// Optional overrides (with defaults matching C-family languages):
+///   binary_expression: "binary_expression"
+///   if_statement: "if_statement"
+///   return_statement: "return_statement"
+///   bool_true: ["true"]
+///   bool_false: ["false"]
+///   operator_field: "operator"
+///   skip_subtree_kinds: []
+macro_rules! define_language {
+    (
+        $struct:ident,
+        name: $name:expr,
+        extensions: [$($ext:expr),* $(,)?],
+        ts_language: $ts_lang:expr
+        $(, binary_expression: $bin:expr)?
+        $(, if_statement: $if_node:expr)?
+        $(, return_statement: $ret:expr)?
+        $(, bool_true: [$($bt:expr),* $(,)?])?
+        $(, bool_false: [$($bf:expr),* $(,)?])?
+        $(, operator_field: $op:expr)?
+        $(, skip_subtree_kinds: [$($sk:expr),* $(,)?])?
+        $(,)?
+    ) => {
+        pub struct $struct;
+
+        impl $crate::languages::LanguageSupport for $struct {
+            fn name(&self) -> &str { $name }
+            fn extensions(&self) -> &[&str] { &[$($ext),*] }
+            fn tree_sitter_language(&self) -> tree_sitter::Language { $ts_lang.into() }
+            fn binary_expression_node(&self) -> &str {
+                $crate::languages::define_language!(@first $($bin)? ; "binary_expression")
+            }
+            fn if_statement_node(&self) -> &str {
+                $crate::languages::define_language!(@first $($if_node)? ; "if_statement")
+            }
+            fn return_statement_node(&self) -> &str {
+                $crate::languages::define_language!(@first $($ret)? ; "return_statement")
+            }
+            fn boolean_true_literals(&self) -> &[&str] {
+                $crate::languages::define_language!(@arr [$($($bt),*)?] ; ["true"])
+            }
+            fn boolean_false_literals(&self) -> &[&str] {
+                $crate::languages::define_language!(@arr [$($($bf),*)?] ; ["false"])
+            }
+            fn operator_field(&self) -> &str {
+                $crate::languages::define_language!(@first $($op)? ; "operator")
+            }
+            fn skip_subtree_kinds(&self) -> &[&str] {
+                $crate::languages::define_language!(@arr [$($($sk),*)?] ; [])
+            }
+        }
+    };
+    // Helper: return first value if present, otherwise default
+    (@first $val:expr ; $default:expr) => { $val };
+    (@first ; $default:expr) => { $default };
+    // Helper: return array if non-empty, otherwise default
+    (@arr [$($val:expr),+] ; [$($default:expr),*]) => { &[$($val),+] };
+    (@arr [] ; [$($default:expr),*]) => { &[$($default),*] };
+}
+
+pub(crate) use define_language;
+
 /// Language-specific configuration for tree-sitter parsing and node identification
 pub trait LanguageSupport: Send + Sync {
     fn name(&self) -> &str;

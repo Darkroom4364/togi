@@ -1,48 +1,14 @@
-use crate::languages::LanguageSupport;
-
-pub struct Cpp;
-
-impl LanguageSupport for Cpp {
-    fn name(&self) -> &str {
-        "cpp"
-    }
-
-    fn extensions(&self) -> &[&str] {
-        &["cpp", "cc", "cxx", "hpp", "hxx"]
-    }
-
-    fn tree_sitter_language(&self) -> tree_sitter::Language {
-        tree_sitter_cpp::LANGUAGE.into()
-    }
-
-    fn binary_expression_node(&self) -> &str {
-        "binary_expression"
-    }
-
-    fn if_statement_node(&self) -> &str {
-        "if_statement"
-    }
-
-    fn boolean_true_literals(&self) -> &[&str] {
-        &["true"]
-    }
-
-    fn boolean_false_literals(&self) -> &[&str] {
-        &["false"]
-    }
-
-    fn return_statement_node(&self) -> &str {
-        "return_statement"
-    }
-
-    fn operator_field(&self) -> &str {
-        "operator"
-    }
-}
+crate::languages::define_language!(
+    Cpp,
+    name: "cpp",
+    extensions: ["cpp", "cc", "cxx", "hpp", "hxx"],
+    ts_language: tree_sitter_cpp::LANGUAGE,
+);
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::languages::LanguageSupport;
 
     #[test]
     fn test_cpp_extension_detection() {

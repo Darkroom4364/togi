@@ -1,52 +1,15 @@
-use crate::languages::LanguageSupport;
-
-pub struct CSharp;
-
-impl LanguageSupport for CSharp {
-    fn name(&self) -> &str {
-        "c_sharp"
-    }
-
-    fn extensions(&self) -> &[&str] {
-        &["cs"]
-    }
-
-    fn tree_sitter_language(&self) -> tree_sitter::Language {
-        tree_sitter_c_sharp::LANGUAGE.into()
-    }
-
-    fn binary_expression_node(&self) -> &str {
-        "binary_expression"
-    }
-
-    fn if_statement_node(&self) -> &str {
-        "if_statement"
-    }
-
-    fn boolean_true_literals(&self) -> &[&str] {
-        &["true"]
-    }
-
-    fn boolean_false_literals(&self) -> &[&str] {
-        &["false"]
-    }
-
-    fn return_statement_node(&self) -> &str {
-        "return_statement"
-    }
-
-    fn operator_field(&self) -> &str {
-        "operator"
-    }
-
-    fn skip_subtree_kinds(&self) -> &[&str] {
-        &["using_directive", "attribute", "type_parameter_list"]
-    }
-}
+crate::languages::define_language!(
+    CSharp,
+    name: "c_sharp",
+    extensions: ["cs"],
+    ts_language: tree_sitter_c_sharp::LANGUAGE,
+    skip_subtree_kinds: ["using_directive", "attribute", "type_parameter_list"],
+);
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::languages::LanguageSupport;
 
     #[test]
     fn test_csharp_extension_detection() {

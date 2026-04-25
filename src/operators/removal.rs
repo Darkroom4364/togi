@@ -1,7 +1,5 @@
-use super::MutationOperator;
+use super::{IF_STMT_KINDS, MutationOperator};
 use crate::MutationCandidate;
-
-const IF_STMT_KINDS: &[&str] = &["if_statement", "if_expression", "if_expr"];
 
 pub struct RemoveIfBody;
 
