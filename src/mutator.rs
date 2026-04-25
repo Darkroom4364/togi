@@ -56,10 +56,34 @@ fn should_skip_return_empty(node: &tree_sitter::Node, language: &str) -> bool {
     }
 }
 
+/// Check if a string_to_empty mutation should be skipped because the string
+/// is inside a context where emptying it almost always causes a build error
+/// in compiled languages (const items, static items, match arms).
+fn should_skip_string_to_empty(node: &tree_sitter::Node, language: &str) -> bool {
+    match language {
+        "rust" | "go" | "c" | "cpp" | "c_sharp" | "java" | "typescript" => {}
+        _ => return false,
+    }
+    let mut parent = node.parent();
+    while let Some(p) = parent {
+        match p.kind() {
+            "const_item" | "const_declaration" | "static_item" => return true,
+            "match_arm" | "match_expression" => return true,
+            // Stop walking at function boundaries
+            k if FUNC_NODE_KINDS.contains(&k) => return false,
+            _ => parent = p.parent(),
+        }
+    }
+    false
+}
+
 /// Check if a mutation candidate should be filtered out for the given language.
 fn should_filter(candidate: &MutationCandidate, node: &tree_sitter::Node, language: &str) -> bool {
     if candidate.operator_id == "return_empty" {
         return should_skip_return_empty(node, language);
+    }
+    if candidate.operator_id == "string_to_empty" {
+        return should_skip_string_to_empty(node, language);
     }
     false
 }
