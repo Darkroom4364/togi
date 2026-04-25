@@ -76,7 +76,7 @@ pub fn to_json_string(report: &MutationReport) -> Result<String> {
         })
         .collect();
 
-    let tested = report.total - report.build_errors;
+    let tested = report.total.saturating_sub(report.build_errors);
     let json_report = JsonReport {
         total: report.total,
         tested,

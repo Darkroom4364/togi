@@ -7,7 +7,7 @@ use std::fs;
 
 /// Compute mutation score as a percentage, excluding build errors from the denominator.
 pub fn mutation_score(report: &MutationReport) -> f64 {
-    let tested = report.total - report.build_errors;
+    let tested = report.total.saturating_sub(report.build_errors);
     if tested > 0 {
         (report.killed as f64 / tested as f64) * 100.0
     } else if report.total == 0 {

@@ -73,7 +73,7 @@ pub fn generate_report(report: &MutationReport) -> Result<String> {
         });
     }
 
-    let tested = report.total - report.build_errors;
+    let tested = report.total.saturating_sub(report.build_errors);
     let score_pct = super::mutation_score(report);
 
     let mut html = String::new();
