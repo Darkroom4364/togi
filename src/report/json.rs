@@ -10,6 +10,7 @@ struct JsonReport {
     survived: usize,
     timeout: usize,
     build_errors: usize,
+    mutation_score: f64,
     duration_ms: u128,
     mutations: Vec<JsonMutation>,
 }
@@ -75,13 +76,22 @@ pub fn to_json_string(report: &MutationReport) -> Result<String> {
         })
         .collect();
 
+    let tested = report.total - report.build_errors;
+    let mutation_score = if tested > 0 {
+        (report.killed as f64 / tested as f64) * 100.0
+    } else if report.total == 0 {
+        100.0
+    } else {
+        0.0
+    };
     let json_report = JsonReport {
         total: report.total,
-        tested: report.total - report.build_errors,
+        tested,
         killed: report.killed,
         survived: report.survived,
         timeout: report.timeout,
         build_errors: report.build_errors,
+        mutation_score,
         duration_ms: report.duration.as_millis(),
         mutations,
     };
@@ -159,6 +169,7 @@ mod tests {
         assert_eq!(value["survived"], 1);
         assert_eq!(value["timeout"], 0);
         assert_eq!(value["build_errors"], 0);
+        assert_eq!(value["mutation_score"], 50.0);
         assert_eq!(value["duration_ms"], 1234);
 
         let mutations = value["mutations"].as_array().unwrap();
@@ -168,6 +179,54 @@ mod tests {
         assert_eq!(mutations[0]["operator"], "binary/lt_to_lte");
         assert_eq!(mutations[0]["result"], "killed");
         assert_eq!(mutations[1]["result"], "survived");
+    }
+
+    #[test]
+    fn json_score_zero_when_all_build_errors() {
+        let report = MutationReport {
+            results: vec![(
+                Mutation {
+                    id: 1,
+                    file: PathBuf::from("src/a.rs"),
+                    language: String::new(),
+                    line: 1,
+                    column: 1,
+                    operator: "op".to_string(),
+                    description: "d".to_string(),
+                    original: "x".to_string(),
+                    replacement: "y".to_string(),
+                    byte_range: 0..1,
+                },
+                MutationResult::BuildError,
+            )],
+            duration: Duration::from_millis(100),
+            total: 1,
+            killed: 0,
+            survived: 0,
+            timeout: 0,
+            build_errors: 1,
+        };
+        let json_str = to_json_string(&report).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(value["mutation_score"], 0.0);
+        assert_eq!(value["tested"], 0);
+    }
+
+    #[test]
+    fn json_score_100_when_empty_report() {
+        let report = MutationReport {
+            results: vec![],
+            duration: Duration::from_millis(0),
+            total: 0,
+            killed: 0,
+            survived: 0,
+            timeout: 0,
+            build_errors: 0,
+        };
+        let json_str = to_json_string(&report).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(value["mutation_score"], 100.0);
+        assert_eq!(value["total"], 0);
     }
 
     #[test]

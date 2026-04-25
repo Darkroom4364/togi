@@ -5,8 +5,26 @@ use std::fmt::Write;
 
 struct FileStats {
     total: usize,
+    build_errors: usize,
     killed: usize,
     mutations: Vec<MutationEntry>,
+}
+
+impl FileStats {
+    fn score_pct(&self) -> f64 {
+        let tested = self.total.saturating_sub(self.build_errors);
+        if tested > 0 {
+            (self.killed as f64 / tested as f64) * 100.0
+        } else if self.total == 0 {
+            100.0
+        } else {
+            0.0
+        }
+    }
+
+    fn tested(&self) -> usize {
+        self.total.saturating_sub(self.build_errors)
+    }
 }
 
 struct MutationEntry {
@@ -30,15 +48,20 @@ pub fn generate_report(report: &MutationReport) -> Result<String> {
             MutationResult::BuildError => "build_error",
         };
         let killed = matches!(result, MutationResult::Killed);
+        let build_error = matches!(result, MutationResult::BuildError);
 
         let stats = files.entry(file_path).or_insert(FileStats {
             total: 0,
+            build_errors: 0,
             killed: 0,
             mutations: Vec::new(),
         });
         stats.total += 1;
         if killed {
             stats.killed += 1;
+        }
+        if build_error {
+            stats.build_errors += 1;
         }
         stats.mutations.push(MutationEntry {
             line: mutation.line,
@@ -50,10 +73,13 @@ pub fn generate_report(report: &MutationReport) -> Result<String> {
         });
     }
 
-    let score_pct = if report.total > 0 {
-        (report.killed as f64 / report.total as f64) * 100.0
-    } else {
+    let tested = report.total - report.build_errors;
+    let score_pct = if tested > 0 {
+        (report.killed as f64 / tested as f64) * 100.0
+    } else if report.total == 0 {
         100.0
+    } else {
+        0.0
     };
 
     let mut html = String::new();
@@ -78,7 +104,7 @@ pub fn generate_report(report: &MutationReport) -> Result<String> {
          &mdash; {:.2}s</div></header>",
         score_pct,
         report.killed,
-        report.total,
+        tested,
         report.survived,
         report.timeout,
         report.build_errors,
@@ -90,12 +116,7 @@ pub fn generate_report(report: &MutationReport) -> Result<String> {
     write!(html, "<h2>Files</h2><ul>")?;
 
     for (path, stats) in &files {
-        let file_pct = if stats.total > 0 {
-            (stats.killed as f64 / stats.total as f64) * 100.0
-        } else {
-            100.0
-        };
-        let class = score_class(file_pct);
+        let class = score_class(stats.score_pct());
         write!(
             html,
             "<li><a href=\"#{}\" class=\"{}\"><code>{}</code> \
@@ -104,7 +125,7 @@ pub fn generate_report(report: &MutationReport) -> Result<String> {
             class,
             html_escape(path),
             stats.killed,
-            stats.total
+            stats.tested()
         )?;
     }
 
@@ -112,20 +133,14 @@ pub fn generate_report(report: &MutationReport) -> Result<String> {
 
     // Per-file sections
     for (path, stats) in &files {
-        let file_pct = if stats.total > 0 {
-            (stats.killed as f64 / stats.total as f64) * 100.0
-        } else {
-            100.0
-        };
-
         write!(
             html,
             "<section id=\"{}\"><h3><code>{}</code> \
              <span class=\"score-inline {}\">({:.0}%)</span></h3>",
             slug(path),
             html_escape(path),
-            score_class(file_pct),
-            file_pct
+            score_class(stats.score_pct()),
+            stats.score_pct()
         )?;
 
         write!(
