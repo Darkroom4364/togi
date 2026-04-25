@@ -49,6 +49,9 @@ pub fn mutation_diff(mutation: &Mutation) -> Option<String> {
     if byte_end > original_line.len() {
         return None;
     }
+    if !original_line.is_char_boundary(byte_start) || !original_line.is_char_boundary(byte_end) {
+        return None;
+    }
     let mutated_line = format!(
         "{}{}{}",
         &original_line[..byte_start],
@@ -180,6 +183,28 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let content = "hello\n";
         let m = make_mutation(tmp.path(), "t.go", content, 0, 1, "h", "H");
+        assert!(mutation_diff(&m).is_none());
+    }
+
+    #[test]
+    fn mutation_diff_multibyte_chars() {
+        let tmp = TempDir::new().unwrap();
+        // "日本語 = true\n" — CJK chars are 3 bytes each
+        let content = "日本語 = true\n";
+        // "true" starts at byte offset 12 (9 bytes for CJK + 3 for " = ")
+        // column is 1-indexed byte offset: 13
+        let m = make_mutation(tmp.path(), "t.rs", content, 1, 13, "true", "false");
+        let diff = mutation_diff(&m).unwrap();
+        assert!(diff.contains("-日本語 = true"), "{diff}");
+        assert!(diff.contains("+日本語 = false"), "{diff}");
+    }
+
+    #[test]
+    fn mutation_diff_invalid_char_boundary_returns_none() {
+        let tmp = TempDir::new().unwrap();
+        let content = "日本語\n";
+        // column 2 (1-indexed) → byte_start 1, which is mid-character
+        let m = make_mutation(tmp.path(), "t.rs", content, 1, 2, "x", "y");
         assert!(mutation_diff(&m).is_none());
     }
 }

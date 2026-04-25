@@ -288,7 +288,7 @@ async fn run_single_mutation(
     // Apply mutation
     let mut mutated = original.clone();
     let range = mutation.byte_range.clone();
-    if range.end > mutated.len() {
+    if range.start > range.end || range.end > mutated.len() {
         return MutationOutcome {
             result: MutationResult::BuildError,
             test_output: None,
