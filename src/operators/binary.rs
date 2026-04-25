@@ -1,7 +1,13 @@
 use super::MutationOperator;
 use crate::MutationCandidate;
 
-const BINARY_EXPR_KINDS: &[&str] = &["binary_expression", "binary_expr", "comparison_expression"];
+const BINARY_EXPR_KINDS: &[&str] = &[
+    "binary_expression",
+    "binary_expr",
+    "comparison_expression",
+    "binary_operator", // Python
+    "binary",          // Ruby
+];
 
 pub fn find_operator_child(
     node: &tree_sitter::Node,

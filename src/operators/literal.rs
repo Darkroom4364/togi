@@ -1,9 +1,15 @@
 use super::MutationOperator;
 use crate::MutationCandidate;
 
-const TRUE_KINDS: &[&str] = &["true", "True", "TRUE"];
-const FALSE_KINDS: &[&str] = &["false", "False", "FALSE"];
-const INT_LITERAL_KINDS: &[&str] = &["integer_literal", "int_literal", "number", "number_literal"];
+const TRUE_KINDS: &[&str] = &["true", "True", "TRUE", "boolean_literal"];
+const FALSE_KINDS: &[&str] = &["false", "False", "FALSE", "boolean_literal"];
+const INT_LITERAL_KINDS: &[&str] = &[
+    "integer_literal",
+    "int_literal",
+    "integer", // Ruby
+    "number",
+    "number_literal",
+];
 const STRING_LITERAL_KINDS: &[&str] = &[
     "interpreted_string_literal",
     "raw_string_literal",

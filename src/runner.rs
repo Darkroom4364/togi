@@ -210,8 +210,9 @@ impl TestRunner {
 
         let mut all_results = Vec::new();
         for handle in handles {
-            if let Ok(results) = handle.await {
-                all_results.extend(results);
+            match handle.await {
+                Ok(results) => all_results.extend(results),
+                Err(e) => eprintln!("warning: mutation task panicked: {e}"),
             }
         }
 
@@ -343,6 +344,7 @@ async fn run_command(
         cmd.stderr(std::process::Stdio::null());
     }
 
+    cmd.kill_on_drop(true);
     let child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {

@@ -6,14 +6,19 @@ use crate::{LineRange, ts_row_to_line};
 /// Node kinds that are relevant for mutation testing.
 const MUTABLE_NODE_KINDS: &[&str] = &[
     "binary_expression",
+    "binary_operator", // Python
+    "binary",          // Ruby
     "if_statement",
     "if_expression",
+    "if", // Ruby
     "return_statement",
     "return_expression",
+    "return", // Ruby
     "true",
     "false",
     "integer_literal",
     "int_literal",
+    "integer", // Ruby
     "number",
     "number_literal",
     "unary_expression",
@@ -93,7 +98,7 @@ fn collect_mutable_nodes<'a>(
 
     // Only add this node if no relevant children were found, no children were
     // skipped, and it's a mutable kind
-    if !found_child && !skipped_child && is_mutable_kind(node.kind()) {
+    if !found_child && !skipped_child && node.is_named() && is_mutable_kind(node.kind()) {
         results.push(node);
     }
     false
@@ -395,7 +400,7 @@ mod tests {
             kinds
         );
         assert!(
-            kinds.contains(&"true"),
+            kinds.contains(&"true") || kinds.contains(&"boolean_literal"),
             "Should still find mutable nodes outside skipped ancestors, got: {:?}",
             kinds
         );
@@ -422,8 +427,8 @@ mod tests {
             kinds
         );
         assert!(
-            kinds.contains(&"true"),
-            "Should still find `true` outside macro, got: {:?}",
+            kinds.contains(&"true") || kinds.contains(&"boolean_literal"),
+            "Should still find boolean literal outside macro, got: {:?}",
             kinds
         );
     }
@@ -567,8 +572,8 @@ mod tests {
         // Should find `true` in prod() but nothing from mod tests
         let kinds: Vec<&str> = nodes.iter().map(|n| n.kind()).collect();
         assert!(
-            kinds.contains(&"true"),
-            "Should find `true` in production code, got: {:?}",
+            kinds.contains(&"true") || kinds.contains(&"boolean_literal"),
+            "Should find boolean literal in production code, got: {:?}",
             kinds
         );
         // All nodes should be from line 1 (prod function), none from line 4+
@@ -592,8 +597,8 @@ mod tests {
         let nodes = find_mutable_nodes(&tree, source, &changed, &lang);
         let kinds: Vec<&str> = nodes.iter().map(|n| n.kind()).collect();
         assert!(
-            kinds.contains(&"true"),
-            "Should find `true` in production code, got: {:?}",
+            kinds.contains(&"true") || kinds.contains(&"boolean_literal"),
+            "Should find boolean literal in production code, got: {:?}",
             kinds
         );
         for node in &nodes {
