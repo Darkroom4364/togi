@@ -79,8 +79,10 @@ pub fn to_json_string(report: &MutationReport) -> Result<String> {
     let tested = report.total - report.build_errors;
     let mutation_score = if tested > 0 {
         (report.killed as f64 / tested as f64) * 100.0
-    } else {
+    } else if report.total == 0 {
         100.0
+    } else {
+        0.0
     };
     let json_report = JsonReport {
         total: report.total,

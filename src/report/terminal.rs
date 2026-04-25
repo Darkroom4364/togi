@@ -78,14 +78,16 @@ pub fn print_report(report: &MutationReport) {
     let separator = "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━";
     println!("{}", separator);
     println!(
-        "Results: {} killed, {} build errors, {} survived",
-        report.killed, report.build_errors, report.survived
+        "Results: {} killed, {} survived, {} timeout, {} build errors",
+        report.killed, report.survived, report.timeout, report.build_errors
     );
     let tested = report.total - report.build_errors;
     let score = if tested > 0 {
         (report.killed as f64 / tested as f64) * 100.0
-    } else {
+    } else if report.total == 0 {
         100.0
+    } else {
+        0.0
     };
     println!("Mutation score (test kills only): {:.1}%", score);
     println!("Duration: {:.2}s", report.duration.as_secs_f64());
@@ -149,15 +151,17 @@ pub fn format_report_plain(report: &MutationReport) -> String {
     writeln!(out, "{}", separator).unwrap();
     writeln!(
         out,
-        "Results: {} killed, {} build errors, {} survived",
-        report.killed, report.build_errors, report.survived
+        "Results: {} killed, {} survived, {} timeout, {} build errors",
+        report.killed, report.survived, report.timeout, report.build_errors
     )
     .unwrap();
     let tested = report.total - report.build_errors;
     let score = if tested > 0 {
         (report.killed as f64 / tested as f64) * 100.0
-    } else {
+    } else if report.total == 0 {
         100.0
+    } else {
+        0.0
     };
     writeln!(out, "Mutation score (test kills only): {:.1}%", score).unwrap();
     writeln!(out, "Duration: {:.2}s", report.duration.as_secs_f64()).unwrap();
@@ -238,7 +242,7 @@ mod tests {
     fn terminal_output_contains_summary() {
         let report = sample_report();
         let output = format_report_plain(&report);
-        assert!(output.contains("Results: 1 killed, 0 build errors, 1 survived"));
+        assert!(output.contains("Results: 1 killed, 1 survived, 0 timeout, 0 build errors"));
         assert!(output.contains("Mutation score (test kills only): 50.0%"));
         assert!(output.contains("Duration: 1.23s"));
     }

@@ -5,6 +5,7 @@ use std::fmt::Write;
 
 struct FileStats {
     total: usize,
+    build_errors: usize,
     killed: usize,
     mutations: Vec<MutationEntry>,
 }
@@ -30,15 +31,20 @@ pub fn generate_report(report: &MutationReport) -> Result<String> {
             MutationResult::BuildError => "build_error",
         };
         let killed = matches!(result, MutationResult::Killed);
+        let build_error = matches!(result, MutationResult::BuildError);
 
         let stats = files.entry(file_path).or_insert(FileStats {
             total: 0,
+            build_errors: 0,
             killed: 0,
             mutations: Vec::new(),
         });
         stats.total += 1;
         if killed {
             stats.killed += 1;
+        }
+        if build_error {
+            stats.build_errors += 1;
         }
         stats.mutations.push(MutationEntry {
             line: mutation.line,
@@ -53,8 +59,10 @@ pub fn generate_report(report: &MutationReport) -> Result<String> {
     let tested = report.total - report.build_errors;
     let score_pct = if tested > 0 {
         (report.killed as f64 / tested as f64) * 100.0
-    } else {
+    } else if report.total == 0 {
         100.0
+    } else {
+        0.0
     };
 
     let mut html = String::new();
@@ -79,7 +87,7 @@ pub fn generate_report(report: &MutationReport) -> Result<String> {
          &mdash; {:.2}s</div></header>",
         score_pct,
         report.killed,
-        report.total,
+        tested,
         report.survived,
         report.timeout,
         report.build_errors,
@@ -91,10 +99,13 @@ pub fn generate_report(report: &MutationReport) -> Result<String> {
     write!(html, "<h2>Files</h2><ul>")?;
 
     for (path, stats) in &files {
-        let file_pct = if stats.total > 0 {
-            (stats.killed as f64 / stats.total as f64) * 100.0
-        } else {
+        let file_tested = stats.total.saturating_sub(stats.build_errors);
+        let file_pct = if file_tested > 0 {
+            (stats.killed as f64 / file_tested as f64) * 100.0
+        } else if stats.total == 0 {
             100.0
+        } else {
+            0.0
         };
         let class = score_class(file_pct);
         write!(
@@ -105,7 +116,7 @@ pub fn generate_report(report: &MutationReport) -> Result<String> {
             class,
             html_escape(path),
             stats.killed,
-            stats.total
+            file_tested
         )?;
     }
 
@@ -113,10 +124,13 @@ pub fn generate_report(report: &MutationReport) -> Result<String> {
 
     // Per-file sections
     for (path, stats) in &files {
-        let file_pct = if stats.total > 0 {
-            (stats.killed as f64 / stats.total as f64) * 100.0
-        } else {
+        let file_tested = stats.total.saturating_sub(stats.build_errors);
+        let file_pct = if file_tested > 0 {
+            (stats.killed as f64 / file_tested as f64) * 100.0
+        } else if stats.total == 0 {
             100.0
+        } else {
+            0.0
         };
 
         write!(
