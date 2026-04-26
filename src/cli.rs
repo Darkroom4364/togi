@@ -9,6 +9,7 @@ pub struct Cli {
 }
 
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)]
 pub enum Commands {
     /// Run mutation testing on the current diff
     Check {
@@ -67,6 +68,12 @@ pub enum Commands {
         /// Disable built-in exclusion of test files, migrations, seeds, etc.
         #[arg(long)]
         no_skip_defaults: bool,
+
+        /// Filter operators: category or id, prefix with - to exclude
+        /// e.g. --operators=-string_to_empty,-increment_numeric
+        /// Categories: binary, literal, boundary, removal, unary, negate, return
+        #[arg(long, value_delimiter = ',')]
+        operators: Option<Vec<String>>,
     },
     /// Generate a togi.toml config template
     Init,

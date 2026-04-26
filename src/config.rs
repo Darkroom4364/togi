@@ -68,6 +68,8 @@ pub struct MutationConfig {
     pub exclude_paths: Vec<String>,
     #[serde(default = "default_true")]
     pub skip_noisy_files: bool,
+    #[serde(default)]
+    pub operators: Vec<String>,
 }
 
 fn default_true() -> bool {
@@ -260,6 +262,7 @@ impl Default for MutationConfig {
             coverage_file: None,
             exclude_paths: vec![],
             skip_noisy_files: true,
+            operators: vec![],
         }
     }
 }
