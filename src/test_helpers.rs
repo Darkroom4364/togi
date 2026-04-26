@@ -56,6 +56,14 @@ pub fn parse_go(src: &str) -> tree_sitter::Tree {
     parser.parse(src, None).unwrap()
 }
 
+/// Parse TypeScript source code into a tree-sitter tree.
+pub fn parse_typescript(src: &str) -> tree_sitter::Tree {
+    let mut parser = tree_sitter::Parser::new();
+    let lang = tree_sitter_typescript::LANGUAGE_TYPESCRIPT;
+    parser.set_language(&lang.into()).unwrap();
+    parser.parse(src, None).unwrap()
+}
+
 /// Recursively find the first node matching `kind` in the tree.
 /// Visits all children (named and anonymous).
 pub fn find_node_by_kind<'a>(
