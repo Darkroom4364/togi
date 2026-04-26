@@ -73,7 +73,6 @@ fn run_check(command: &[String], cwd: &Path) -> bool {
 mod tests {
     use super::*;
     use crate::Mutation;
-    use std::path::PathBuf;
 
     fn sample_mutation(file: &Path, original: &str, replacement: &str) -> Mutation {
         let start = 0;

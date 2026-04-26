@@ -2,7 +2,7 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "togi", about = "Fast, diff-targeted mutation testing")]
+#[command(name = "togi", version, about = "Fast, diff-targeted mutation testing")]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Commands,
