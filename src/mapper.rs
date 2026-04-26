@@ -105,10 +105,12 @@ fn collect_mutable_nodes<'a>(
 }
 
 /// Check if a node's line range overlaps with any changed line range.
+/// Uses binary search since changed_lines is sorted by start.
 fn overlaps(node_start: usize, node_end: usize, changed_lines: &[LineRange]) -> bool {
-    changed_lines
-        .iter()
-        .any(|range| node_start <= range.end && node_end >= range.start)
+    // Find first range whose end >= node_start (could overlap)
+    let idx = changed_lines.partition_point(|r| r.end < node_start);
+    // Check if that range's start <= node_end (actual overlap)
+    idx < changed_lines.len() && changed_lines[idx].start <= node_end
 }
 
 /// Check if a node kind is relevant for mutation.

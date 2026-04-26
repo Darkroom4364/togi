@@ -18,6 +18,20 @@ pub fn parse_file(
     Ok((tree, lang))
 }
 
+/// Parse with a reusable parser instance (avoids repeated allocation).
+pub fn parse_file_with_parser(
+    parser: &mut tree_sitter::Parser,
+    path: &Path,
+    source: &[u8],
+) -> Result<(tree_sitter::Tree, Box<dyn LanguageSupport>)> {
+    let lang = detect_language(path)?;
+    parser.set_language(&lang.tree_sitter_language())?;
+    let tree = parser
+        .parse(source, None)
+        .ok_or_else(|| anyhow!("failed to parse {}", path.display()))?;
+    Ok((tree, lang))
+}
+
 /// Detect language from file extension.
 fn detect_language(path: &Path) -> Result<Box<dyn LanguageSupport>> {
     let ext = path
