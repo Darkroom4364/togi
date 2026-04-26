@@ -126,6 +126,66 @@ impl MutationOperator for ReturnEmpty {
 }
 
 /// Returns all mutation operators
+/// Return the category for an operator ID.
+pub fn operator_category(id: &str) -> &str {
+    match id {
+        "lt_to_lte" | "gt_to_gte" | "eq_to_neq" | "and_to_or" | "or_to_and" | "mul_to_div"
+        | "div_to_mul" | "mod_to_mul" => "binary",
+        "true_to_false" | "false_to_true" | "zero_to_one" | "string_to_empty"
+        | "increment_numeric" | "decrement_numeric" => "literal",
+        "plus_to_minus" | "minus_to_plus" => "boundary",
+        "remove_if_body" | "remove_else" | "remove_call_statement" | "remove_assignment" => {
+            "removal"
+        }
+        "remove_unary_not" | "remove_unary_neg" => "unary",
+        "negate_condition" => "negate",
+        "return_empty" => "return",
+        _ => "other",
+    }
+}
+
+/// Filter operators based on include/exclude patterns.
+/// Patterns can be operator IDs or category names.
+/// Prefix with `-` to exclude. If any non-exclude pattern exists,
+/// only matching operators are included.
+pub fn filter_operators(
+    operators: Vec<Box<dyn MutationOperator>>,
+    patterns: &[String],
+) -> Vec<Box<dyn MutationOperator>> {
+    if patterns.is_empty() {
+        return operators;
+    }
+
+    let excludes: Vec<&str> = patterns
+        .iter()
+        .filter(|p| p.starts_with('-'))
+        .map(|p| p.trim_start_matches('-'))
+        .collect();
+    let includes: Vec<&str> = patterns
+        .iter()
+        .filter(|p| !p.starts_with('-'))
+        .map(|s| s.as_str())
+        .collect();
+
+    operators
+        .into_iter()
+        .filter(|op| {
+            let id = op.id();
+            let cat = operator_category(id);
+
+            // Check excludes first
+            if excludes.contains(&id) || excludes.contains(&cat) {
+                return false;
+            }
+            // If includes specified, must match
+            if !includes.is_empty() {
+                return includes.contains(&id) || includes.contains(&cat);
+            }
+            true
+        })
+        .collect()
+}
+
 pub fn all_operators() -> Vec<Box<dyn MutationOperator>> {
     vec![
         Box::new(binary::LtToLte),

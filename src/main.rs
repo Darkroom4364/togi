@@ -20,6 +20,7 @@ struct CheckConfig {
     build_cmd: Option<String>,
     fail_fast: bool,
     no_skip_defaults: bool,
+    operators: Option<Vec<String>>,
 }
 
 #[tokio::main]
@@ -42,6 +43,7 @@ async fn main() {
             build_cmd,
             fail_fast,
             no_skip_defaults,
+            operators,
         } => {
             let cfg = CheckConfig {
                 all,
@@ -58,6 +60,7 @@ async fn main() {
                 build_cmd,
                 fail_fast,
                 no_skip_defaults,
+                operators,
             };
             if let Err(e) = run_check(cfg).await {
                 eprintln!("Error: {e:#}");
@@ -191,6 +194,9 @@ fn resolve_config(cfg: CheckConfig) -> anyhow::Result<(togi::config::Config, boo
     if cfg.no_skip_defaults {
         config.mutations.skip_noisy_files = false;
     }
+    if let Some(ops) = cfg.operators {
+        config.mutations.operators = ops;
+    }
 
     let has_explicit_build_cmd = has_cli_build_cmd || !config.test.build_command.is_empty();
     let fail_fast = cfg.fail_fast && !has_custom_test_cmd;
@@ -265,6 +271,7 @@ fn generate_mutations(
         project_root,
         generation_limit,
         config.mutations.max_per_file,
+        &config.mutations.operators,
     )
 }
 

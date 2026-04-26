@@ -122,8 +122,9 @@ pub fn generate_mutations(
     project_root: &Path,
     max_mutations: usize,
     max_per_file: usize,
+    operator_filters: &[String],
 ) -> Result<Vec<Mutation>> {
-    let operators = operators::all_operators();
+    let operators = operators::filter_operators(operators::all_operators(), operator_filters);
     let mut mutations = Vec::new();
     let mut next_id: u32 = 0;
 
@@ -297,7 +298,7 @@ mod tests {
             hunks: vec![LineRange { start: 4, end: 5 }],
         }];
 
-        let mutations = generate_mutations(&changed, tmp.path(), 100, 0).unwrap();
+        let mutations = generate_mutations(&changed, tmp.path(), 100, 0, &[]).unwrap();
         assert!(!mutations.is_empty());
 
         let operators: Vec<&str> = mutations.iter().map(|m| m.operator.as_str()).collect();
@@ -324,7 +325,7 @@ mod tests {
             hunks: vec![LineRange { start: 1, end: 8 }],
         }];
 
-        let mutations = generate_mutations(&changed, tmp.path(), 2, 0).unwrap();
+        let mutations = generate_mutations(&changed, tmp.path(), 2, 0, &[]).unwrap();
         assert_eq!(mutations.len(), 2);
     }
 
@@ -337,7 +338,7 @@ mod tests {
             hunks: vec![LineRange { start: 1, end: 5 }],
         }];
 
-        let mutations = generate_mutations(&changed, tmp.path(), 100, 0).unwrap();
+        let mutations = generate_mutations(&changed, tmp.path(), 100, 0, &[]).unwrap();
         assert!(mutations.is_empty());
     }
 
@@ -361,7 +362,7 @@ mod tests {
             },
         ];
 
-        let mutations = generate_mutations(&changed, tmp.path(), 100, 0).unwrap();
+        let mutations = generate_mutations(&changed, tmp.path(), 100, 0, &[]).unwrap();
         let files: std::collections::HashSet<_> =
             mutations.iter().map(|m| m.file.clone()).collect();
         assert!(
@@ -382,7 +383,7 @@ mod tests {
             hunks: vec![LineRange { start: 1, end: 2 }],
         }];
 
-        let mutations = generate_mutations(&changed, tmp.path(), 100, 0).unwrap();
+        let mutations = generate_mutations(&changed, tmp.path(), 100, 0, &[]).unwrap();
         assert!(!mutations.is_empty(), "expected mutations for Python file");
         assert_eq!(mutations[0].language, "python");
     }
@@ -398,7 +399,7 @@ mod tests {
             hunks: vec![LineRange { start: 1, end: 3 }],
         }];
 
-        let mutations = generate_mutations(&changed, tmp.path(), 100, 0).unwrap();
+        let mutations = generate_mutations(&changed, tmp.path(), 100, 0, &[]).unwrap();
         assert!(!mutations.is_empty(), "expected mutations for Rust file");
         assert_eq!(mutations[0].language, "rust");
     }
@@ -414,7 +415,7 @@ mod tests {
             hunks: vec![LineRange { start: 1, end: 8 }],
         }];
 
-        let mutations = generate_mutations(&changed, tmp.path(), 100, 0).unwrap();
+        let mutations = generate_mutations(&changed, tmp.path(), 100, 0, &[]).unwrap();
         assert!(!mutations.is_empty(), "expected at least one mutation");
         for (i, m) in mutations.iter().enumerate() {
             assert_eq!(m.id, i as u32, "mutation ids should be sequential");
@@ -432,7 +433,7 @@ mod tests {
             hunks: vec![LineRange { start: 1, end: 3 }],
         }];
 
-        let mutations = generate_mutations(&changed, tmp.path(), 100, 0).unwrap();
+        let mutations = generate_mutations(&changed, tmp.path(), 100, 0, &[]).unwrap();
         let has_return_empty = mutations.iter().any(|m| m.operator == "return_empty");
         assert!(
             !has_return_empty,
@@ -454,7 +455,7 @@ mod tests {
             hunks: vec![LineRange { start: 1, end: 3 }],
         }];
 
-        let mutations = generate_mutations(&changed, tmp.path(), 100, 0).unwrap();
+        let mutations = generate_mutations(&changed, tmp.path(), 100, 0, &[]).unwrap();
         let has_return_empty = mutations.iter().any(|m| m.operator == "return_empty");
         assert!(
             has_return_empty,
@@ -474,7 +475,7 @@ mod tests {
             hunks: vec![LineRange { start: 1, end: 5 }],
         }];
 
-        let mutations = generate_mutations(&changed, tmp.path(), 100, 0).unwrap();
+        let mutations = generate_mutations(&changed, tmp.path(), 100, 0, &[]).unwrap();
         let has_return_empty = mutations.iter().any(|m| m.operator == "return_empty");
         assert!(
             !has_return_empty,
@@ -493,7 +494,7 @@ mod tests {
             hunks: vec![LineRange { start: 1, end: 1 }],
         }];
 
-        let mutations = generate_mutations(&changed, tmp.path(), 100, 0).unwrap();
+        let mutations = generate_mutations(&changed, tmp.path(), 100, 0, &[]).unwrap();
         assert!(mutations.is_empty());
     }
 
@@ -509,8 +510,8 @@ mod tests {
             hunks: vec![LineRange { start: 1, end: 11 }],
         }];
 
-        let uncapped = generate_mutations(&changed, tmp.path(), 1000, 0).unwrap();
-        let capped = generate_mutations(&changed, tmp.path(), 1000, 3).unwrap();
+        let uncapped = generate_mutations(&changed, tmp.path(), 1000, 0, &[]).unwrap();
+        let capped = generate_mutations(&changed, tmp.path(), 1000, 3, &[]).unwrap();
 
         assert!(
             uncapped.len() > 3,
@@ -608,7 +609,7 @@ mod tests {
             hunks: vec![LineRange { start: 1, end: 5 }],
         }];
 
-        let mutations = generate_mutations(&changed, tmp.path(), 100, 0).unwrap();
+        let mutations = generate_mutations(&changed, tmp.path(), 100, 0, &[]).unwrap();
         let ret_mut = mutations.iter().find(|m| m.operator == "return_empty");
         if let Some(m) = ret_mut {
             // column should point to "42", not "return"
