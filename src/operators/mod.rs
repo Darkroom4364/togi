@@ -159,12 +159,14 @@ pub fn filter_operators(
     let excludes: Vec<&str> = patterns
         .iter()
         .map(|p| p.trim())
+        .filter(|p| !p.is_empty())
         .filter(|p| p.starts_with('-'))
         .map(|p| p.trim_start_matches('-'))
         .collect();
     let includes: Vec<&str> = patterns
         .iter()
         .map(|p| p.trim())
+        .filter(|p| !p.is_empty())
         .filter(|p| !p.starts_with('-'))
         .collect();
 
