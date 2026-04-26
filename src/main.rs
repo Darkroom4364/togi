@@ -7,6 +7,7 @@ use togi::{ChangedFile, Mutation, MutationReport};
 
 struct CheckConfig {
     all: bool,
+    paths: Vec<PathBuf>,
     base: Option<String>,
     config_path: Option<PathBuf>,
     output_format: String,
@@ -30,6 +31,7 @@ async fn main() {
     match cli.command {
         togi::cli::Commands::Check {
             all,
+            path,
             base,
             config,
             format,
@@ -47,6 +49,7 @@ async fn main() {
         } => {
             let cfg = CheckConfig {
                 all,
+                paths: path,
                 base,
                 config_path: config,
                 output_format: format,
@@ -97,6 +100,7 @@ async fn main() {
 
 async fn run_check(cfg: CheckConfig) -> anyhow::Result<()> {
     let all = cfg.all;
+    let paths = cfg.paths.clone();
     let dry_run = cfg.dry_run;
     let verbose = cfg.verbose;
     let show_output = cfg.show_output;
@@ -122,7 +126,7 @@ async fn run_check(cfg: CheckConfig) -> anyhow::Result<()> {
     let known: Vec<&str> = all_langs.iter().map(|l| l.name()).collect();
     config.warn_unknown_languages(&known);
 
-    let changed_files = collect_files(&config, all, dry_run, &project_root)?;
+    let changed_files = collect_files(&config, all, &paths, dry_run, &project_root)?;
     if changed_files.is_empty() {
         return Ok(());
     }
@@ -208,6 +212,7 @@ fn resolve_config(cfg: CheckConfig) -> anyhow::Result<(togi::config::Config, boo
 fn collect_files(
     config: &togi::config::Config,
     all: bool,
+    paths: &[PathBuf],
     dry_run: bool,
     project_root: &Path,
 ) -> anyhow::Result<Vec<ChangedFile>> {
@@ -215,8 +220,11 @@ fn collect_files(
     let exclude_globs = &config.mutations.exclude_paths;
 
     if all {
-        let files =
+        let mut files =
             togi::diff::collect_all_supported_files(project_root, skip_noisy, exclude_globs)?;
+        if !paths.is_empty() {
+            files.retain(|f| paths.iter().any(|p| f.path.starts_with(p)));
+        }
         if files.is_empty() {
             println!("No supported source files found. Nothing to mutate.");
             return Ok(vec![]);
