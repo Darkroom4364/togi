@@ -123,9 +123,10 @@ async fn run_check(cfg: CheckConfig) -> anyhow::Result<()> {
     let mutations = filter_mutations(mutations, &config, &project_root)?;
 
     if mutations.is_empty() {
-        println!(
-            "No mutations generated. This can happen if the changed files are in an unsupported language.\nSupported: Go (.go), Rust (.rs), Python (.py), TypeScript (.ts/.tsx)"
-        );
+        println!("No mutations generated. Possible causes:");
+        println!("  - Changed files are in an unsupported language");
+        println!("  - All mutable nodes were filtered out (test files, noisy patterns)");
+        println!("  - max_per_run or max_per_file is set to 0 in togi.toml");
         return Ok(());
     }
 
@@ -242,12 +243,17 @@ fn generate_mutations(
     config: &togi::config::Config,
     project_root: &Path,
 ) -> anyhow::Result<Vec<Mutation>> {
+    let max = if config.mutations.max_per_run == 0 {
+        usize::MAX
+    } else {
+        config.mutations.max_per_run
+    };
     let generation_limit = if config.mutations.coverage_file.is_some() {
         usize::MAX
     } else if !config.test.build_command.is_empty() {
-        config.mutations.max_per_run * 2
+        max.saturating_mul(2)
     } else {
-        config.mutations.max_per_run
+        max
     };
     togi::mutator::generate_mutations(
         changed_files,
@@ -288,7 +294,7 @@ fn filter_mutations(
     } else {
         mutations
     };
-    if mutations.len() > config.mutations.max_per_run {
+    if config.mutations.max_per_run > 0 && mutations.len() > config.mutations.max_per_run {
         eprintln!(
             "warning: mutation count capped at max_per_run ({}). Increase in togi.toml or use --dry-run to preview.",
             config.mutations.max_per_run
@@ -342,7 +348,11 @@ async fn execute(
         project_root,
         verbose,
         show_output,
-        max_tested: Some(config.mutations.max_per_run),
+        max_tested: if config.mutations.max_per_run == 0 {
+            None
+        } else {
+            Some(config.mutations.max_per_run)
+        },
     };
 
     runner.run(mutations).await
