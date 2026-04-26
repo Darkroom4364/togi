@@ -87,6 +87,27 @@ pub fn print_report(report: &MutationReport) {
     );
     println!("Duration: {:.2}s", report.duration.as_secs_f64());
     println!("{}", separator);
+
+    if let Some(guidance) = all_build_error_guidance(report) {
+        println!();
+        print!("{guidance}");
+    }
+}
+
+/// Guidance text when every mutation is a build error.
+fn all_build_error_guidance(report: &MutationReport) -> Option<String> {
+    if report.build_errors == 0 || report.build_errors != report.total {
+        return None;
+    }
+    Some(
+        "All mutations caused build errors — no mutations were testable.\n\
+         This typically happens with strictly-typed languages where mutations\n\
+         break compilation. Try:\n\
+         \x20 togi check --operators=-string_to_empty    (skip string mutations)\n\
+         \x20 togi check --operators=binary,removal       (only logic operators)\n\
+         \x20 togi check --build-cmd='cargo check'        (custom build check)\n"
+            .to_string(),
+    )
 }
 
 /// Format report as a plain-text string (no ANSI colors, for testing).
@@ -158,6 +179,11 @@ pub fn format_report_plain(report: &MutationReport) -> String {
     .unwrap();
     writeln!(out, "Duration: {:.2}s", report.duration.as_secs_f64()).unwrap();
     writeln!(out, "{}", separator).unwrap();
+
+    if let Some(guidance) = all_build_error_guidance(report) {
+        writeln!(out).unwrap();
+        write!(out, "{guidance}").unwrap();
+    }
 
     out
 }
@@ -258,5 +284,51 @@ mod tests {
         assert!(output.contains("Results: 1 killed, 1 survived, 0 timeout, 0 build errors"));
         assert!(output.contains("Mutation score (test kills only): 50.0%"));
         assert!(output.contains("Duration: 1.23s"));
+    }
+
+    #[test]
+    fn all_build_errors_shows_guidance() {
+        let report = MutationReport {
+            results: vec![(
+                Mutation {
+                    id: 0,
+                    file: PathBuf::from("test.rs"),
+                    line: 1,
+                    column: 1,
+                    operator: "eq_to_neq".into(),
+                    description: "test".into(),
+                    original: "==".into(),
+                    replacement: "!=".into(),
+                    byte_range: 0..2,
+                    language: "rust".into(),
+                },
+                MutationResult::BuildError,
+            )],
+            duration: Duration::from_secs(1),
+            total: 1,
+            killed: 0,
+            survived: 0,
+            timeout: 0,
+            build_errors: 1,
+        };
+        let output = format_report_plain(&report);
+        assert!(output.contains("All mutations caused build errors"));
+        assert!(output.contains("--operators="));
+        assert!(output.contains("--build-cmd="));
+    }
+
+    #[test]
+    fn partial_build_errors_no_guidance() {
+        let report = MutationReport {
+            results: vec![],
+            duration: Duration::from_secs(1),
+            total: 2,
+            killed: 1,
+            survived: 0,
+            timeout: 0,
+            build_errors: 1,
+        };
+        let output = format_report_plain(&report);
+        assert!(!output.contains("All mutations caused build errors"));
     }
 }
