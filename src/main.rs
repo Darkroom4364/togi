@@ -64,6 +64,14 @@ async fn main() {
                 process::exit(2);
             }
         }
+        togi::cli::Commands::Clean => {
+            let project_root = get_project_root().unwrap_or_else(|e| {
+                eprintln!("Error: {e:#}");
+                process::exit(2);
+            });
+            togi::cache::clear(&project_root);
+            println!("Cache cleared.");
+        }
         togi::cli::Commands::Init => {
             let path = std::path::Path::new("togi.toml");
             if path.exists() {
@@ -74,7 +82,7 @@ async fn main() {
                 eprintln!("Error: {e}");
                 process::exit(2);
             }
-            println!("Created togi.toml");
+            println!("Created togi.toml (auto-detected from project)");
         }
     }
 }

@@ -70,4 +70,6 @@ pub enum Commands {
     },
     /// Generate a togi.toml config template
     Init,
+    /// Delete the .togi-cache directory
+    Clean,
 }

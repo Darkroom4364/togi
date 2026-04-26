@@ -145,7 +145,7 @@ Run it yourself: `cargo test -- --ignored` (requires Go).
 | Ruby | `.rb` |
 | C# | `.cs` |
 
-Adding a language is ~30 lines using the `define_language!` macro.
+Adding a language is ~5-10 lines via the `define_language!` macro.
 
 ## Mutation operators
 
