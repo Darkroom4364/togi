@@ -23,17 +23,17 @@ Duration: 0.84s
 
 ## Why
 
-Existing mutation testing tools are either too slow for CI, locked to one language, or depend on LLM calls:
+Good mutation testing tools exist, but each makes trade-offs:
 
-| Tool | Languages | CI-fast? | Deterministic? |
-|------|-----------|----------|----------------|
-| Stryker | JS/TS/.NET | Yes (with caching) | Yes |
-| cargo-mutants | Rust only | Depends | Yes |
-| mewt | Multi (tree-sitter) | Explicitly no | Yes |
-| mutahunter | Multi (LLM) | No | No |
-| **togi** | **Multi (tree-sitter)** | **Yes** | **Yes** |
+| Tool | Languages | Diff-targeted | Zero config | Single binary |
+|------|-----------|---------------|-------------|---------------|
+| Stryker | JS/TS/.NET | Incremental mode | No | No |
+| cargo-mutants | Rust | `--in-diff` flag | Partial | Yes |
+| mewt | Multi (tree-sitter) | No | No | Yes |
+| mutahunter | Multi (LLM) | Yes | No | No |
+| **togi** | **9 languages** | **By default** | **Yes** | **Yes** |
 
-togi is fast because it only mutates the diff — 5-15 targeted mutations instead of thousands — and runs them in parallel.
+togi's differentiator: multi-language + diff-targeted by default + single binary + zero config. It mutates only changed lines — 5-15 mutations instead of thousands — and runs them in parallel.
 
 ## Install
 
@@ -133,25 +133,31 @@ Run it yourself: `cargo test -- --ignored` (requires Go).
 
 ## Supported languages
 
-| Language | Extension | Status |
-|----------|-----------|--------|
-| Go | `.go` | Supported |
-| Rust | `.rs` | Supported |
-| Python | `.py` | Supported |
-| TypeScript | `.ts/.tsx` | Supported |
+| Language | Extensions |
+|----------|------------|
+| Go | `.go` |
+| Rust | `.rs` |
+| Python | `.py` |
+| TypeScript | `.ts`, `.tsx` |
+| Java | `.java` |
+| C | `.c`, `.h` |
+| C++ | `.cpp`, `.cc`, `.cxx`, `.hpp`, `.hxx` |
+| Ruby | `.rb` |
+| C# | `.cs` |
 
-Adding a language is ~50 lines of tree-sitter node mappings.
+Adding a language is ~5-10 lines via the `define_language!` macro.
 
 ## Mutation operators
 
-togi applies 14 targeted mutation operators:
+togi applies 24 targeted mutation operators:
 
 | Category | Mutations |
 |----------|-----------|
-| Binary | `<` to `<=`, `>` to `>=`, `==` to `!=`, `&&` to `\|\|`, `\|\|` to `&&` |
-| Literal | `true` to `false`, `false` to `true`, `0` to `1` |
+| Binary | `<` to `<=`, `>` to `>=`, `==` to `!=`, `&&` to `\|\|`, `\|\|` to `&&`, `*` to `/`, `/` to `*`, `%` to `*` |
+| Literal | `true` to `false`, `false` to `true`, `0` to `1`, string to `""`, increment numeric, decrement numeric |
 | Boundary | `+` to `-`, `-` to `+` |
-| Removal | Remove if body, remove else branch |
+| Removal | Remove if body, remove else branch, remove call statement, remove assignment |
+| Unary | Remove `!`, remove unary `-` |
 | Return | Replace return value with default |
 | Negate | Negate condition expression |
 
@@ -194,4 +200,4 @@ jobs:
 
 ## License
 
-Apache-2.0
+MIT OR Apache-2.0

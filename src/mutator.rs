@@ -2,7 +2,7 @@
 
 use crate::mapper::find_mutable_nodes;
 use crate::operators::{self};
-use crate::{ChangedFile, Mutation, MutationCandidate, ts_row_to_line};
+use crate::{ChangedFile, Mutation, MutationCandidate};
 use anyhow::Result;
 use std::path::Path;
 
@@ -99,6 +99,21 @@ fn should_filter(candidate: &MutationCandidate, node: &tree_sitter::Node, langua
     false
 }
 
+/// Convert a byte offset in source to (line, column), both 1-indexed.
+fn byte_offset_to_line_col(source: &[u8], offset: usize) -> (usize, usize) {
+    let mut line = 1usize;
+    let mut col = 1usize;
+    for &b in source.iter().take(offset) {
+        if b == b'\n' {
+            line += 1;
+            col = 1;
+        } else {
+            col += 1;
+        }
+    }
+    (line, col)
+}
+
 /// Generate mutations for all changed files.
 /// Reads each file, parses it, finds mutable nodes in changed regions,
 /// applies all operators, and returns concrete Mutation structs.
@@ -150,8 +165,10 @@ pub fn generate_mutations(
                         continue;
                     }
 
-                    let line = ts_row_to_line(node.start_position().row);
-                    let column = node.start_position().column + 1;
+                    // Compute line/column from the byte range, not the AST node,
+                    // so that mutation_diff() renders correctly.
+                    let (line, column) =
+                        byte_offset_to_line_col(&source, candidate.byte_range.start);
                     let original =
                         String::from_utf8_lossy(&source[candidate.byte_range.clone()]).to_string();
 
@@ -567,5 +584,38 @@ mod tests {
         let mutations = vec![make("op_a", 1), make("op_b", 2)];
         let sampled = sample_diverse(mutations, 10);
         assert_eq!(sampled.len(), 2);
+    }
+
+    #[test]
+    fn byte_offset_to_line_col_basic() {
+        let src = b"line1\nline2\nline3\n";
+        assert_eq!(byte_offset_to_line_col(src, 0), (1, 1));
+        assert_eq!(byte_offset_to_line_col(src, 4), (1, 5));
+        assert_eq!(byte_offset_to_line_col(src, 6), (2, 1));
+        assert_eq!(byte_offset_to_line_col(src, 12), (3, 1));
+    }
+
+    #[test]
+    fn mutation_line_col_matches_byte_range() {
+        let tmp = TempDir::new().unwrap();
+        // return_empty mutation: the operator targets the value (column 12),
+        // not the return keyword (column 5)
+        let src = "package main\n\nfunc f() int {\n\treturn 42\n}\n";
+        let rel = write_test_file(tmp.path(), "main.go", src);
+
+        let changed = vec![ChangedFile {
+            path: rel,
+            hunks: vec![LineRange { start: 1, end: 5 }],
+        }];
+
+        let mutations = generate_mutations(&changed, tmp.path(), 100, 0).unwrap();
+        let ret_mut = mutations.iter().find(|m| m.operator == "return_empty");
+        if let Some(m) = ret_mut {
+            // column should point to "42", not "return"
+            assert_eq!(
+                m.column, 9,
+                "column should point to the value, not the return keyword"
+            );
+        }
     }
 }

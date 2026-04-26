@@ -107,7 +107,17 @@ pub fn detect_test_command(project_root: &Path) -> Vec<String> {
         detected.push(("pyproject.toml/setup.py", vec!["pytest".into()]));
     }
     if project_root.join("package.json").exists() {
-        detected.push(("package.json", vec!["npm".into(), "test".into()]));
+        let runner = if project_root.join("pnpm-lock.yaml").exists() {
+            "pnpm"
+        } else if project_root.join("yarn.lock").exists() {
+            "yarn"
+        } else if project_root.join("bun.lockb").exists() || project_root.join("bun.lock").exists()
+        {
+            "bun"
+        } else {
+            "npm"
+        };
+        detected.push(("package.json", vec![runner.into(), "test".into()]));
     }
     if project_root.join("pom.xml").exists() {
         detected.push(("pom.xml", vec!["mvn".into(), "test".into()]));
@@ -156,7 +166,9 @@ pub fn failfast_args(command: &[String]) -> Vec<String> {
         Some("go") => vec!["-failfast".into()],
         Some("pytest") => vec!["-x".into()],
         Some("npx") => vec!["--bail".into()],
-        Some("npm") => vec!["--".into(), "--bail".into()],
+        Some("npm") | Some("pnpm") | Some("yarn") | Some("bun") => {
+            vec!["--".into(), "--bail".into()]
+        }
         Some("mvn") => vec!["--fail-fast".into()],
         Some("./gradlew") | Some("gradlew") => vec!["--fail-fast".into()],
         Some("bundle") => vec!["--fail-fast".into()],
@@ -313,25 +325,97 @@ impl Config {
 
     /// Write a template togi.toml to the given path.
     pub fn write_template(path: &Path) -> anyhow::Result<()> {
-        let template = r#"# togi.toml — mutation testing configuration
+        let project_root = path.parent().unwrap_or(Path::new("."));
+        let test_cmd = detect_test_command(project_root);
+        let build_cmd = detect_build_command(project_root);
 
-[test]
-command = ["cargo", "test"]
-# build_command = ["cargo", "check"]  # auto-detected; compile check before running tests
-timeout = 30
-# jobs = 4  # defaults to number of CPUs
+        let test_cmd_toml: Vec<String> = test_cmd.iter().map(|s| format!("\"{}\"", s)).collect();
 
-# Per-language test commands (key = language name, e.g. typescript, python, go)
-# [test.languages.typescript]
-# command = ["npx", "jest"]
+        let mut template = format!(
+            "# togi.toml — mutation testing configuration\n\
+             \n\
+             [test]\n\
+             command = [{}]\n",
+            test_cmd_toml.join(", ")
+        );
 
-[diff]
-base = "origin/main"
+        if !build_cmd.is_empty() {
+            let build_cmd_toml: Vec<String> =
+                build_cmd.iter().map(|s| format!("\"{}\"", s)).collect();
+            template.push_str(&format!(
+                "# build_command = [{}]  # uncomment to pre-filter mutations that don't compile\n",
+                build_cmd_toml.join(", ")
+            ));
+        }
 
-[mutations]
-max_per_run = 20
-# max_per_file = 20  # cap mutations per source file (0 = unlimited)
-"#;
+        template.push_str(
+            "timeout = 30\n\
+             # jobs = 4  # defaults to number of CPUs\n\
+             \n",
+        );
+
+        // Detect additional languages for polyglot repos
+        let has_python = project_root.join("pyproject.toml").exists()
+            || project_root.join("setup.py").exists()
+            || project_root.join("setup.cfg").exists();
+        let has_js = project_root.join("package.json").exists();
+        let has_go = project_root.join("go.mod").exists();
+        let has_rust = project_root.join("Cargo.toml").exists();
+
+        let mut lang_sections: Vec<String> = Vec::new();
+        // Only add language sections for languages that aren't the primary test command
+        if has_python && test_cmd.first().map(|s| s.as_str()) != Some("pytest") {
+            lang_sections.push("[test.languages.python]\ncommand = [\"pytest\"]\n".to_string());
+        }
+        if has_js
+            && !matches!(
+                test_cmd.first().map(|s| s.as_str()),
+                Some("npm" | "pnpm" | "yarn" | "bun")
+            )
+        {
+            let runner = if project_root.join("bun.lockb").exists()
+                || project_root.join("bun.lock").exists()
+            {
+                "bun"
+            } else if project_root.join("pnpm-lock.yaml").exists() {
+                "pnpm"
+            } else if project_root.join("yarn.lock").exists() {
+                "yarn"
+            } else {
+                "npm"
+            };
+            lang_sections.push(format!(
+                "[test.languages.typescript]\ncommand = [\"{}\", \"test\"]\n",
+                runner
+            ));
+        }
+        if has_go && test_cmd.first().map(|s| s.as_str()) != Some("go") {
+            lang_sections
+                .push("[test.languages.go]\ncommand = [\"go\", \"test\", \"./...\"]\n".to_string());
+        }
+        if has_rust && test_cmd.first().map(|s| s.as_str()) != Some("cargo") {
+            lang_sections
+                .push("[test.languages.rust]\ncommand = [\"cargo\", \"test\"]\n".to_string());
+        }
+
+        if !lang_sections.is_empty() {
+            template.push_str("# Per-language test commands (auto-detected)\n");
+            for section in &lang_sections {
+                template.push('\n');
+                template.push_str(section);
+            }
+            template.push('\n');
+        }
+
+        template.push_str(
+            "[diff]\n\
+             base = \"origin/main\"\n\
+             \n\
+             [mutations]\n\
+             max_per_run = 20\n\
+             # max_per_file = 20  # cap mutations per source file (0 = unlimited)\n",
+        );
+
         std::fs::write(path, template)?;
         Ok(())
     }
@@ -408,7 +492,42 @@ timeout = 120
         Config::write_template(&path).unwrap();
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(content.contains("[test]"));
+        assert!(content.contains("command = "));
+        assert!(content.contains("[diff]"));
+        assert!(content.contains("[mutations]"));
+    }
+
+    #[test]
+    fn write_template_detects_cargo() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "").unwrap();
+        let path = dir.path().join("togi.toml");
+        Config::write_template(&path).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
         assert!(content.contains("command = [\"cargo\", \"test\"]"));
+    }
+
+    #[test]
+    fn write_template_detects_pnpm() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("package.json"), "{}").unwrap();
+        std::fs::write(dir.path().join("pnpm-lock.yaml"), "").unwrap();
+        let path = dir.path().join("togi.toml");
+        Config::write_template(&path).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("command = [\"pnpm\", \"test\"]"));
+    }
+
+    #[test]
+    fn write_template_polyglot() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("package.json"), "{}").unwrap();
+        std::fs::write(dir.path().join("pyproject.toml"), "").unwrap();
+        let path = dir.path().join("togi.toml");
+        Config::write_template(&path).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        // pytest wins as primary, so JS gets a language section
+        assert!(content.contains("[test.languages.typescript]"));
     }
 
     #[test]
@@ -430,6 +549,30 @@ timeout = 120
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("package.json"), "").unwrap();
         assert_eq!(detect_test_command(dir.path()), vec!["npm", "test"]);
+    }
+
+    #[test]
+    fn detect_pnpm() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("package.json"), "").unwrap();
+        std::fs::write(dir.path().join("pnpm-lock.yaml"), "").unwrap();
+        assert_eq!(detect_test_command(dir.path()), vec!["pnpm", "test"]);
+    }
+
+    #[test]
+    fn detect_yarn() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("package.json"), "").unwrap();
+        std::fs::write(dir.path().join("yarn.lock"), "").unwrap();
+        assert_eq!(detect_test_command(dir.path()), vec!["yarn", "test"]);
+    }
+
+    #[test]
+    fn detect_bun() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("package.json"), "").unwrap();
+        std::fs::write(dir.path().join("bun.lockb"), "").unwrap();
+        assert_eq!(detect_test_command(dir.path()), vec!["bun", "test"]);
     }
 
     #[test]
