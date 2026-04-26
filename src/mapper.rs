@@ -105,13 +105,15 @@ fn collect_mutable_nodes<'a>(
 }
 
 /// Check if a node's line range overlaps with any changed line range.
-/// Requires: changed_lines sorted with non-decreasing `end` values,
+/// Requires: changed_lines sorted with non-decreasing start and end values,
 /// and each range satisfies `start <= end`. Produced by `parse_diff`.
 fn overlaps(node_start: usize, node_end: usize, changed_lines: &[LineRange]) -> bool {
     debug_assert!(
-        changed_lines.windows(2).all(|w| w[0].end <= w[1].end)
+        changed_lines
+            .windows(2)
+            .all(|w| w[0].start <= w[1].start && w[0].end <= w[1].end)
             && changed_lines.iter().all(|r| r.start <= r.end),
-        "changed_lines must be sorted with non-decreasing end values"
+        "changed_lines must be sorted with non-decreasing start and end values"
     );
     // Find first range whose end >= node_start (could overlap)
     let idx = changed_lines.partition_point(|r| r.end < node_start);
