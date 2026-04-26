@@ -355,8 +355,9 @@ impl Config {
         );
 
         // Detect additional languages for polyglot repos
-        let has_python =
-            project_root.join("pyproject.toml").exists() || project_root.join("setup.py").exists() || project_root.join("setup.cfg").exists();
+        let has_python = project_root.join("pyproject.toml").exists()
+            || project_root.join("setup.py").exists()
+            || project_root.join("setup.cfg").exists();
         let has_js = project_root.join("package.json").exists();
         let has_go = project_root.join("go.mod").exists();
         let has_rust = project_root.join("Cargo.toml").exists();
