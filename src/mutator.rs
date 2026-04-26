@@ -127,6 +127,7 @@ pub fn generate_mutations(
     let operators = operators::filter_operators(operators::all_operators(), operator_filters);
     let mut mutations = Vec::new();
     let mut next_id: u32 = 0;
+    let mut parser = tree_sitter::Parser::new();
 
     for changed_file in changed_files {
         let file_path = project_root.join(&changed_file.path);
@@ -135,16 +136,18 @@ pub fn generate_mutations(
         }
 
         let source = std::fs::read(&file_path)?;
-        let (tree, lang) = match crate::parser::parse_file(&changed_file.path, &source) {
-            Ok(result) => result,
-            Err(_) => {
-                eprintln!(
-                    "warning: skipping {} — unsupported language",
-                    changed_file.path.display()
-                );
-                continue;
-            }
-        };
+        let (tree, lang) =
+            match crate::parser::parse_file_with_parser(&mut parser, &changed_file.path, &source) {
+                Ok(result) => result,
+                Err(err) => {
+                    eprintln!(
+                        "warning: skipping {} — {}",
+                        changed_file.path.display(),
+                        err
+                    );
+                    continue;
+                }
+            };
         let language_name = lang.name().to_string();
 
         let nodes = find_mutable_nodes(&tree, &source, &changed_file.hunks, lang.as_ref());
