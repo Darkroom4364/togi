@@ -87,6 +87,15 @@ pub fn print_report(report: &MutationReport) {
     );
     println!("Duration: {:.2}s", report.duration.as_secs_f64());
     println!("{}", separator);
+
+    if report.build_errors > 0 && report.build_errors == report.total {
+        println!();
+        println!("All mutations caused build errors — no mutations were testable.");
+        println!("This typically happens with strictly-typed languages where mutations");
+        println!("break compilation. Try:");
+        println!("  togi check --operators=-string_to_empty    (skip string mutations)");
+        println!("  togi check --operators=binary,removal       (only logic operators)");
+    }
 }
 
 /// Format report as a plain-text string (no ANSI colors, for testing).
