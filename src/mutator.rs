@@ -139,10 +139,11 @@ pub fn generate_mutations(
         let (tree, lang) =
             match crate::parser::parse_file_with_parser(&mut parser, &changed_file.path, &source) {
                 Ok(result) => result,
-                Err(_) => {
+                Err(err) => {
                     eprintln!(
-                        "warning: skipping {} — unsupported language",
-                        changed_file.path.display()
+                        "warning: skipping {} — {}",
+                        changed_file.path.display(),
+                        err
                     );
                     continue;
                 }
