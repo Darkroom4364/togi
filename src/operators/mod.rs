@@ -158,13 +158,14 @@ pub fn filter_operators(
 
     let excludes: Vec<&str> = patterns
         .iter()
+        .map(|p| p.trim())
         .filter(|p| p.starts_with('-'))
         .map(|p| p.trim_start_matches('-'))
         .collect();
     let includes: Vec<&str> = patterns
         .iter()
+        .map(|p| p.trim())
         .filter(|p| !p.starts_with('-'))
-        .map(|s| s.as_str())
         .collect();
 
     operators
@@ -287,5 +288,71 @@ func f() string { return "hello" }"#;
         let ret_node = find_node_by_kind(tree.root_node(), "return_statement").unwrap();
         let candidates = ReturnEmpty.apply(&ret_node, src.as_bytes());
         assert!(candidates.is_empty());
+    }
+
+    // Stub operator for filter tests
+    struct StubOp(&'static str);
+    impl MutationOperator for StubOp {
+        fn id(&self) -> &str {
+            self.0
+        }
+        fn description(&self) -> &str {
+            ""
+        }
+        fn apply(&self, _: &tree_sitter::Node, _: &[u8]) -> Vec<crate::MutationCandidate> {
+            vec![]
+        }
+    }
+
+    fn stub_ops() -> Vec<Box<dyn MutationOperator>> {
+        vec![
+            Box::new(StubOp("lt_to_lte")),        // binary
+            Box::new(StubOp("string_to_empty")),  // literal
+            Box::new(StubOp("plus_to_minus")),    // boundary
+            Box::new(StubOp("remove_if_body")),   // removal
+            Box::new(StubOp("remove_unary_not")), // unary
+            Box::new(StubOp("negate_condition")), // negate
+            Box::new(StubOp("return_empty")),     // return
+        ]
+    }
+
+    fn ids(ops: &[Box<dyn MutationOperator>]) -> Vec<&str> {
+        ops.iter().map(|o| o.id()).collect()
+    }
+
+    #[test]
+    fn filter_include_only() {
+        let ops = filter_operators(stub_ops(), &["binary".into(), "removal".into()]);
+        assert_eq!(ids(&ops), vec!["lt_to_lte", "remove_if_body"]);
+    }
+
+    #[test]
+    fn filter_exclude_only() {
+        let ops = filter_operators(stub_ops(), &["-literal".into(), "-boundary".into()]);
+        let result = ids(&ops);
+        assert!(!result.contains(&"string_to_empty"));
+        assert!(!result.contains(&"plus_to_minus"));
+        assert!(result.contains(&"lt_to_lte"));
+        assert!(result.contains(&"return_empty"));
+    }
+
+    #[test]
+    fn filter_mixed_exclude_wins() {
+        // Include binary category but exclude lt_to_lte specifically
+        let ops = filter_operators(stub_ops(), &["binary".into(), "-lt_to_lte".into()]);
+        assert!(ids(&ops).is_empty());
+    }
+
+    #[test]
+    fn filter_category_matches() {
+        let ops = filter_operators(stub_ops(), &["literal".into()]);
+        assert_eq!(ids(&ops), vec!["string_to_empty"]);
+    }
+
+    #[test]
+    fn filter_whitespace_trimmed() {
+        let ops = filter_operators(stub_ops(), &[" -literal ".into()]);
+        assert!(!ids(&ops).contains(&"string_to_empty"));
+        assert!(ids(&ops).contains(&"lt_to_lte"));
     }
 }
