@@ -76,11 +76,12 @@ pub fn store(project_root: &Path, key: &CacheKey, result: CachedResult) {
 }
 
 /// Delete all cached results.
-pub fn clear(project_root: &Path) {
+pub fn clear(project_root: &Path) -> std::io::Result<()> {
     let dir = cache_dir(project_root);
     if dir.exists() {
-        let _ = fs::remove_dir_all(&dir);
+        fs::remove_dir_all(&dir)?;
     }
+    Ok(())
 }
 
 /// Return the cache directory path under the given project root.

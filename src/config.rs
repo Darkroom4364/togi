@@ -343,7 +343,7 @@ impl Config {
             let build_cmd_toml: Vec<String> =
                 build_cmd.iter().map(|s| format!("\"{}\"", s)).collect();
             template.push_str(&format!(
-                "# build_command = [{}]  # auto-detected\n",
+                "# build_command = [{}]  # uncomment to pre-filter mutations that don't compile\n",
                 build_cmd_toml.join(", ")
             ));
         }
@@ -356,7 +356,7 @@ impl Config {
 
         // Detect additional languages for polyglot repos
         let has_python =
-            project_root.join("pyproject.toml").exists() || project_root.join("setup.py").exists();
+            project_root.join("pyproject.toml").exists() || project_root.join("setup.py").exists() || project_root.join("setup.cfg").exists();
         let has_js = project_root.join("package.json").exists();
         let has_go = project_root.join("go.mod").exists();
         let has_rust = project_root.join("Cargo.toml").exists();
@@ -372,7 +372,11 @@ impl Config {
                 Some("npm" | "pnpm" | "yarn" | "bun")
             )
         {
-            let runner = if project_root.join("pnpm-lock.yaml").exists() {
+            let runner = if project_root.join("bun.lockb").exists()
+                || project_root.join("bun.lock").exists()
+            {
+                "bun"
+            } else if project_root.join("pnpm-lock.yaml").exists() {
                 "pnpm"
             } else if project_root.join("yarn.lock").exists() {
                 "yarn"

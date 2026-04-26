@@ -69,8 +69,13 @@ async fn main() {
                 eprintln!("Error: {e:#}");
                 process::exit(2);
             });
-            togi::cache::clear(&project_root);
-            println!("Cache cleared.");
+            match togi::cache::clear(&project_root) {
+                Ok(()) => println!("Cache cleared."),
+                Err(e) => {
+                    eprintln!("Error clearing cache: {e}");
+                    process::exit(2);
+                }
+            }
         }
         togi::cli::Commands::Init => {
             let path = std::path::Path::new("togi.toml");
@@ -341,7 +346,11 @@ async fn execute(
     let runner = togi::runner::TestRunner {
         command: config.test.command,
         language_commands,
-        build_command: config.test.build_command,
+        build_command: if build_command_explicit {
+            config.test.build_command
+        } else {
+            vec![]
+        },
         build_command_explicit,
         timeout: Duration::from_secs(config.test.timeout),
         parallelism: config.test.jobs,
