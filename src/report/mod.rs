@@ -1,3 +1,4 @@
+pub mod github;
 pub mod html;
 pub mod json;
 pub mod terminal;
@@ -20,6 +21,7 @@ pub fn mutation_score(report: &MutationReport) -> f64 {
 pub fn print_report(report: &crate::MutationReport, format: &str) -> anyhow::Result<()> {
     match format {
         "json" => json::print_report(report)?,
+        "github" => github::print_report(report),
         "html" => {
             let path = std::path::Path::new("togi-report.html");
             html::write_report(report, path)?;
