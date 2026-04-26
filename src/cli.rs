@@ -17,6 +17,10 @@ pub enum Commands {
         #[arg(long, conflicts_with = "base")]
         all: bool,
 
+        /// Limit --all to files under this path (repeatable)
+        #[arg(long, requires = "all")]
+        path: Vec<PathBuf>,
+
         /// Base branch to diff against
         #[arg(long)]
         base: Option<String>,

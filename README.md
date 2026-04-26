@@ -71,6 +71,24 @@ togi check --all
 # Adjust parallelism and timeout
 togi check --jobs 8 --timeout 60
 
+# Scope to a directory
+togi check --all --path src/rules/
+
+# Exclude noisy operators
+togi check --operators=-string_to_empty
+
+# Include only specific categories
+togi check --operators=binary,removal
+
+# Stop on first test failure per mutation
+togi check --fail-fast
+
+# Show each mutation as it runs
+togi check --verbose
+
+# Clear mutation cache
+togi clean
+
 # Generate a config file
 togi init
 ```
@@ -79,6 +97,8 @@ togi init
 
 Optional. togi works with zero config — it auto-detects your language and test command.
 
+Run `togi init` to auto-detect your language, test runner (including pnpm/yarn/bun), and generate a `togi.toml`. For polyglot repos it creates per-language sections automatically.
+
 Create a `togi.toml` for customization:
 
 ```toml
@@ -86,12 +106,19 @@ Create a `togi.toml` for customization:
 command = ["go", "test", "./..."]
 timeout = 30
 jobs = 4
+# build_command = ["cargo", "check"]
+
+[test.languages.python]
+command = ["pytest"]
 
 [diff]
 base = "origin/main"
 
 [mutations]
 max_per_run = 20
+max_per_file = 20
+operators = ["-string_to_empty"]
+exclude_paths = ["vendor/**"]
 ```
 
 ## Example: finding real test gaps
@@ -151,15 +178,15 @@ Adding a language is ~5-10 lines via the `define_language!` macro.
 
 togi applies 24 targeted mutation operators:
 
-| Category | Mutations |
-|----------|-----------|
-| Binary | `<` to `<=`, `>` to `>=`, `==` to `!=`, `&&` to `\|\|`, `\|\|` to `&&`, `*` to `/`, `/` to `*`, `%` to `*` |
-| Literal | `true` to `false`, `false` to `true`, `0` to `1`, string to `""`, increment numeric, decrement numeric |
-| Boundary | `+` to `-`, `-` to `+` |
-| Removal | Remove if body, remove else branch, remove call statement, remove assignment |
-| Unary | Remove `!`, remove unary `-` |
-| Return | Replace return value with default |
-| Negate | Negate condition expression |
+| Category (--operators name) | Mutations |
+|-----------------------------|-----------|
+| `binary` | `<` to `<=`, `>` to `>=`, `==` to `!=`, `&&` to `\|\|`, `\|\|` to `&&`, `*` to `/`, `/` to `*`, `%` to `*` |
+| `literal` | `true` to `false`, `false` to `true`, `0` to `1`, string to `""`, increment numeric, decrement numeric |
+| `boundary` | `+` to `-`, `-` to `+` |
+| `removal` | Remove if body, remove else branch, remove call statement, remove assignment |
+| `unary` | Remove `!`, remove unary `-` |
+| `return` | Replace return value with default |
+| `negate` | Negate condition expression |
 
 ## How it works
 

@@ -13,6 +13,7 @@ Single Rust binary. Pipeline: diff → parse → map → mutate → run → repo
 - `src/runner.rs` — parallel test execution with timeouts and file guards
 - `src/report/` — terminal and JSON output
 - `src/operators/` — mutation operators (binary, literal, boundary, removal)
+- `src/operators/mod.rs` — `operator_category()` and `filter_operators()` for `--operators` flag
 - `src/languages/` — per-language tree-sitter node mappings
 - `src/config.rs` — togi.toml parsing with auto-detection
 - `src/cli.rs` — clap CLI definitions
@@ -23,6 +24,7 @@ Single Rust binary. Pipeline: diff → parse → map → mutate → run → repo
 - All changes via PR, never direct to main.
 - `cargo test` must pass. `cargo clippy -- -D warnings` must pass.
 - `cargo fmt` enforced.
+- Build check is opt-in. Auto-detected build commands are NOT used as pre-filters unless explicitly configured in `togi.toml` or via `--build-cmd`.
 
 ## Adding a language
 
@@ -37,6 +39,13 @@ Single Rust binary. Pipeline: diff → parse → map → mutate → run → repo
 1. Implement `MutationOperator` trait in the appropriate file under `src/operators/`
 2. Add to `all_operators()` in `src/operators/mod.rs`
 3. The operator checks `node.kind()` and returns `MutationCandidate` with byte range and replacement
+4. Update `operator_category()` in `src/operators/mod.rs` to map your operator ID to its category
+
+## CLI subcommands
+
+- `togi check` — run mutation testing (default)
+- `togi init` — generate `togi.toml` with auto-detected settings
+- `togi clean` — remove leftover mutant files from interrupted runs
 
 ## Test command
 
