@@ -45,12 +45,25 @@ pub fn parse_lcov(content: &str, project_root: &Path) -> CoverageMap {
             if let Some(ref file) = current_file {
                 let parts: Vec<&str> = brda.split(',').collect();
                 if parts.len() >= 4 {
-                    if let Ok(line_no) = parts[0].parse::<usize>() {
-                        // taken is "-" for never executed, or a count
-                        let taken = parts[3].trim();
-                        if taken != "-" && taken != "0" {
+                    let Ok(line_no) = parts[0].parse::<usize>() else {
+                        eprintln!(
+                            "warning: malformed BRDA line number at line {} in coverage file: {line}",
+                            line_num + 1
+                        );
+                        continue;
+                    };
+                    let taken = parts[3].trim();
+                    if taken == "-" || taken == "0" {
+                        // Never executed or zero count — not covered
+                    } else if let Ok(count) = taken.parse::<u64>() {
+                        if count > 0 {
                             map.entry(file.clone()).or_default().insert(line_no);
                         }
+                    } else {
+                        eprintln!(
+                            "warning: malformed BRDA taken value at line {} in coverage file: {line}",
+                            line_num + 1
+                        );
                     }
                 } else {
                     eprintln!(
