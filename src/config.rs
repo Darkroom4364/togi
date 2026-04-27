@@ -696,6 +696,33 @@ command = ["pytest"]
     }
 
     #[test]
+    fn parse_per_language_timeout() {
+        let toml_str = r#"
+[test]
+command = ["cargo", "test"]
+
+[test.languages.java]
+command = ["mvn", "test"]
+timeout = 120
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.test.languages["java"].timeout, Some(120));
+    }
+
+    #[test]
+    fn parse_per_language_timeout_absent() {
+        let toml_str = r#"
+[test]
+command = ["cargo", "test"]
+
+[test.languages.go]
+command = ["go", "test", "./..."]
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.test.languages["go"].timeout, None);
+    }
+
+    #[test]
     fn command_for_language_resolution() {
         let toml_str = r#"
 [test]

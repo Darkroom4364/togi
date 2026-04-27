@@ -105,7 +105,12 @@ impl TestRunner {
 
             let cmd_str = command.join(" ");
             let build_str = build_command.join(" ");
-            let cache_ctx = format!("{};build={}", cmd_str, build_str);
+            let cache_ctx = format!(
+                "{};build={};timeout={}",
+                cmd_str,
+                build_str,
+                timeout.as_secs()
+            );
 
             let handle = tokio::spawn(async move {
                 let mut results = Vec::new();
@@ -831,5 +836,59 @@ mod tests {
             "mutations on the same file ran concurrently"
         );
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "hello world");
+    }
+
+    #[tokio::test]
+    async fn per_language_timeout_overrides_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("test.txt");
+        std::fs::write(&file, b"hello world").unwrap();
+
+        // "slow_lang" gets a 100ms timeout → sleep 1s will timeout
+        // "fast_lang" uses the default 5s → sleep 0.01s will survive
+        let mut language_timeouts = HashMap::new();
+        language_timeouts.insert("slow_lang".into(), Duration::from_millis(100));
+
+        let mut m_slow = make_test_mutation(&file);
+        m_slow.language = "slow_lang".into();
+        m_slow.description = "slow".into();
+
+        let mut m_fast = make_test_mutation(&file);
+        m_fast.id = 2;
+        m_fast.file = dir.path().join("test2.txt");
+        std::fs::write(&m_fast.file, b"hello world").unwrap();
+        m_fast.language = "fast_lang".into();
+        m_fast.description = "fast".into();
+
+        let runner = TestRunner {
+            commands: CommandConfig {
+                command: vec!["sleep".into(), "1".into()],
+                language_commands: HashMap::new(),
+                build_command: vec![],
+                build_command_explicit: false,
+                timeout: Duration::from_secs(5),
+                language_timeouts,
+            },
+            parallelism: 2,
+            project_root: dir.path().to_path_buf(),
+            verbose: false,
+            show_output: false,
+            max_tested: None,
+        };
+
+        let report = runner.run(vec![m_slow, m_fast]).await;
+        let slow_result = report
+            .results
+            .iter()
+            .find(|(m, _)| m.description == "slow")
+            .map(|(_, r)| *r);
+        let fast_result = report
+            .results
+            .iter()
+            .find(|(m, _)| m.description == "fast")
+            .map(|(_, r)| *r);
+
+        assert_eq!(slow_result, Some(MutationResult::Timeout));
+        assert_eq!(fast_result, Some(MutationResult::Survived));
     }
 }
