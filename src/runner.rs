@@ -10,6 +10,17 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
 
+/// Write `data` to `path` atomically: write to a temp file in the same
+/// directory, fsync, then rename over the target.
+fn atomic_write(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    let dir = path.parent().unwrap_or(Path::new("."));
+    let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
+    tmp.write_all(data)?;
+    tmp.as_file().sync_all()?;
+    tmp.persist(path)?;
+    Ok(())
+}
+
 fn to_cached(r: MutationResult) -> CachedResult {
     match r {
         MutationResult::Killed => CachedResult::Killed,
@@ -48,8 +59,12 @@ struct FileGuard {
 
 impl Drop for FileGuard {
     fn drop(&mut self) {
-        if let Err(e) = std::fs::write(&self.path, &self.original) {
-            eprintln!("error: failed to restore {}: {}", self.path.display(), e);
+        if let Err(e) = atomic_write(&self.path, &self.original) {
+            eprintln!(
+                "error: failed to restore {}: {} — file may be corrupted, check git status",
+                self.path.display(),
+                e
+            );
         }
     }
 }
@@ -103,7 +118,7 @@ impl TestRunner {
                 for mutation in file_mutations {
                     // Stop if enough mutations have been tested
                     if let Some(max) = max_tested
-                        && tested_counter.load(Ordering::Relaxed) >= max
+                        && tested_counter.load(Ordering::Acquire) >= max
                     {
                         break;
                     }
@@ -119,7 +134,7 @@ impl TestRunner {
                     {
                         let result = from_cached(cached);
                         if result != MutationResult::BuildError {
-                            tested_counter.fetch_add(1, Ordering::Relaxed);
+                            tested_counter.fetch_add(1, Ordering::Release);
                         }
                         let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
                         if verbose {
@@ -159,7 +174,7 @@ impl TestRunner {
                     }
 
                     if outcome.result != MutationResult::BuildError {
-                        tested_counter.fetch_add(1, Ordering::Relaxed);
+                        tested_counter.fetch_add(1, Ordering::Release);
                     }
                     let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
                     if verbose {
@@ -297,7 +312,7 @@ async fn run_single_mutation(
     }
     mutated.splice(range, mutation.replacement.as_bytes().iter().copied());
 
-    if let Err(e) = std::fs::write(&file_path, &mutated) {
+    if let Err(e) = atomic_write(&file_path, &mutated) {
         eprintln!("warning: could not write {}: {e}", file_path.display());
         return MutationOutcome {
             result: MutationResult::BuildError,
