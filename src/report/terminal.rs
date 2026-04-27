@@ -1,97 +1,115 @@
 use crate::{MutationReport, MutationResult};
-#[allow(unused_imports)]
 use colored::Colorize;
+use std::fmt::Write;
 
 pub fn print_report(report: &MutationReport) {
-    println!();
+    print!("{}", format_report(report, true));
+}
+
+pub fn format_report_plain(report: &MutationReport) -> String {
+    format_report(report, false)
+}
+
+fn format_report(report: &MutationReport, color: bool) -> String {
+    let mut out = String::new();
+    writeln!(out).unwrap();
 
     for (mutation, result) in &report.results {
-        let file = mutation.file.display();
+        let file = mutation.file.display().to_string();
         let line = mutation.line;
         let operator = &mutation.operator;
         let desc = &mutation.description;
 
-        match result {
-            MutationResult::Killed => {
-                println!(
-                    "  {} {}:{}  {} {}: {}",
-                    "✓ KILLED".green(),
-                    file,
-                    line,
-                    "—".dimmed(),
-                    operator.dimmed(),
-                    desc
-                );
-            }
+        let (tag, extra) = match result {
+            MutationResult::Killed => ("✓ KILLED", None),
             MutationResult::Survived => {
-                println!(
-                    "  {} {}:{}  {} {}: {}",
-                    "✗ SURVIVED".red(),
-                    file,
-                    line,
-                    "—".dimmed(),
-                    operator.dimmed(),
-                    desc
-                );
-                println!(
+                let mut detail = String::new();
+                writeln!(
+                    detail,
                     "              {}",
-                    "Your tests don't catch this mutation.".red()
-                );
+                    if color {
+                        "Your tests don't catch this mutation.".red().to_string()
+                    } else {
+                        "Your tests don't catch this mutation.".to_string()
+                    }
+                )
+                .unwrap();
                 if let Some(diff) = super::mutation_diff(mutation) {
                     for diff_line in diff.lines() {
-                        if diff_line.starts_with('-') {
-                            println!("              {}", diff_line.red());
-                        } else if diff_line.starts_with('+') {
-                            println!("              {}", diff_line.green());
+                        if color {
+                            if diff_line.starts_with('-') {
+                                writeln!(detail, "              {}", diff_line.red())
+                            } else if diff_line.starts_with('+') {
+                                writeln!(detail, "              {}", diff_line.green())
+                            } else {
+                                writeln!(detail, "              {}", diff_line.dimmed())
+                            }
                         } else {
-                            println!("              {}", diff_line.dimmed());
+                            writeln!(detail, "              {diff_line}")
                         }
+                        .unwrap();
                     }
                 }
+                ("✗ SURVIVED", Some(detail))
             }
-            MutationResult::Timeout => {
-                println!(
-                    "  {} {}:{}  {} {}: {}",
-                    "⏱ TIMEOUT".yellow(),
-                    file,
-                    line,
-                    "—".dimmed(),
-                    operator.dimmed(),
-                    desc
-                );
-            }
-            MutationResult::BuildError => {
-                println!(
-                    "  {} {}:{}  {} {}: {}",
-                    "⚠ BUILD ERROR".yellow(),
-                    file,
-                    line,
-                    "—".dimmed(),
-                    operator.dimmed(),
-                    desc
-                );
-            }
+            MutationResult::Timeout => ("⏱ TIMEOUT", None),
+            MutationResult::BuildError => ("⚠ BUILD ERROR", None),
+        };
+
+        if color {
+            let tag_colored = match result {
+                MutationResult::Killed => tag.green().to_string(),
+                MutationResult::Survived => tag.red().to_string(),
+                MutationResult::Timeout | MutationResult::BuildError => tag.yellow().to_string(),
+            };
+            writeln!(
+                out,
+                "  {} {}:{}  {} {}: {}",
+                tag_colored,
+                file,
+                line,
+                "—".dimmed(),
+                operator.dimmed(),
+                desc
+            )
+        } else {
+            writeln!(
+                out,
+                "  {:<14}{}:{} — {}: {}",
+                tag, file, line, operator, desc
+            )
         }
-        println!();
+        .unwrap();
+
+        if let Some(detail) = extra {
+            write!(out, "{detail}").unwrap();
+        }
+        writeln!(out).unwrap();
     }
 
     let separator = "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━";
-    println!("{}", separator);
-    println!(
+    writeln!(out, "{separator}").unwrap();
+    writeln!(
+        out,
         "Results: {} killed, {} survived, {} timeout, {} build errors",
         report.killed, report.survived, report.timeout, report.build_errors
-    );
-    println!(
+    )
+    .unwrap();
+    writeln!(
+        out,
         "Mutation score (test kills only): {:.1}%",
         super::mutation_score(report)
-    );
-    println!("Duration: {:.2}s", report.duration.as_secs_f64());
-    println!("{}", separator);
+    )
+    .unwrap();
+    writeln!(out, "Duration: {:.2}s", report.duration.as_secs_f64()).unwrap();
+    writeln!(out, "{separator}").unwrap();
 
     if let Some(guidance) = all_build_error_guidance(report) {
-        println!();
-        print!("{guidance}");
+        writeln!(out).unwrap();
+        write!(out, "{guidance}").unwrap();
     }
+
+    out
 }
 
 /// Guidance text when every mutation is a build error.
@@ -108,84 +126,6 @@ fn all_build_error_guidance(report: &MutationReport) -> Option<String> {
          \x20 togi check --build-cmd='cargo check'        (custom build check)\n"
             .to_string(),
     )
-}
-
-/// Format report as a plain-text string (no ANSI colors, for testing).
-pub fn format_report_plain(report: &MutationReport) -> String {
-    use std::fmt::Write;
-    let mut out = String::new();
-
-    for (mutation, result) in &report.results {
-        let file = mutation.file.display();
-        let line = mutation.line;
-        let operator = &mutation.operator;
-        let desc = &mutation.description;
-
-        match result {
-            MutationResult::Killed => {
-                writeln!(
-                    out,
-                    "  ✓ KILLED    {}:{} — {}: {}",
-                    file, line, operator, desc
-                )
-                .unwrap();
-            }
-            MutationResult::Survived => {
-                writeln!(
-                    out,
-                    "  ✗ SURVIVED  {}:{} — {}: {}",
-                    file, line, operator, desc
-                )
-                .unwrap();
-                writeln!(out, "              Your tests don't catch this mutation.").unwrap();
-                if let Some(diff) = super::mutation_diff(mutation) {
-                    for diff_line in diff.lines() {
-                        writeln!(out, "              {}", diff_line).unwrap();
-                    }
-                }
-            }
-            MutationResult::Timeout => {
-                writeln!(
-                    out,
-                    "  ⏱ TIMEOUT   {}:{} — {}: {}",
-                    file, line, operator, desc
-                )
-                .unwrap();
-            }
-            MutationResult::BuildError => {
-                writeln!(
-                    out,
-                    "  ⚠ BUILD ERROR {}:{} — {}: {}",
-                    file, line, operator, desc
-                )
-                .unwrap();
-            }
-        }
-    }
-
-    let separator = "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━";
-    writeln!(out, "{}", separator).unwrap();
-    writeln!(
-        out,
-        "Results: {} killed, {} survived, {} timeout, {} build errors",
-        report.killed, report.survived, report.timeout, report.build_errors
-    )
-    .unwrap();
-    writeln!(
-        out,
-        "Mutation score (test kills only): {:.1}%",
-        super::mutation_score(report)
-    )
-    .unwrap();
-    writeln!(out, "Duration: {:.2}s", report.duration.as_secs_f64()).unwrap();
-    writeln!(out, "{}", separator).unwrap();
-
-    if let Some(guidance) = all_build_error_guidance(report) {
-        writeln!(out).unwrap();
-        write!(out, "{guidance}").unwrap();
-    }
-
-    out
 }
 
 #[cfg(test)]
