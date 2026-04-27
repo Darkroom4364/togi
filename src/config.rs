@@ -36,6 +36,8 @@ pub struct ProjectTestConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct LanguageTestConfig {
     pub command: Vec<String>,
+    #[serde(default)]
+    pub timeout: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]

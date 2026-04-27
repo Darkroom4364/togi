@@ -28,6 +28,7 @@ pub struct CommandConfig {
     pub build_command: Vec<String>,
     pub build_command_explicit: bool,
     pub timeout: Duration,
+    pub language_timeouts: HashMap<String, Duration>,
 }
 
 pub struct TestRunner {
@@ -89,7 +90,12 @@ impl TestRunner {
                 .get(language)
                 .unwrap_or(&self.commands.command)
                 .clone();
-            let timeout = self.commands.timeout;
+            let timeout = self
+                .commands
+                .language_timeouts
+                .get(language)
+                .copied()
+                .unwrap_or(self.commands.timeout);
             let project_root = project_root.clone();
             let build_command = build_command.clone();
             let counter = counter.clone();
@@ -681,6 +687,7 @@ mod tests {
                 build_command: vec![],
                 build_command_explicit: false,
                 timeout: Duration::from_secs(5),
+                language_timeouts: HashMap::new(),
             },
             parallelism: 1,
             project_root: dir.path().to_path_buf(),
@@ -719,6 +726,7 @@ mod tests {
                 build_command: vec![],
                 build_command_explicit: false,
                 timeout: Duration::from_secs(5),
+                language_timeouts: HashMap::new(),
             },
             parallelism: 2,
             project_root: dir.path().to_path_buf(),
@@ -754,6 +762,7 @@ mod tests {
                 build_command: vec![],
                 build_command_explicit: false,
                 timeout: Duration::from_secs(5),
+                language_timeouts: HashMap::new(),
             },
             parallelism: 1,
             project_root: dir.path().to_path_buf(),
@@ -805,6 +814,7 @@ mod tests {
                 build_command: vec![],
                 build_command_explicit: false,
                 timeout: Duration::from_secs(5),
+                language_timeouts: HashMap::new(),
             },
             parallelism: 4, // high parallelism, but same-file should serialize
             project_root: dir.path().to_path_buf(),

@@ -57,6 +57,7 @@ async fn verify_mutation_outcomes_match_independent_replay() {
             build_command: vec![],
             build_command_explicit: false,
             timeout: Duration::from_secs(30),
+            language_timeouts: std::collections::HashMap::new(),
         },
         parallelism: 1,
         project_root: root.clone(),
