@@ -36,6 +36,8 @@ pub struct ProjectTestConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct LanguageTestConfig {
     pub command: Vec<String>,
+    #[serde(default)]
+    pub timeout: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -691,6 +693,33 @@ command = ["pytest"]
             vec!["npx", "jest"]
         );
         assert_eq!(config.test.languages["python"].command, vec!["pytest"]);
+    }
+
+    #[test]
+    fn parse_per_language_timeout() {
+        let toml_str = r#"
+[test]
+command = ["cargo", "test"]
+
+[test.languages.java]
+command = ["mvn", "test"]
+timeout = 120
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.test.languages["java"].timeout, Some(120));
+    }
+
+    #[test]
+    fn parse_per_language_timeout_absent() {
+        let toml_str = r#"
+[test]
+command = ["cargo", "test"]
+
+[test.languages.go]
+command = ["go", "test", "./..."]
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.test.languages["go"].timeout, None);
     }
 
     #[test]

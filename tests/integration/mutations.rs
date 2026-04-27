@@ -89,6 +89,7 @@ async fn end_to_end_go_fixture_some_mutations_survive() {
             build_command: vec![],
             build_command_explicit: false,
             timeout: Duration::from_secs(30),
+            language_timeouts: std::collections::HashMap::new(),
         },
         parallelism: 1,
         project_root: root,

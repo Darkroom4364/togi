@@ -380,12 +380,16 @@ async fn execute(
     show_output: bool,
     build_command_explicit: bool,
 ) -> MutationReport {
-    let language_commands: std::collections::HashMap<String, Vec<String>> = config
-        .test
-        .languages
-        .into_iter()
-        .map(|(k, v)| (k, v.command))
-        .collect();
+    let mut language_commands: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    let mut language_timeouts: std::collections::HashMap<String, Duration> =
+        std::collections::HashMap::new();
+    for (lang, lang_config) in config.test.languages {
+        language_commands.insert(lang.clone(), lang_config.command);
+        if let Some(t) = lang_config.timeout {
+            language_timeouts.insert(lang, Duration::from_secs(t));
+        }
+    }
 
     let runner = togi::runner::TestRunner {
         commands: togi::runner::CommandConfig {
@@ -398,6 +402,7 @@ async fn execute(
             },
             build_command_explicit,
             timeout: Duration::from_secs(config.test.timeout),
+            language_timeouts,
         },
         parallelism: config.test.jobs,
         project_root,
