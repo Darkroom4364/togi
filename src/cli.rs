@@ -91,4 +91,6 @@ pub enum Commands {
     Init,
     /// Delete the .togi-cache directory
     Clean,
+    /// List all available mutation operators
+    ListOperators,
 }

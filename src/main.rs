@@ -83,6 +83,9 @@ async fn main() {
                 }
             }
         }
+        togi::cli::Commands::ListOperators => {
+            print_operators();
+        }
         togi::cli::Commands::Init => {
             let path = std::path::Path::new("togi.toml");
             if path.exists() {
@@ -95,6 +98,26 @@ async fn main() {
             }
             println!("Created togi.toml (auto-detected from project)");
         }
+    }
+}
+
+fn print_operators() {
+    let ops = togi::operators::all_operators();
+    let mut by_category: std::collections::BTreeMap<&str, Vec<(&str, &str)>> =
+        std::collections::BTreeMap::new();
+    for op in &ops {
+        let cat = togi::operators::operator_category(op.id());
+        by_category
+            .entry(cat)
+            .or_default()
+            .push((op.id(), op.description()));
+    }
+    for (category, ops) in &by_category {
+        println!("{category}:");
+        for (id, desc) in ops {
+            println!("  {id:<30} {desc}");
+        }
+        println!();
     }
 }
 
