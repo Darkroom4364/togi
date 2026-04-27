@@ -6,6 +6,7 @@ crate::languages::define_language!(
     binary_expression: "binary",
     if_statement: "if",
     return_statement: "return",
+    empty_block_replacement: "nil",
 );
 
 #[cfg(test)]
