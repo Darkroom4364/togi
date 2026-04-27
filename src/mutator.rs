@@ -124,7 +124,11 @@ pub fn generate_mutations(
     max_per_file: usize,
     operator_filters: &[String],
 ) -> Result<Vec<Mutation>> {
-    let operators = operators::filter_operators(operators::all_operators(), operator_filters);
+    let all = operators::all_operators();
+    if !operator_filters.is_empty() {
+        operators::validate_patterns(&all, operator_filters).map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+    let operators = operators::filter_operators(all, operator_filters);
     let mut mutations = Vec::new();
     let mut next_id: u32 = 0;
     let mut parser = tree_sitter::Parser::new();

@@ -144,6 +144,61 @@ pub fn operator_category(id: &str) -> &str {
     }
 }
 
+/// All known category names.
+const CATEGORIES: &[&str] = &[
+    "binary", "literal", "boundary", "removal", "unary", "negate", "return",
+];
+
+/// Validate that every pattern in `patterns` matches a known operator ID or category.
+/// Returns the first unknown pattern as an error with did-you-mean suggestions.
+pub fn validate_patterns(
+    operators: &[Box<dyn MutationOperator>],
+    patterns: &[String],
+) -> Result<(), String> {
+    let known_ids: Vec<&str> = operators.iter().map(|o| o.id()).collect();
+    for raw in patterns {
+        let trimmed = raw.trim().trim_start_matches('-');
+        if trimmed.is_empty() {
+            continue;
+        }
+        if known_ids.contains(&trimmed) || CATEGORIES.contains(&trimmed) {
+            continue;
+        }
+        let mut candidates: Vec<(&str, usize)> = known_ids
+            .iter()
+            .chain(CATEGORIES.iter())
+            .map(|k| (*k, edit_distance(trimmed, k)))
+            .filter(|(_, d)| *d <= 3)
+            .collect();
+        candidates.sort_by_key(|(_, d)| *d);
+        let suggestion = candidates
+            .first()
+            .map(|(k, _)| format!(" Did you mean '{k}'?"))
+            .unwrap_or_default();
+        return Err(format!(
+            "unknown operator or category '{trimmed}'.{suggestion}"
+        ));
+    }
+    Ok(())
+}
+
+/// Simple Levenshtein distance for did-you-mean suggestions.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let a = a.as_bytes();
+    let b = b.as_bytes();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut curr = vec![0; b.len() + 1];
+    for (i, &ca) in a.iter().enumerate() {
+        curr[0] = i + 1;
+        for (j, &cb) in b.iter().enumerate() {
+            let cost = if ca == cb { 0 } else { 1 };
+            curr[j + 1] = (prev[j + 1] + 1).min(curr[j] + 1).min(prev[j] + cost);
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+    prev[b.len()]
+}
+
 /// Filter operators based on include/exclude patterns.
 /// Patterns can be operator IDs or category names.
 /// Prefix with `-` to exclude. If any non-exclude pattern exists,
@@ -356,5 +411,23 @@ func f() string { return "hello" }"#;
         let ops = filter_operators(stub_ops(), &[" -literal ".into()]);
         assert!(!ids(&ops).contains(&"string_to_empty"));
         assert!(ids(&ops).contains(&"lt_to_lte"));
+    }
+
+    #[test]
+    fn validate_accepts_known_ids_and_categories() {
+        assert!(validate_patterns(&stub_ops(), &["lt_to_lte".into(), "binary".into()]).is_ok());
+        assert!(validate_patterns(&stub_ops(), &["-removal".into()]).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_unknown_pattern() {
+        let err = validate_patterns(&stub_ops(), &["invalid_name".into()]).unwrap_err();
+        assert!(err.contains("unknown operator or category 'invalid_name'"));
+    }
+
+    #[test]
+    fn validate_suggests_similar_name() {
+        let err = validate_patterns(&stub_ops(), &["litral".into()]).unwrap_err();
+        assert!(err.contains("Did you mean 'literal'?"), "{err}");
     }
 }
