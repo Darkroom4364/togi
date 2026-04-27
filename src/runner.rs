@@ -766,24 +766,41 @@ mod tests {
         assert_eq!(report.killed, 1, "should use language-specific command");
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn mutations_on_same_file_run_sequentially() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("test.txt");
         std::fs::write(&file, b"hello world").unwrap();
+        let lock_file = dir.path().join("running.lock");
 
-        // Create 3 mutations on the same file
-        let mutations: Vec<Mutation> = (0..3)
-            .map(|i| {
-                let mut m = make_test_mutation(&file);
-                m.id = i;
-                m
+        // Each mutation has a unique description so cache can't short-circuit
+        let mutations: Vec<Mutation> = (0..5)
+            .map(|i| Mutation {
+                id: i,
+                file: file.clone(),
+                language: String::new(),
+                line: 1,
+                column: 1,
+                operator: "test".into(),
+                description: format!("unique mutation {i}"),
+                original: "hello".into(),
+                replacement: "world".into(),
+                byte_range: 0..5,
             })
             .collect();
 
+        // Command that creates a lock file, sleeps briefly, then removes it.
+        // If two run concurrently on the same file, the second will see
+        // the lock file and fail (exit 1 = killed).
+        let script = format!(
+            "if [ -f {lock} ]; then exit 1; fi; touch {lock}; sleep 0.05; rm {lock}",
+            lock = lock_file.display()
+        );
+
         let runner = TestRunner {
             commands: CommandConfig {
-                command: vec!["true".into()],
+                command: vec!["sh".into(), "-c".into(), script],
                 language_commands: HashMap::new(),
                 build_command: vec![],
                 build_command_explicit: false,
@@ -797,10 +814,12 @@ mod tests {
         };
 
         let report = runner.run(mutations).await;
-        assert_eq!(report.total, 3);
-        // All should succeed — file is restored between each
-        assert_eq!(report.survived, 3);
-        // File should be restored to original
+        assert_eq!(report.total, 5);
+        // All should survive — if any were killed, two ran concurrently
+        assert_eq!(
+            report.killed, 0,
+            "mutations on the same file ran concurrently"
+        );
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "hello world");
     }
 }
