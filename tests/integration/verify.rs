@@ -128,6 +128,11 @@ async fn verify_mutation_outcomes_match_independent_replay() {
 
     std::fs::write(&calc_path, &original).expect("failed to restore calc.go");
 
+    assert!(
+        verified > 0,
+        "no mutations were actually compared — all were build errors or timeouts"
+    );
+
     if !mismatches.is_empty() {
         panic!(
             "mutation verification failed — {}/{} mismatches:\n{}",
