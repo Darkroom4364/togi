@@ -65,9 +65,7 @@ async fn verify_mutation_outcomes_match_independent_replay() {
     let mut mismatches = Vec::new();
 
     for (mutation, togi_result) in &report.results {
-        if *togi_result == MutationResult::BuildError
-            || *togi_result == MutationResult::Timeout
-        {
+        if *togi_result == MutationResult::BuildError || *togi_result == MutationResult::Timeout {
             continue;
         }
 
