@@ -10,7 +10,7 @@ struct CheckConfig {
     paths: Vec<PathBuf>,
     base: Option<String>,
     config_path: Option<PathBuf>,
-    output_format: String,
+    output_format: togi::cli::OutputFormat,
     jobs: Option<usize>,
     timeout: Option<u64>,
     dry_run: bool,
@@ -104,7 +104,7 @@ async fn run_check(cfg: CheckConfig) -> anyhow::Result<()> {
     let dry_run = cfg.dry_run;
     let verbose = cfg.verbose;
     let show_output = cfg.show_output;
-    let output_format = cfg.output_format.clone();
+    let output_format = cfg.output_format;
 
     let (mut config, fail_fast, has_explicit_build_cmd) = resolve_config(cfg)?;
     let project_root = get_project_root()?;
@@ -159,7 +159,7 @@ async fn run_check(cfg: CheckConfig) -> anyhow::Result<()> {
     )
     .await;
 
-    togi::report::print_report(&report, &output_format)?;
+    togi::report::print_report(&report, output_format)?;
 
     if report.survived > 0 {
         drop(_lock);
