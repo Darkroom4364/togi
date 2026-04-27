@@ -4,25 +4,15 @@
 //! description, test command hash) so unchanged mutations can be skipped
 //! on subsequent runs. Results are stored as JSON files in `.togi-cache/`.
 
+use crate::MutationResult;
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
 use siphasher::sip::SipHasher;
 
-use serde::{Deserialize, Serialize};
-
 /// Directory where cache entries are stored.
 const CACHE_DIR: &str = ".togi-cache";
-
-/// A cached mutation test result.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum CachedResult {
-    Killed,
-    Survived,
-    Timeout,
-    BuildError,
-}
 
 /// Components that form a unique cache key.
 pub struct CacheKey {
@@ -57,7 +47,7 @@ impl CacheKey {
 /// Look up a previously cached result.
 ///
 /// Returns `None` on cache miss or any I/O / deserialization error.
-pub fn lookup(project_root: &Path, key: &CacheKey) -> Option<CachedResult> {
+pub fn lookup(project_root: &Path, key: &CacheKey) -> Option<MutationResult> {
     let path = entry_path(project_root, key);
     let data = fs::read_to_string(path).ok()?;
     serde_json::from_str(&data).ok()
@@ -67,7 +57,7 @@ pub fn lookup(project_root: &Path, key: &CacheKey) -> Option<CachedResult> {
 ///
 /// Creates the cache directory if it doesn't exist. Silently ignores
 /// write errors so cache failures never break the main pipeline.
-pub fn store(project_root: &Path, key: &CacheKey, result: CachedResult) {
+pub fn store(project_root: &Path, key: &CacheKey, result: MutationResult) {
     let path = entry_path(project_root, key);
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
@@ -114,8 +104,8 @@ mod tests {
     fn store_and_lookup() {
         let tmp = tempfile::tempdir().expect("create tempdir");
         let key = CacheKey::new(b"fn main() {}", "replace + with -", "cargo test");
-        store(tmp.path(), &key, CachedResult::Killed);
-        assert_eq!(lookup(tmp.path(), &key), Some(CachedResult::Killed));
+        store(tmp.path(), &key, MutationResult::Killed);
+        assert_eq!(lookup(tmp.path(), &key), Some(MutationResult::Killed));
     }
 
     #[test]
@@ -130,19 +120,19 @@ mod tests {
         let tmp = tempfile::tempdir().expect("create tempdir");
         let k1 = CacheKey::new(b"v1", "desc", "cmd");
         let k2 = CacheKey::new(b"v2", "desc", "cmd");
-        store(tmp.path(), &k1, CachedResult::Survived);
-        store(tmp.path(), &k2, CachedResult::Killed);
-        assert_eq!(lookup(tmp.path(), &k1), Some(CachedResult::Survived));
-        assert_eq!(lookup(tmp.path(), &k2), Some(CachedResult::Killed));
+        store(tmp.path(), &k1, MutationResult::Survived);
+        store(tmp.path(), &k2, MutationResult::Killed);
+        assert_eq!(lookup(tmp.path(), &k1), Some(MutationResult::Survived));
+        assert_eq!(lookup(tmp.path(), &k2), Some(MutationResult::Killed));
     }
 
     #[test]
     fn clear_removes_cache() {
         let tmp = tempfile::tempdir().expect("create tempdir");
         let key = CacheKey::new(b"code", "desc", "cmd");
-        store(tmp.path(), &key, CachedResult::Timeout);
+        store(tmp.path(), &key, MutationResult::Timeout);
         assert!(cache_dir(tmp.path()).exists());
-        clear(tmp.path());
+        let _ = clear(tmp.path());
         assert!(!cache_dir(tmp.path()).exists());
         assert_eq!(lookup(tmp.path(), &key), None);
     }
@@ -151,10 +141,10 @@ mod tests {
     fn all_result_variants_roundtrip() {
         let tmp = tempfile::tempdir().expect("create tempdir");
         for (i, result) in [
-            CachedResult::Killed,
-            CachedResult::Survived,
-            CachedResult::Timeout,
-            CachedResult::BuildError,
+            MutationResult::Killed,
+            MutationResult::Survived,
+            MutationResult::Timeout,
+            MutationResult::BuildError,
         ]
         .iter()
         .enumerate()

@@ -1,6 +1,6 @@
 // Parallel test execution with timeouts
 
-use crate::cache::{self, CacheKey, CachedResult};
+use crate::cache::{self, CacheKey};
 use crate::{Mutation, MutationReport, MutationResult};
 use std::collections::HashMap;
 use std::io::{IsTerminal, Write};
@@ -21,30 +21,17 @@ fn atomic_write(path: &Path, data: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
-fn to_cached(r: MutationResult) -> CachedResult {
-    match r {
-        MutationResult::Killed => CachedResult::Killed,
-        MutationResult::Survived => CachedResult::Survived,
-        MutationResult::Timeout => CachedResult::Timeout,
-        MutationResult::BuildError => CachedResult::BuildError,
-    }
-}
-
-fn from_cached(r: CachedResult) -> MutationResult {
-    match r {
-        CachedResult::Killed => MutationResult::Killed,
-        CachedResult::Survived => MutationResult::Survived,
-        CachedResult::Timeout => MutationResult::Timeout,
-        CachedResult::BuildError => MutationResult::BuildError,
-    }
-}
-
-pub struct TestRunner {
+/// Command configuration: what to run and how long to wait.
+pub struct CommandConfig {
     pub command: Vec<String>,
     pub language_commands: HashMap<String, Vec<String>>,
     pub build_command: Vec<String>,
     pub build_command_explicit: bool,
     pub timeout: Duration,
+}
+
+pub struct TestRunner {
+    pub commands: CommandConfig,
     pub parallelism: usize,
     pub project_root: PathBuf,
     pub verbose: bool,
@@ -87,7 +74,7 @@ impl TestRunner {
 
         let semaphore = Arc::new(Semaphore::new(self.parallelism));
         let project_root = Arc::new(self.project_root.clone());
-        let build_command = Arc::new(self.build_command.clone());
+        let build_command = Arc::new(self.commands.build_command.clone());
         let mut handles = Vec::new();
 
         for (_file, file_mutations) in by_file {
@@ -97,11 +84,12 @@ impl TestRunner {
                 .map(|m| m.language.as_str())
                 .unwrap_or("");
             let command = self
+                .commands
                 .language_commands
                 .get(language)
-                .unwrap_or(&self.command)
+                .unwrap_or(&self.commands.command)
                 .clone();
-            let timeout = self.timeout;
+            let timeout = self.commands.timeout;
             let project_root = project_root.clone();
             let build_command = build_command.clone();
             let counter = counter.clone();
@@ -132,7 +120,7 @@ impl TestRunner {
                     if let Some(ref key) = cache_key
                         && let Some(cached) = cache::lookup(&project_root, key)
                     {
-                        let result = from_cached(cached);
+                        let result = cached;
                         if result != MutationResult::BuildError {
                             tested_counter.fetch_add(1, Ordering::Release);
                         }
@@ -170,7 +158,7 @@ impl TestRunner {
 
                     // Store result in cache
                     if let Some(ref key) = cache_key {
-                        cache::store(&project_root, key, to_cached(outcome.result));
+                        cache::store(&project_root, key, outcome.result);
                     }
 
                     if outcome.result != MutationResult::BuildError {
@@ -687,11 +675,13 @@ mod tests {
             .collect();
 
         let runner = TestRunner {
-            command: vec!["true".into()],
-            language_commands: HashMap::new(),
-            build_command: vec![],
-            build_command_explicit: false,
-            timeout: Duration::from_secs(5),
+            commands: CommandConfig {
+                command: vec!["true".into()],
+                language_commands: HashMap::new(),
+                build_command: vec![],
+                build_command_explicit: false,
+                timeout: Duration::from_secs(5),
+            },
             parallelism: 1,
             project_root: dir.path().to_path_buf(),
             verbose: false,
@@ -723,11 +713,13 @@ mod tests {
         lang_cmds.insert("killed_lang".into(), vec!["false".into()]);
 
         let runner = TestRunner {
-            command: vec!["true".into()],
-            language_commands: lang_cmds,
-            build_command: vec![],
-            build_command_explicit: false,
-            timeout: Duration::from_secs(5),
+            commands: CommandConfig {
+                command: vec!["true".into()],
+                language_commands: lang_cmds,
+                build_command: vec![],
+                build_command_explicit: false,
+                timeout: Duration::from_secs(5),
+            },
             parallelism: 2,
             project_root: dir.path().to_path_buf(),
             verbose: false,
@@ -756,11 +748,13 @@ mod tests {
         lang_cmds.insert("go".into(), vec!["false".into()]); // "false" = always fails = killed
 
         let runner = TestRunner {
-            command: vec!["true".into()], // default would survive
-            language_commands: lang_cmds,
-            build_command: vec![],
-            build_command_explicit: false,
-            timeout: Duration::from_secs(5),
+            commands: CommandConfig {
+                command: vec!["true".into()], // default would survive
+                language_commands: lang_cmds,
+                build_command: vec![],
+                build_command_explicit: false,
+                timeout: Duration::from_secs(5),
+            },
             parallelism: 1,
             project_root: dir.path().to_path_buf(),
             verbose: false,
@@ -770,5 +764,62 @@ mod tests {
 
         let report = runner.run(vec![mutation]).await;
         assert_eq!(report.killed, 1, "should use language-specific command");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mutations_on_same_file_run_sequentially() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("test.txt");
+        std::fs::write(&file, b"hello world").unwrap();
+        let lock_file = dir.path().join("running.lock");
+
+        // Each mutation has a unique description so cache can't short-circuit
+        let mutations: Vec<Mutation> = (0..5)
+            .map(|i| Mutation {
+                id: i,
+                file: file.clone(),
+                language: String::new(),
+                line: 1,
+                column: 1,
+                operator: "test".into(),
+                description: format!("unique mutation {i}"),
+                original: "hello".into(),
+                replacement: "world".into(),
+                byte_range: 0..5,
+            })
+            .collect();
+
+        // Command that creates a lock file, sleeps briefly, then removes it.
+        // If two run concurrently on the same file, the second will see
+        // the lock file and fail (exit 1 = killed).
+        let script = format!(
+            "if [ -f {lock} ]; then exit 1; fi; touch {lock}; sleep 0.05; rm {lock}",
+            lock = lock_file.display()
+        );
+
+        let runner = TestRunner {
+            commands: CommandConfig {
+                command: vec!["sh".into(), "-c".into(), script],
+                language_commands: HashMap::new(),
+                build_command: vec![],
+                build_command_explicit: false,
+                timeout: Duration::from_secs(5),
+            },
+            parallelism: 4, // high parallelism, but same-file should serialize
+            project_root: dir.path().to_path_buf(),
+            verbose: false,
+            show_output: false,
+            max_tested: None,
+        };
+
+        let report = runner.run(mutations).await;
+        assert_eq!(report.total, 5);
+        // All should survive — if any were killed, two ran concurrently
+        assert_eq!(
+            report.killed, 0,
+            "mutations on the same file ran concurrently"
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "hello world");
     }
 }

@@ -74,7 +74,7 @@ pub struct MutationCandidate {
 }
 
 /// Result of running a single mutation
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum MutationResult {
     Killed,
     Survived,

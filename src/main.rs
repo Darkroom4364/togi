@@ -388,15 +388,17 @@ async fn execute(
         .collect();
 
     let runner = togi::runner::TestRunner {
-        command: config.test.command,
-        language_commands,
-        build_command: if build_command_explicit {
-            config.test.build_command
-        } else {
-            vec![]
+        commands: togi::runner::CommandConfig {
+            command: config.test.command,
+            language_commands,
+            build_command: if build_command_explicit {
+                config.test.build_command
+            } else {
+                vec![]
+            },
+            build_command_explicit,
+            timeout: Duration::from_secs(config.test.timeout),
         },
-        build_command_explicit,
-        timeout: Duration::from_secs(config.test.timeout),
         parallelism: config.test.jobs,
         project_root,
         verbose,

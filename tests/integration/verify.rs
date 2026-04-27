@@ -51,16 +51,18 @@ async fn verify_mutation_outcomes_match_independent_replay() {
     }
 
     let runner = togi::runner::TestRunner {
-        command: vec!["go".into(), "test".into(), "./...".into()],
-        language_commands: std::collections::HashMap::new(),
-        timeout: Duration::from_secs(30),
+        commands: togi::runner::CommandConfig {
+            command: vec!["go".into(), "test".into(), "./...".into()],
+            language_commands: std::collections::HashMap::new(),
+            build_command: vec![],
+            build_command_explicit: false,
+            timeout: Duration::from_secs(30),
+        },
         parallelism: 1,
         project_root: root.clone(),
         verbose: false,
-        build_command: vec![],
-        build_command_explicit: false,
-        max_tested: None,
         show_output: false,
+        max_tested: None,
     };
 
     let report = runner.run(mutations).await;
