@@ -6,6 +6,7 @@ crate::languages::define_language!(
     binary_expression: "binary_operator",
     bool_true: ["True"],
     bool_false: ["False"],
+    empty_block_replacement: "pass",
 );
 
 #[cfg(test)]

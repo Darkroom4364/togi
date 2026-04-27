@@ -77,17 +77,6 @@ fn should_skip_string_to_empty(node: &tree_sitter::Node, language: &str) -> bool
     false
 }
 
-/// Adjust replacement text for language-specific syntax.
-fn fixup_replacement(candidate: &mut MutationCandidate, language: &str) {
-    if candidate.operator_id == "remove_if_body" && candidate.replacement == "{}" {
-        match language {
-            "python" => candidate.replacement = "pass".to_string(),
-            "ruby" => candidate.replacement = "nil".to_string(),
-            _ => {}
-        }
-    }
-}
-
 /// Check if a mutation candidate should be filtered out for the given language.
 fn should_filter(candidate: &MutationCandidate, node: &tree_sitter::Node, language: &str) -> bool {
     if candidate.operator_id == "return_empty" {
@@ -165,7 +154,7 @@ pub fn generate_mutations(
                     if should_filter(&candidate, node, &language_name) {
                         continue;
                     }
-                    fixup_replacement(&mut candidate, &language_name);
+                    lang.fixup_replacement(&mut candidate);
 
                     if candidate.byte_range.start > candidate.byte_range.end
                         || candidate.byte_range.end > source.len()

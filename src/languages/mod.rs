@@ -32,6 +32,7 @@ macro_rules! define_language {
         $(, bool_false: [$($bf:expr),* $(,)?])?
         $(, operator_field: $op:expr)?
         $(, skip_subtree_kinds: [$($sk:expr),* $(,)?])?
+        $(, empty_block_replacement: $ebr:expr)?
         $(,)?
     ) => {
         pub struct $struct;
@@ -61,6 +62,7 @@ macro_rules! define_language {
             fn skip_subtree_kinds(&self) -> &[&str] {
                 $crate::languages::define_language!(@arr [$($($sk),*)?] ; [])
             }
+            $crate::languages::define_language!(@fixup $($ebr)?);
         }
     };
     // Helper: return first value if present, otherwise default
@@ -69,6 +71,15 @@ macro_rules! define_language {
     // Helper: return array if non-empty, otherwise default
     (@arr [$($val:expr),+] ; [$($default:expr),*]) => { &[$($val),+] };
     (@arr [] ; [$($default:expr),*]) => { &[$($default),*] };
+    // Helper: override fixup_replacement if empty_block_replacement is set
+    (@fixup $replacement:expr) => {
+        fn fixup_replacement(&self, candidate: &mut $crate::MutationCandidate) {
+            if candidate.operator_id == "remove_if_body" && candidate.replacement == "{}" {
+                candidate.replacement = $replacement.to_string();
+            }
+        }
+    };
+    (@fixup) => {};
 }
 
 pub(crate) use define_language;
@@ -96,6 +107,10 @@ pub trait LanguageSupport: Send + Sync {
     fn should_skip_node(&self, _node: &tree_sitter::Node, _source: &[u8]) -> bool {
         false
     }
+
+    /// Adjust a mutation candidate's replacement for language-specific syntax.
+    /// For example, Python replaces `{}` (empty block) with `pass`.
+    fn fixup_replacement(&self, _candidate: &mut crate::MutationCandidate) {}
 }
 
 /// Returns instances of all supported languages.
