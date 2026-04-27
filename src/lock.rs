@@ -29,7 +29,26 @@ fn try_flock(file: &File) -> bool {
     unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0 }
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn try_flock(file: &File) -> bool {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx,
+    };
+    unsafe {
+        let mut overlapped: windows_sys::Win32::System::IO::OVERLAPPED = std::mem::zeroed();
+        LockFileEx(
+            file.as_raw_handle() as isize,
+            LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+            0,
+            1,
+            0,
+            &mut overlapped,
+        ) != 0
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
 fn try_flock(_file: &File) -> bool {
     true
 }
