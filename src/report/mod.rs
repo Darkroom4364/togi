@@ -18,16 +18,20 @@ pub fn mutation_score(report: &MutationReport) -> f64 {
     }
 }
 
-pub fn print_report(report: &crate::MutationReport, format: &str) -> anyhow::Result<()> {
+pub fn print_report(
+    report: &crate::MutationReport,
+    format: crate::cli::OutputFormat,
+) -> anyhow::Result<()> {
+    use crate::cli::OutputFormat;
     match format {
-        "json" => json::print_report(report)?,
-        "github" => github::print_report(report),
-        "html" => {
+        OutputFormat::Json => json::print_report(report)?,
+        OutputFormat::Github => github::print_report(report),
+        OutputFormat::Html => {
             let path = std::path::Path::new("togi-report.html");
             html::write_report(report, path)?;
             eprintln!("HTML report written to {}", path.display());
         }
-        _ => terminal::print_report(report),
+        OutputFormat::Terminal => terminal::print_report(report),
     }
     Ok(())
 }

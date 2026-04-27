@@ -1,5 +1,13 @@
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum OutputFormat {
+    Terminal,
+    Json,
+    Github,
+    Html,
+}
 
 #[derive(Parser)]
 #[command(name = "togi", version, about = "Fast, diff-targeted mutation testing")]
@@ -31,7 +39,7 @@ pub enum Commands {
 
         /// Output format
         #[arg(short, long, default_value = "terminal")]
-        format: String,
+        format: OutputFormat,
 
         /// Number of parallel jobs
         #[arg(short, long)]
