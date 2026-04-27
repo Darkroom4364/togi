@@ -29,9 +29,10 @@ pub fn parse_lcov(content: &str, project_root: &Path) -> CoverageMap {
                 if let (Some(line_str), Some(count_str)) = (parts.next(), parts.next())
                     && let (Ok(line_no), Ok(count)) =
                         (line_str.parse::<usize>(), count_str.parse::<u64>())
-                    && count > 0
                 {
-                    map.entry(file.clone()).or_default().insert(line_no);
+                    if count > 0 {
+                        map.entry(file.clone()).or_default().insert(line_no);
+                    }
                 } else {
                     eprintln!(
                         "warning: malformed DA record at line {} in coverage file: {line}",
