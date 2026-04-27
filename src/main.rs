@@ -317,23 +317,29 @@ fn filter_mutations(
         } else {
             PathBuf::from(cov_path)
         };
-        let cov_content = std::fs::read_to_string(&resolved_cov_path).map_err(|e| {
-            anyhow::anyhow!(
-                "Could not read coverage file {}: {e}",
-                resolved_cov_path.display()
-            )
-        })?;
-        let coverage = togi::coverage::parse_lcov(&cov_content, project_root);
-        let before = mutations.len();
-        let filtered = togi::coverage::filter_by_coverage(mutations, &coverage, project_root);
-        if before > filtered.len() {
-            eprintln!(
-                "Coverage filter: {} of {} mutations on covered lines",
-                filtered.len(),
-                before
-            );
+        match std::fs::read_to_string(&resolved_cov_path) {
+            Ok(cov_content) => {
+                let coverage = togi::coverage::parse_lcov(&cov_content, project_root);
+                let before = mutations.len();
+                let filtered =
+                    togi::coverage::filter_by_coverage(mutations, &coverage, project_root);
+                if before > filtered.len() {
+                    eprintln!(
+                        "Coverage filter: {} of {} mutations on covered lines",
+                        filtered.len(),
+                        before
+                    );
+                }
+                filtered
+            }
+            Err(e) => {
+                eprintln!(
+                    "warning: could not read coverage file {}: {e} — running all mutations",
+                    resolved_cov_path.display()
+                );
+                mutations
+            }
         }
-        filtered
     } else {
         mutations
     };
