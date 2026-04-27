@@ -31,12 +31,6 @@ async fn verify_mutation_outcomes_match_independent_replay() {
     let root = fixture_path();
     let calc_path = root.join("calc.go");
 
-    // Disable Go build+test caching so each mutation gets a fresh compile
-    unsafe {
-        std::env::set_var("GOFLAGS", "-count=1");
-        std::env::set_var("GOCACHE", "off");
-    }
-
     let changed = vec![ChangedFile {
         path: PathBuf::from("calc.go"),
         hunks: vec![LineRange { start: 1, end: 32 }],
@@ -44,6 +38,17 @@ async fn verify_mutation_outcomes_match_independent_replay() {
 
     let mutations = togi::mutator::generate_mutations(&changed, &root, 200, 0, &[]).unwrap();
     assert!(!mutations.is_empty());
+
+    // Capture pristine fixture before runner.run() touches it
+    let original = std::fs::read(&calc_path).expect("failed to read calc.go");
+
+    // Disable Go build+test caching via env on each spawned process.
+    // togi's runner inherits process env, so these reach `go test`.
+    let go_env = [("GOFLAGS", "-count=1"), ("GOCACHE", "off")];
+    // Set for togi's runner (it spawns child processes that inherit env)
+    for (k, v) in &go_env {
+        unsafe { std::env::set_var(k, v) };
+    }
 
     let runner = togi::runner::TestRunner {
         command: vec!["go".into(), "test".into(), "./...".into()],
@@ -59,7 +64,13 @@ async fn verify_mutation_outcomes_match_independent_replay() {
     };
 
     let report = runner.run(mutations).await;
-    let original = std::fs::read(&calc_path).expect("failed to read calc.go");
+
+    // Verify runner restored the file
+    let after_run = std::fs::read(&calc_path).expect("failed to re-read calc.go");
+    assert_eq!(
+        after_run, original,
+        "runner did not restore calc.go to its original contents"
+    );
 
     let mut verified = 0;
     let mut mismatches = Vec::new();
@@ -70,16 +81,28 @@ async fn verify_mutation_outcomes_match_independent_replay() {
         }
 
         let range = mutation.byte_range.clone();
-        if range.end > original.len() {
-            continue;
-        }
+        assert!(
+            range.start <= range.end && range.end <= original.len(),
+            "mutation {} has invalid byte range {:?} for calc.go (len {})",
+            mutation.id,
+            range,
+            original.len(),
+        );
+        assert_eq!(
+            &original[range.clone()],
+            mutation.original.as_bytes(),
+            "mutation {} byte_range does not match original source bytes",
+            mutation.id,
+        );
 
         let mut mutated = original.clone();
         mutated.splice(range, mutation.replacement.as_bytes().iter().copied());
         std::fs::write(&calc_path, &mutated).expect("failed to write mutated file");
 
+        // Replay with same cache-defeating env
         let output = Command::new("go")
             .args(["test", "./..."])
+            .envs(go_env)
             .current_dir(&root)
             .output()
             .expect("failed to run go test");
