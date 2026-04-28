@@ -48,14 +48,6 @@ pub fn sample_report() -> MutationReport {
     }
 }
 
-/// Parse Python source code into a tree-sitter tree.
-pub fn parse_python(src: &str) -> tree_sitter::Tree {
-    let mut parser = tree_sitter::Parser::new();
-    let lang = tree_sitter_python::LANGUAGE;
-    parser.set_language(&lang.into()).unwrap();
-    parser.parse(src, None).unwrap()
-}
-
 /// Parse Go source code into a tree-sitter tree.
 pub fn parse_go(src: &str) -> tree_sitter::Tree {
     let mut parser = tree_sitter::Parser::new();
