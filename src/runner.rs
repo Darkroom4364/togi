@@ -114,7 +114,7 @@ impl TestRunner {
                 "{};build={};timeout={};env={}",
                 cmd_str,
                 build_str,
-                timeout.as_secs(),
+                timeout.as_millis(),
                 env_parts.join(",")
             );
 
