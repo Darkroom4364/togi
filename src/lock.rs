@@ -38,7 +38,7 @@ fn try_flock(file: &File) -> bool {
     unsafe {
         let mut overlapped: windows_sys::Win32::System::IO::OVERLAPPED = std::mem::zeroed();
         LockFileEx(
-            file.as_raw_handle() as isize,
+            file.as_raw_handle(),
             LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
             0,
             1,

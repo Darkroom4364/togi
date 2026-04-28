@@ -15,7 +15,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -39,6 +39,19 @@ jobs:
       - name: Format
         run: cargo fmt -- --check
 
+  integration:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - name: Integration tests
+        run: cargo test -- --ignored
+
   dogfood:
     name: Dogfood (togi on togi)
     runs-on: ubuntu-latest
@@ -51,4 +64,5 @@ jobs:
       - name: Build togi
         run: cargo build --release
       - name: Run togi on last commit
-        run: ./target/release/togi check --base HEAD~1 --test-cmd "cargo test" --format terminal || true
+        continue-on-error: true
+        run: ./target/release/togi check --base HEAD~1 --test-cmd "cargo test" --format terminal
