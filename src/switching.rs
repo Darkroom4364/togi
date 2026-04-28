@@ -9,15 +9,19 @@ use crate::Mutation;
 /// Languages that support mutation switching (interpreted, no compile step).
 const SWITCHABLE_LANGUAGES: &[&str] = &["python", "ruby", "typescript"];
 
-/// Operators that produce statement-level mutations which cannot be wrapped
-/// in a ternary/conditional expression.
-const STATEMENT_LEVEL_OPERATORS: &[&str] = &[
-    "remove_if_body",
-    "remove_else",
-    "remove_break",
-    "remove_continue",
-    "remove_call_statement",
-    "remove_assignment",
+/// Operators whose byte range covers a full expression value, making it safe
+/// to wrap in a conditional. Token-level operators (e.g., `<` → `<=` inside
+/// a binary expression) produce invalid code when wrapped and must use the
+/// one-at-a-time path.
+const EXPRESSION_LEVEL_OPERATORS: &[&str] = &[
+    "true_to_false",
+    "false_to_true",
+    "zero_to_one",
+    "string_to_empty",
+    "increment_numeric",
+    "decrement_numeric",
+    "return_empty",
+    "negate_condition",
 ];
 
 /// Check if a language supports mutation switching.
@@ -26,8 +30,11 @@ pub fn is_switchable_language(language: &str) -> bool {
 }
 
 /// Check if a mutation can be embedded as a conditional expression.
+/// Only expression-level operators (where the byte range covers a complete
+/// expression) are safe. Token-level operators like `lt_to_lte` replace
+/// a token inside a larger expression, producing invalid code if wrapped.
 pub fn is_switchable_mutation(mutation: &Mutation) -> bool {
-    !STATEMENT_LEVEL_OPERATORS.contains(&mutation.operator.as_str())
+    EXPRESSION_LEVEL_OPERATORS.contains(&mutation.operator.as_str())
 }
 
 /// Partition a file's mutations into (switchable, fallback).
@@ -150,37 +157,49 @@ mod tests {
 
     #[test]
     fn switchable_mutation_classification() {
-        let expr = make_mutation(0, "lt_to_lte", 0, 1, "<=");
-        assert!(is_switchable_mutation(&expr));
-
-        let stmt = make_mutation(0, "remove_if_body", 0, 10, "{}");
-        assert!(!is_switchable_mutation(&stmt));
-
+        // Expression-level: safe to wrap in conditional
         let literal = make_mutation(0, "true_to_false", 0, 4, "false");
         assert!(is_switchable_mutation(&literal));
+
+        let numeric = make_mutation(0, "zero_to_one", 0, 1, "1");
+        assert!(is_switchable_mutation(&numeric));
+
+        let ret = make_mutation(0, "return_empty", 0, 5, "0");
+        assert!(is_switchable_mutation(&ret));
+
+        // Token-level: NOT safe (replaces operator token inside expression)
+        let token = make_mutation(0, "lt_to_lte", 0, 1, "<=");
+        assert!(!is_switchable_mutation(&token));
+
+        let boundary = make_mutation(0, "plus_to_minus", 0, 1, "-");
+        assert!(!is_switchable_mutation(&boundary));
+
+        // Statement-level: NOT safe
+        let stmt = make_mutation(0, "remove_if_body", 0, 10, "{}");
+        assert!(!is_switchable_mutation(&stmt));
 
         let brk = make_mutation(0, "remove_break", 0, 5, "");
         assert!(!is_switchable_mutation(&brk));
     }
 
     #[test]
-    fn partition_separates_statement_level() {
+    fn partition_separates_non_expression_level() {
         let mutations = vec![
-            make_mutation(0, "lt_to_lte", 0, 1, "<="),
-            make_mutation(1, "remove_if_body", 5, 15, "{}"),
-            make_mutation(2, "true_to_false", 20, 24, "false"),
+            make_mutation(0, "lt_to_lte", 0, 1, "<="), // token-level → fallback
+            make_mutation(1, "remove_if_body", 5, 15, "{}"), // statement-level → fallback
+            make_mutation(2, "true_to_false", 20, 24, "false"), // expression-level → switchable
         ];
         let (switchable, fallback) = partition_mutations(mutations);
-        assert_eq!(switchable.len(), 2);
-        assert_eq!(fallback.len(), 1);
-        assert_eq!(fallback[0].operator, "remove_if_body");
+        assert_eq!(switchable.len(), 1);
+        assert_eq!(switchable[0].operator, "true_to_false");
+        assert_eq!(fallback.len(), 2);
     }
 
     #[test]
     fn partition_moves_overlapping_to_fallback() {
         let mutations = vec![
-            make_mutation(0, "lt_to_lte", 10, 15, "<="),
-            make_mutation(1, "gt_to_gte", 12, 18, ">="), // overlaps with above
+            make_mutation(0, "true_to_false", 10, 15, "false"),
+            make_mutation(1, "zero_to_one", 12, 18, "1"), // overlaps with above
             make_mutation(2, "true_to_false", 30, 34, "false"), // no overlap
         ];
         let (switchable, fallback) = partition_mutations(mutations);
@@ -192,8 +211,8 @@ mod tests {
     #[test]
     fn adjacent_ranges_are_not_overlapping() {
         let mutations = vec![
-            make_mutation(0, "lt_to_lte", 10, 15, "<="),
-            make_mutation(1, "gt_to_gte", 15, 20, ">="), // adjacent, not overlapping
+            make_mutation(0, "true_to_false", 10, 14, "false"),
+            make_mutation(1, "zero_to_one", 14, 15, "1"), // adjacent, not overlapping
         ];
         let (switchable, fallback) = partition_mutations(mutations);
         assert_eq!(switchable.len(), 2);
@@ -291,46 +310,132 @@ mod tests {
 
     #[test]
     fn rewrite_preserves_surrounding_code() {
-        let source = b"result = a + b\nprint(result)";
+        // Use an expression-level mutation (true_to_false)
+        let source = b"if True:\n    print('yes')";
         let mutations = vec![Mutation {
             id: 5,
             file: PathBuf::from("test.py"),
             language: "python".into(),
             line: 1,
-            column: 12,
-            operator: "plus_to_minus".into(),
+            column: 4,
+            operator: "true_to_false".into(),
             description: "test".into(),
-            original: "+".into(),
-            replacement: "-".into(),
-            byte_range: 11..12,
+            original: "True".into(),
+            replacement: "False".into(),
+            byte_range: 3..7,
         }];
         let result = rewrite_source(source, &mutations, "python");
         let result_str = String::from_utf8(result).unwrap();
-        assert!(result_str.starts_with("result = a "));
+        assert!(result_str.starts_with("if "));
         assert!(result_str.contains("TOGI_MUTANT"));
-        assert!(result_str.ends_with(" b\nprint(result)"));
+        assert!(result_str.contains("(False)"));
+        assert!(result_str.contains("(True)"));
+        assert!(result_str.ends_with(":\n    print('yes')"));
     }
 
     #[test]
     fn rewrite_with_conditional_like_replacement() {
-        // Replacement text contains conditional-like syntax
-        let source = b"x";
+        let source = b"True";
         let mutations = vec![Mutation {
             id: 1,
             file: PathBuf::from("test.py"),
             language: "python".into(),
             line: 1,
             column: 1,
-            operator: "test_op".into(),
+            operator: "true_to_false".into(),
             description: "test".into(),
-            original: "x".into(),
+            original: "True".into(),
             replacement: "foo if bar else baz".into(),
-            byte_range: 0..1,
+            byte_range: 0..4,
         }];
         let result = rewrite_source(source, &mutations, "python");
         let result_str = String::from_utf8(result).unwrap();
-        // Should wrap in parens, preventing parsing issues
         assert!(result_str.contains("(foo if bar else baz)"));
+    }
+
+    #[test]
+    fn rewrite_produces_parseable_python() {
+        // Regression test: verify the rewritten source is syntactically valid
+        // by parsing it with tree-sitter. Token-level mutations (lt_to_lte etc.)
+        // must NOT go through switching — they'd produce invalid code.
+        let source = b"x = True\ny = 0\n";
+        let mutations = vec![
+            Mutation {
+                id: 1,
+                file: PathBuf::from("test.py"),
+                language: "python".into(),
+                line: 1,
+                column: 5,
+                operator: "true_to_false".into(),
+                description: "test".into(),
+                original: "True".into(),
+                replacement: "False".into(),
+                byte_range: 4..8,
+            },
+            Mutation {
+                id: 2,
+                file: PathBuf::from("test.py"),
+                language: "python".into(),
+                line: 2,
+                column: 5,
+                operator: "zero_to_one".into(),
+                description: "test".into(),
+                original: "0".into(),
+                replacement: "1".into(),
+                byte_range: 13..14,
+            },
+        ];
+        let result = rewrite_source(source, &mutations, "python");
+        let result_str = String::from_utf8(result).unwrap();
+
+        // Parse the rewritten source with tree-sitter Python
+        let tree = crate::test_helpers::parse_python(&result_str);
+        let root = tree.root_node();
+        // A valid parse should have no ERROR nodes
+        assert!(
+            !root.has_error(),
+            "rewritten Python source has parse errors:\n{result_str}"
+        );
+    }
+
+    #[test]
+    fn rewrite_produces_parseable_typescript() {
+        let source = b"const x = true;\nconst y = 0;\n";
+        let mutations = vec![
+            Mutation {
+                id: 1,
+                file: PathBuf::from("test.ts"),
+                language: "typescript".into(),
+                line: 1,
+                column: 11,
+                operator: "true_to_false".into(),
+                description: "test".into(),
+                original: "true".into(),
+                replacement: "false".into(),
+                byte_range: 10..14,
+            },
+            Mutation {
+                id: 2,
+                file: PathBuf::from("test.ts"),
+                language: "typescript".into(),
+                line: 2,
+                column: 11,
+                operator: "zero_to_one".into(),
+                description: "test".into(),
+                original: "0".into(),
+                replacement: "1".into(),
+                byte_range: 26..27,
+            },
+        ];
+        let result = rewrite_source(source, &mutations, "typescript");
+        let result_str = String::from_utf8(result).unwrap();
+
+        let tree = crate::test_helpers::parse_typescript(&result_str);
+        let root = tree.root_node();
+        assert!(
+            !root.has_error(),
+            "rewritten TypeScript source has parse errors:\n{result_str}"
+        );
     }
 
     #[test]
