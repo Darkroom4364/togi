@@ -263,7 +263,10 @@ fn parse_shard(s: &str) -> anyhow::Result<(usize, usize)> {
     let n: usize = parts[1]
         .parse()
         .map_err(|_| anyhow::anyhow!("invalid shard count '{}'", parts[1]))?;
-    if n == 0 || k == 0 || k > n {
+    if n == 0 {
+        anyhow::bail!("invalid shard count: n must be >= 1 for --shard {s}");
+    }
+    if k == 0 || k > n {
         anyhow::bail!("--shard {s}: k must be 1..={n}");
     }
     Ok((k, n))
