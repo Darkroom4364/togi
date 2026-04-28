@@ -38,6 +38,8 @@ pub struct TestRunner {
     pub verbose: bool,
     pub show_output: bool,
     pub max_tested: Option<usize>,
+    /// Extra environment variables passed to every spawned command.
+    pub env: HashMap<String, String>,
 }
 
 struct FileGuard {
@@ -102,14 +104,18 @@ impl TestRunner {
             let tested_counter = tested_counter.clone();
             let max_tested = self.max_tested;
             let show_output = self.show_output;
+            let env = self.env.clone();
 
             let cmd_str = command.join(" ");
             let build_str = build_command.join(" ");
+            let mut env_parts: Vec<String> = env.iter().map(|(k, v)| format!("{k}={v}")).collect();
+            env_parts.sort();
             let cache_ctx = format!(
-                "{};build={};timeout={}",
+                "{};build={};timeout={};env={}",
                 cmd_str,
                 build_str,
-                timeout.as_secs()
+                timeout.as_millis(),
+                env_parts.join(",")
             );
 
             let handle = tokio::spawn(async move {
@@ -164,6 +170,7 @@ impl TestRunner {
                         &project_root,
                         &mutation,
                         show_output,
+                        &env,
                     )
                     .await;
 
@@ -279,6 +286,7 @@ async fn run_single_mutation(
     project_root: &Path,
     mutation: &Mutation,
     capture_output: bool,
+    env: &HashMap<String, String>,
 ) -> MutationOutcome {
     let file_path = project_root.join(&mutation.file);
 
@@ -321,7 +329,7 @@ async fn run_single_mutation(
 
     // Build check: skip expensive test if mutation doesn't compile
     if !build_command.is_empty() {
-        let build_outcome = run_command(build_command, project_root, timeout, false).await;
+        let build_outcome = run_command(build_command, project_root, timeout, false, env).await;
         if build_outcome.result != MutationResult::Survived {
             return MutationOutcome {
                 result: MutationResult::BuildError,
@@ -331,7 +339,7 @@ async fn run_single_mutation(
     }
 
     // Run test command; guard will restore the file on drop
-    run_command(command, project_root, timeout, capture_output).await
+    run_command(command, project_root, timeout, capture_output, env).await
 }
 
 async fn run_command(
@@ -339,6 +347,7 @@ async fn run_command(
     cwd: &Path,
     timeout_dur: Duration,
     capture_output: bool,
+    env: &HashMap<String, String>,
 ) -> MutationOutcome {
     if command.is_empty() {
         return MutationOutcome {
@@ -348,7 +357,7 @@ async fn run_command(
     }
 
     let mut cmd = tokio::process::Command::new(&command[0]);
-    cmd.args(&command[1..]).current_dir(cwd);
+    cmd.args(&command[1..]).current_dir(cwd).envs(env);
 
     if capture_output {
         cmd.stdout(std::process::Stdio::piped());
@@ -464,6 +473,7 @@ mod tests {
             &dir.path().to_path_buf(),
             &mutation,
             false,
+            &HashMap::new(),
         )
         .await;
 
@@ -482,6 +492,7 @@ mod tests {
             &dir.path().to_path_buf(),
             &mutation,
             false,
+            &HashMap::new(),
         )
         .await;
 
@@ -516,6 +527,7 @@ mod tests {
             &dir.path().to_path_buf(),
             &mutation,
             false,
+            &HashMap::new(),
         )
         .await;
 
@@ -535,6 +547,7 @@ mod tests {
             &dir.path().to_path_buf(),
             &mutation,
             false,
+            &HashMap::new(),
         )
         .await;
 
@@ -554,6 +567,7 @@ mod tests {
             &dir.path().to_path_buf(),
             &mutation,
             false,
+            &HashMap::new(),
         )
         .await;
 
@@ -579,6 +593,7 @@ mod tests {
             &dir.path().to_path_buf(),
             &mutation,
             false,
+            &HashMap::new(),
         )
         .await;
 
@@ -599,6 +614,7 @@ mod tests {
             &dir.path().to_path_buf(),
             &mutation,
             false,
+            &HashMap::new(),
         )
         .await;
 
@@ -621,6 +637,7 @@ mod tests {
             &dir.path().to_path_buf(),
             &mutation,
             false,
+            &HashMap::new(),
         )
         .await;
 
@@ -639,6 +656,7 @@ mod tests {
             &dir.path().to_path_buf(),
             &mutation,
             false,
+            &HashMap::new(),
         )
         .await;
 
@@ -647,7 +665,14 @@ mod tests {
 
     #[tokio::test]
     async fn empty_command_returns_build_error() {
-        let outcome = run_command(&[], &PathBuf::from("."), Duration::from_secs(5), false).await;
+        let outcome = run_command(
+            &[],
+            &PathBuf::from("."),
+            Duration::from_secs(5),
+            false,
+            &HashMap::new(),
+        )
+        .await;
 
         assert_eq!(outcome.result, MutationResult::BuildError);
     }
@@ -664,6 +689,7 @@ mod tests {
             &PathBuf::from("."),
             Duration::from_secs(5),
             true,
+            &HashMap::new(),
         )
         .await;
 
@@ -699,6 +725,7 @@ mod tests {
             verbose: false,
             show_output: false,
             max_tested: Some(2),
+            env: HashMap::new(),
         };
 
         let report = runner.run(mutations).await;
@@ -738,6 +765,7 @@ mod tests {
             verbose: false,
             show_output: false,
             max_tested: None,
+            env: HashMap::new(),
         };
 
         let report = runner.run(vec![m_survived, m_killed]).await;
@@ -774,6 +802,7 @@ mod tests {
             verbose: false,
             show_output: false,
             max_tested: None,
+            env: HashMap::new(),
         };
 
         let report = runner.run(vec![mutation]).await;
@@ -826,6 +855,7 @@ mod tests {
             verbose: false,
             show_output: false,
             max_tested: None,
+            env: HashMap::new(),
         };
 
         let report = runner.run(mutations).await;
@@ -874,6 +904,7 @@ mod tests {
             verbose: false,
             show_output: false,
             max_tested: None,
+            env: HashMap::new(),
         };
 
         let report = runner.run(vec![m_slow, m_fast]).await;

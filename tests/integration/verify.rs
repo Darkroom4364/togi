@@ -42,13 +42,12 @@ async fn verify_mutation_outcomes_match_independent_replay() {
     // Capture pristine fixture before runner.run() touches it
     let original = std::fs::read(&calc_path).expect("failed to read calc.go");
 
-    // Disable Go build+test caching via env on each spawned process.
-    // togi's runner inherits process env, so these reach `go test`.
-    let go_env = [("GOFLAGS", "-count=1"), ("GOCACHE", "off")];
-    // Set for togi's runner (it spawns child processes that inherit env)
-    for (k, v) in &go_env {
-        unsafe { std::env::set_var(k, v) };
-    }
+    // Disable Go build+test caching via runner env (no process-wide set_var)
+    let go_env: std::collections::HashMap<String, String> = [
+        ("GOFLAGS".into(), "-count=1".into()),
+        ("GOCACHE".into(), "off".into()),
+    ]
+    .into();
 
     let runner = togi::runner::TestRunner {
         commands: togi::runner::CommandConfig {
@@ -64,6 +63,7 @@ async fn verify_mutation_outcomes_match_independent_replay() {
         verbose: false,
         show_output: false,
         max_tested: None,
+        env: go_env.clone(),
     };
 
     let report = runner.run(mutations).await;
@@ -105,7 +105,7 @@ async fn verify_mutation_outcomes_match_independent_replay() {
         // Replay with same cache-defeating env
         let output = Command::new("go")
             .args(["test", "./..."])
-            .envs(go_env)
+            .envs(&go_env)
             .current_dir(&root)
             .output()
             .expect("failed to run go test");

@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 use std::time::Duration;
-use togi::{ChangedFile, LineRange, MutationResult};
+use togi::{ChangedFile, LineRange};
 
 fn fixture_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/go")
@@ -70,8 +70,9 @@ fn generates_mutations_for_go_fixture() {
 /// Requires `go` to be installed. Run with: cargo test -- --ignored
 #[tokio::test]
 #[ignore]
-async fn end_to_end_go_fixture_some_mutations_survive() {
+async fn end_to_end_go_fixture_all_killed_with_cache_off() {
     let root = fixture_path();
+    togi::cache::clear(&root).expect("failed to clear togi cache");
 
     // Cover all lines of calc.go
     let changed = vec![ChangedFile {
@@ -81,6 +82,13 @@ async fn end_to_end_go_fixture_some_mutations_survive() {
 
     let mutations = togi::mutator::generate_mutations(&changed, &root, 200, 0, &[]).unwrap();
     assert!(!mutations.is_empty());
+
+    // Disable Go caching via runner env (no process-wide set_var)
+    let go_env: std::collections::HashMap<String, String> = [
+        ("GOFLAGS".into(), "-count=1".into()),
+        ("GOCACHE".into(), "off".into()),
+    ]
+    .into();
 
     let runner = togi::runner::TestRunner {
         commands: togi::runner::CommandConfig {
@@ -96,6 +104,7 @@ async fn end_to_end_go_fixture_some_mutations_survive() {
         verbose: false,
         show_output: false,
         max_tested: None,
+        env: go_env,
     };
 
     let report = runner.run(mutations).await;
@@ -117,19 +126,8 @@ async fn end_to_end_go_fixture_some_mutations_survive() {
         );
     }
 
-    // Some mutations should survive because the tests are deliberately weak
-    assert!(
-        report.survived > 0,
-        "expected some mutations to survive due to weak tests, but all were killed"
-    );
-
-    // Specifically: a mutation of > to >= in Max (line 18) should survive
-    // because the test only checks Max(3,5) — never the a > b case
-    let gt_to_gte_survived = report.results.iter().any(|(m, r)| {
-        m.operator.contains("gt_to_gte") && m.line == 18 && *r == MutationResult::Survived
-    });
-    assert!(
-        gt_to_gte_survived,
-        "expected > to >= mutation in Max (line 18) to survive"
-    );
+    // With GOCACHE=off, all mutations are killed because Go recompiles fresh.
+    assert_eq!(report.total, 14);
+    assert_eq!(report.killed, report.total);
+    assert_eq!(report.build_errors, 0);
 }

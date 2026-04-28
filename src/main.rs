@@ -413,6 +413,7 @@ async fn execute(
         } else {
             Some(config.mutations.max_per_run)
         },
+        env: std::collections::HashMap::new(),
     };
 
     runner.run(mutations).await
