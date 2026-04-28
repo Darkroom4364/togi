@@ -23,6 +23,7 @@ struct CheckConfig {
     no_skip_defaults: bool,
     operators: Option<Vec<String>>,
     fail_under: Option<f64>,
+    shard: Option<String>,
 }
 
 #[tokio::main]
@@ -48,6 +49,7 @@ async fn main() {
             no_skip_defaults,
             operators,
             fail_under,
+            shard,
         } => {
             let cfg = CheckConfig {
                 all,
@@ -67,6 +69,7 @@ async fn main() {
                 no_skip_defaults,
                 operators,
                 fail_under,
+                shard,
             };
             if let Err(e) = run_check(cfg).await {
                 eprintln!("Error: {e:#}");
@@ -132,6 +135,7 @@ async fn run_check(cfg: CheckConfig) -> anyhow::Result<()> {
     let show_output = cfg.show_output;
     let output_format = cfg.output_format;
     let fail_under = cfg.fail_under;
+    let shard = cfg.shard.as_deref().map(parse_shard).transpose()?;
 
     let (mut config, fail_fast, has_explicit_build_cmd) = resolve_config(cfg)?;
     let project_root = get_project_root()?;
@@ -159,7 +163,13 @@ async fn run_check(cfg: CheckConfig) -> anyhow::Result<()> {
     }
 
     let mutations = generate_mutations(&changed_files, &config, &project_root)?;
-    let mutations = filter_mutations(mutations, &config, &project_root)?;
+    let mut mutations = filter_mutations(mutations, &config, &project_root)?;
+
+    if let Some((k, n)) = shard {
+        let total = mutations.len();
+        mutations.retain(|m| m.id as usize % n == k - 1);
+        eprintln!("Shard {k}/{n}: {} of {total} mutations", mutations.len());
+    }
 
     if mutations.is_empty() {
         println!("No mutations generated. Possible causes:");
@@ -239,6 +249,27 @@ fn resolve_config(cfg: CheckConfig) -> anyhow::Result<(togi::config::Config, boo
     let has_explicit_build_cmd = has_cli_build_cmd || !config.test.build_command.is_empty();
     let fail_fast = cfg.fail_fast && !has_custom_test_cmd;
     Ok((config, fail_fast, has_explicit_build_cmd))
+}
+
+/// Parse a shard spec like "1/4" into (k, n) where k is 1-indexed.
+fn parse_shard(s: &str) -> anyhow::Result<(usize, usize)> {
+    let parts: Vec<&str> = s.split('/').collect();
+    if parts.len() != 2 {
+        anyhow::bail!("invalid --shard format '{s}', expected k/n (e.g. 1/4)");
+    }
+    let k: usize = parts[0]
+        .parse()
+        .map_err(|_| anyhow::anyhow!("invalid shard index '{}'", parts[0]))?;
+    let n: usize = parts[1]
+        .parse()
+        .map_err(|_| anyhow::anyhow!("invalid shard count '{}'", parts[1]))?;
+    if n == 0 {
+        anyhow::bail!("invalid shard count: n must be >= 1 for --shard {s}");
+    }
+    if k == 0 || k > n {
+        anyhow::bail!("--shard {s}: k must be 1..={n}");
+    }
+    Ok((k, n))
 }
 
 /// Collects files to mutate. Returns an empty vec with user-facing messages

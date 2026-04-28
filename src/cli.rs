@@ -90,6 +90,10 @@ pub enum Commands {
         /// Fail if mutation score is below this percentage (e.g. --fail-under 80)
         #[arg(long)]
         fail_under: Option<f64>,
+
+        /// Run only a subset of mutations for parallel CI (e.g. --shard 1/4)
+        #[arg(long)]
+        shard: Option<String>,
     },
     /// Generate a togi.toml config template
     Init,
