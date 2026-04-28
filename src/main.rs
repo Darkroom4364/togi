@@ -22,6 +22,7 @@ struct CheckConfig {
     fail_fast: bool,
     no_skip_defaults: bool,
     operators: Option<Vec<String>>,
+    fail_under: Option<f64>,
 }
 
 #[tokio::main]
@@ -46,6 +47,7 @@ async fn main() {
             fail_fast,
             no_skip_defaults,
             operators,
+            fail_under,
         } => {
             let cfg = CheckConfig {
                 all,
@@ -64,6 +66,7 @@ async fn main() {
                 fail_fast,
                 no_skip_defaults,
                 operators,
+                fail_under,
             };
             if let Err(e) = run_check(cfg).await {
                 eprintln!("Error: {e:#}");
@@ -128,6 +131,7 @@ async fn run_check(cfg: CheckConfig) -> anyhow::Result<()> {
     let verbose = cfg.verbose;
     let show_output = cfg.show_output;
     let output_format = cfg.output_format;
+    let fail_under = cfg.fail_under;
 
     let (mut config, fail_fast, has_explicit_build_cmd) = resolve_config(cfg)?;
     let project_root = get_project_root()?;
@@ -184,7 +188,14 @@ async fn run_check(cfg: CheckConfig) -> anyhow::Result<()> {
 
     togi::report::print_report(&report, output_format)?;
 
-    if report.survived > 0 {
+    let score = togi::report::mutation_score(&report);
+    if let Some(threshold) = fail_under {
+        if score < threshold {
+            eprintln!("Mutation score {score:.1}% is below --fail-under threshold {threshold:.1}%");
+            drop(_lock);
+            process::exit(1);
+        }
+    } else if report.survived > 0 {
         drop(_lock);
         process::exit(1);
     }
