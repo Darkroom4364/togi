@@ -36,6 +36,97 @@ pub fn print_report(
     Ok(())
 }
 
+/// Generate a markdown PR comment summarizing mutation results.
+///
+/// Includes a hidden marker comment so CI pipelines can find/replace
+/// existing togi comments on subsequent runs.
+pub fn format_pr_comment(report: &MutationReport, baseline_score: Option<f64>) -> String {
+    use crate::MutationResult;
+    use std::fmt::Write;
+
+    let score = mutation_score(report);
+    let tested = report.total.saturating_sub(report.build_errors);
+    let emoji = if report.survived == 0 && report.timeout == 0 {
+        "✓"
+    } else if score >= 80.0 {
+        "⚠"
+    } else {
+        "✗"
+    };
+
+    let mut md = String::new();
+    writeln!(md, "<!-- togi-mutation-report -->").unwrap();
+    writeln!(md, "## {emoji} togi mutation report").unwrap();
+    writeln!(md).unwrap();
+    let delta_str = if let Some(base) = baseline_score {
+        let delta = score - base;
+        let sign = if delta >= 0.0 { "+" } else { "" };
+        format!(" ({sign}{delta:.1}% vs baseline)")
+    } else {
+        String::new()
+    };
+    writeln!(
+        md,
+        "**{score:.1}%** mutation score{delta_str} — {}/{tested} killed, {} survived, {} timeout, {} build errors — {:.2}s",
+        report.killed, report.survived, report.timeout, report.build_errors, report.duration.as_secs_f64()
+    ).unwrap();
+    writeln!(md).unwrap();
+
+    let survived: Vec<_> = report
+        .results
+        .iter()
+        .filter(|(_, r)| *r == MutationResult::Survived)
+        .collect();
+
+    if !survived.is_empty() {
+        writeln!(md, "<details>").unwrap();
+        writeln!(
+            md,
+            "<summary>{} survived mutation{}</summary>",
+            survived.len(),
+            if survived.len() == 1 { "" } else { "s" }
+        )
+        .unwrap();
+        writeln!(md).unwrap();
+        writeln!(md, "| File | Line | Operator | Description |").unwrap();
+        writeln!(md, "|------|------|----------|-------------|").unwrap();
+        for (m, _) in &survived {
+            writeln!(
+                md,
+                "| `{}` | {} | `{}` | {} |",
+                escape_md_cell(&m.file.display().to_string()),
+                m.line,
+                escape_md_cell(&m.operator),
+                escape_md_cell(&m.description)
+            )
+            .unwrap();
+        }
+        writeln!(md).unwrap();
+        writeln!(md, "</details>").unwrap();
+    }
+
+    md
+}
+
+/// Escape characters that break markdown table cells.
+fn escape_md_cell(s: &str) -> String {
+    s.replace('|', "\\|").replace('\n', " ").replace('\r', "")
+}
+
+/// Write a PR comment markdown file.
+pub fn write_pr_comment(
+    report: &MutationReport,
+    path: &std::path::Path,
+    baseline_score: Option<f64>,
+) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let md = format_pr_comment(report, baseline_score);
+    fs::write(path, md)?;
+    Ok(())
+}
+
 /// Generate a unified diff snippet for a survived mutation.
 ///
 /// Reads the source file, extracts context around the mutated line,
@@ -212,5 +303,95 @@ mod tests {
         // column 2 (1-indexed) → byte_start 1, which is mid-character
         let m = make_mutation(tmp.path(), "t.rs", content, 1, 2, "x", "y");
         assert!(mutation_diff(&m).is_none());
+    }
+
+    #[test]
+    fn pr_comment_contains_marker_and_score() {
+        let report = crate::test_helpers::sample_report();
+        let md = format_pr_comment(&report, None);
+        assert!(md.contains("<!-- togi-mutation-report -->"));
+        assert!(md.contains("50.0%"));
+        assert!(md.contains("togi mutation report"));
+    }
+
+    #[test]
+    fn pr_comment_lists_survived_mutations() {
+        let report = crate::test_helpers::sample_report();
+        let md = format_pr_comment(&report, None);
+        assert!(md.contains("survived mutation"));
+        assert!(md.contains("src/handler.rs"));
+    }
+
+    #[test]
+    fn pr_comment_no_details_when_all_killed() {
+        use crate::{MutationReport, MutationResult};
+        use std::time::Duration;
+        let report = MutationReport {
+            results: vec![(
+                Mutation {
+                    id: 0,
+                    file: std::path::PathBuf::from("test.rs"),
+                    language: "rust".into(),
+                    line: 1,
+                    column: 1,
+                    operator: "op".into(),
+                    description: "d".into(),
+                    original: "x".into(),
+                    replacement: "y".into(),
+                    byte_range: 0..1,
+                },
+                MutationResult::Killed,
+            )],
+            duration: Duration::from_secs(1),
+            total: 1,
+            killed: 1,
+            survived: 0,
+            timeout: 0,
+            build_errors: 0,
+        };
+        let md = format_pr_comment(&report, None);
+        assert!(md.contains("✓"));
+        assert!(!md.contains("<details>"));
+    }
+
+    #[test]
+    fn pr_comment_no_checkmark_when_timeouts() {
+        use crate::{MutationReport, MutationResult};
+        use std::time::Duration;
+        let report = MutationReport {
+            results: vec![(
+                Mutation {
+                    id: 0,
+                    file: std::path::PathBuf::from("test.rs"),
+                    language: "rust".into(),
+                    line: 1,
+                    column: 1,
+                    operator: "op".into(),
+                    description: "d".into(),
+                    original: "x".into(),
+                    replacement: "y".into(),
+                    byte_range: 0..1,
+                },
+                MutationResult::Timeout,
+            )],
+            duration: Duration::from_secs(1),
+            total: 1,
+            killed: 0,
+            survived: 0,
+            timeout: 1,
+            build_errors: 0,
+        };
+        let md = format_pr_comment(&report, None);
+        assert!(!md.contains("✓"), "should not show checkmark with timeouts");
+        assert!(md.contains("1 timeout"));
+        assert!(!md.contains("<details>"));
+    }
+
+    #[test]
+    fn pr_comment_includes_baseline_delta() {
+        let report = crate::test_helpers::sample_report();
+        let md = format_pr_comment(&report, Some(40.0));
+        assert!(md.contains("vs baseline"), "should include baseline delta");
+        assert!(md.contains("+10.0%"), "50% - 40% = +10%");
     }
 }
