@@ -108,11 +108,14 @@ impl TestRunner {
 
             let cmd_str = command.join(" ");
             let build_str = build_command.join(" ");
+            let mut env_parts: Vec<String> = env.iter().map(|(k, v)| format!("{k}={v}")).collect();
+            env_parts.sort();
             let cache_ctx = format!(
-                "{};build={};timeout={}",
+                "{};build={};timeout={};env={}",
                 cmd_str,
                 build_str,
-                timeout.as_secs()
+                timeout.as_secs(),
+                env_parts.join(",")
             );
 
             let handle = tokio::spawn(async move {
