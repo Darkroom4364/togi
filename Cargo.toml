@@ -30,7 +30,7 @@ tree-sitter-ruby = "0.23"
 tree-sitter-c-sharp = "0.23"
 
 # Diff parsing
-diffy = "0.4"
+diffy = "0.5"
 
 # Config
 serde = { version = "1", features = ["derive"] }
