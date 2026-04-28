@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 use std::time::Duration;
-use togi::{ChangedFile, LineRange, MutationResult};
+use togi::{ChangedFile, LineRange};
 
 fn fixture_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/go")
