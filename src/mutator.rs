@@ -93,19 +93,20 @@ fn should_filter(
     // Skip arithmetic mutations on expressions like `x * 1` or `1 * x`
     // where one operand is literal 1 — these produce equivalent mutants.
     if matches!(candidate.operator_id.as_str(), "mul_to_div" | "div_to_mul") {
-        return has_literal_one_operand(node, source);
+        return has_rhs_literal_one(node, source);
     }
     false
 }
 
-/// Check if a binary expression has a literal `1` operand.
-fn has_literal_one_operand(node: &tree_sitter::Node, source: &[u8]) -> bool {
+/// Check if a binary expression has literal `1` as its right-hand operand.
+/// `x * 1` → `x / 1` is equivalent, but `1 * x` → `1 / x` is not.
+fn has_rhs_literal_one(node: &tree_sitter::Node, source: &[u8]) -> bool {
+    // The right operand is the last named child of a binary expression
     let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        let text = std::str::from_utf8(&source[child.byte_range()]).unwrap_or("");
-        if text == "1" {
-            return true;
-        }
+    let children: Vec<_> = node.named_children(&mut cursor).collect();
+    if let Some(rhs) = children.last() {
+        let text = std::str::from_utf8(&source[rhs.byte_range()]).unwrap_or("");
+        return text == "1";
     }
     false
 }

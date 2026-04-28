@@ -83,7 +83,7 @@ pub enum Commands {
 
         /// Filter operators: category or id, prefix with - to exclude
         /// e.g. --operators=-string_to_empty,-increment_numeric
-        /// Categories: binary, literal, boundary, removal, unary, negate, return
+        /// Categories: binary, literal, boundary, removal, unary, loop, negate, return
         #[arg(long, value_delimiter = ',')]
         operators: Option<Vec<String>>,
 
