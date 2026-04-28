@@ -46,13 +46,12 @@ pub fn format_pr_comment(report: &MutationReport) -> String {
 
     let score = mutation_score(report);
     let tested = report.total.saturating_sub(report.build_errors);
-    // Only ✅ when no survived AND no timeouts (timeouts could hide survivors)
     let emoji = if report.survived == 0 && report.timeout == 0 {
-        "\u{2705}" // ✅
+        "✓"
     } else if score >= 80.0 {
-        "\u{26a0}\u{fe0f}" // ⚠️
+        "⚠"
     } else {
-        "\u{274c}" // ❌
+        "✗"
     };
 
     let mut md = String::new();
@@ -340,7 +339,7 @@ mod tests {
             build_errors: 0,
         };
         let md = format_pr_comment(&report);
-        assert!(md.contains("✅"));
+        assert!(md.contains("✓"));
         assert!(!md.contains("<details>"));
     }
 }
