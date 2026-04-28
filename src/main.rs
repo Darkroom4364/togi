@@ -211,11 +211,6 @@ async fn run_check(cfg: CheckConfig) -> anyhow::Result<()> {
 
     togi::report::print_report(&report, output_format)?;
 
-    if let Some(ref path) = pr_comment {
-        togi::report::write_pr_comment(&report, path)?;
-        eprintln!("PR comment written to {}", path.display());
-    }
-
     let current = togi::baseline::from_report(&report, &project_root_ref);
 
     if save_baseline {
@@ -240,6 +235,11 @@ async fn run_check(cfg: CheckConfig) -> anyhow::Result<()> {
         } else {
             eprintln!("warning: no baseline found — use --save-baseline first");
         }
+    }
+
+    if let Some(ref path) = pr_comment {
+        togi::report::write_pr_comment(&report, path)?;
+        eprintln!("PR comment written to {}", path.display());
     }
 
     let score = togi::report::mutation_score(&report);

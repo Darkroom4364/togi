@@ -46,7 +46,8 @@ pub fn format_pr_comment(report: &MutationReport) -> String {
 
     let score = mutation_score(report);
     let tested = report.total.saturating_sub(report.build_errors);
-    let emoji = if report.survived == 0 {
+    // Only ✅ when no survived AND no timeouts (timeouts could hide survivors)
+    let emoji = if report.survived == 0 && report.timeout == 0 {
         "\u{2705}" // ✅
     } else if score >= 80.0 {
         "\u{26a0}\u{fe0f}" // ⚠️
@@ -87,10 +88,10 @@ pub fn format_pr_comment(report: &MutationReport) -> String {
             writeln!(
                 md,
                 "| `{}` | {} | `{}` | {} |",
-                m.file.display(),
+                escape_md_cell(&m.file.display().to_string()),
                 m.line,
-                m.operator,
-                m.description
+                escape_md_cell(&m.operator),
+                escape_md_cell(&m.description)
             )
             .unwrap();
         }
@@ -101,8 +102,16 @@ pub fn format_pr_comment(report: &MutationReport) -> String {
     md
 }
 
+/// Escape characters that break markdown table cells.
+fn escape_md_cell(s: &str) -> String {
+    s.replace('|', "\\|").replace('\n', " ").replace('\r', "")
+}
+
 /// Write a PR comment markdown file.
 pub fn write_pr_comment(report: &MutationReport, path: &std::path::Path) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
     let md = format_pr_comment(report);
     fs::write(path, md)?;
     Ok(())
