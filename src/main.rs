@@ -24,6 +24,8 @@ struct CheckConfig {
     operators: Option<Vec<String>>,
     fail_under: Option<f64>,
     shard: Option<String>,
+    save_baseline: bool,
+    check_baseline: bool,
 }
 
 #[tokio::main]
@@ -50,6 +52,8 @@ async fn main() {
             operators,
             fail_under,
             shard,
+            save_baseline,
+            check_baseline,
         } => {
             let cfg = CheckConfig {
                 all,
@@ -70,6 +74,8 @@ async fn main() {
                 operators,
                 fail_under,
                 shard,
+                save_baseline,
+                check_baseline,
             };
             if let Err(e) = run_check(cfg).await {
                 eprintln!("Error: {e:#}");
@@ -136,6 +142,8 @@ async fn run_check(cfg: CheckConfig) -> anyhow::Result<()> {
     let output_format = cfg.output_format;
     let fail_under = cfg.fail_under;
     let shard = cfg.shard.as_deref().map(parse_shard).transpose()?;
+    let save_baseline = cfg.save_baseline;
+    let check_baseline = cfg.check_baseline;
 
     let (mut config, fail_fast, has_explicit_build_cmd) = resolve_config(cfg)?;
     let project_root = get_project_root()?;
@@ -186,6 +194,7 @@ async fn run_check(cfg: CheckConfig) -> anyhow::Result<()> {
 
     eprintln!("Running {} mutations...", mutations.len());
 
+    let project_root_ref = project_root.clone();
     let report = execute(
         mutations,
         config,
@@ -197,6 +206,32 @@ async fn run_check(cfg: CheckConfig) -> anyhow::Result<()> {
     .await;
 
     togi::report::print_report(&report, output_format)?;
+
+    let current = togi::baseline::from_report(&report, &project_root_ref);
+
+    if save_baseline {
+        togi::baseline::save_baseline(&current, &project_root_ref)?;
+        eprintln!("Baseline saved to .togi-baseline");
+    }
+
+    if check_baseline {
+        if let Some(baseline) = togi::baseline::load_baseline(&project_root_ref) {
+            if togi::baseline::check_regression(&current, &baseline) {
+                let regressions = togi::baseline::per_file_regressions(&current, &baseline);
+                eprintln!("Mutation score regression detected!");
+                for r in &regressions {
+                    eprintln!(
+                        "  {} — {:.1}% → {:.1}%",
+                        r.file, r.baseline_pct, r.current_pct
+                    );
+                }
+                drop(_lock);
+                process::exit(1);
+            }
+        } else {
+            eprintln!("warning: no baseline found — use --save-baseline first");
+        }
+    }
 
     let score = togi::report::mutation_score(&report);
     if let Some(threshold) = fail_under {

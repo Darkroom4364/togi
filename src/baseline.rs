@@ -19,6 +19,36 @@ pub struct Baseline {
     pub total: usize,
 }
 
+/// Build a baseline from a mutation report.
+pub fn from_report(report: &crate::MutationReport, project_root: &Path) -> Baseline {
+    let mut files: HashMap<String, FileScore> = HashMap::new();
+    for (mutation, result) in &report.results {
+        let rel = mutation
+            .file
+            .strip_prefix(project_root)
+            .unwrap_or(&mutation.file)
+            .display()
+            .to_string();
+        let entry = files.entry(rel).or_insert(FileScore {
+            killed: 0,
+            total: 0,
+        });
+        if *result != crate::MutationResult::BuildError {
+            entry.total += 1;
+            if *result == crate::MutationResult::Killed {
+                entry.killed += 1;
+            }
+        }
+    }
+    let killed = report.killed;
+    let total = report.total.saturating_sub(report.build_errors);
+    Baseline {
+        files,
+        killed,
+        total,
+    }
+}
+
 /// Persist a baseline snapshot to `.togi-baseline` inside `dir`.
 pub fn save_baseline(baseline: &Baseline, dir: &Path) -> anyhow::Result<()> {
     let json = serde_json::to_string_pretty(baseline)?;
