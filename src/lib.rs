@@ -13,6 +13,7 @@ pub mod operators;
 pub mod parser;
 pub mod report;
 pub mod runner;
+pub mod switching;
 
 #[cfg(test)]
 pub mod test_helpers;
