@@ -78,12 +78,34 @@ fn should_skip_string_to_empty(node: &tree_sitter::Node, language: &str) -> bool
 }
 
 /// Check if a mutation candidate should be filtered out for the given language.
-fn should_filter(candidate: &MutationCandidate, node: &tree_sitter::Node, language: &str) -> bool {
+fn should_filter(
+    candidate: &MutationCandidate,
+    node: &tree_sitter::Node,
+    source: &[u8],
+    language: &str,
+) -> bool {
     if candidate.operator_id == "return_empty" {
         return should_skip_return_empty(node, language);
     }
     if candidate.operator_id == "string_to_empty" {
         return should_skip_string_to_empty(node, language);
+    }
+    // Skip arithmetic mutations on expressions like `x * 1` or `1 * x`
+    // where one operand is literal 1 — these produce equivalent mutants.
+    if matches!(candidate.operator_id.as_str(), "mul_to_div" | "div_to_mul") {
+        return has_literal_one_operand(node, source);
+    }
+    false
+}
+
+/// Check if a binary expression has a literal `1` operand.
+fn has_literal_one_operand(node: &tree_sitter::Node, source: &[u8]) -> bool {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        let text = std::str::from_utf8(&source[child.byte_range()]).unwrap_or("");
+        if text == "1" {
+            return true;
+        }
     }
     false
 }
@@ -151,7 +173,7 @@ pub fn generate_mutations(
             for op in &operators {
                 let candidates = op.apply(node, &source);
                 for mut candidate in candidates {
-                    if should_filter(&candidate, node, &language_name) {
+                    if should_filter(&candidate, node, &source, &language_name) {
                         continue;
                     }
                     lang.fixup_replacement(&mut candidate);

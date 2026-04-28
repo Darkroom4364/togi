@@ -38,6 +38,13 @@ const MUTABLE_NODE_KINDS: &[&str] = &[
     "assignment",
     "augmented_assignment",
     "augmented_assignment_expression",
+    // Loop control
+    "break_statement",
+    "break_expression", // Rust
+    "break",            // Ruby
+    "continue_statement",
+    "continue_expression", // Rust
+    "next",                // Ruby
 ];
 
 /// Find AST nodes that overlap with changed line ranges and are candidates for mutation.
