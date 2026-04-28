@@ -315,9 +315,7 @@ async fn run_single_mutation(
     let root = match project_root.canonicalize() {
         Ok(p) => p,
         Err(e) => {
-            eprintln!(
-                "warning: path traversal blocked: cannot resolve project root: {e}",
-            );
+            eprintln!("warning: path traversal blocked: cannot resolve project root: {e}");
             return MutationOutcome {
                 result: MutationResult::BuildError,
                 test_output: None,
