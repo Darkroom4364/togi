@@ -2,6 +2,7 @@
 name = "togi"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.87"
 description = "Fast, diff-targeted, multi-language mutation testing"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/Darkroom4364/togi"
@@ -62,6 +63,10 @@ libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem", "Win32_System_IO"] }
+
+[profile.release]
+lto = "thin"
+strip = true
 
 [dev-dependencies]
 assert_cmd = "2"
