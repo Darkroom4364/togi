@@ -212,14 +212,17 @@ async fn run_check(cfg: CheckConfig) -> anyhow::Result<()> {
     togi::report::print_report(&report, output_format)?;
 
     let current = togi::baseline::from_report(&report, &project_root_ref);
+    let mut should_fail = false;
 
     if save_baseline {
         togi::baseline::save_baseline(&current, &project_root_ref)?;
         eprintln!("Baseline saved to .togi-baseline");
     }
 
+    let mut baseline_score: Option<f64> = None;
     if check_baseline {
         if let Some(baseline) = togi::baseline::load_baseline(&project_root_ref) {
+            baseline_score = Some(baseline.killed as f64 / baseline.total.max(1) as f64 * 100.0);
             if togi::baseline::check_regression(&current, &baseline) {
                 let regressions = togi::baseline::per_file_regressions(&current, &baseline);
                 eprintln!("Mutation score regression detected!");
@@ -229,8 +232,7 @@ async fn run_check(cfg: CheckConfig) -> anyhow::Result<()> {
                         r.file, r.baseline_pct, r.current_pct
                     );
                 }
-                drop(_lock);
-                process::exit(1);
+                should_fail = true;
             }
         } else {
             eprintln!("warning: no baseline found — use --save-baseline first");
@@ -238,12 +240,15 @@ async fn run_check(cfg: CheckConfig) -> anyhow::Result<()> {
     }
 
     if let Some(ref path) = pr_comment {
-        togi::report::write_pr_comment(&report, path)?;
+        togi::report::write_pr_comment(&report, path, baseline_score)?;
         eprintln!("PR comment written to {}", path.display());
     }
 
     let score = togi::report::mutation_score(&report);
-    if let Some(threshold) = fail_under {
+    if should_fail {
+        drop(_lock);
+        process::exit(1);
+    } else if let Some(threshold) = fail_under {
         if score < threshold {
             eprintln!("Mutation score {score:.1}% is below --fail-under threshold {threshold:.1}%");
             drop(_lock);
