@@ -13,6 +13,33 @@ fn fixture_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/go")
 }
 
+/// RAII guard that restores env vars on drop.
+struct EnvGuard {
+    vars: Vec<(String, Option<std::ffi::OsString>)>,
+}
+
+impl EnvGuard {
+    fn set(pairs: &[(&str, &str)]) -> Self {
+        let mut vars = Vec::new();
+        for (k, v) in pairs {
+            vars.push((k.to_string(), std::env::var_os(k)));
+            unsafe { std::env::set_var(k, v) };
+        }
+        EnvGuard { vars }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        for (k, prev) in &self.vars {
+            match prev {
+                Some(v) => unsafe { std::env::set_var(k, v) },
+                None => unsafe { std::env::remove_var(k) },
+            }
+        }
+    }
+}
+
 fn classify_result(status: std::process::ExitStatus) -> MutationResult {
     if status.success() {
         MutationResult::Survived
@@ -42,13 +69,9 @@ async fn verify_mutation_outcomes_match_independent_replay() {
     // Capture pristine fixture before runner.run() touches it
     let original = std::fs::read(&calc_path).expect("failed to read calc.go");
 
-    // Disable Go build+test caching via env on each spawned process.
-    // togi's runner inherits process env, so these reach `go test`.
+    // Disable Go build+test caching; guard restores on drop.
     let go_env = [("GOFLAGS", "-count=1"), ("GOCACHE", "off")];
-    // Set for togi's runner (it spawns child processes that inherit env)
-    for (k, v) in &go_env {
-        unsafe { std::env::set_var(k, v) };
-    }
+    let _env = EnvGuard::set(&go_env);
 
     let runner = togi::runner::TestRunner {
         commands: togi::runner::CommandConfig {

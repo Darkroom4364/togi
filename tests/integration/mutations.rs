@@ -6,6 +6,33 @@ fn fixture_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/go")
 }
 
+/// RAII guard that restores env vars on drop.
+struct EnvGuard {
+    vars: Vec<(String, Option<std::ffi::OsString>)>,
+}
+
+impl EnvGuard {
+    fn set(pairs: &[(&str, &str)]) -> Self {
+        let mut vars = Vec::new();
+        for (k, v) in pairs {
+            vars.push((k.to_string(), std::env::var_os(k)));
+            unsafe { std::env::set_var(k, v) };
+        }
+        EnvGuard { vars }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        for (k, prev) in &self.vars {
+            match prev {
+                Some(v) => unsafe { std::env::set_var(k, v) },
+                None => unsafe { std::env::remove_var(k) },
+            }
+        }
+    }
+}
+
 #[test]
 fn generates_mutations_for_go_fixture() {
     let root = fixture_path();
@@ -70,17 +97,12 @@ fn generates_mutations_for_go_fixture() {
 /// Requires `go` to be installed. Run with: cargo test -- --ignored
 #[tokio::test]
 #[ignore]
-async fn end_to_end_go_fixture_some_mutations_survive() {
-    // Disable Go caching to get deterministic results.
-    // The verify test also sets these, and env vars leak between tests
-    // in the same process — so we must use the same settings.
-    unsafe {
-        std::env::set_var("GOFLAGS", "-count=1");
-        std::env::set_var("GOCACHE", "off");
-    }
+async fn end_to_end_go_fixture_all_killed_with_cache_off() {
+    // Disable Go caching for deterministic results; guard restores on drop.
+    let _env = EnvGuard::set(&[("GOFLAGS", "-count=1"), ("GOCACHE", "off")]);
 
     let root = fixture_path();
-    let _ = togi::cache::clear(&root);
+    togi::cache::clear(&root).expect("failed to clear togi cache");
 
     // Cover all lines of calc.go
     let changed = vec![ChangedFile {
@@ -126,9 +148,8 @@ async fn end_to_end_go_fixture_some_mutations_survive() {
         );
     }
 
-    // With GOCACHE=off, the deliberately weak tests actually kill all mutations
-    // because Go recompiles fresh each time. Verify the report is sane.
+    // With GOCACHE=off, all mutations are killed because Go recompiles fresh.
     assert_eq!(report.total, 14);
-    assert!(report.killed > 0);
+    assert_eq!(report.killed, report.total);
     assert_eq!(report.build_errors, 0);
 }
