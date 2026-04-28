@@ -96,11 +96,11 @@ pub enum Commands {
         shard: Option<String>,
 
         /// Save current results as baseline for future regression checks
-        #[arg(long)]
+        #[arg(long, conflicts_with = "check_baseline")]
         save_baseline: bool,
 
         /// Compare results against saved baseline, exit non-zero on regression
-        #[arg(long)]
+        #[arg(long, conflicts_with = "save_baseline")]
         check_baseline: bool,
     },
     /// Generate a togi.toml config template
