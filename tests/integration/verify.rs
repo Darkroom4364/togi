@@ -13,33 +13,6 @@ fn fixture_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/go")
 }
 
-/// RAII guard that restores env vars on drop.
-struct EnvGuard {
-    vars: Vec<(String, Option<std::ffi::OsString>)>,
-}
-
-impl EnvGuard {
-    fn set(pairs: &[(&str, &str)]) -> Self {
-        let mut vars = Vec::new();
-        for (k, v) in pairs {
-            vars.push((k.to_string(), std::env::var_os(k)));
-            unsafe { std::env::set_var(k, v) };
-        }
-        EnvGuard { vars }
-    }
-}
-
-impl Drop for EnvGuard {
-    fn drop(&mut self) {
-        for (k, prev) in &self.vars {
-            match prev {
-                Some(v) => unsafe { std::env::set_var(k, v) },
-                None => unsafe { std::env::remove_var(k) },
-            }
-        }
-    }
-}
-
 fn classify_result(status: std::process::ExitStatus) -> MutationResult {
     if status.success() {
         MutationResult::Survived
@@ -69,9 +42,12 @@ async fn verify_mutation_outcomes_match_independent_replay() {
     // Capture pristine fixture before runner.run() touches it
     let original = std::fs::read(&calc_path).expect("failed to read calc.go");
 
-    // Disable Go build+test caching; guard restores on drop.
-    let go_env = [("GOFLAGS", "-count=1"), ("GOCACHE", "off")];
-    let _env = EnvGuard::set(&go_env);
+    // Disable Go build+test caching via runner env (no process-wide set_var)
+    let go_env: std::collections::HashMap<String, String> = [
+        ("GOFLAGS".into(), "-count=1".into()),
+        ("GOCACHE".into(), "off".into()),
+    ]
+    .into();
 
     let runner = togi::runner::TestRunner {
         commands: togi::runner::CommandConfig {
@@ -87,6 +63,7 @@ async fn verify_mutation_outcomes_match_independent_replay() {
         verbose: false,
         show_output: false,
         max_tested: None,
+        env: go_env.clone(),
     };
 
     let report = runner.run(mutations).await;
@@ -128,7 +105,7 @@ async fn verify_mutation_outcomes_match_independent_replay() {
         // Replay with same cache-defeating env
         let output = Command::new("go")
             .args(["test", "./..."])
-            .envs(go_env)
+            .envs(&go_env)
             .current_dir(&root)
             .output()
             .expect("failed to run go test");

@@ -6,33 +6,6 @@ fn fixture_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/go")
 }
 
-/// RAII guard that restores env vars on drop.
-struct EnvGuard {
-    vars: Vec<(String, Option<std::ffi::OsString>)>,
-}
-
-impl EnvGuard {
-    fn set(pairs: &[(&str, &str)]) -> Self {
-        let mut vars = Vec::new();
-        for (k, v) in pairs {
-            vars.push((k.to_string(), std::env::var_os(k)));
-            unsafe { std::env::set_var(k, v) };
-        }
-        EnvGuard { vars }
-    }
-}
-
-impl Drop for EnvGuard {
-    fn drop(&mut self) {
-        for (k, prev) in &self.vars {
-            match prev {
-                Some(v) => unsafe { std::env::set_var(k, v) },
-                None => unsafe { std::env::remove_var(k) },
-            }
-        }
-    }
-}
-
 #[test]
 fn generates_mutations_for_go_fixture() {
     let root = fixture_path();
@@ -98,9 +71,6 @@ fn generates_mutations_for_go_fixture() {
 #[tokio::test]
 #[ignore]
 async fn end_to_end_go_fixture_all_killed_with_cache_off() {
-    // Disable Go caching for deterministic results; guard restores on drop.
-    let _env = EnvGuard::set(&[("GOFLAGS", "-count=1"), ("GOCACHE", "off")]);
-
     let root = fixture_path();
     togi::cache::clear(&root).expect("failed to clear togi cache");
 
@@ -112,6 +82,13 @@ async fn end_to_end_go_fixture_all_killed_with_cache_off() {
 
     let mutations = togi::mutator::generate_mutations(&changed, &root, 200, 0, &[]).unwrap();
     assert!(!mutations.is_empty());
+
+    // Disable Go caching via runner env (no process-wide set_var)
+    let go_env: std::collections::HashMap<String, String> = [
+        ("GOFLAGS".into(), "-count=1".into()),
+        ("GOCACHE".into(), "off".into()),
+    ]
+    .into();
 
     let runner = togi::runner::TestRunner {
         commands: togi::runner::CommandConfig {
@@ -127,6 +104,7 @@ async fn end_to_end_go_fixture_all_killed_with_cache_off() {
         verbose: false,
         show_output: false,
         max_tested: None,
+        env: go_env,
     };
 
     let report = runner.run(mutations).await;
