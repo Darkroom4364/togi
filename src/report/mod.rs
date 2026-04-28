@@ -36,6 +36,78 @@ pub fn print_report(
     Ok(())
 }
 
+/// Generate a markdown PR comment summarizing mutation results.
+///
+/// Includes a hidden marker comment so CI pipelines can find/replace
+/// existing togi comments on subsequent runs.
+pub fn format_pr_comment(report: &MutationReport) -> String {
+    use crate::MutationResult;
+    use std::fmt::Write;
+
+    let score = mutation_score(report);
+    let tested = report.total.saturating_sub(report.build_errors);
+    let emoji = if report.survived == 0 {
+        "\u{2705}" // ✅
+    } else if score >= 80.0 {
+        "\u{26a0}\u{fe0f}" // ⚠️
+    } else {
+        "\u{274c}" // ❌
+    };
+
+    let mut md = String::new();
+    writeln!(md, "<!-- togi-mutation-report -->").unwrap();
+    writeln!(md, "## {emoji} togi mutation report").unwrap();
+    writeln!(md).unwrap();
+    writeln!(
+        md,
+        "**{score:.1}%** mutation score — {}/{tested} killed, {} survived, {} timeout, {} build errors — {:.2}s",
+        report.killed, report.survived, report.timeout, report.build_errors, report.duration.as_secs_f64()
+    ).unwrap();
+    writeln!(md).unwrap();
+
+    let survived: Vec<_> = report
+        .results
+        .iter()
+        .filter(|(_, r)| *r == MutationResult::Survived)
+        .collect();
+
+    if !survived.is_empty() {
+        writeln!(md, "<details>").unwrap();
+        writeln!(
+            md,
+            "<summary>{} survived mutation{}</summary>",
+            survived.len(),
+            if survived.len() == 1 { "" } else { "s" }
+        )
+        .unwrap();
+        writeln!(md).unwrap();
+        writeln!(md, "| File | Line | Operator | Description |").unwrap();
+        writeln!(md, "|------|------|----------|-------------|").unwrap();
+        for (m, _) in &survived {
+            writeln!(
+                md,
+                "| `{}` | {} | `{}` | {} |",
+                m.file.display(),
+                m.line,
+                m.operator,
+                m.description
+            )
+            .unwrap();
+        }
+        writeln!(md).unwrap();
+        writeln!(md, "</details>").unwrap();
+    }
+
+    md
+}
+
+/// Write a PR comment markdown file.
+pub fn write_pr_comment(report: &MutationReport, path: &std::path::Path) -> anyhow::Result<()> {
+    let md = format_pr_comment(report);
+    fs::write(path, md)?;
+    Ok(())
+}
+
 /// Generate a unified diff snippet for a survived mutation.
 ///
 /// Reads the source file, extracts context around the mutated line,
@@ -212,5 +284,54 @@ mod tests {
         // column 2 (1-indexed) → byte_start 1, which is mid-character
         let m = make_mutation(tmp.path(), "t.rs", content, 1, 2, "x", "y");
         assert!(mutation_diff(&m).is_none());
+    }
+
+    #[test]
+    fn pr_comment_contains_marker_and_score() {
+        let report = crate::test_helpers::sample_report();
+        let md = format_pr_comment(&report);
+        assert!(md.contains("<!-- togi-mutation-report -->"));
+        assert!(md.contains("50.0%"));
+        assert!(md.contains("togi mutation report"));
+    }
+
+    #[test]
+    fn pr_comment_lists_survived_mutations() {
+        let report = crate::test_helpers::sample_report();
+        let md = format_pr_comment(&report);
+        assert!(md.contains("survived mutation"));
+        assert!(md.contains("src/handler.rs"));
+    }
+
+    #[test]
+    fn pr_comment_no_details_when_all_killed() {
+        use crate::{MutationReport, MutationResult};
+        use std::time::Duration;
+        let report = MutationReport {
+            results: vec![(
+                Mutation {
+                    id: 0,
+                    file: std::path::PathBuf::from("test.rs"),
+                    language: "rust".into(),
+                    line: 1,
+                    column: 1,
+                    operator: "op".into(),
+                    description: "d".into(),
+                    original: "x".into(),
+                    replacement: "y".into(),
+                    byte_range: 0..1,
+                },
+                MutationResult::Killed,
+            )],
+            duration: Duration::from_secs(1),
+            total: 1,
+            killed: 1,
+            survived: 0,
+            timeout: 0,
+            build_errors: 0,
+        };
+        let md = format_pr_comment(&report);
+        assert!(md.contains("✅"));
+        assert!(!md.contains("<details>"));
     }
 }

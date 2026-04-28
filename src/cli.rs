@@ -102,6 +102,10 @@ pub enum Commands {
         /// Compare results against saved baseline, exit non-zero on regression
         #[arg(long, conflicts_with = "save_baseline")]
         check_baseline: bool,
+
+        /// Write a PR comment as markdown to a file (e.g. --pr-comment togi-pr-comment.md)
+        #[arg(long)]
+        pr_comment: Option<PathBuf>,
     },
     /// Generate a togi.toml config template
     Init,

@@ -26,6 +26,7 @@ struct CheckConfig {
     shard: Option<String>,
     save_baseline: bool,
     check_baseline: bool,
+    pr_comment: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -54,6 +55,7 @@ async fn main() {
             shard,
             save_baseline,
             check_baseline,
+            pr_comment,
         } => {
             let cfg = CheckConfig {
                 all,
@@ -76,6 +78,7 @@ async fn main() {
                 shard,
                 save_baseline,
                 check_baseline,
+                pr_comment,
             };
             if let Err(e) = run_check(cfg).await {
                 eprintln!("Error: {e:#}");
@@ -144,6 +147,7 @@ async fn run_check(cfg: CheckConfig) -> anyhow::Result<()> {
     let shard = cfg.shard.as_deref().map(parse_shard).transpose()?;
     let save_baseline = cfg.save_baseline;
     let check_baseline = cfg.check_baseline;
+    let pr_comment = cfg.pr_comment.clone();
 
     let (mut config, fail_fast, has_explicit_build_cmd) = resolve_config(cfg)?;
     let project_root = get_project_root()?;
@@ -206,6 +210,11 @@ async fn run_check(cfg: CheckConfig) -> anyhow::Result<()> {
     .await;
 
     togi::report::print_report(&report, output_format)?;
+
+    if let Some(ref path) = pr_comment {
+        togi::report::write_pr_comment(&report, path)?;
+        eprintln!("PR comment written to {}", path.display());
+    }
 
     let current = togi::baseline::from_report(&report, &project_root_ref);
 
