@@ -118,113 +118,148 @@ impl TestRunner {
                 env_parts.join(",")
             );
 
+            // Determine if we can use mutation switching for this file.
+            // Switching is used for interpreted languages with no build command.
+            // Conservative: any build command disables switching since it may
+            // need to run per-mutation (e.g., tsc --noEmit for TypeScript).
+            let language = language.to_string();
+            let use_switching =
+                crate::switching::is_switchable_language(&language) && build_command.is_empty();
+
+            let (switchable, one_at_a_time) = if use_switching {
+                crate::switching::partition_mutations(file_mutations)
+            } else {
+                (vec![], file_mutations)
+            };
+
             let handle = tokio::spawn(async move {
                 let mut results = Vec::new();
-                for mutation in file_mutations {
-                    // Stop if enough mutations have been tested
-                    if let Some(max) = max_tested
-                        && tested_counter.load(Ordering::Acquire) >= max
-                    {
-                        break;
-                    }
 
-                    // Check cache before running
-                    let file_path = project_root.join(&mutation.file);
-                    let file_content = std::fs::read(&file_path).ok();
-                    let cache_key = file_content
-                        .as_ref()
-                        .map(|content| CacheKey::new(content, &mutation.description, &cache_ctx));
-                    if let Some(ref key) = cache_key
-                        && let Some(cached) = cache::lookup(&project_root, key)
-                    {
-                        let result = cached;
-                        if result != MutationResult::BuildError {
-                            tested_counter.fetch_add(1, Ordering::Release);
-                        }
-                        let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                        if verbose {
-                            eprintln!(
-                                "  [{}/{}] \u{21bb} cached  {}:{} \u{2014} {}",
-                                n,
+                // --- Switching path: rewrite file once, test N times ---
+                if !switchable.is_empty() {
+                    let file_path = project_root.join(&switchable[0].file);
+                    let original = match std::fs::read(&file_path) {
+                        Ok(c) => c,
+                        Err(_) => {
+                            for m in switchable {
+                                results.push((m, MutationResult::BuildError));
+                            }
+                            return run_one_at_a_time(
+                                one_at_a_time,
+                                &command,
+                                &build_command,
+                                timeout,
+                                &project_root,
+                                &cache_ctx,
+                                &env,
+                                &counter,
+                                &tested_counter,
+                                max_tested,
                                 total,
-                                mutation.file.display(),
-                                mutation.line,
-                                mutation.operator
-                            );
-                        } else if is_tty {
-                            eprint!("\r  [{}/{}] testing mutations...", n, total);
-                            let _ = std::io::stderr().flush();
-                        } else if n == total || (total >= 4 && n % (total / 4) == 0) {
-                            eprintln!("  [{}/{}] testing mutations...", n, total);
+                                verbose,
+                                show_output,
+                                is_tty,
+                                &sem,
+                                results,
+                            )
+                            .await;
                         }
-                        results.push((mutation, result));
-                        continue;
+                    };
+
+                    // Check cache for all switchable mutations first
+                    let mut uncached = Vec::new();
+                    for m in switchable {
+                        let cache_key = CacheKey::new(&original, &m.description, &cache_ctx);
+                        if let Some(cached) = cache::lookup(&project_root, &cache_key) {
+                            if cached != MutationResult::BuildError {
+                                tested_counter.fetch_add(1, Ordering::Release);
+                            }
+                            let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                            report_progress(verbose, is_tty, n, total, &m, Some(cached));
+                            results.push((m, cached));
+                        } else {
+                            uncached.push(m);
+                        }
                     }
 
-                    // Semaphore is never closed, so acquire cannot fail
-                    let _permit = sem.acquire().await.unwrap();
-                    let outcome = run_single_mutation(
-                        &command,
-                        &build_command,
-                        timeout,
-                        &project_root,
-                        &mutation,
-                        show_output,
-                        &env,
-                    )
-                    .await;
+                    if !uncached.is_empty() {
+                        // Rewrite file with all uncached switchable mutations
+                        let switched =
+                            crate::switching::rewrite_source(&original, &uncached, &language);
 
-                    // Store result in cache
-                    if let Some(ref key) = cache_key {
-                        cache::store(&project_root, key, outcome.result);
-                    }
-
-                    if outcome.result != MutationResult::BuildError {
-                        tested_counter.fetch_add(1, Ordering::Release);
-                    }
-                    let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                    if verbose {
-                        let symbol = match outcome.result {
-                            MutationResult::Killed => "\u{2713} killed",
-                            MutationResult::Survived => "\u{2717} survived",
-                            MutationResult::Timeout => "⧖ timeout",
-                            MutationResult::BuildError => "⚠ build error",
+                        // Write switched source, guard restores original on drop
+                        let _guard = FileGuard {
+                            path: file_path.clone(),
+                            original: original.clone(),
                         };
-                        eprintln!(
-                            "  [{}/{}] {}  {}:{} \u{2014} {}",
-                            n,
-                            total,
-                            symbol,
-                            mutation.file.display(),
-                            mutation.line,
-                            mutation.operator
-                        );
-                    } else {
-                        if is_tty {
-                            eprint!("\r  [{}/{}] testing mutations...", n, total);
-                            let _ = std::io::stderr().flush();
-                        } else if n == total || (total >= 4 && n % (total / 4) == 0) {
-                            eprintln!("  [{}/{}] testing mutations...", n, total);
+                        if let Err(e) = atomic_write(&file_path, &switched) {
+                            eprintln!(
+                                "warning: could not write switched file {}: {e}",
+                                file_path.display()
+                            );
+                            for m in uncached {
+                                results.push((m, MutationResult::BuildError));
+                            }
+                        } else {
+                            // Run tests for each mutation with TOGI_MUTANT env var
+                            for m in uncached {
+                                if let Some(max) = max_tested
+                                    && tested_counter.load(Ordering::Acquire) >= max
+                                {
+                                    break;
+                                }
+
+                                let _permit = sem.acquire().await.unwrap();
+                                let mut switched_env = env.clone();
+                                switched_env.insert("TOGI_MUTANT".to_string(), m.id.to_string());
+
+                                let outcome = run_command(
+                                    &command,
+                                    &project_root,
+                                    timeout,
+                                    show_output,
+                                    &switched_env,
+                                )
+                                .await;
+
+                                // Cache using original file hash
+                                let cache_key =
+                                    CacheKey::new(&original, &m.description, &cache_ctx);
+                                cache::store(&project_root, &cache_key, outcome.result);
+
+                                if outcome.result != MutationResult::BuildError {
+                                    tested_counter.fetch_add(1, Ordering::Release);
+                                }
+                                let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                                report_progress(verbose, is_tty, n, total, &m, None);
+                                report_output(show_output, &m, &outcome);
+                                results.push((m, outcome.result));
+                            }
                         }
+                        // FileGuard restores original on drop
                     }
-                    if show_output
-                        && outcome.result == MutationResult::Survived
-                        && let Some(output) = &outcome.test_output
-                    {
-                        eprintln!(
-                            "  ┌─ test output for {}:{} ({})",
-                            mutation.file.display(),
-                            mutation.line,
-                            mutation.operator
-                        );
-                        for line in output.lines() {
-                            eprintln!("  │ {}", line);
-                        }
-                        eprintln!("  └─");
-                    }
-                    results.push((mutation, outcome.result));
                 }
-                results
+
+                // --- One-at-a-time path (fallback + non-switchable languages) ---
+                run_one_at_a_time(
+                    one_at_a_time,
+                    &command,
+                    &build_command,
+                    timeout,
+                    &project_root,
+                    &cache_ctx,
+                    &env,
+                    &counter,
+                    &tested_counter,
+                    max_tested,
+                    total,
+                    verbose,
+                    show_output,
+                    is_tty,
+                    &sem,
+                    results,
+                )
+                .await
             });
             handles.push(handle);
         }
@@ -277,6 +312,158 @@ impl TestRunner {
 struct MutationOutcome {
     result: MutationResult,
     test_output: Option<String>,
+}
+
+fn report_progress(
+    verbose: bool,
+    is_tty: bool,
+    n: usize,
+    total: usize,
+    mutation: &Mutation,
+    cached_result: Option<MutationResult>,
+) {
+    if let Some(result) = cached_result {
+        if verbose {
+            eprintln!(
+                "  [{}/{}] \u{21bb} cached  {}:{} \u{2014} {}",
+                n,
+                total,
+                mutation.file.display(),
+                mutation.line,
+                mutation.operator
+            );
+        } else if is_tty {
+            eprint!("\r  [{}/{}] testing mutations...", n, total);
+            let _ = std::io::stderr().flush();
+        } else if n == total || (total >= 4 && n.is_multiple_of(total / 4)) {
+            eprintln!("  [{}/{}] testing mutations...", n, total);
+        }
+        let _ = result; // used above via verbose path
+    } else if verbose {
+        eprintln!(
+            "  [{}/{}] testing {}:{} \u{2014} {}",
+            n,
+            total,
+            mutation.file.display(),
+            mutation.line,
+            mutation.operator
+        );
+    } else if is_tty {
+        eprint!("\r  [{}/{}] testing mutations...", n, total);
+        let _ = std::io::stderr().flush();
+    } else if n == total || (total >= 4 && n.is_multiple_of(total / 4)) {
+        eprintln!("  [{}/{}] testing mutations...", n, total);
+    }
+}
+
+fn report_output(show_output: bool, mutation: &Mutation, outcome: &MutationOutcome) {
+    if show_output
+        && outcome.result == MutationResult::Survived
+        && let Some(output) = &outcome.test_output
+    {
+        eprintln!(
+            "  ┌─ test output for {}:{} ({})",
+            mutation.file.display(),
+            mutation.line,
+            mutation.operator
+        );
+        for line in output.lines() {
+            eprintln!("  │ {}", line);
+        }
+        eprintln!("  └─");
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_one_at_a_time(
+    mutations: Vec<Mutation>,
+    command: &[String],
+    build_command: &[String],
+    timeout: Duration,
+    project_root: &Path,
+    cache_ctx: &str,
+    env: &HashMap<String, String>,
+    counter: &AtomicUsize,
+    tested_counter: &AtomicUsize,
+    max_tested: Option<usize>,
+    total: usize,
+    verbose: bool,
+    show_output: bool,
+    is_tty: bool,
+    sem: &Semaphore,
+    mut results: Vec<(Mutation, MutationResult)>,
+) -> Vec<(Mutation, MutationResult)> {
+    for mutation in mutations {
+        if let Some(max) = max_tested
+            && tested_counter.load(Ordering::Acquire) >= max
+        {
+            break;
+        }
+
+        let file_path = project_root.join(&mutation.file);
+        let file_content = std::fs::read(&file_path).ok();
+        let cache_key = file_content
+            .as_ref()
+            .map(|content| CacheKey::new(content, &mutation.description, cache_ctx));
+        if let Some(ref key) = cache_key
+            && let Some(cached) = cache::lookup(project_root, key)
+        {
+            if cached != MutationResult::BuildError {
+                tested_counter.fetch_add(1, Ordering::Release);
+            }
+            let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
+            report_progress(verbose, is_tty, n, total, &mutation, Some(cached));
+            results.push((mutation, cached));
+            continue;
+        }
+
+        let _permit = sem.acquire().await.unwrap();
+        let outcome = run_single_mutation(
+            command,
+            build_command,
+            timeout,
+            project_root,
+            &mutation,
+            show_output,
+            env,
+        )
+        .await;
+
+        if let Some(ref key) = cache_key {
+            cache::store(project_root, key, outcome.result);
+        }
+
+        if outcome.result != MutationResult::BuildError {
+            tested_counter.fetch_add(1, Ordering::Release);
+        }
+        let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
+
+        if verbose {
+            let symbol = match outcome.result {
+                MutationResult::Killed => "\u{2713} killed",
+                MutationResult::Survived => "\u{2717} survived",
+                MutationResult::Timeout => "⧖ timeout",
+                MutationResult::BuildError => "⚠ build error",
+            };
+            eprintln!(
+                "  [{}/{}] {}  {}:{} \u{2014} {}",
+                n,
+                total,
+                symbol,
+                mutation.file.display(),
+                mutation.line,
+                mutation.operator
+            );
+        } else if is_tty {
+            eprint!("\r  [{}/{}] testing mutations...", n, total);
+            let _ = std::io::stderr().flush();
+        } else if n == total || (total >= 4 && n.is_multiple_of(total / 4)) {
+            eprintln!("  [{}/{}] testing mutations...", n, total);
+        }
+        report_output(show_output, &mutation, &outcome);
+        results.push((mutation, outcome.result));
+    }
+    results
 }
 
 async fn run_single_mutation(
