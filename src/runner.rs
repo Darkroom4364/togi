@@ -298,19 +298,41 @@ async fn run_single_mutation(
 
     // Validate the resolved path stays within project_root to prevent
     // path traversal from crafted diffs (e.g. "../../../etc/passwd").
-    if let Ok(canonical) = file_path.canonicalize() {
-        if let Ok(root) = project_root.canonicalize() {
-            if !canonical.starts_with(&root) {
-                eprintln!(
-                    "warning: path traversal blocked: {} escapes project root",
-                    mutation.file.display()
-                );
-                return MutationOutcome {
-                    result: MutationResult::BuildError,
-                    test_output: None,
-                };
-            }
+    // Fail closed: if canonicalization fails, treat it as an escape.
+    let canonical = match file_path.canonicalize() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!(
+                "warning: path traversal blocked: cannot resolve {}: {e}",
+                mutation.file.display()
+            );
+            return MutationOutcome {
+                result: MutationResult::BuildError,
+                test_output: None,
+            };
         }
+    };
+    let root = match project_root.canonicalize() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!(
+                "warning: path traversal blocked: cannot resolve project root: {e}",
+            );
+            return MutationOutcome {
+                result: MutationResult::BuildError,
+                test_output: None,
+            };
+        }
+    };
+    if !canonical.starts_with(&root) {
+        eprintln!(
+            "warning: path traversal blocked: {} escapes project root",
+            mutation.file.display()
+        );
+        return MutationOutcome {
+            result: MutationResult::BuildError,
+            test_output: None,
+        };
     }
 
     // Read original content
