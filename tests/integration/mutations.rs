@@ -105,6 +105,7 @@ async fn end_to_end_go_fixture_all_killed_with_cache_off() {
         show_output: false,
         max_tested: None,
         env: go_env,
+        cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
 
     let report = runner.run(mutations).await;

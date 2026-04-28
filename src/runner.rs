@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
 
@@ -40,6 +40,8 @@ pub struct TestRunner {
     pub max_tested: Option<usize>,
     /// Extra environment variables passed to every spawned command.
     pub env: HashMap<String, String>,
+    /// Set to true externally (e.g. Ctrl+C handler) to stop spawning new mutations.
+    pub cancelled: Arc<AtomicBool>,
 }
 
 struct FileGuard {
@@ -105,6 +107,7 @@ impl TestRunner {
             let max_tested = self.max_tested;
             let show_output = self.show_output;
             let env = self.env.clone();
+            let cancelled = self.cancelled.clone();
 
             let cmd_str = command.join(" ");
             let build_str = build_command.join(" ");
@@ -121,7 +124,10 @@ impl TestRunner {
             let handle = tokio::spawn(async move {
                 let mut results = Vec::new();
                 for mutation in file_mutations {
-                    // Stop if enough mutations have been tested
+                    // Stop if cancelled (Ctrl+C) or enough mutations have been tested
+                    if cancelled.load(Ordering::Relaxed) {
+                        break;
+                    }
                     if let Some(max) = max_tested
                         && tested_counter.load(Ordering::Acquire) >= max
                     {
@@ -289,6 +295,23 @@ async fn run_single_mutation(
     env: &HashMap<String, String>,
 ) -> MutationOutcome {
     let file_path = project_root.join(&mutation.file);
+
+    // Validate the resolved path stays within project_root to prevent
+    // path traversal from crafted diffs (e.g. "../../../etc/passwd").
+    if let Ok(canonical) = file_path.canonicalize() {
+        if let Ok(root) = project_root.canonicalize() {
+            if !canonical.starts_with(&root) {
+                eprintln!(
+                    "warning: path traversal blocked: {} escapes project root",
+                    mutation.file.display()
+                );
+                return MutationOutcome {
+                    result: MutationResult::BuildError,
+                    test_output: None,
+                };
+            }
+        }
+    }
 
     // Read original content
     let original = match std::fs::read(&file_path) {
@@ -726,6 +749,7 @@ mod tests {
             show_output: false,
             max_tested: Some(2),
             env: HashMap::new(),
+            cancelled: Arc::new(AtomicBool::new(false)),
         };
 
         let report = runner.run(mutations).await;
@@ -766,6 +790,7 @@ mod tests {
             show_output: false,
             max_tested: None,
             env: HashMap::new(),
+            cancelled: Arc::new(AtomicBool::new(false)),
         };
 
         let report = runner.run(vec![m_survived, m_killed]).await;
@@ -803,6 +828,7 @@ mod tests {
             show_output: false,
             max_tested: None,
             env: HashMap::new(),
+            cancelled: Arc::new(AtomicBool::new(false)),
         };
 
         let report = runner.run(vec![mutation]).await;
@@ -856,6 +882,7 @@ mod tests {
             show_output: false,
             max_tested: None,
             env: HashMap::new(),
+            cancelled: Arc::new(AtomicBool::new(false)),
         };
 
         let report = runner.run(mutations).await;
@@ -905,6 +932,7 @@ mod tests {
             show_output: false,
             max_tested: None,
             env: HashMap::new(),
+            cancelled: Arc::new(AtomicBool::new(false)),
         };
 
         let report = runner.run(vec![m_slow, m_fast]).await;
