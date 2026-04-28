@@ -78,12 +78,35 @@ fn should_skip_string_to_empty(node: &tree_sitter::Node, language: &str) -> bool
 }
 
 /// Check if a mutation candidate should be filtered out for the given language.
-fn should_filter(candidate: &MutationCandidate, node: &tree_sitter::Node, language: &str) -> bool {
+fn should_filter(
+    candidate: &MutationCandidate,
+    node: &tree_sitter::Node,
+    source: &[u8],
+    language: &str,
+) -> bool {
     if candidate.operator_id == "return_empty" {
         return should_skip_return_empty(node, language);
     }
     if candidate.operator_id == "string_to_empty" {
         return should_skip_string_to_empty(node, language);
+    }
+    // Skip arithmetic mutations on expressions like `x * 1` or `1 * x`
+    // where one operand is literal 1 — these produce equivalent mutants.
+    if matches!(candidate.operator_id.as_str(), "mul_to_div" | "div_to_mul") {
+        return has_rhs_literal_one(node, source);
+    }
+    false
+}
+
+/// Check if a binary expression has literal `1` as its right-hand operand.
+/// `x * 1` → `x / 1` is equivalent, but `1 * x` → `1 / x` is not.
+fn has_rhs_literal_one(node: &tree_sitter::Node, source: &[u8]) -> bool {
+    // The right operand is the last named child of a binary expression
+    let mut cursor = node.walk();
+    let children: Vec<_> = node.named_children(&mut cursor).collect();
+    if let Some(rhs) = children.last() {
+        let text = std::str::from_utf8(&source[rhs.byte_range()]).unwrap_or("");
+        return text == "1";
     }
     false
 }
@@ -151,7 +174,7 @@ pub fn generate_mutations(
             for op in &operators {
                 let candidates = op.apply(node, &source);
                 for mut candidate in candidates {
-                    if should_filter(&candidate, node, &language_name) {
+                    if should_filter(&candidate, node, &source, &language_name) {
                         continue;
                     }
                     lang.fixup_replacement(&mut candidate);

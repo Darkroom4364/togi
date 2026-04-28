@@ -1,6 +1,7 @@
 pub mod binary;
 pub mod boundary;
 pub mod literal;
+pub mod loop_control;
 pub mod removal;
 pub mod unary;
 
@@ -138,6 +139,7 @@ pub fn operator_category(id: &str) -> &str {
             "removal"
         }
         "remove_unary_not" | "remove_unary_neg" => "unary",
+        "remove_break" | "remove_continue" => "loop",
         "negate_condition" => "negate",
         "return_empty" => "return",
         _ => "other",
@@ -146,7 +148,7 @@ pub fn operator_category(id: &str) -> &str {
 
 /// All known category names.
 const CATEGORIES: &[&str] = &[
-    "binary", "literal", "boundary", "removal", "unary", "negate", "return",
+    "binary", "literal", "boundary", "removal", "unary", "loop", "negate", "return",
 ];
 
 /// Validate that every pattern in `patterns` matches a known operator ID or category.
@@ -268,6 +270,8 @@ pub fn all_operators() -> Vec<Box<dyn MutationOperator>> {
         Box::new(removal::RemoveAssignment),
         Box::new(unary::RemoveUnaryNot),
         Box::new(unary::RemoveUnaryNeg),
+        Box::new(loop_control::RemoveBreak),
+        Box::new(loop_control::RemoveContinue),
         Box::new(NegateCondition),
         Box::new(ReturnEmpty),
     ]
