@@ -86,6 +86,10 @@ pub enum Commands {
         /// Categories: binary, literal, boundary, removal, unary, negate, return
         #[arg(long, value_delimiter = ',')]
         operators: Option<Vec<String>>,
+
+        /// Fail if mutation score is below this percentage (e.g. --fail-under 80)
+        #[arg(long)]
+        fail_under: Option<f64>,
     },
     /// Generate a togi.toml config template
     Init,
