@@ -43,7 +43,25 @@ impl MutationOperator for NegateCondition {
             let text = std::str::from_utf8(&source[cond_node.byte_range()]).unwrap_or("");
             let replacement = if let Some(stripped) = text.strip_prefix('!') {
                 let stripped = stripped.trim();
-                if stripped.starts_with('(') && stripped.ends_with(')') {
+                let fully_wrapped = stripped.starts_with('(') && {
+                    let mut depth = 0;
+                    let mut closes_at_end = false;
+                    for (idx, ch) in stripped.char_indices() {
+                        match ch {
+                            '(' => depth += 1,
+                            ')' => {
+                                depth -= 1;
+                                if depth == 0 {
+                                    closes_at_end = idx + ch.len_utf8() == stripped.len();
+                                    break;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    closes_at_end
+                };
+                if fully_wrapped {
                     stripped[1..stripped.len() - 1].to_string()
                 } else {
                     stripped.to_string()
@@ -358,6 +376,15 @@ mod tests {
         let if_node = find_node_by_kind(tree.root_node(), "if_statement").unwrap();
         let candidates = NegateCondition.apply(&if_node, src.as_bytes());
         assert_single_candidate(&candidates, src, "foo()", "!foo()");
+    }
+
+    #[test]
+    fn test_negate_already_negated_partial_grouping() {
+        let src = "package main\nfunc f(a, b bool) { if !(a) || (b) { return } }";
+        let tree = parse_go(src);
+        let if_node = find_node_by_kind(tree.root_node(), "if_statement").unwrap();
+        let candidates = NegateCondition.apply(&if_node, src.as_bytes());
+        assert_single_candidate(&candidates, src, "(a) || (b)", "!(a) || (b)");
     }
 
     #[test]

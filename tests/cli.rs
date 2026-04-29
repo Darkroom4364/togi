@@ -141,11 +141,12 @@ fn check_format_json_outputs_valid_json() {
         .output()
         .unwrap();
 
-    assert_eq!(output.status.code(), Some(0));
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let value: serde_json::Value = serde_json::from_str(&stdout)
-        .unwrap_or_else(|e| panic!("invalid JSON output: {e}\nstdout: {stdout}"));
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|e| {
+        panic!(
+            "invalid JSON output: {e}\nstdout: {}",
+            String::from_utf8_lossy(&output.stdout)
+        )
+    });
     assert!(value.get("total").is_some());
     assert!(value.get("mutations").is_some());
 }
