@@ -99,6 +99,54 @@ macro_rules! define_language {
 
 pub(crate) use define_language;
 
+const FUNC_NODE_KINDS: &[&str] = &[
+    "function_item",
+    "function_declaration",
+    "method_declaration",
+    "function_definition",
+    "method",
+];
+
+const SIMPLE_RETURN_TYPE_KINDS: &[&str] = &[
+    "primitive_type",
+    "type_identifier",
+    "predefined_type",
+    "boolean_type",
+    "void_type",
+    "unit_type",
+    "integral_type",
+    "floating_point_type",
+];
+
+pub(crate) fn should_skip_return_empty_for_type(
+    node: &tree_sitter::Node,
+    skip_go_multi_return: bool,
+) -> bool {
+    let mut parent = node.parent();
+    let func_node = loop {
+        match parent {
+            Some(p) if FUNC_NODE_KINDS.contains(&p.kind()) => break p,
+            Some(p) => parent = p.parent(),
+            None => return false,
+        }
+    };
+
+    let ret_type = func_node
+        .child_by_field_name("return_type")
+        .or_else(|| func_node.child_by_field_name("type"))
+        .or_else(|| func_node.child_by_field_name("result"));
+
+    match ret_type {
+        None => false,
+        Some(rt) => {
+            if skip_go_multi_return && rt.kind() == "parameter_list" {
+                return true;
+            }
+            !SIMPLE_RETURN_TYPE_KINDS.contains(&rt.kind())
+        }
+    }
+}
+
 pub(crate) fn should_skip_string_to_empty_in_compiled_context(node: &tree_sitter::Node) -> bool {
     let mut parent = node.parent();
     while let Some(p) = parent {

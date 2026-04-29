@@ -7,56 +7,6 @@ use crate::{ChangedFile, Mutation, MutationCandidate};
 use anyhow::Result;
 use std::path::Path;
 
-const FUNC_NODE_KINDS: &[&str] = &[
-    "function_item",        // Rust
-    "function_declaration", // Go, TypeScript, C/C++
-    "method_declaration",   // Java, C#
-    "function_definition",  // Python, C/C++
-    "method",               // Ruby
-];
-
-/// Return type node kinds where a literal replacement (0, false, "") is valid.
-const SIMPLE_RETURN_TYPE_KINDS: &[&str] = &[
-    "primitive_type",      // Rust: i32, bool, f64, char, etc.
-    "type_identifier",     // Rust: String, custom newtypes wrapping primitives
-    "predefined_type",     // TypeScript: number, string, boolean
-    "boolean_type",        // TypeScript: boolean
-    "void_type",           // C#, Java
-    "integral_type",       // C#: int, long, byte
-    "floating_point_type", // C#, Java: float, double
-];
-
-/// Check if a return_empty mutation should be skipped because the return type
-/// is too complex for a simple literal replacement.
-fn should_skip_return_empty(node: &tree_sitter::Node, language: &str) -> bool {
-    // Walk up to find the enclosing function
-    let mut parent = node.parent();
-    let func_node = loop {
-        match parent {
-            Some(p) if FUNC_NODE_KINDS.contains(&p.kind()) => break p,
-            Some(p) => parent = p.parent(),
-            None => return false, // no enclosing function found, don't skip
-        }
-    };
-
-    // Check the return type field — field name varies by language
-    let ret_type = func_node
-        .child_by_field_name("return_type")
-        .or_else(|| func_node.child_by_field_name("type"))
-        .or_else(|| func_node.child_by_field_name("result"));
-
-    match ret_type {
-        None => false, // no return type annotation, don't skip
-        Some(rt) => {
-            if language == "go" && rt.kind() == "parameter_list" {
-                // Go multi-return: (int, error)
-                return true;
-            }
-            !SIMPLE_RETURN_TYPE_KINDS.contains(&rt.kind())
-        }
-    }
-}
-
 /// Check if a mutation candidate should be filtered out for the given language.
 fn should_filter(
     candidate: &MutationCandidate,
@@ -66,9 +16,6 @@ fn should_filter(
 ) -> bool {
     if lang.should_filter_candidate(candidate, node, source) {
         return true;
-    }
-    if candidate.operator_id == "return_empty" {
-        return should_skip_return_empty(node, lang.name());
     }
     false
 }
