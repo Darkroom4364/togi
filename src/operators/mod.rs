@@ -436,6 +436,17 @@ func f() string { return "hello" }"#;
     }
 
     #[test]
+    fn all_operator_ids_are_unique() {
+        let ops = all_operators();
+        let unique: std::collections::HashSet<&str> = ops.iter().map(|o| o.id()).collect();
+        assert_eq!(
+            unique.len(),
+            ops.len(),
+            "duplicate operator id in all_operators()"
+        );
+    }
+
+    #[test]
     fn every_operator_has_known_category() {
         for op in all_operators() {
             let cat = operator_category(op.id());
