@@ -227,13 +227,7 @@ mod tests {
         assert!(!nodes.is_empty());
         let kinds: Vec<&str> = nodes.iter().map(|n| n.kind()).collect();
         // Should find mutable nodes inside the if condition (deepest wins)
-        assert!(
-            kinds.contains(&"if_statement")
-                || kinds.contains(&"binary_expression")
-                || kinds.contains(&"int_literal"),
-            "Expected a mutable node from the if line, got: {:?}",
-            kinds
-        );
+        assert_eq!(kinds, vec!["int_literal"]);
     }
 
     #[test]
@@ -271,11 +265,7 @@ mod tests {
         assert!(!nodes.is_empty());
         let kinds: Vec<&str> = nodes.iter().map(|n| n.kind()).collect();
         // Deepest mutable node inside `return 42` is the int_literal
-        assert!(
-            kinds.contains(&"int_literal") || kinds.contains(&"return_statement"),
-            "Expected return_statement or int_literal, got: {:?}",
-            kinds
-        );
+        assert_eq!(kinds, vec!["int_literal"]);
     }
 
     #[test]
@@ -289,15 +279,8 @@ mod tests {
 
         assert!(!nodes.is_empty());
         let kinds: Vec<&str> = nodes.iter().map(|n| n.kind()).collect();
-        // Should find the binary_expression (deepest) or assignment-related node
-        assert!(
-            kinds.contains(&"binary_expression")
-                || kinds.contains(&"assignment_statement")
-                || kinds.contains(&"expression_statement")
-                || kinds.contains(&"int_literal"),
-            "Expected mutable node on assignment line, got: {:?}",
-            kinds
-        );
+        // Deepest mutable node inside `x = x + 2` is the int_literal
+        assert_eq!(kinds, vec!["int_literal"]);
     }
 
     #[test]
@@ -312,12 +295,9 @@ mod tests {
 
         assert!(!nodes.is_empty());
         let kinds: Vec<&str> = nodes.iter().map(|n| n.kind()).collect();
-        // Should find deepest mutable nodes (binary_expression, int_literal) not outer if
-        assert!(
-            kinds.contains(&"binary_expression") || kinds.contains(&"int_literal"),
-            "Expected deepest nested nodes, got: {:?}",
-            kinds
-        );
+        // Should find deepest mutable nodes, not the outer if
+        assert!(kinds.contains(&"binary_expression"));
+        assert!(kinds.contains(&"int_literal"));
     }
 
     #[test]
@@ -391,13 +371,7 @@ mod tests {
 
         assert!(!nodes.is_empty());
         let kinds: Vec<&str> = nodes.iter().map(|n| n.kind()).collect();
-        assert!(
-            kinds.contains(&"binary_expression")
-                || kinds.contains(&"return_expression")
-                || kinds.contains(&"integer_literal"),
-            "Expected mutable node from Rust return line, got: {:?}",
-            kinds
-        );
+        assert_eq!(kinds, vec!["binary_expression"]);
     }
 
     #[test]
@@ -572,11 +546,7 @@ mod tests {
 
         assert!(!nodes.is_empty());
         let kinds: Vec<&str> = nodes.iter().map(|n| n.kind()).collect();
-        assert!(
-            kinds.contains(&"binary_expression") || kinds.contains(&"integer_literal"),
-            "Expected deepest nodes from nested Rust if, got: {:?}",
-            kinds
-        );
+        assert!(kinds.contains(&"binary_expression"));
     }
 
     #[test]
