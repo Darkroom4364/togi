@@ -4,13 +4,35 @@ crate::languages::define_language!(
     extensions: ["go"],
     ts_language: tree_sitter_go::LANGUAGE,
     skip_subtree_kinds: ["import_spec", "import_spec_list", "type_spec"],
+    filter_candidate: should_filter_candidate,
 );
+
+fn should_filter_candidate(
+    candidate: &crate::MutationCandidate,
+    node: &tree_sitter::Node,
+    source: &[u8],
+) -> bool {
+    // Skip arithmetic mutations on expressions like `x * 1`.
+    // `x * 1` -> `x / 1` is equivalent, but `1 * x` -> `1 / x` is not.
+    matches!(candidate.operator_id.as_str(), "mul_to_div" | "div_to_mul")
+        && has_rhs_literal_one(node, source)
+}
+
+fn has_rhs_literal_one(node: &tree_sitter::Node, source: &[u8]) -> bool {
+    let mut cursor = node.walk();
+    let children: Vec<_> = node.named_children(&mut cursor).collect();
+    if let Some(rhs) = children.last() {
+        let text = std::str::from_utf8(&source[rhs.byte_range()]).unwrap_or("");
+        return text == "1";
+    }
+    false
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::languages::LanguageSupport;
-    use crate::test_helpers::{walk_for_kind, walk_for_two_kinds};
+    use crate::test_helpers::{find_node_by_kind, parse_go, walk_for_kind, walk_for_two_kinds};
 
     #[test]
     fn test_go_extension_detection() {
@@ -81,5 +103,35 @@ mod tests {
         );
         assert!(found_return, "Expected return_statement node");
         assert!(found_binary, "Expected binary_expression node");
+    }
+
+    #[test]
+    fn rhs_literal_one_detects_right_hand_one_only() {
+        let src = "package main\nfunc f(x int) int { return x * 1 }";
+        let tree = parse_go(src);
+        let bin = find_node_by_kind(tree.root_node(), "binary_expression")
+            .expect("should find binary_expression node");
+
+        assert!(has_rhs_literal_one(&bin, src.as_bytes()));
+    }
+
+    #[test]
+    fn rhs_literal_one_ignores_left_hand_one() {
+        let src = "package main\nfunc f(x int) int { return 1 * x }";
+        let tree = parse_go(src);
+        let bin = find_node_by_kind(tree.root_node(), "binary_expression")
+            .expect("should find binary_expression node");
+
+        assert!(!has_rhs_literal_one(&bin, src.as_bytes()));
+    }
+
+    #[test]
+    fn rhs_literal_one_ignores_other_literals() {
+        let src = "package main\nfunc f(x int) int { return x * 2 }";
+        let tree = parse_go(src);
+        let bin = find_node_by_kind(tree.root_node(), "binary_expression")
+            .expect("should find binary_expression node");
+
+        assert!(!has_rhs_literal_one(&bin, src.as_bytes()));
     }
 }
