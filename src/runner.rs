@@ -78,12 +78,17 @@ impl TestRunner {
         }
 
         let semaphore = Arc::new(Semaphore::new(self.parallelism));
+        // The test command usually exercises the whole working tree. Until
+        // mutations run in isolated worktrees, only one mutation can be active
+        // without contaminating another mutation's result.
+        let mutation_lock = Arc::new(Semaphore::new(1));
         let project_root = Arc::new(self.project_root.clone());
         let build_command = Arc::new(self.commands.build_command.clone());
         let mut handles = Vec::new();
 
         for (_file, file_mutations) in by_file {
             let sem = semaphore.clone();
+            let mutation_lock = mutation_lock.clone();
             let language = file_mutations
                 .first()
                 .map(|m| m.language.as_str())
@@ -169,6 +174,7 @@ impl TestRunner {
 
                     // Semaphore is never closed, so acquire cannot fail
                     let _permit = sem.acquire().await.unwrap();
+                    let _mutation_permit = mutation_lock.acquire().await.unwrap();
                     let outcome = run_single_mutation(
                         &command,
                         &build_command,
@@ -945,6 +951,66 @@ mod tests {
             "mutations on the same file ran concurrently"
         );
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "hello world");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mutations_on_different_files_do_not_overlap_in_shared_worktree() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first.txt");
+        let second = dir.path().join("second.txt");
+        std::fs::write(&first, b"hello world").unwrap();
+        std::fs::write(&second, b"hello world").unwrap();
+
+        let mutations: Vec<Mutation> = [first.clone(), second.clone()]
+            .into_iter()
+            .enumerate()
+            .map(|(i, file)| Mutation {
+                id: i as u32,
+                file,
+                language: String::new(),
+                line: 1,
+                column: 1,
+                operator: "test".into(),
+                description: format!("different file mutation {i}"),
+                original: "hello".into(),
+                replacement: "world".into(),
+                byte_range: 0..5,
+            })
+            .collect();
+
+        let lock_dir = dir.path().join("whole-tree-command.lock.d");
+        let script = format!(
+            "mkdir {lock} 2>/dev/null || exit 1; rmdir {lock}",
+            lock = lock_dir.display()
+        );
+
+        let runner = TestRunner {
+            commands: CommandConfig {
+                command: vec!["sh".into(), "-c".into(), script],
+                language_commands: HashMap::new(),
+                build_command: vec![],
+                build_command_explicit: false,
+                timeout: Duration::from_secs(5),
+                language_timeouts: HashMap::new(),
+            },
+            parallelism: 4,
+            project_root: dir.path().to_path_buf(),
+            verbose: false,
+            show_output: false,
+            max_tested: None,
+            env: HashMap::new(),
+            cancelled: Arc::new(AtomicBool::new(false)),
+        };
+
+        let report = runner.run(mutations).await;
+        assert_eq!(report.total, 2);
+        assert_eq!(
+            report.killed, 0,
+            "different-file mutations overlapped in the shared working tree"
+        );
+        assert_eq!(std::fs::read_to_string(&first).unwrap(), "hello world");
+        assert_eq!(std::fs::read_to_string(&second).unwrap(), "hello world");
     }
 
     #[tokio::test]
