@@ -141,8 +141,7 @@ fn check_format_json_outputs_valid_json() {
         .output()
         .unwrap();
 
-    // Exit code 1 = survived mutations exist
-    assert!(output.status.code() == Some(1) || output.status.code() == Some(0));
+    assert_eq!(output.status.code(), Some(0));
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let value: serde_json::Value = serde_json::from_str(&stdout)

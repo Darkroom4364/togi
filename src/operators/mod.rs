@@ -42,10 +42,12 @@ impl MutationOperator for NegateCondition {
         if let Some(cond_node) = cond {
             let text = std::str::from_utf8(&source[cond_node.byte_range()]).unwrap_or("");
             let replacement = if let Some(stripped) = text.strip_prefix('!') {
-                stripped
-                    .trim_start_matches('(')
-                    .trim_end_matches(')')
-                    .to_string()
+                let stripped = stripped.trim();
+                if stripped.starts_with('(') && stripped.ends_with(')') {
+                    stripped[1..stripped.len() - 1].to_string()
+                } else {
+                    stripped.to_string()
+                }
             } else {
                 format!("!({})", text)
             };
@@ -337,8 +339,7 @@ mod tests {
         let tree = parse_go(src);
         let if_node = find_node_by_kind(tree.root_node(), "if_statement").unwrap();
         let candidates = NegateCondition.apply(&if_node, src.as_bytes());
-        assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0].replacement, "!(x > 0)");
+        assert_single_candidate(&candidates, src, "!(x > 0)", "x > 0");
     }
 
     #[test]
@@ -347,8 +348,16 @@ mod tests {
         let tree = parse_go(src);
         let if_node = find_node_by_kind(tree.root_node(), "if_statement").unwrap();
         let candidates = NegateCondition.apply(&if_node, src.as_bytes());
-        assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0].replacement, "x");
+        assert_single_candidate(&candidates, src, "x", "!x");
+    }
+
+    #[test]
+    fn test_negate_already_negated_call() {
+        let src = "package main\nfunc f() { if !foo() { return } }";
+        let tree = parse_go(src);
+        let if_node = find_node_by_kind(tree.root_node(), "if_statement").unwrap();
+        let candidates = NegateCondition.apply(&if_node, src.as_bytes());
+        assert_single_candidate(&candidates, src, "foo()", "!foo()");
     }
 
     #[test]

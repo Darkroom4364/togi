@@ -114,6 +114,7 @@ mod tests {
             .expect("should find break_expression");
         let candidates = RemoveBreak.apply(&node, src.as_bytes());
         assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].replacement, "");
     }
 
     #[test]
@@ -124,6 +125,7 @@ mod tests {
             .expect("should find continue_expression");
         let candidates = RemoveContinue.apply(&node, src.as_bytes());
         assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].replacement, "");
     }
 
     // Ruby tests
@@ -134,6 +136,7 @@ mod tests {
         let node = find_node_by_kind(tree.root_node(), "break").expect("should find break");
         let candidates = RemoveBreak.apply(&node, src.as_bytes());
         assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].replacement, "");
     }
 
     #[test]
@@ -143,5 +146,6 @@ mod tests {
         let node = find_node_by_kind(tree.root_node(), "next").expect("should find next");
         let candidates = RemoveContinue.apply(&node, src.as_bytes());
         assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].replacement, "");
     }
 }
