@@ -99,6 +99,23 @@ macro_rules! define_language {
 
 pub(crate) use define_language;
 
+pub(crate) fn should_skip_string_to_empty_in_compiled_context(node: &tree_sitter::Node) -> bool {
+    let mut parent = node.parent();
+    while let Some(p) = parent {
+        match p.kind() {
+            "const_item" | "const_declaration" | "static_item" => return true,
+            "match_arm" => return true,
+            "function_item"
+            | "function_declaration"
+            | "method_declaration"
+            | "function_definition"
+            | "method" => return false,
+            _ => parent = p.parent(),
+        }
+    }
+    false
+}
+
 /// Language-specific configuration for tree-sitter parsing and node identification
 pub trait LanguageSupport: Send + Sync {
     fn name(&self) -> &str;

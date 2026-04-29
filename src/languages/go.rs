@@ -12,10 +12,15 @@ fn should_filter_candidate(
     node: &tree_sitter::Node,
     source: &[u8],
 ) -> bool {
-    // Skip arithmetic mutations on expressions like `x * 1`.
-    // `x * 1` -> `x / 1` is equivalent, but `1 * x` -> `1 / x` is not.
-    matches!(candidate.operator_id.as_str(), "mul_to_div" | "div_to_mul")
-        && has_rhs_literal_one(node, source)
+    match candidate.operator_id.as_str() {
+        // Skip arithmetic mutations on expressions like `x * 1`.
+        // `x * 1` -> `x / 1` is equivalent, but `1 * x` -> `1 / x` is not.
+        "mul_to_div" | "div_to_mul" => has_rhs_literal_one(node, source),
+        "string_to_empty" => {
+            crate::languages::should_skip_string_to_empty_in_compiled_context(node)
+        }
+        _ => false,
+    }
 }
 
 fn has_rhs_literal_one(node: &tree_sitter::Node, source: &[u8]) -> bool {
@@ -33,6 +38,15 @@ mod tests {
     use super::*;
     use crate::languages::LanguageSupport;
     use crate::test_helpers::{find_node_by_kind, parse_go, walk_for_kind, walk_for_two_kinds};
+
+    fn candidate(operator_id: &str) -> crate::MutationCandidate {
+        crate::MutationCandidate {
+            byte_range: 0..1,
+            replacement: String::new(),
+            operator_id: operator_id.to_string(),
+            description: String::new(),
+        }
+    }
 
     #[test]
     fn test_go_extension_detection() {
@@ -133,5 +147,23 @@ mod tests {
             .expect("should find binary_expression node");
 
         assert!(!has_rhs_literal_one(&bin, src.as_bytes()));
+    }
+
+    #[test]
+    fn string_to_empty_allowed_inside_function_body() {
+        let go = Go;
+        let src = r#"package main
+func f() string {
+	return "hello"
+}"#;
+        let tree = parse_go(src);
+        let string = find_node_by_kind(tree.root_node(), "interpreted_string_literal")
+            .expect("should find interpreted_string_literal node");
+
+        assert!(!go.should_filter_candidate(
+            &candidate("string_to_empty"),
+            &string,
+            src.as_bytes()
+        ));
     }
 }

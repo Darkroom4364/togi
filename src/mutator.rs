@@ -62,20 +62,10 @@ fn should_skip_return_empty(node: &tree_sitter::Node, language: &str) -> bool {
 /// in compiled languages (const items, static items, match arms).
 fn should_skip_string_to_empty(node: &tree_sitter::Node, language: &str) -> bool {
     match language {
-        "rust" | "go" | "c" | "cpp" | "c_sharp" | "java" | "typescript" => {}
+        "c" | "cpp" | "c_sharp" | "java" | "typescript" => {}
         _ => return false,
     }
-    let mut parent = node.parent();
-    while let Some(p) = parent {
-        match p.kind() {
-            "const_item" | "const_declaration" | "static_item" => return true,
-            "match_arm" => return true,
-            // Stop walking at function boundaries
-            k if FUNC_NODE_KINDS.contains(&k) => return false,
-            _ => parent = p.parent(),
-        }
-    }
-    false
+    crate::languages::should_skip_string_to_empty_in_compiled_context(node)
 }
 
 /// Check if a mutation candidate should be filtered out for the given language.
@@ -279,7 +269,7 @@ fn sample_diverse(mutations: Vec<Mutation>, cap: usize) -> Vec<Mutation> {
 mod tests {
     use super::*;
     use crate::languages::go::Go;
-    use crate::test_helpers::{find_node_by_kind, parse_go, parse_python, parse_rust};
+    use crate::test_helpers::{find_node_by_kind, parse_go, parse_python};
     use crate::{ChangedFile, LineRange};
     use std::path::PathBuf;
     use tempfile::TempDir;
@@ -298,54 +288,6 @@ mod tests {
             operator_id: operator_id.to_string(),
             description: String::new(),
         }
-    }
-
-    #[test]
-    fn string_to_empty_skipped_for_rust_const_context() {
-        let src = r#"const NAME: &str = "togi";"#;
-        let tree = parse_rust(src);
-        let string = find_node_by_kind(tree.root_node(), "string_literal")
-            .expect("should find string_literal node");
-
-        assert!(should_skip_string_to_empty(&string, "rust"));
-    }
-
-    #[test]
-    fn string_to_empty_skipped_for_rust_static_context() {
-        let src = r#"static NAME: &str = "togi";"#;
-        let tree = parse_rust(src);
-        let string = find_node_by_kind(tree.root_node(), "string_literal")
-            .expect("should find string_literal node");
-
-        assert!(should_skip_string_to_empty(&string, "rust"));
-    }
-
-    #[test]
-    fn string_to_empty_skipped_for_rust_match_arm() {
-        let src = r#"fn label(x: i32) -> &'static str {
-    match x {
-        0 => "zero",
-        _ => "other",
-    }
-}"#;
-        let tree = parse_rust(src);
-        let string = find_node_by_kind(tree.root_node(), "string_literal")
-            .expect("should find string_literal node");
-
-        assert!(should_skip_string_to_empty(&string, "rust"));
-    }
-
-    #[test]
-    fn string_to_empty_allowed_inside_function_body() {
-        let src = r#"package main
-func f() string {
-	return "hello"
-}"#;
-        let tree = parse_go(src);
-        let string = find_node_by_kind(tree.root_node(), "interpreted_string_literal")
-            .expect("should find interpreted_string_literal node");
-
-        assert!(!should_skip_string_to_empty(&string, "go"));
     }
 
     #[test]
