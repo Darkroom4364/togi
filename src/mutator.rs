@@ -294,6 +294,7 @@ fn sample_diverse(mutations: Vec<Mutation>, cap: usize) -> Vec<Mutation> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_helpers::{find_node_by_kind, parse_go, parse_python, parse_rust};
     use crate::{ChangedFile, LineRange};
     use std::path::PathBuf;
     use tempfile::TempDir;
@@ -303,6 +304,232 @@ mod tests {
         std::fs::create_dir_all(full.parent().unwrap()).unwrap();
         std::fs::write(&full, content).unwrap();
         PathBuf::from(rel_path)
+    }
+
+    fn candidate(operator_id: &str) -> MutationCandidate {
+        MutationCandidate {
+            byte_range: 0..1,
+            replacement: String::new(),
+            operator_id: operator_id.to_string(),
+            description: String::new(),
+        }
+    }
+
+    #[test]
+    fn string_to_empty_skipped_for_rust_const_context() {
+        let src = r#"const NAME: &str = "togi";"#;
+        let tree = parse_rust(src);
+        let string = find_node_by_kind(tree.root_node(), "string_literal")
+            .expect("should find string_literal node");
+
+        assert!(should_skip_string_to_empty(&string, "rust"));
+    }
+
+    #[test]
+    fn string_to_empty_skipped_for_rust_static_context() {
+        let src = r#"static NAME: &str = "togi";"#;
+        let tree = parse_rust(src);
+        let string = find_node_by_kind(tree.root_node(), "string_literal")
+            .expect("should find string_literal node");
+
+        assert!(should_skip_string_to_empty(&string, "rust"));
+    }
+
+    #[test]
+    fn string_to_empty_skipped_for_rust_match_arm() {
+        let src = r#"fn label(x: i32) -> &'static str {
+    match x {
+        0 => "zero",
+        _ => "other",
+    }
+}"#;
+        let tree = parse_rust(src);
+        let string = find_node_by_kind(tree.root_node(), "string_literal")
+            .expect("should find string_literal node");
+
+        assert!(should_skip_string_to_empty(&string, "rust"));
+    }
+
+    #[test]
+    fn string_to_empty_allowed_inside_function_body() {
+        let src = r#"package main
+func f() string {
+	return "hello"
+}"#;
+        let tree = parse_go(src);
+        let string = find_node_by_kind(tree.root_node(), "interpreted_string_literal")
+            .expect("should find interpreted_string_literal node");
+
+        assert!(!should_skip_string_to_empty(&string, "go"));
+    }
+
+    #[test]
+    fn string_to_empty_not_skipped_for_dynamic_languages() {
+        let src = r#"NAME = "togi""#;
+        let tree = parse_python(src);
+        let string =
+            find_node_by_kind(tree.root_node(), "string").expect("should find string node");
+
+        assert!(!should_skip_string_to_empty(&string, "python"));
+    }
+
+    #[test]
+    fn rhs_literal_one_detects_right_hand_one_only() {
+        let src = "package main\nfunc f(x int) int { return x * 1 }";
+        let tree = parse_go(src);
+        let bin = find_node_by_kind(tree.root_node(), "binary_expression")
+            .expect("should find binary_expression node");
+
+        assert!(has_rhs_literal_one(&bin, src.as_bytes()));
+    }
+
+    #[test]
+    fn rhs_literal_one_ignores_left_hand_one() {
+        let src = "package main\nfunc f(x int) int { return 1 * x }";
+        let tree = parse_go(src);
+        let bin = find_node_by_kind(tree.root_node(), "binary_expression")
+            .expect("should find binary_expression node");
+
+        assert!(!has_rhs_literal_one(&bin, src.as_bytes()));
+    }
+
+    #[test]
+    fn rhs_literal_one_ignores_other_literals() {
+        let src = "package main\nfunc f(x int) int { return x * 2 }";
+        let tree = parse_go(src);
+        let bin = find_node_by_kind(tree.root_node(), "binary_expression")
+            .expect("should find binary_expression node");
+
+        assert!(!has_rhs_literal_one(&bin, src.as_bytes()));
+    }
+
+    #[test]
+    fn mul_to_div_filter_skips_right_hand_one() {
+        let src = "package main\nfunc f(x int) int { return x * 1 }";
+        let tree = parse_go(src);
+        let bin = find_node_by_kind(tree.root_node(), "binary_expression")
+            .expect("should find binary_expression node");
+
+        assert!(should_filter(
+            &candidate("mul_to_div"),
+            &bin,
+            src.as_bytes(),
+            "go"
+        ));
+    }
+
+    #[test]
+    fn mul_to_div_filter_allows_left_hand_one() {
+        let src = "package main\nfunc f(x int) int { return 1 * x }";
+        let tree = parse_go(src);
+        let bin = find_node_by_kind(tree.root_node(), "binary_expression")
+            .expect("should find binary_expression node");
+
+        assert!(!should_filter(
+            &candidate("mul_to_div"),
+            &bin,
+            src.as_bytes(),
+            "go"
+        ));
+    }
+
+    #[test]
+    fn div_to_mul_filter_skips_right_hand_one() {
+        let src = "package main\nfunc f(x int) int { return x / 1 }";
+        let tree = parse_go(src);
+        let bin = find_node_by_kind(tree.root_node(), "binary_expression")
+            .expect("should find binary_expression node");
+
+        assert!(should_filter(
+            &candidate("div_to_mul"),
+            &bin,
+            src.as_bytes(),
+            "go"
+        ));
+    }
+
+    #[test]
+    fn string_to_empty_absent_for_go_const_declaration() {
+        let tmp = TempDir::new().unwrap();
+        let src = "package main\n\nconst name = \"togi\"\n";
+        let rel = write_test_file(tmp.path(), "main.go", src);
+
+        let changed = vec![ChangedFile {
+            path: rel,
+            hunks: vec![LineRange { start: 3, end: 3 }],
+        }];
+
+        let mutations =
+            generate_mutations(&changed, tmp.path(), 100, 0, &["string_to_empty".into()]).unwrap();
+
+        assert!(
+            mutations.is_empty(),
+            "string_to_empty should be skipped for const declarations, got: {:?}",
+            mutations.iter().map(|m| &m.operator).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn string_to_empty_present_for_go_function_body() {
+        let tmp = TempDir::new().unwrap();
+        let src = "package main\n\nfunc f() string {\n\treturn \"togi\"\n}\n";
+        let rel = write_test_file(tmp.path(), "main.go", src);
+
+        let changed = vec![ChangedFile {
+            path: rel,
+            hunks: vec![LineRange { start: 4, end: 4 }],
+        }];
+
+        let mutations =
+            generate_mutations(&changed, tmp.path(), 100, 0, &["string_to_empty".into()]).unwrap();
+
+        assert!(
+            mutations.iter().any(|m| m.operator == "string_to_empty"),
+            "string_to_empty should be allowed in function bodies, got: {:?}",
+            mutations.iter().map(|m| &m.operator).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn python_remove_if_body_uses_pass_replacement() {
+        let tmp = TempDir::new().unwrap();
+        let src = "def f(x):\n    if x:\n        return 1\n    return 0\n";
+        let rel = write_test_file(tmp.path(), "test.py", src);
+
+        let changed = vec![ChangedFile {
+            path: rel,
+            hunks: vec![LineRange { start: 2, end: 2 }],
+        }];
+
+        let mutations =
+            generate_mutations(&changed, tmp.path(), 100, 0, &["remove_if_body".into()]).unwrap();
+        let m = mutations
+            .iter()
+            .find(|m| m.operator == "remove_if_body")
+            .expect("remove_if_body mutation should be generated");
+
+        assert_eq!(m.replacement, "pass");
+    }
+
+    #[test]
+    fn ruby_remove_if_body_uses_nil_replacement() {
+        let tmp = TempDir::new().unwrap();
+        let src = "def f(x)\n  if x\n    1\n  end\nend\n";
+        let rel = write_test_file(tmp.path(), "test.rb", src);
+
+        let changed = vec![ChangedFile {
+            path: rel,
+            hunks: vec![LineRange { start: 2, end: 2 }],
+        }];
+
+        let mutations =
+            generate_mutations(&changed, tmp.path(), 100, 0, &["remove_if_body".into()]).unwrap();
+        let m = mutations
+            .iter()
+            .find(|m| m.operator == "remove_if_body")
+            .expect("remove_if_body mutation should be generated");
+
+        assert_eq!(m.replacement, "nil");
     }
 
     #[test]
