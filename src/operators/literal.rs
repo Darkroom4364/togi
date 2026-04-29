@@ -187,6 +187,17 @@ mod tests {
 
     use crate::test_helpers::{find_node_by_kind, parse_go};
 
+    fn assert_single_candidate(
+        candidates: &[MutationCandidate],
+        src: &str,
+        replacement: &str,
+        original: &str,
+    ) {
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].replacement, replacement);
+        assert_eq!(&src[candidates[0].byte_range.clone()], original);
+    }
+
     fn collect_all_candidates(
         node: tree_sitter::Node,
         source: &[u8],
@@ -206,8 +217,7 @@ mod tests {
         let tree = parse_go(src);
         let node = find_node_by_kind(tree.root_node(), "true").expect("should find true node");
         let candidates = TrueToFalse.apply(&node, src.as_bytes());
-        assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0].replacement, "false");
+        assert_single_candidate(&candidates, src, "false", "true");
     }
 
     #[test]
@@ -216,8 +226,7 @@ mod tests {
         let tree = parse_go(src);
         let node = find_node_by_kind(tree.root_node(), "false").expect("should find false node");
         let candidates = FalseToTrue.apply(&node, src.as_bytes());
-        assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0].replacement, "true");
+        assert_single_candidate(&candidates, src, "true", "false");
     }
 
     #[test]
@@ -227,8 +236,7 @@ mod tests {
         let node = find_node_by_kind(tree.root_node(), "int_literal")
             .expect("should find int_literal node");
         let candidates = ZeroToOne.apply(&node, src.as_bytes());
-        assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0].replacement, "1");
+        assert_single_candidate(&candidates, src, "1", "0");
     }
 
     #[test]
@@ -253,5 +261,68 @@ mod tests {
             &mut candidates,
         );
         assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn test_string_to_empty_double_quoted() {
+        let src = r#"package main
+func f() string { return "hello" }"#;
+        let tree = parse_go(src);
+        let node = find_node_by_kind(tree.root_node(), "interpreted_string_literal")
+            .expect("should find interpreted_string_literal node");
+        let candidates = StringToEmpty.apply(&node, src.as_bytes());
+        assert_single_candidate(&candidates, src, r#""""#, r#""hello""#);
+    }
+
+    #[test]
+    fn test_string_to_empty_raw_string() {
+        let src = "package main\nfunc f() string { return `hello` }";
+        let tree = parse_go(src);
+        let node = find_node_by_kind(tree.root_node(), "raw_string_literal")
+            .expect("should find raw_string_literal node");
+        let candidates = StringToEmpty.apply(&node, src.as_bytes());
+        assert_single_candidate(&candidates, src, "``", "`hello`");
+    }
+
+    #[test]
+    fn test_string_to_empty_skips_empty_string() {
+        let src = r#"package main
+func f() string { return "" }"#;
+        let tree = parse_go(src);
+        let node = find_node_by_kind(tree.root_node(), "interpreted_string_literal")
+            .expect("should find interpreted_string_literal node");
+        let candidates = StringToEmpty.apply(&node, src.as_bytes());
+        assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn test_increment_numeric() {
+        let src = "package main\nfunc f() int { return 41 }";
+        let tree = parse_go(src);
+        let node = find_node_by_kind(tree.root_node(), "int_literal")
+            .expect("should find int_literal node");
+        let candidates = IncrementNumeric.apply(&node, src.as_bytes());
+        assert_single_candidate(&candidates, src, "42", "41");
+    }
+
+    #[test]
+    fn test_decrement_numeric() {
+        let src = "package main\nfunc f() int { return 41 }";
+        let tree = parse_go(src);
+        let node = find_node_by_kind(tree.root_node(), "int_literal")
+            .expect("should find int_literal node");
+        let candidates = DecrementNumeric.apply(&node, src.as_bytes());
+        assert_single_candidate(&candidates, src, "40", "41");
+    }
+
+    #[test]
+    fn numeric_mutators_skip_non_integer_text() {
+        let src = "package main\nfunc f() float64 { return 4.5 }";
+        let tree = parse_go(src);
+        let node = find_node_by_kind(tree.root_node(), "float_literal")
+            .expect("should find float_literal node");
+
+        assert!(IncrementNumeric.apply(&node, src.as_bytes()).is_empty());
+        assert!(DecrementNumeric.apply(&node, src.as_bytes()).is_empty());
     }
 }
