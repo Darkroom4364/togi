@@ -28,6 +28,7 @@ fn classify_result(status: std::process::ExitStatus) -> MutationResult {
 #[tokio::test]
 #[ignore]
 async fn verify_mutation_outcomes_match_independent_replay() {
+    let _fixture_guard = crate::go_fixture_lock().await;
     let root = fixture_path();
     let calc_path = root.join("calc.go");
 
