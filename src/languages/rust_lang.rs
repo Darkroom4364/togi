@@ -51,6 +51,16 @@ impl LanguageSupport for Rust {
             _ => false,
         }
     }
+
+    fn should_filter_candidate(
+        &self,
+        candidate: &crate::MutationCandidate,
+        node: &tree_sitter::Node,
+        _source: &[u8],
+    ) -> bool {
+        candidate.operator_id == "string_to_empty"
+            && crate::languages::should_skip_string_to_empty_in_compiled_context(node)
+    }
 }
 
 /// Check if a node has a preceding sibling `attribute_item` matching a predicate.
@@ -76,7 +86,16 @@ fn has_attribute(node: &tree_sitter::Node, source: &[u8], matches: impl Fn(&str)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_helpers::{walk_for_kind, walk_for_two_kinds};
+    use crate::test_helpers::{find_node_by_kind, walk_for_kind, walk_for_two_kinds};
+
+    fn candidate(operator_id: &str) -> crate::MutationCandidate {
+        crate::MutationCandidate {
+            byte_range: 0..1,
+            replacement: String::new(),
+            operator_id: operator_id.to_string(),
+            description: String::new(),
+        }
+    }
 
     #[test]
     fn test_rust_extension_detection() {
@@ -207,6 +226,44 @@ mod tests {
         let func =
             find_first(tree.root_node(), "function_item").expect("function_item should be present");
         assert!(!rs.should_skip_node(&func, src));
+    }
+
+    #[test]
+    fn string_to_empty_skipped_for_const_context() {
+        let rs = Rust;
+        let src = r#"const NAME: &str = "togi";"#;
+        let tree = crate::test_helpers::parse_rust(src);
+        let string = find_node_by_kind(tree.root_node(), "string_literal")
+            .expect("should find string_literal node");
+
+        assert!(rs.should_filter_candidate(&candidate("string_to_empty"), &string, src.as_bytes()));
+    }
+
+    #[test]
+    fn string_to_empty_skipped_for_static_context() {
+        let rs = Rust;
+        let src = r#"static NAME: &str = "togi";"#;
+        let tree = crate::test_helpers::parse_rust(src);
+        let string = find_node_by_kind(tree.root_node(), "string_literal")
+            .expect("should find string_literal node");
+
+        assert!(rs.should_filter_candidate(&candidate("string_to_empty"), &string, src.as_bytes()));
+    }
+
+    #[test]
+    fn string_to_empty_skipped_for_match_arm() {
+        let rs = Rust;
+        let src = r#"fn label(x: i32) -> &'static str {
+    match x {
+        0 => "zero",
+        _ => "other",
+    }
+}"#;
+        let tree = crate::test_helpers::parse_rust(src);
+        let string = find_node_by_kind(tree.root_node(), "string_literal")
+            .expect("should find string_literal node");
+
+        assert!(rs.should_filter_candidate(&candidate("string_to_empty"), &string, src.as_bytes()));
     }
 
     #[test]
