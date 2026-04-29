@@ -1,6 +1,8 @@
 use clap::Parser;
 use std::path::{Path, PathBuf};
 use std::process;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use togi::{ChangedFile, Mutation, MutationReport};
@@ -31,6 +33,20 @@ struct CheckConfig {
 
 #[tokio::main]
 async fn main() {
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let cancelled_handler = cancelled.clone();
+
+    // First Ctrl+C sets the flag so the runner can stop gracefully.
+    // Second Ctrl+C force-exits for impatient users.
+    ctrlc::set_handler(move || {
+        if cancelled_handler.swap(true, Ordering::SeqCst) {
+            eprintln!("\nForce exit — files may need manual restoration (check git status)");
+            process::exit(130);
+        }
+        eprintln!("\nInterrupted — finishing current mutation and cleaning up...");
+    })
+    .expect("failed to set Ctrl+C handler");
+
     let cli = togi::cli::Cli::parse();
 
     match cli.command {
@@ -80,7 +96,7 @@ async fn main() {
                 check_baseline,
                 pr_comment,
             };
-            if let Err(e) = run_check(cfg).await {
+            if let Err(e) = run_check(cfg, cancelled).await {
                 eprintln!("Error: {e:#}");
                 process::exit(2);
             }
@@ -136,7 +152,7 @@ fn print_operators() {
     }
 }
 
-async fn run_check(cfg: CheckConfig) -> anyhow::Result<()> {
+async fn run_check(cfg: CheckConfig, cancelled: Arc<AtomicBool>) -> anyhow::Result<()> {
     let all = cfg.all;
     let paths = cfg.paths.clone();
     let dry_run = cfg.dry_run;
@@ -206,6 +222,7 @@ async fn run_check(cfg: CheckConfig) -> anyhow::Result<()> {
         verbose,
         show_output,
         has_explicit_build_cmd,
+        cancelled,
     )
     .await;
 
@@ -470,6 +487,7 @@ async fn execute(
     verbose: bool,
     show_output: bool,
     build_command_explicit: bool,
+    cancelled: Arc<AtomicBool>,
 ) -> MutationReport {
     let mut language_commands: std::collections::HashMap<String, Vec<String>> =
         std::collections::HashMap::new();
@@ -505,6 +523,7 @@ async fn execute(
             Some(config.mutations.max_per_run)
         },
         env: std::collections::HashMap::new(),
+        cancelled,
     };
 
     runner.run(mutations).await
