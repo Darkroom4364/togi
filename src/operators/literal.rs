@@ -316,7 +316,7 @@ func f() string { return "" }"#;
     }
 
     #[test]
-    fn numeric_mutators_skip_non_integer_text() {
+    fn numeric_mutators_skip_float_literals() {
         let src = "package main\nfunc f() float64 { return 4.5 }";
         let tree = parse_go(src);
         let node = find_node_by_kind(tree.root_node(), "float_literal")
