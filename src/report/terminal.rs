@@ -182,16 +182,32 @@ mod tests {
 
     #[test]
     fn terminal_output_lists_mutations_with_status_and_location() {
+        let killed_path = PathBuf::from("src").join("a.rs");
+        let survived_path = PathBuf::from("src").join("b.rs");
         let report = report(vec![
-            (mutation(1, "src/a.rs", 1), MutationResult::Killed),
-            (mutation(2, "src/b.rs", 2), MutationResult::Survived),
+            (
+                mutation(1, &killed_path.display().to_string(), 1),
+                MutationResult::Killed,
+            ),
+            (
+                mutation(2, &survived_path.display().to_string(), 2),
+                MutationResult::Survived,
+            ),
         ]);
         let output = format_report_plain(&report);
+        let killed_location = format!("{}:1", killed_path.display());
+        let survived_location = format!("{}:2", survived_path.display());
 
-        assert!(output.contains("KILLED"));
-        assert!(output.contains("src/a.rs:1"));
-        assert!(output.contains("SURVIVED"));
-        assert!(output.contains("src/b.rs:2"));
+        assert!(
+            output
+                .lines()
+                .any(|line| line.contains("KILLED") && line.contains(&killed_location))
+        );
+        assert!(
+            output
+                .lines()
+                .any(|line| line.contains("SURVIVED") && line.contains(&survived_location))
+        );
         assert!(output.contains("Your tests don't catch this mutation."));
     }
 
