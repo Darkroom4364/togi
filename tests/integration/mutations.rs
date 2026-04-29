@@ -71,6 +71,7 @@ fn generates_mutations_for_go_fixture() {
 #[tokio::test]
 #[ignore]
 async fn end_to_end_go_fixture_all_killed_with_cache_off() {
+    let _fixture_guard = crate::go_fixture_lock().await;
     let root = fixture_path();
     togi::cache::clear(&root).expect("failed to clear togi cache");
 
