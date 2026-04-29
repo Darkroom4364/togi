@@ -163,3 +163,75 @@ fn check_invalid_config_exits_two() {
         .code(2)
         .stderr(predicate::str::contains("Error"));
 }
+
+#[test]
+fn clean_removes_cache_dir() {
+    let dir = setup_git_repo();
+    let cache_dir = dir.path().join(".togi-cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+    fs::write(cache_dir.join("entry-1"), "{}").unwrap();
+    fs::write(cache_dir.join("entry-2"), "{}").unwrap();
+    assert!(cache_dir.exists());
+
+    togi()
+        .arg("clean")
+        .current_dir(dir.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Cache cleared"));
+
+    assert!(!cache_dir.exists(), ".togi-cache should be removed");
+}
+
+#[test]
+fn clean_succeeds_when_cache_missing() {
+    let dir = setup_git_repo();
+    assert!(!dir.path().join(".togi-cache").exists());
+
+    togi()
+        .arg("clean")
+        .current_dir(dir.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Cache cleared"));
+}
+
+#[test]
+fn list_operators_prints_known_ids_and_categories() {
+    let output = togi().arg("list-operators").assert().success();
+    let stdout = String::from_utf8(output.get_output().stdout.clone()).unwrap();
+
+    // Known operator IDs (one per category) should appear in output.
+    for id in [
+        "lt_to_lte",        // binary
+        "true_to_false",    // literal
+        "plus_to_minus",    // boundary
+        "remove_if_body",   // removal
+        "remove_unary_not", // unary
+        "remove_break",     // loop
+        "negate_condition", // negate
+        "return_empty",     // return
+    ] {
+        assert!(
+            stdout.contains(id),
+            "expected list-operators output to contain '{id}', got:\n{stdout}"
+        );
+    }
+
+    // All expected category headers should appear.
+    for cat in [
+        "binary:",
+        "literal:",
+        "boundary:",
+        "removal:",
+        "unary:",
+        "loop:",
+        "negate:",
+        "return:",
+    ] {
+        assert!(
+            stdout.contains(cat),
+            "expected list-operators output to contain category '{cat}', got:\n{stdout}"
+        );
+    }
+}

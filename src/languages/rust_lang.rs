@@ -211,9 +211,28 @@ mod tests {
 
     #[test]
     fn should_skip_qualified_test_attribute() {
-        // e.g. #[tokio::test] / #[test_case::test(...)]
         let rs = Rust;
         let src = b"#[tokio::test]\nasync fn it_runs() {}\n";
+        let tree = crate::test_helpers::parse_rust(std::str::from_utf8(src).unwrap());
+        let func =
+            find_first(tree.root_node(), "function_item").expect("function_item should be present");
+        assert!(rs.should_skip_node(&func, src));
+    }
+
+    #[test]
+    fn should_skip_double_colon_test_attribute() {
+        let rs = Rust;
+        let src = b"#[test_case::test(42)]\nfn generated_case() {}\n";
+        let tree = crate::test_helpers::parse_rust(std::str::from_utf8(src).unwrap());
+        let func =
+            find_first(tree.root_node(), "function_item").expect("function_item should be present");
+        assert!(rs.should_skip_node(&func, src));
+    }
+
+    #[test]
+    fn should_skip_plain_test_attribute() {
+        let rs = Rust;
+        let src = b"#[test(foo)]\nfn parameterized_case() {}\n";
         let tree = crate::test_helpers::parse_rust(std::str::from_utf8(src).unwrap());
         let func =
             find_first(tree.root_node(), "function_item").expect("function_item should be present");

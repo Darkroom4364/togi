@@ -114,3 +114,87 @@ pub enum Commands {
     /// List all available mutation operators
     ListOperators,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn check_all_conflicts_with_base() {
+        let res = Cli::try_parse_from(["togi", "check", "--all", "--base", "main"]);
+        assert!(res.is_err(), "--all and --base should conflict");
+    }
+
+    #[test]
+    fn check_save_baseline_conflicts_with_check_baseline() {
+        let args = ["togi", "check", "--save-baseline", "--check-baseline"];
+        let res = Cli::try_parse_from(args);
+        assert!(res.is_err(), "save/check baseline should conflict");
+    }
+
+    #[test]
+    fn check_path_requires_all() {
+        let res = Cli::try_parse_from(["togi", "check", "--path", "src/"]);
+        assert!(res.is_err(), "--path should require --all");
+    }
+
+    #[test]
+    fn shard_argument_is_accepted() {
+        let cli = Cli::try_parse_from(["togi", "check", "--shard", "1/3"]).unwrap();
+        match cli.command {
+            Commands::Check { shard, .. } => {
+                assert_eq!(shard.as_deref(), Some("1/3"));
+            }
+            _ => panic!("expected Check command"),
+        }
+    }
+
+    #[test]
+    fn operators_flag_splits_on_comma() {
+        let args = ["togi", "check", "--operators=binary,literal"];
+        let cli = Cli::try_parse_from(args).unwrap();
+        match cli.command {
+            Commands::Check { operators, .. } => {
+                let expected = vec!["binary".to_string(), "literal".to_string()];
+                assert_eq!(operators, Some(expected));
+            }
+            _ => panic!("expected Check command"),
+        }
+    }
+
+    #[test]
+    fn operators_flag_accepts_negation() {
+        let args = [
+            "togi",
+            "check",
+            "--operators=-string_to_empty,-increment_numeric",
+        ];
+        let cli = Cli::try_parse_from(args).unwrap();
+        match cli.command {
+            Commands::Check { operators, .. } => {
+                let expected = vec![
+                    "-string_to_empty".to_string(),
+                    "-increment_numeric".to_string(),
+                ];
+                assert_eq!(operators, Some(expected));
+            }
+            _ => panic!("expected Check command"),
+        }
+    }
+
+    #[test]
+    fn validate_patterns_rejects_unknown_operator() {
+        let ops = crate::operators::all_operators();
+        let res = crate::operators::validate_patterns(&ops, &["arith".into()]);
+        let err = res.unwrap_err();
+        assert!(err.contains("unknown operator or category 'arith'"));
+    }
+
+    #[test]
+    fn validate_patterns_accepts_known_categories() {
+        let ops = crate::operators::all_operators();
+        let patterns = vec!["binary".to_string(), "literal".to_string()];
+        assert!(crate::operators::validate_patterns(&ops, &patterns).is_ok());
+    }
+}
