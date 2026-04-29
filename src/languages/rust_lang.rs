@@ -175,8 +175,8 @@ mod tests {
         let rs = Rust;
         let src = b"#[test]\nfn it_works() {}\n";
         let tree = crate::test_helpers::parse_rust(std::str::from_utf8(src).unwrap());
-        let func = find_first(tree.root_node(), "function_item")
-            .expect("function_item should be present");
+        let func =
+            find_first(tree.root_node(), "function_item").expect("function_item should be present");
         assert!(rs.should_skip_node(&func, src));
     }
 
@@ -194,8 +194,8 @@ mod tests {
         let rs = Rust;
         let src = b"fn add(a: i32, b: i32) -> i32 { a + b }\n";
         let tree = crate::test_helpers::parse_rust(std::str::from_utf8(src).unwrap());
-        let func = find_first(tree.root_node(), "function_item")
-            .expect("function_item should be present");
+        let func =
+            find_first(tree.root_node(), "function_item").expect("function_item should be present");
         assert!(!rs.should_skip_node(&func, src));
     }
 
@@ -204,8 +204,8 @@ mod tests {
         let rs = Rust;
         let src = b"#[inline]\nfn fast() {}\n";
         let tree = crate::test_helpers::parse_rust(std::str::from_utf8(src).unwrap());
-        let func = find_first(tree.root_node(), "function_item")
-            .expect("function_item should be present");
+        let func =
+            find_first(tree.root_node(), "function_item").expect("function_item should be present");
         assert!(!rs.should_skip_node(&func, src));
     }
 
@@ -215,8 +215,8 @@ mod tests {
         let rs = Rust;
         let src = b"#[tokio::test]\nasync fn it_runs() {}\n";
         let tree = crate::test_helpers::parse_rust(std::str::from_utf8(src).unwrap());
-        let func = find_first(tree.root_node(), "function_item")
-            .expect("function_item should be present");
+        let func =
+            find_first(tree.root_node(), "function_item").expect("function_item should be present");
         assert!(rs.should_skip_node(&func, src));
     }
 
@@ -228,8 +228,8 @@ mod tests {
         let rs = Rust;
         let src = b"#[test]\n#[ignore]\nfn skipped() {}\n";
         let tree = crate::test_helpers::parse_rust(std::str::from_utf8(src).unwrap());
-        let func = find_first(tree.root_node(), "function_item")
-            .expect("function_item should be present");
+        let func =
+            find_first(tree.root_node(), "function_item").expect("function_item should be present");
         assert!(rs.should_skip_node(&func, src));
     }
 
@@ -237,8 +237,8 @@ mod tests {
     fn has_attribute_returns_false_when_no_attribute() {
         let src = b"fn lonely() {}\n";
         let tree = crate::test_helpers::parse_rust(std::str::from_utf8(src).unwrap());
-        let func = find_first(tree.root_node(), "function_item")
-            .expect("function_item should be present");
+        let func =
+            find_first(tree.root_node(), "function_item").expect("function_item should be present");
         assert!(!has_attribute(&func, src, |a| a == "#[test]"));
     }
 

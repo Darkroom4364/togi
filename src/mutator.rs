@@ -618,14 +618,14 @@ mod tests {
     #[test]
     fn mutation_line_col_matches_byte_range() {
         let tmp = TempDir::new().unwrap();
-        // return_empty mutation: the operator targets the value (column 12),
-        // not the return keyword (column 5)
-        let src = "package main\n\nfunc f() int {\n\treturn 42\n}\n";
+        // return_empty mutation: the operator targets the return value,
+        // not the return keyword.
+        let src = "package main\n\nfunc value() int { return 42 }\n\nfunc f() int {\n\treturn value()\n}\n";
         let rel = write_test_file(tmp.path(), "main.go", src);
 
         let changed = vec![ChangedFile {
             path: rel,
-            hunks: vec![LineRange { start: 1, end: 5 }],
+            hunks: vec![LineRange { start: 6, end: 6 }],
         }];
 
         let mutations = generate_mutations(&changed, tmp.path(), 100, 0, &[]).unwrap();

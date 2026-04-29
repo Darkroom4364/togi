@@ -498,7 +498,10 @@ mod tests {
             panic!("simulated panic mid-mutation");
         });
 
-        assert!(result.is_err(), "panic should propagate out of catch_unwind");
+        assert!(
+            result.is_err(),
+            "panic should propagate out of catch_unwind"
+        );
         assert_eq!(
             std::fs::read(&path).unwrap(),
             b"original",
@@ -538,7 +541,7 @@ mod tests {
             &["true".to_string()],
             &[],
             Duration::from_secs(5),
-            &dir.path().to_path_buf(),
+            dir.path(),
             &mutation,
             false,
             &HashMap::new(),
@@ -557,7 +560,7 @@ mod tests {
             &["false".to_string()],
             &[],
             Duration::from_secs(5),
-            &dir.path().to_path_buf(),
+            dir.path(),
             &mutation,
             false,
             &HashMap::new(),
@@ -592,7 +595,7 @@ mod tests {
             &["true".to_string()],
             &[],
             Duration::from_secs(5),
-            &dir.path().to_path_buf(),
+            dir.path(),
             &mutation,
             false,
             &HashMap::new(),
@@ -612,7 +615,7 @@ mod tests {
             &["nonexistent_binary_xyz_12345".to_string()],
             &[],
             Duration::from_secs(5),
-            &dir.path().to_path_buf(),
+            dir.path(),
             &mutation,
             false,
             &HashMap::new(),
@@ -632,7 +635,7 @@ mod tests {
             &["sleep".to_string(), "10".to_string()],
             &[],
             Duration::from_millis(100),
-            &dir.path().to_path_buf(),
+            dir.path(),
             &mutation,
             false,
             &HashMap::new(),
@@ -658,7 +661,7 @@ mod tests {
             ],
             &["false".to_string()], // build fails
             Duration::from_secs(5),
-            &dir.path().to_path_buf(),
+            dir.path(),
             &mutation,
             false,
             &HashMap::new(),
@@ -679,7 +682,7 @@ mod tests {
             &["false".to_string()], // test fails = killed
             &["true".to_string()],  // build succeeds
             Duration::from_secs(5),
-            &dir.path().to_path_buf(),
+            dir.path(),
             &mutation,
             false,
             &HashMap::new(),
@@ -702,7 +705,7 @@ mod tests {
             &["true".to_string()],
             &[],
             Duration::from_secs(5),
-            &dir.path().to_path_buf(),
+            dir.path(),
             &mutation,
             false,
             &HashMap::new(),
@@ -721,7 +724,7 @@ mod tests {
             &["true".to_string()],
             &[],
             Duration::from_secs(5),
-            &dir.path().to_path_buf(),
+            dir.path(),
             &mutation,
             false,
             &HashMap::new(),
