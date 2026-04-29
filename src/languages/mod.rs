@@ -108,6 +108,16 @@ pub trait LanguageSupport: Send + Sync {
         false
     }
 
+    /// Return true when this language should suppress a generated mutation.
+    fn should_filter_candidate(
+        &self,
+        _candidate: &crate::MutationCandidate,
+        _node: &tree_sitter::Node,
+        _source: &[u8],
+    ) -> bool {
+        false
+    }
+
     /// Adjust a mutation candidate's replacement for language-specific syntax.
     /// For example, Python replaces `{}` (empty block) with `pass`.
     fn fixup_replacement(&self, _candidate: &mut crate::MutationCandidate) {}

@@ -1,5 +1,6 @@
 // Combine mapper + operators to generate mutations
 
+use crate::languages::LanguageSupport;
 use crate::mapper::find_mutable_nodes;
 use crate::operators::{self};
 use crate::{ChangedFile, Mutation, MutationCandidate};
@@ -82,13 +83,16 @@ fn should_filter(
     candidate: &MutationCandidate,
     node: &tree_sitter::Node,
     source: &[u8],
-    language: &str,
+    lang: &dyn LanguageSupport,
 ) -> bool {
+    if lang.should_filter_candidate(candidate, node, source) {
+        return true;
+    }
     if candidate.operator_id == "return_empty" {
-        return should_skip_return_empty(node, language);
+        return should_skip_return_empty(node, lang.name());
     }
     if candidate.operator_id == "string_to_empty" {
-        return should_skip_string_to_empty(node, language);
+        return should_skip_string_to_empty(node, lang.name());
     }
     // Skip arithmetic mutations on expressions like `x * 1` or `1 * x`
     // where one operand is literal 1 — these produce equivalent mutants.
@@ -164,8 +168,6 @@ pub fn generate_mutations(
                     continue;
                 }
             };
-        let language_name = lang.name().to_string();
-
         let nodes = find_mutable_nodes(&tree, &source, &changed_file.hunks, lang.as_ref());
 
         let mut file_mutations = Vec::new();
@@ -174,7 +176,7 @@ pub fn generate_mutations(
             for op in &operators {
                 let candidates = op.apply(node, &source);
                 for mut candidate in candidates {
-                    if should_filter(&candidate, node, &source, &language_name) {
+                    if should_filter(&candidate, node, &source, lang.as_ref()) {
                         continue;
                     }
                     lang.fixup_replacement(&mut candidate);
@@ -195,7 +197,7 @@ pub fn generate_mutations(
                     file_mutations.push(Mutation {
                         id: 0,
                         file: file_path.clone(),
-                        language: language_name.clone(),
+                        language: lang.name().to_string(),
                         line,
                         column,
                         operator: candidate.operator_id,
@@ -294,6 +296,7 @@ fn sample_diverse(mutations: Vec<Mutation>, cap: usize) -> Vec<Mutation> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::languages::go::Go;
     use crate::test_helpers::{find_node_by_kind, parse_go, parse_python, parse_rust};
     use crate::{ChangedFile, LineRange};
     use std::path::PathBuf;
@@ -405,6 +408,7 @@ func f() string {
 
     #[test]
     fn mul_to_div_filter_skips_right_hand_one() {
+        let lang = Go;
         let src = "package main\nfunc f(x int) int { return x * 1 }";
         let tree = parse_go(src);
         let bin = find_node_by_kind(tree.root_node(), "binary_expression")
@@ -414,12 +418,13 @@ func f() string {
             &candidate("mul_to_div"),
             &bin,
             src.as_bytes(),
-            "go"
+            &lang
         ));
     }
 
     #[test]
     fn mul_to_div_filter_allows_left_hand_one() {
+        let lang = Go;
         let src = "package main\nfunc f(x int) int { return 1 * x }";
         let tree = parse_go(src);
         let bin = find_node_by_kind(tree.root_node(), "binary_expression")
@@ -429,12 +434,13 @@ func f() string {
             &candidate("mul_to_div"),
             &bin,
             src.as_bytes(),
-            "go"
+            &lang
         ));
     }
 
     #[test]
     fn div_to_mul_filter_skips_right_hand_one() {
+        let lang = Go;
         let src = "package main\nfunc f(x int) int { return x / 1 }";
         let tree = parse_go(src);
         let bin = find_node_by_kind(tree.root_node(), "binary_expression")
@@ -444,7 +450,7 @@ func f() string {
             &candidate("div_to_mul"),
             &bin,
             src.as_bytes(),
-            "go"
+            &lang
         ));
     }
 
