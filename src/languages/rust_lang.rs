@@ -58,8 +58,13 @@ impl LanguageSupport for Rust {
         node: &tree_sitter::Node,
         _source: &[u8],
     ) -> bool {
-        candidate.operator_id == "string_to_empty"
-            && crate::languages::should_skip_string_to_empty_in_compiled_context(node)
+        match candidate.operator_id.as_str() {
+            "return_empty" => crate::languages::should_skip_return_empty_for_type(node, false),
+            "string_to_empty" => {
+                crate::languages::should_skip_string_to_empty_in_compiled_context(node)
+            }
+            _ => false,
+        }
     }
 }
 

@@ -13,6 +13,7 @@ fn should_filter_candidate(
     source: &[u8],
 ) -> bool {
     match candidate.operator_id.as_str() {
+        "return_empty" => crate::languages::should_skip_return_empty_for_type(node, true),
         // Skip arithmetic mutations on expressions like `x * 1`.
         // `x * 1` -> `x / 1` is equivalent, but `1 * x` -> `1 / x` is not.
         "mul_to_div" | "div_to_mul" => has_rhs_literal_one(node, source),
