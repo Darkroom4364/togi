@@ -113,6 +113,7 @@ const SIMPLE_RETURN_TYPE_KINDS: &[&str] = &[
     "predefined_type",
     "boolean_type",
     "void_type",
+    "unit_type",
     "integral_type",
     "floating_point_type",
 ];
