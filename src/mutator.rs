@@ -629,13 +629,14 @@ mod tests {
         }];
 
         let mutations = generate_mutations(&changed, tmp.path(), 100, 0, &[]).unwrap();
-        let ret_mut = mutations.iter().find(|m| m.operator == "return_empty");
-        if let Some(m) = ret_mut {
-            // column should point to "42", not "return"
-            assert_eq!(
-                m.column, 9,
-                "column should point to the value, not the return keyword"
-            );
-        }
+        let m = mutations
+            .iter()
+            .find(|m| m.operator == "return_empty")
+            .expect("return_empty mutation should be generated");
+        // column should point to "42", not "return"
+        assert_eq!(
+            m.column, 9,
+            "column should point to the value, not the return keyword"
+        );
     }
 }
