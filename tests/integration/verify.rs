@@ -64,6 +64,7 @@ async fn verify_mutation_outcomes_match_independent_replay() {
         show_output: false,
         max_tested: None,
         env: go_env.clone(),
+        cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
 
     let report = runner.run(mutations).await;

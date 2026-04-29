@@ -100,14 +100,32 @@ pub fn collect_changed_since(
     skip_noisy: bool,
     exclude_globs: &[String],
 ) -> anyhow::Result<Vec<ChangedFile>> {
-    // Try as a commit ref first (SHA, branch, tag).
-    let output = Command::new("git")
-        .args(["diff", &format!("{since}..HEAD")])
+    // Validate the ref before using it in git commands to prevent
+    // arbitrary strings from being passed to git diff.
+    let ref_valid = Command::new("git")
+        .args(["rev-parse", "--verify", &format!("{since}^{{commit}}")])
         .current_dir(project_root)
-        .output()?;
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
 
-    let diff_output = if output.status.success() {
-        String::from_utf8(output.stdout)?
+    // Try as a commit ref first (SHA, branch, tag).
+    let output = if ref_valid {
+        let o = Command::new("git")
+            .args(["diff", &format!("{since}..HEAD")])
+            .current_dir(project_root)
+            .output()?;
+        if o.status.success() {
+            Some(String::from_utf8(o.stdout)?)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let diff_output = if let Some(diff) = output {
+        diff
     } else {
         // Fall back to date-based: resolve to a baseline commit, then diff.
         let rev_output = Command::new("git")
