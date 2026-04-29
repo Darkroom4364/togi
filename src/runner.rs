@@ -481,6 +481,31 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), b"original");
     }
 
+    #[test]
+    fn file_guard_restores_content_on_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.txt");
+        std::fs::write(&path, b"original").unwrap();
+        let path_for_closure = path.clone();
+
+        let result = std::panic::catch_unwind(move || {
+            let _guard = FileGuard {
+                path: path_for_closure.clone(),
+                original: b"original".to_vec(),
+            };
+            std::fs::write(&path_for_closure, b"mutated").unwrap();
+            assert_eq!(std::fs::read(&path_for_closure).unwrap(), b"mutated");
+            panic!("simulated panic mid-mutation");
+        });
+
+        assert!(result.is_err(), "panic should propagate out of catch_unwind");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"original",
+            "FileGuard must restore original content even when unwinding"
+        );
+    }
+
     fn make_test_mutation(file: &std::path::Path) -> Mutation {
         Mutation {
             id: 1,
