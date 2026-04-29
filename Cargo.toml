@@ -54,6 +54,9 @@ shell-words = "1"
 # Error handling
 anyhow = "1"
 
+# Signal handling
+ctrlc = "3"
+
 # Hashing
 siphasher = "1"
 
