@@ -472,10 +472,18 @@ max_per_run = 50
         let config: Config = toml::from_str("").unwrap();
         // Command is empty sentinel when not explicitly configured
         assert!(config.test.command.is_empty());
+        assert!(config.test.build_command.is_empty());
+        assert!(config.test.languages.is_empty());
         assert_eq!(config.test.timeout, 30);
         assert!(config.test.jobs >= 1);
         assert_eq!(config.diff.base, "origin/main");
         assert_eq!(config.mutations.max_per_run, 20);
+        assert_eq!(config.mutations.max_per_file, 20);
+        assert!(config.mutations.operators.is_empty());
+        assert!(config.mutations.coverage_file.is_none());
+        assert!(config.mutations.exclude_paths.is_empty());
+        assert!(config.mutations.skip_noisy_files);
+        assert!(config.projects.is_empty());
     }
 
     #[test]
@@ -632,12 +640,6 @@ coverage_file = "coverage.lcov"
     }
 
     #[test]
-    fn coverage_file_defaults_to_none() {
-        let config: Config = toml::from_str("").unwrap();
-        assert!(config.mutations.coverage_file.is_none());
-    }
-
-    #[test]
     fn detect_cmake() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("CMakeLists.txt"), "").unwrap();
@@ -663,16 +665,6 @@ coverage_file = "coverage.lcov"
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("pom.xml"), "").unwrap();
         assert_eq!(detect_test_command(dir.path()), vec!["mvn", "test"]);
-    }
-
-    #[test]
-    fn default_max_per_run_is_20() {
-        assert_eq!(default_max_per_run(), 20);
-    }
-
-    #[test]
-    fn default_timeout_is_30() {
-        assert_eq!(default_timeout(), 30);
     }
 
     #[test]
@@ -837,12 +829,6 @@ path = "services/api"
     }
 
     #[test]
-    fn no_projects_by_default() {
-        let config: Config = toml::from_str("").unwrap();
-        assert!(config.projects.is_empty());
-    }
-
-    #[test]
     fn project_without_test_override() {
         let toml_str = r#"
 [projects.lib]
@@ -868,19 +854,6 @@ skip_noisy_files = false
             vec!["vendor/**", "*.generated.ts"]
         );
         assert!(!config.mutations.skip_noisy_files);
-    }
-
-    #[test]
-    fn skip_noisy_files_defaults_to_true() {
-        let config: Config = toml::from_str("").unwrap();
-        assert!(config.mutations.skip_noisy_files);
-        assert!(config.mutations.exclude_paths.is_empty());
-    }
-
-    #[test]
-    fn max_per_file_defaults_to_20() {
-        let config: Config = toml::from_str("").unwrap();
-        assert_eq!(config.mutations.max_per_file, 20);
     }
 
     #[test]

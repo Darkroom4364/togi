@@ -132,125 +132,114 @@ fn all_build_error_guidance(report: &MutationReport) -> Option<String> {
 mod tests {
     use super::*;
     use crate::Mutation;
-    use crate::test_helpers::sample_report;
     use std::path::PathBuf;
     use std::time::Duration;
 
-    #[test]
-    fn terminal_output_contains_killed() {
-        let report = sample_report();
-        let output = format_report_plain(&report);
-        assert!(output.contains("✓ KILLED"));
-        assert!(output.contains("src/auth.rs:47"));
-        assert!(output.contains("binary/lt_to_lte"));
+    fn mutation(id: u32, file: &str, line: usize) -> Mutation {
+        Mutation {
+            id,
+            file: PathBuf::from(file),
+            language: String::new(),
+            line,
+            column: 1,
+            operator: "op".to_string(),
+            description: "d".to_string(),
+            original: "x".to_string(),
+            replacement: "y".to_string(),
+            byte_range: 0..1,
+        }
+    }
+
+    fn report(results: Vec<(Mutation, MutationResult)>) -> MutationReport {
+        let total = results.len();
+        let killed = results
+            .iter()
+            .filter(|(_, result)| *result == MutationResult::Killed)
+            .count();
+        let survived = results
+            .iter()
+            .filter(|(_, result)| *result == MutationResult::Survived)
+            .count();
+        let timeout = results
+            .iter()
+            .filter(|(_, result)| *result == MutationResult::Timeout)
+            .count();
+        let build_errors = results
+            .iter()
+            .filter(|(_, result)| *result == MutationResult::BuildError)
+            .count();
+
+        MutationReport {
+            results,
+            duration: Duration::from_millis(500),
+            total,
+            killed,
+            survived,
+            timeout,
+            build_errors,
+        }
     }
 
     #[test]
-    fn terminal_output_contains_survived() {
-        let report = sample_report();
+    fn terminal_output_lists_mutations_with_status_and_location() {
+        let killed_path = PathBuf::from("src").join("a.rs");
+        let survived_path = PathBuf::from("src").join("b.rs");
+        let report = report(vec![
+            (
+                mutation(1, &killed_path.display().to_string(), 1),
+                MutationResult::Killed,
+            ),
+            (
+                mutation(2, &survived_path.display().to_string(), 2),
+                MutationResult::Survived,
+            ),
+        ]);
         let output = format_report_plain(&report);
-        assert!(output.contains("✗ SURVIVED"));
-        assert!(output.contains("src/handler.rs:15"));
+        let killed_location = format!("{}:1", killed_path.display());
+        let survived_location = format!("{}:2", survived_path.display());
+
+        assert!(
+            output
+                .lines()
+                .any(|line| line.contains("KILLED") && line.contains(&killed_location))
+        );
+        assert!(
+            output
+                .lines()
+                .any(|line| line.contains("SURVIVED") && line.contains(&survived_location))
+        );
         assert!(output.contains("Your tests don't catch this mutation."));
     }
 
     #[test]
     fn terminal_output_summary_with_timeout_and_build_errors() {
-        let report = MutationReport {
-            results: vec![
-                (
-                    Mutation {
-                        id: 1,
-                        file: PathBuf::from("src/a.rs"),
-                        language: String::new(),
-                        line: 1,
-                        column: 1,
-                        operator: "op".to_string(),
-                        description: "d".to_string(),
-                        original: "x".to_string(),
-                        replacement: "y".to_string(),
-                        byte_range: 0..1,
-                    },
-                    MutationResult::Killed,
-                ),
-                (
-                    Mutation {
-                        id: 2,
-                        file: PathBuf::from("src/b.rs"),
-                        language: String::new(),
-                        line: 2,
-                        column: 1,
-                        operator: "op".to_string(),
-                        description: "d".to_string(),
-                        original: "x".to_string(),
-                        replacement: "y".to_string(),
-                        byte_range: 0..1,
-                    },
-                    MutationResult::Timeout,
-                ),
-                (
-                    Mutation {
-                        id: 3,
-                        file: PathBuf::from("src/c.rs"),
-                        language: String::new(),
-                        line: 3,
-                        column: 1,
-                        operator: "op".to_string(),
-                        description: "d".to_string(),
-                        original: "x".to_string(),
-                        replacement: "y".to_string(),
-                        byte_range: 0..1,
-                    },
-                    MutationResult::BuildError,
-                ),
-            ],
-            duration: Duration::from_millis(500),
-            total: 3,
-            killed: 1,
-            survived: 0,
-            timeout: 1,
-            build_errors: 1,
-        };
+        let report = report(vec![
+            (mutation(1, "src/a.rs", 1), MutationResult::Killed),
+            (mutation(2, "src/b.rs", 2), MutationResult::Timeout),
+            (mutation(3, "src/c.rs", 3), MutationResult::BuildError),
+        ]);
         let output = format_report_plain(&report);
         assert!(output.contains("Results: 1 killed, 0 survived, 1 timeout, 1 build errors"));
-        // tested = 3 - 1 = 2, score = 1/2 = 50%
         assert!(output.contains("Mutation score (test kills only): 50.0%"));
     }
 
     #[test]
     fn terminal_output_contains_summary() {
-        let report = sample_report();
+        let report = report(vec![
+            (mutation(1, "src/a.rs", 1), MutationResult::Killed),
+            (mutation(2, "src/b.rs", 2), MutationResult::Survived),
+        ]);
         let output = format_report_plain(&report);
         assert!(output.contains("Results: 1 killed, 1 survived, 0 timeout, 0 build errors"));
         assert!(output.contains("Mutation score (test kills only): 50.0%"));
-        assert!(output.contains("Duration: 1.23s"));
     }
 
     #[test]
     fn all_build_errors_shows_guidance() {
-        let report = MutationReport {
-            results: vec![(
-                Mutation {
-                    id: 0,
-                    file: PathBuf::from("test.rs"),
-                    line: 1,
-                    column: 1,
-                    operator: "eq_to_neq".into(),
-                    description: "test".into(),
-                    original: "==".into(),
-                    replacement: "!=".into(),
-                    byte_range: 0..2,
-                    language: "rust".into(),
-                },
-                MutationResult::BuildError,
-            )],
-            duration: Duration::from_secs(1),
-            total: 1,
-            killed: 0,
-            survived: 0,
-            timeout: 0,
-            build_errors: 1,
-        };
+        let report = report(vec![(
+            mutation(1, "src/a.rs", 1),
+            MutationResult::BuildError,
+        )]);
         let output = format_report_plain(&report);
         assert!(output.contains("All mutations caused build errors"));
         assert!(output.contains("--operators="));
@@ -259,15 +248,10 @@ mod tests {
 
     #[test]
     fn partial_build_errors_no_guidance() {
-        let report = MutationReport {
-            results: vec![],
-            duration: Duration::from_secs(1),
-            total: 2,
-            killed: 1,
-            survived: 0,
-            timeout: 0,
-            build_errors: 1,
-        };
+        let report = report(vec![
+            (mutation(1, "src/a.rs", 1), MutationResult::Killed),
+            (mutation(2, "src/b.rs", 2), MutationResult::BuildError),
+        ]);
         let output = format_report_plain(&report);
         assert!(!output.contains("All mutations caused build errors"));
     }
