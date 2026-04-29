@@ -12,6 +12,7 @@ crate::languages::define_language!(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::MutationCandidate;
     use crate::languages::LanguageSupport;
     use crate::test_helpers::{walk_for_kind, walk_for_two_kinds};
 
@@ -84,5 +85,35 @@ mod tests {
         );
         assert!(found_return, "Expected return_statement node");
         assert!(found_binary, "Expected binary_operator node");
+    }
+
+    #[test]
+    fn remove_if_body_replacement_uses_pass() {
+        let py = Python;
+        let mut candidate = MutationCandidate {
+            byte_range: 0..2,
+            replacement: "{}".to_string(),
+            operator_id: "remove_if_body".to_string(),
+            description: String::new(),
+        };
+
+        py.fixup_replacement(&mut candidate);
+
+        assert_eq!(candidate.replacement, "pass");
+    }
+
+    #[test]
+    fn non_remove_if_body_replacement_is_unchanged() {
+        let py = Python;
+        let mut candidate = MutationCandidate {
+            byte_range: 0..2,
+            replacement: "{}".to_string(),
+            operator_id: "remove_else".to_string(),
+            description: String::new(),
+        };
+
+        py.fixup_replacement(&mut candidate);
+
+        assert_eq!(candidate.replacement, "{}");
     }
 }
