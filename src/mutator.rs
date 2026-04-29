@@ -94,24 +94,6 @@ fn should_filter(
     if candidate.operator_id == "string_to_empty" {
         return should_skip_string_to_empty(node, lang.name());
     }
-    // Skip arithmetic mutations on expressions like `x * 1` or `1 * x`
-    // where one operand is literal 1 — these produce equivalent mutants.
-    if matches!(candidate.operator_id.as_str(), "mul_to_div" | "div_to_mul") {
-        return has_rhs_literal_one(node, source);
-    }
-    false
-}
-
-/// Check if a binary expression has literal `1` as its right-hand operand.
-/// `x * 1` → `x / 1` is equivalent, but `1 * x` → `1 / x` is not.
-fn has_rhs_literal_one(node: &tree_sitter::Node, source: &[u8]) -> bool {
-    // The right operand is the last named child of a binary expression
-    let mut cursor = node.walk();
-    let children: Vec<_> = node.named_children(&mut cursor).collect();
-    if let Some(rhs) = children.last() {
-        let text = std::str::from_utf8(&source[rhs.byte_range()]).unwrap_or("");
-        return text == "1";
-    }
     false
 }
 
@@ -374,36 +356,6 @@ func f() string {
             find_node_by_kind(tree.root_node(), "string").expect("should find string node");
 
         assert!(!should_skip_string_to_empty(&string, "python"));
-    }
-
-    #[test]
-    fn rhs_literal_one_detects_right_hand_one_only() {
-        let src = "package main\nfunc f(x int) int { return x * 1 }";
-        let tree = parse_go(src);
-        let bin = find_node_by_kind(tree.root_node(), "binary_expression")
-            .expect("should find binary_expression node");
-
-        assert!(has_rhs_literal_one(&bin, src.as_bytes()));
-    }
-
-    #[test]
-    fn rhs_literal_one_ignores_left_hand_one() {
-        let src = "package main\nfunc f(x int) int { return 1 * x }";
-        let tree = parse_go(src);
-        let bin = find_node_by_kind(tree.root_node(), "binary_expression")
-            .expect("should find binary_expression node");
-
-        assert!(!has_rhs_literal_one(&bin, src.as_bytes()));
-    }
-
-    #[test]
-    fn rhs_literal_one_ignores_other_literals() {
-        let src = "package main\nfunc f(x int) int { return x * 2 }";
-        let tree = parse_go(src);
-        let bin = find_node_by_kind(tree.root_node(), "binary_expression")
-            .expect("should find binary_expression node");
-
-        assert!(!has_rhs_literal_one(&bin, src.as_bytes()));
     }
 
     #[test]

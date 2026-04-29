@@ -19,6 +19,7 @@ pub mod typescript;
 ///   bool_false: ["false"]
 ///   operator_field: "operator"
 ///   skip_subtree_kinds: []
+///   filter_candidate: function path
 macro_rules! define_language {
     (
         $struct:ident,
@@ -32,6 +33,7 @@ macro_rules! define_language {
         $(, bool_false: [$($bf:expr),* $(,)?])?
         $(, operator_field: $op:expr)?
         $(, skip_subtree_kinds: [$($sk:expr),* $(,)?])?
+        $(, filter_candidate: $filter:expr)?
         $(, empty_block_replacement: $ebr:expr)?
         $(,)?
     ) => {
@@ -62,6 +64,7 @@ macro_rules! define_language {
             fn skip_subtree_kinds(&self) -> &[&str] {
                 $crate::languages::define_language!(@arr [$($($sk),*)?] ; [])
             }
+            $crate::languages::define_language!(@filter $($filter)?);
             $crate::languages::define_language!(@fixup $($ebr)?);
         }
     };
@@ -71,6 +74,18 @@ macro_rules! define_language {
     // Helper: return array if non-empty, otherwise default
     (@arr [$($val:expr),+] ; [$($default:expr),*]) => { &[$($val),+] };
     (@arr [] ; [$($default:expr),*]) => { &[$($default),*] };
+    // Helper: override should_filter_candidate if filter_candidate is set
+    (@filter $filter:expr) => {
+        fn should_filter_candidate(
+            &self,
+            candidate: &$crate::MutationCandidate,
+            node: &tree_sitter::Node,
+            source: &[u8],
+        ) -> bool {
+            $filter(candidate, node, source)
+        }
+    };
+    (@filter) => {};
     // Helper: override fixup_replacement if empty_block_replacement is set
     (@fixup $replacement:expr) => {
         fn fixup_replacement(&self, candidate: &mut $crate::MutationCandidate) {
