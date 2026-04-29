@@ -155,4 +155,99 @@ mod tests {
         assert_eq!(rs.if_statement_node(), "if_expression");
         assert_eq!(rs.return_statement_node(), "return_expression");
     }
+
+    /// Find the first node of the given kind in the tree (depth-first).
+    fn find_first<'a>(node: tree_sitter::Node<'a>, kind: &str) -> Option<tree_sitter::Node<'a>> {
+        if node.kind() == kind {
+            return Some(node);
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if let Some(found) = find_first(child, kind) {
+                return Some(found);
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn should_skip_test_function() {
+        let rs = Rust;
+        let src = b"#[test]\nfn it_works() {}\n";
+        let tree = crate::test_helpers::parse_rust(std::str::from_utf8(src).unwrap());
+        let func =
+            find_first(tree.root_node(), "function_item").expect("function_item should be present");
+        assert!(rs.should_skip_node(&func, src));
+    }
+
+    #[test]
+    fn should_skip_cfg_test_module() {
+        let rs = Rust;
+        let src = b"#[cfg(test)]\nmod tests { fn x() {} }\n";
+        let tree = crate::test_helpers::parse_rust(std::str::from_utf8(src).unwrap());
+        let m = find_first(tree.root_node(), "mod_item").expect("mod_item should be present");
+        assert!(rs.should_skip_node(&m, src));
+    }
+
+    #[test]
+    fn should_not_skip_plain_function() {
+        let rs = Rust;
+        let src = b"fn add(a: i32, b: i32) -> i32 { a + b }\n";
+        let tree = crate::test_helpers::parse_rust(std::str::from_utf8(src).unwrap());
+        let func =
+            find_first(tree.root_node(), "function_item").expect("function_item should be present");
+        assert!(!rs.should_skip_node(&func, src));
+    }
+
+    #[test]
+    fn should_not_skip_non_test_attributed_function() {
+        let rs = Rust;
+        let src = b"#[inline]\nfn fast() {}\n";
+        let tree = crate::test_helpers::parse_rust(std::str::from_utf8(src).unwrap());
+        let func =
+            find_first(tree.root_node(), "function_item").expect("function_item should be present");
+        assert!(!rs.should_skip_node(&func, src));
+    }
+
+    #[test]
+    fn should_skip_qualified_test_attribute() {
+        // e.g. #[tokio::test] / #[test_case::test(...)]
+        let rs = Rust;
+        let src = b"#[tokio::test]\nasync fn it_runs() {}\n";
+        let tree = crate::test_helpers::parse_rust(std::str::from_utf8(src).unwrap());
+        let func =
+            find_first(tree.root_node(), "function_item").expect("function_item should be present");
+        assert!(rs.should_skip_node(&func, src));
+    }
+
+    #[test]
+    fn has_attribute_walks_consecutive_attributes() {
+        // Two attributes precede the function; #[test] is the further one.
+        // should_skip_node uses has_attribute under the hood; it must walk
+        // past #[ignore] to find #[test].
+        let rs = Rust;
+        let src = b"#[test]\n#[ignore]\nfn skipped() {}\n";
+        let tree = crate::test_helpers::parse_rust(std::str::from_utf8(src).unwrap());
+        let func =
+            find_first(tree.root_node(), "function_item").expect("function_item should be present");
+        assert!(rs.should_skip_node(&func, src));
+    }
+
+    #[test]
+    fn has_attribute_returns_false_when_no_attribute() {
+        let src = b"fn lonely() {}\n";
+        let tree = crate::test_helpers::parse_rust(std::str::from_utf8(src).unwrap());
+        let func =
+            find_first(tree.root_node(), "function_item").expect("function_item should be present");
+        assert!(!has_attribute(&func, src, |a| a == "#[test]"));
+    }
+
+    #[test]
+    fn has_attribute_normalizes_whitespace() {
+        // Attribute with extra whitespace should still match the normalized form.
+        let src = b"#[ cfg ( test ) ]\nmod m {}\n";
+        let tree = crate::test_helpers::parse_rust(std::str::from_utf8(src).unwrap());
+        let m = find_first(tree.root_node(), "mod_item").expect("mod_item should be present");
+        assert!(has_attribute(&m, src, |a| a == "#[cfg(test)]"));
+    }
 }
