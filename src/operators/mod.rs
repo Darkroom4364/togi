@@ -280,7 +280,56 @@ pub fn all_operators() -> Vec<Box<dyn MutationOperator>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_helpers::{find_node_by_kind, parse_go};
+    use crate::test_helpers::{
+        find_node_by_kind, parse_go, parse_python, parse_ruby, parse_rust, parse_typescript,
+    };
+
+    fn apply_to_first_node(
+        src: &str,
+        parse: fn(&str) -> tree_sitter::Tree,
+        node_kind: &str,
+        op: &dyn MutationOperator,
+    ) -> Vec<crate::MutationCandidate> {
+        let tree = parse(src);
+        let node = find_node_by_kind(tree.root_node(), node_kind)
+            .unwrap_or_else(|| panic!("should find {node_kind} node"));
+        op.apply(&node, src.as_bytes())
+    }
+
+    fn collect_candidates(
+        node: tree_sitter::Node,
+        source: &[u8],
+        op: &dyn MutationOperator,
+        out: &mut Vec<crate::MutationCandidate>,
+    ) {
+        out.extend(op.apply(&node, source));
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            collect_candidates(child, source, op, out);
+        }
+    }
+
+    fn apply_to_tree(
+        src: &str,
+        parse: fn(&str) -> tree_sitter::Tree,
+        op: &dyn MutationOperator,
+    ) -> Vec<crate::MutationCandidate> {
+        let tree = parse(src);
+        let mut candidates = Vec::new();
+        collect_candidates(tree.root_node(), src.as_bytes(), op, &mut candidates);
+        candidates
+    }
+
+    fn assert_single_candidate(
+        candidates: &[crate::MutationCandidate],
+        src: &str,
+        replacement: &str,
+        original: &str,
+    ) {
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].replacement, replacement);
+        assert_eq!(&src[candidates[0].byte_range.clone()], original);
+    }
 
     #[test]
     fn test_negate_simple_condition() {
@@ -349,6 +398,148 @@ func f() string { return "hello" }"#;
         let ret_node = find_node_by_kind(tree.root_node(), "return_statement").unwrap();
         let candidates = ReturnEmpty.apply(&ret_node, src.as_bytes());
         assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn mul_to_div_works_across_binary_node_kinds() {
+        for (src, parse, node_kind) in [
+            (
+                "package main\nfunc f(a, b int) int { return a * b }",
+                parse_go as fn(&str) -> tree_sitter::Tree,
+                "binary_expression",
+            ),
+            (
+                "fn f(a: i32, b: i32) -> i32 { a * b }",
+                parse_rust as fn(&str) -> tree_sitter::Tree,
+                "binary_expression",
+            ),
+            (
+                "def f(a, b):\n    return a * b\n",
+                parse_python as fn(&str) -> tree_sitter::Tree,
+                "binary_operator",
+            ),
+            (
+                "def f(a, b)\n  a * b\nend\n",
+                parse_ruby as fn(&str) -> tree_sitter::Tree,
+                "binary",
+            ),
+            (
+                "function f(a: number, b: number): number { return a * b; }",
+                parse_typescript as fn(&str) -> tree_sitter::Tree,
+                "binary_expression",
+            ),
+        ] {
+            let candidates = apply_to_first_node(src, parse, node_kind, &binary::MulToDiv);
+            assert_single_candidate(&candidates, src, "/", "*");
+        }
+    }
+
+    #[test]
+    fn true_to_false_works_across_literal_node_kinds() {
+        for (src, parse, original) in [
+            (
+                "package main\nfunc f() bool { return true }",
+                parse_go as fn(&str) -> tree_sitter::Tree,
+                "true",
+            ),
+            (
+                "fn f() -> bool { true }",
+                parse_rust as fn(&str) -> tree_sitter::Tree,
+                "true",
+            ),
+            (
+                "def f():\n    return True\n",
+                parse_python as fn(&str) -> tree_sitter::Tree,
+                "True",
+            ),
+            (
+                "def f\n  true\nend\n",
+                parse_ruby as fn(&str) -> tree_sitter::Tree,
+                "true",
+            ),
+            (
+                "const value = true;",
+                parse_typescript as fn(&str) -> tree_sitter::Tree,
+                "true",
+            ),
+        ] {
+            let candidates = apply_to_tree(src, parse, &literal::TrueToFalse);
+            assert!(
+                candidates.iter().any(|c| {
+                    c.replacement == "false" && &src[c.byte_range.clone()] == original
+                }),
+                "expected true_to_false for {original:?}, got {candidates:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn return_empty_works_across_return_node_kinds() {
+        for (src, parse, node_kind) in [
+            (
+                "package main\nfunc f() int { return 42 }",
+                parse_go as fn(&str) -> tree_sitter::Tree,
+                "return_statement",
+            ),
+            (
+                "fn f() -> i32 { return 42; }",
+                parse_rust as fn(&str) -> tree_sitter::Tree,
+                "return_expression",
+            ),
+            (
+                "def f():\n    return 42\n",
+                parse_python as fn(&str) -> tree_sitter::Tree,
+                "return_statement",
+            ),
+            (
+                "def f\n  return 42\nend\n",
+                parse_ruby as fn(&str) -> tree_sitter::Tree,
+                "return",
+            ),
+            (
+                "function f(): number { return 42; }",
+                parse_typescript as fn(&str) -> tree_sitter::Tree,
+                "return_statement",
+            ),
+        ] {
+            let candidates = apply_to_first_node(src, parse, node_kind, &ReturnEmpty);
+            assert_single_candidate(&candidates, src, "0", "42");
+        }
+    }
+
+    #[test]
+    fn remove_if_body_works_across_if_node_kinds() {
+        for (src, parse, node_kind) in [
+            (
+                "package main\nfunc f(x bool) { if x { println(x) } }",
+                parse_go as fn(&str) -> tree_sitter::Tree,
+                "if_statement",
+            ),
+            (
+                "fn f(x: bool) { if x { call(); } }",
+                parse_rust as fn(&str) -> tree_sitter::Tree,
+                "if_expression",
+            ),
+            (
+                "def f(x):\n    if x:\n        call()\n",
+                parse_python as fn(&str) -> tree_sitter::Tree,
+                "if_statement",
+            ),
+            (
+                "def f(x)\n  if x\n    call\n  end\nend\n",
+                parse_ruby as fn(&str) -> tree_sitter::Tree,
+                "if",
+            ),
+            (
+                "function f(x: boolean) { if (x) { call(); } }",
+                parse_typescript as fn(&str) -> tree_sitter::Tree,
+                "if_statement",
+            ),
+        ] {
+            let candidates = apply_to_first_node(src, parse, node_kind, &removal::RemoveIfBody);
+            assert_eq!(candidates.len(), 1, "{src}");
+            assert_eq!(candidates[0].replacement, "{}");
+        }
     }
 
     // Stub operator for filter tests
