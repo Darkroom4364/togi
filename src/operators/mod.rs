@@ -451,7 +451,8 @@ func f() string { return "hello" }"#;
         for op in all_operators() {
             let cat = operator_category(op.id());
             assert_ne!(
-                cat, "other",
+                cat,
+                "other",
                 "operator '{}' is missing a category in operator_category()",
                 op.id()
             );

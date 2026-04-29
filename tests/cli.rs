@@ -220,7 +220,14 @@ fn list_operators_prints_known_ids_and_categories() {
 
     // All expected category headers should appear.
     for cat in [
-        "binary:", "literal:", "boundary:", "removal:", "unary:", "loop:", "negate:", "return:",
+        "binary:",
+        "literal:",
+        "boundary:",
+        "removal:",
+        "unary:",
+        "loop:",
+        "negate:",
+        "return:",
     ] {
         assert!(
             stdout.contains(cat),
