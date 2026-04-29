@@ -83,74 +83,85 @@ mod tests {
 
     use crate::test_helpers::{find_node_by_kind, parse_go};
 
-    #[test]
-    fn test_lt_to_lte() {
-        let src = "package main\nfunc f() bool { return x < y }";
+    fn apply_to_binary(src: &str, op: &dyn MutationOperator) -> Vec<MutationCandidate> {
         let tree = parse_go(src);
         let root = tree.root_node();
         let bin =
             find_node_by_kind(root, "binary_expression").expect("should find binary_expression");
-        let candidates = LtToLte.apply(&bin, src.as_bytes());
+        op.apply(&bin, src.as_bytes())
+    }
+
+    fn assert_single_candidate(
+        candidates: &[MutationCandidate],
+        src: &str,
+        replacement: &str,
+        original: &str,
+    ) {
         assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0].replacement, "<=");
+        assert_eq!(candidates[0].replacement, replacement);
+        assert_eq!(&src[candidates[0].byte_range.clone()], original);
+    }
+
+    #[test]
+    fn test_lt_to_lte() {
+        let src = "package main\nfunc f() bool { return x < y }";
+        let candidates = apply_to_binary(src, &LtToLte);
+        assert_single_candidate(&candidates, src, "<=", "<");
     }
 
     #[test]
     fn test_gt_to_gte() {
         let src = "package main\nfunc f() bool { return x > y }";
-        let tree = parse_go(src);
-        let root = tree.root_node();
-        let bin =
-            find_node_by_kind(root, "binary_expression").expect("should find binary_expression");
-        let candidates = GtToGte.apply(&bin, src.as_bytes());
-        assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0].replacement, ">=");
+        let candidates = apply_to_binary(src, &GtToGte);
+        assert_single_candidate(&candidates, src, ">=", ">");
     }
 
     #[test]
     fn test_eq_to_neq() {
         let src = "package main\nfunc f() bool { return x == y }";
-        let tree = parse_go(src);
-        let root = tree.root_node();
-        let bin =
-            find_node_by_kind(root, "binary_expression").expect("should find binary_expression");
-        let candidates = EqToNeq.apply(&bin, src.as_bytes());
-        assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0].replacement, "!=");
+        let candidates = apply_to_binary(src, &EqToNeq);
+        assert_single_candidate(&candidates, src, "!=", "==");
     }
 
     #[test]
     fn test_and_to_or() {
         let src = "package main\nfunc f() bool { return x && y }";
-        let tree = parse_go(src);
-        let root = tree.root_node();
-        let bin =
-            find_node_by_kind(root, "binary_expression").expect("should find binary_expression");
-        let candidates = AndToOr.apply(&bin, src.as_bytes());
-        assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0].replacement, "||");
+        let candidates = apply_to_binary(src, &AndToOr);
+        assert_single_candidate(&candidates, src, "||", "&&");
     }
 
     #[test]
     fn test_or_to_and() {
         let src = "package main\nfunc f() bool { return x || y }";
-        let tree = parse_go(src);
-        let root = tree.root_node();
-        let bin =
-            find_node_by_kind(root, "binary_expression").expect("should find binary_expression");
-        let candidates = OrToAnd.apply(&bin, src.as_bytes());
-        assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0].replacement, "&&");
+        let candidates = apply_to_binary(src, &OrToAnd);
+        assert_single_candidate(&candidates, src, "&&", "||");
+    }
+
+    #[test]
+    fn test_mul_to_div() {
+        let src = "package main\nfunc f() int { return x * y }";
+        let candidates = apply_to_binary(src, &MulToDiv);
+        assert_single_candidate(&candidates, src, "/", "*");
+    }
+
+    #[test]
+    fn test_div_to_mul() {
+        let src = "package main\nfunc f() int { return x / y }";
+        let candidates = apply_to_binary(src, &DivToMul);
+        assert_single_candidate(&candidates, src, "*", "/");
+    }
+
+    #[test]
+    fn test_mod_to_mul() {
+        let src = "package main\nfunc f() int { return x % y }";
+        let candidates = apply_to_binary(src, &ModToMul);
+        assert_single_candidate(&candidates, src, "*", "%");
     }
 
     #[test]
     fn test_no_match() {
         let src = "package main\nfunc f() bool { return x + y }";
-        let tree = parse_go(src);
-        let root = tree.root_node();
-        let bin =
-            find_node_by_kind(root, "binary_expression").expect("should find binary_expression");
-        let candidates = LtToLte.apply(&bin, src.as_bytes());
+        let candidates = apply_to_binary(src, &LtToLte);
         assert!(candidates.is_empty());
     }
 }

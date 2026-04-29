@@ -150,6 +150,17 @@ mod tests {
 
     use crate::test_helpers::{find_node_by_kind, parse_go};
 
+    fn assert_single_candidate(
+        candidates: &[MutationCandidate],
+        src: &str,
+        replacement: &str,
+        original: &str,
+    ) {
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].replacement, replacement);
+        assert_eq!(&src[candidates[0].byte_range.clone()], original);
+    }
+
     #[test]
     fn test_remove_if_body() {
         let src = r#"package main
@@ -157,8 +168,7 @@ func f(x int) { if x > 0 { println("yes") } }"#;
         let tree = parse_go(src);
         let if_node = find_node_by_kind(tree.root_node(), "if_statement").unwrap();
         let candidates = RemoveIfBody.apply(&if_node, src.as_bytes());
-        assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0].replacement, "{}");
+        assert_single_candidate(&candidates, src, "{}", r#"{ println("yes") }"#);
     }
 
     #[test]
@@ -167,11 +177,37 @@ func f(x int) { if x > 0 { println("yes") } }"#;
         let tree = parse_go(src);
         let if_node = find_node_by_kind(tree.root_node(), "if_statement").unwrap();
         let candidates = RemoveElse.apply(&if_node, src.as_bytes());
-        assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0].replacement, "");
-        // The byte range should cover the else clause
-        let removed = &src[candidates[0].byte_range.clone()];
-        assert!(removed.contains("else"));
+        assert_single_candidate(&candidates, src, "", "else { return 0 }");
+    }
+
+    #[test]
+    fn test_remove_call_statement() {
+        let src = "package main\nfunc f() { println(\"hi\") }";
+        let tree = parse_go(src);
+        let stmt = find_node_by_kind(tree.root_node(), "expression_statement")
+            .expect("should find expression_statement node");
+        let candidates = RemoveCallStatement.apply(&stmt, src.as_bytes());
+        assert_single_candidate(&candidates, src, "", r#"println("hi")"#);
+    }
+
+    #[test]
+    fn test_remove_call_statement_no_match_on_binary_expression() {
+        let src = "package main\nfunc f() int { return x + y }";
+        let tree = parse_go(src);
+        let bin = find_node_by_kind(tree.root_node(), "binary_expression")
+            .expect("should find binary_expression node");
+        let candidates = RemoveCallStatement.apply(&bin, src.as_bytes());
+        assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn test_remove_assignment() {
+        let src = "package main\nfunc f() { x = 1 }";
+        let tree = parse_go(src);
+        let stmt = find_node_by_kind(tree.root_node(), "assignment_statement")
+            .expect("should find assignment_statement node");
+        let candidates = RemoveAssignment.apply(&stmt, src.as_bytes());
+        assert_single_candidate(&candidates, src, "", "x = 1");
     }
 
     #[test]
