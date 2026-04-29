@@ -57,17 +57,6 @@ fn should_skip_return_empty(node: &tree_sitter::Node, language: &str) -> bool {
     }
 }
 
-/// Check if a string_to_empty mutation should be skipped because the string
-/// is inside a context where emptying it almost always causes a build error
-/// in compiled languages (const items, static items, match arms).
-fn should_skip_string_to_empty(node: &tree_sitter::Node, language: &str) -> bool {
-    match language {
-        "c" | "cpp" | "c_sharp" | "java" | "typescript" => {}
-        _ => return false,
-    }
-    crate::languages::should_skip_string_to_empty_in_compiled_context(node)
-}
-
 /// Check if a mutation candidate should be filtered out for the given language.
 fn should_filter(
     candidate: &MutationCandidate,
@@ -80,9 +69,6 @@ fn should_filter(
     }
     if candidate.operator_id == "return_empty" {
         return should_skip_return_empty(node, lang.name());
-    }
-    if candidate.operator_id == "string_to_empty" {
-        return should_skip_string_to_empty(node, lang.name());
     }
     false
 }
@@ -269,7 +255,7 @@ fn sample_diverse(mutations: Vec<Mutation>, cap: usize) -> Vec<Mutation> {
 mod tests {
     use super::*;
     use crate::languages::go::Go;
-    use crate::test_helpers::{find_node_by_kind, parse_go, parse_python};
+    use crate::test_helpers::{find_node_by_kind, parse_go};
     use crate::{ChangedFile, LineRange};
     use std::path::PathBuf;
     use tempfile::TempDir;
@@ -288,16 +274,6 @@ mod tests {
             operator_id: operator_id.to_string(),
             description: String::new(),
         }
-    }
-
-    #[test]
-    fn string_to_empty_not_skipped_for_dynamic_languages() {
-        let src = r#"NAME = "togi""#;
-        let tree = parse_python(src);
-        let string =
-            find_node_by_kind(tree.root_node(), "string").expect("should find string node");
-
-        assert!(!should_skip_string_to_empty(&string, "python"));
     }
 
     #[test]

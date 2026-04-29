@@ -4,7 +4,17 @@ crate::languages::define_language!(
     extensions: ["cs"],
     ts_language: tree_sitter_c_sharp::LANGUAGE,
     skip_subtree_kinds: ["using_directive", "attribute", "type_parameter_list"],
+    filter_candidate: should_filter_candidate,
 );
+
+fn should_filter_candidate(
+    candidate: &crate::MutationCandidate,
+    node: &tree_sitter::Node,
+    _source: &[u8],
+) -> bool {
+    candidate.operator_id == "string_to_empty"
+        && crate::languages::should_skip_string_to_empty_in_compiled_context(node)
+}
 
 #[cfg(test)]
 mod tests {
