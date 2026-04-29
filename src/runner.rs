@@ -861,7 +861,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("test.txt");
         std::fs::write(&file, b"hello world").unwrap();
-        let lock_file = dir.path().join("running.lock");
+        let lock_dir = dir.path().join("running.lock.d");
 
         // Each mutation has a unique description so cache can't short-circuit
         let mutations: Vec<Mutation> = (0..5)
@@ -879,12 +879,16 @@ mod tests {
             })
             .collect();
 
-        // Command that creates a lock file, sleeps briefly, then removes it.
-        // If two run concurrently on the same file, the second will see
-        // the lock file and fail (exit 1 = killed).
+        // Use `mkdir` as the lock — POSIX guarantees it's atomic and fails
+        // with a non-zero exit if the directory already exists. Replaces the
+        // previous `[ -f ] && touch` check, which has a TOCTOU race window.
+        // If sequential execution is honored, every script sees an empty
+        // lock dir, creates it, removes it, and exits 0. If two scripts run
+        // concurrently, exactly one mkdir succeeds and the loser exits 1
+        // (killed) — deterministically, without depending on sleep timing.
         let script = format!(
-            "if [ -f {lock} ]; then exit 1; fi; touch {lock}; sleep 0.05; rm {lock}",
-            lock = lock_file.display()
+            "mkdir {lock} 2>/dev/null || exit 1; rmdir {lock}",
+            lock = lock_dir.display()
         );
 
         let runner = TestRunner {
