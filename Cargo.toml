@@ -24,13 +24,13 @@ tree-sitter-python = "0.25"
 tree-sitter-rust = "0.24"
 tree-sitter-typescript = "0.23.2"
 tree-sitter-java = "0.23"
-tree-sitter-c = "0.23"
+tree-sitter-c = "0.24"
 tree-sitter-cpp = "0.23"
 tree-sitter-ruby = "0.23"
 tree-sitter-c-sharp = "0.23"
 
 # Diff parsing
-diffy = "0.4"
+diffy = "0.5"
 
 # Config
 serde = { version = "1", features = ["derive"] }
@@ -53,6 +53,9 @@ shell-words = "1"
 
 # Error handling
 anyhow = "1"
+
+# Signal handling
+ctrlc = "3"
 
 # Hashing
 siphasher = "1"
