@@ -434,4 +434,22 @@ func f() string { return "hello" }"#;
         let err = validate_patterns(&stub_ops(), &["litral".into()]).unwrap_err();
         assert!(err.contains("Did you mean 'literal'?"), "{err}");
     }
+
+    #[test]
+    fn every_operator_has_known_category() {
+        for op in all_operators() {
+            let cat = operator_category(op.id());
+            assert_ne!(
+                cat, "other",
+                "operator '{}' is missing a category in operator_category()",
+                op.id()
+            );
+            assert!(
+                CATEGORIES.contains(&cat),
+                "operator '{}' has unknown category '{}'",
+                op.id(),
+                cat
+            );
+        }
+    }
 }
