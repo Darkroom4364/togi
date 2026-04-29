@@ -97,15 +97,24 @@ mod tests {
     use super::*;
     use crate::Mutation;
     use crate::test_helpers::sample_report;
+    use serde_json::Value;
     use std::path::PathBuf;
     use std::time::Duration;
+
+    fn assert_object_keys(value: &Value, expected: &[&str]) {
+        let object = value.as_object().expect("value should be a JSON object");
+        let mut actual: Vec<&str> = object.keys().map(String::as_str).collect();
+        let mut expected = expected.to_vec();
+        actual.sort_unstable();
+        expected.sort_unstable();
+        assert_eq!(actual, expected);
+    }
 
     #[test]
     fn json_output_is_valid_json() {
         let report = sample_report();
         let json_str = to_json_string(&report).unwrap();
-        let value: serde_json::Value =
-            serde_json::from_str(&json_str).expect("output should be valid JSON");
+        let value: Value = serde_json::from_str(&json_str).expect("output should be valid JSON");
         assert!(value.is_object());
     }
 
@@ -130,6 +139,47 @@ mod tests {
         assert_eq!(mutations[0]["operator"], "binary/lt_to_lte");
         assert_eq!(mutations[0]["result"], "killed");
         assert_eq!(mutations[1]["result"], "survived");
+    }
+
+    #[test]
+    fn json_output_schema_is_stable() {
+        let report = sample_report();
+        let json_str = to_json_string(&report).unwrap();
+        let value: Value = serde_json::from_str(&json_str).unwrap();
+
+        assert_object_keys(
+            &value,
+            &[
+                "total",
+                "tested",
+                "killed",
+                "survived",
+                "timeout",
+                "build_errors",
+                "mutation_score",
+                "duration_ms",
+                "mutations",
+            ],
+        );
+
+        let mutations = value["mutations"].as_array().unwrap();
+        assert_object_keys(
+            &mutations[0],
+            &["file", "line", "operator", "description", "result"],
+        );
+        assert_object_keys(
+            &mutations[1],
+            &[
+                "file",
+                "line",
+                "operator",
+                "description",
+                "result",
+                "column",
+                "original",
+                "replacement",
+            ],
+        );
     }
 
     #[test]
