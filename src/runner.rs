@@ -2,14 +2,14 @@
 
 use crate::cache::{self, CacheKey};
 use crate::{Mutation, MutationReport, MutationResult};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 /// Write `data` to `path` atomically: write to a temp file in the same
 /// directory, fsync, then rename over the target.
@@ -163,6 +163,78 @@ pub(crate) fn copy_workspace(project_root: &Path) -> std::io::Result<WorkspaceCo
         _tempdir: tempdir,
         root,
     })
+}
+
+#[allow(dead_code, reason = "prepared for #155 workspace-isolated execution")]
+pub(crate) struct WorkspacePool {
+    slots: Arc<Vec<WorkspaceCopy>>,
+    semaphore: Arc<Semaphore>,
+    free_slots: Arc<Mutex<VecDeque<usize>>>,
+}
+
+impl WorkspacePool {
+    #[allow(dead_code, reason = "prepared for #155 workspace-isolated execution")]
+    pub(crate) fn new(project_root: &Path, slots: usize) -> std::io::Result<Self> {
+        let slots = slots.max(1);
+        let mut copies = Vec::with_capacity(slots);
+        for _ in 0..slots {
+            copies.push(copy_workspace(project_root)?);
+        }
+
+        let free_slots = (0..slots).collect();
+
+        Ok(Self {
+            slots: Arc::new(copies),
+            semaphore: Arc::new(Semaphore::new(slots)),
+            free_slots: Arc::new(Mutex::new(free_slots)),
+        })
+    }
+
+    #[allow(dead_code, reason = "prepared for #155 workspace-isolated execution")]
+    pub(crate) fn len(&self) -> usize {
+        self.slots.len()
+    }
+
+    #[allow(dead_code, reason = "prepared for #155 workspace-isolated execution")]
+    pub(crate) async fn acquire(&self) -> WorkspaceSlot {
+        let permit = self.semaphore.clone().acquire_owned().await.unwrap();
+        let index = self
+            .free_slots
+            .lock()
+            .expect("workspace free-list mutex poisoned")
+            .pop_front()
+            .expect("workspace semaphore permit without a free slot");
+        WorkspaceSlot {
+            slots: self.slots.clone(),
+            free_slots: self.free_slots.clone(),
+            index,
+            _permit: permit,
+        }
+    }
+}
+
+#[allow(dead_code, reason = "prepared for #155 workspace-isolated execution")]
+pub(crate) struct WorkspaceSlot {
+    slots: Arc<Vec<WorkspaceCopy>>,
+    free_slots: Arc<Mutex<VecDeque<usize>>>,
+    index: usize,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl WorkspaceSlot {
+    #[allow(dead_code, reason = "prepared for #155 workspace-isolated execution")]
+    pub(crate) fn root(&self) -> &Path {
+        self.slots[self.index].root()
+    }
+}
+
+impl Drop for WorkspaceSlot {
+    fn drop(&mut self) {
+        self.free_slots
+            .lock()
+            .expect("workspace free-list mutex poisoned")
+            .push_back(self.index);
+    }
 }
 
 impl TestRunner {
@@ -757,6 +829,41 @@ mod tests {
         assert!(!copy.root().join("target").exists());
         assert!(!copy.root().join(".git").exists());
         assert!(!copy.root().join(".togi").exists());
+    }
+
+    #[tokio::test]
+    async fn workspace_pool_creates_slots_and_reuses_after_drop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), b"pub fn f() {}\n").unwrap();
+
+        let pool = WorkspacePool::new(root, 2).unwrap();
+        assert_eq!(pool.len(), 2);
+
+        let first = pool.acquire().await;
+        let second = pool.acquire().await;
+        assert_ne!(first.root(), second.root());
+        assert!(first.root().join("src/lib.rs").exists());
+        assert!(second.root().join("src/lib.rs").exists());
+
+        let first_root = first.root().to_path_buf();
+        let second_root = second.root().to_path_buf();
+        drop(second);
+
+        let third = pool.acquire().await;
+        assert_eq!(third.root(), second_root.as_path());
+        assert_ne!(third.root(), first_root.as_path());
+    }
+
+    #[test]
+    fn workspace_pool_uses_at_least_one_slot() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("file.txt"), b"content").unwrap();
+
+        let pool = WorkspacePool::new(tmp.path(), 0).unwrap();
+
+        assert_eq!(pool.len(), 1);
     }
 
     #[tokio::test]
