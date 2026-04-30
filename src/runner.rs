@@ -3,6 +3,7 @@
 use crate::cache::{self, CacheKey};
 use crate::{Mutation, MutationReport, MutationResult};
 use std::collections::HashMap;
+use std::fs;
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -82,6 +83,86 @@ impl Drop for FileGuard {
             );
         }
     }
+}
+
+#[allow(dead_code, reason = "prepared for #155 workspace-isolated execution")]
+pub(crate) struct WorkspaceCopy {
+    _tempdir: tempfile::TempDir,
+    root: PathBuf,
+}
+
+impl WorkspaceCopy {
+    #[allow(dead_code, reason = "prepared for #155 workspace-isolated execution")]
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
+    }
+}
+
+#[allow(dead_code, reason = "prepared for #155 workspace-isolated execution")]
+pub(crate) fn should_skip_workspace_entry(relative: &Path) -> bool {
+    relative
+        .components()
+        .next()
+        .and_then(|component| component.as_os_str().to_str())
+        .is_some_and(|name| matches!(name, ".git" | ".togi" | "target"))
+}
+
+fn should_copy_workspace_entry(project_root: &Path, path: &Path) -> bool {
+    path == project_root
+        || path
+            .strip_prefix(project_root)
+            .is_ok_and(|relative| !should_skip_workspace_entry(relative))
+}
+
+#[allow(dead_code, reason = "prepared for #155 workspace-isolated execution")]
+pub(crate) fn copy_workspace(project_root: &Path) -> std::io::Result<WorkspaceCopy> {
+    let tempdir = tempfile::tempdir()?;
+    let root = tempdir.path().join("workspace");
+    fs::create_dir(&root)?;
+    let project_root_for_filter = project_root.to_path_buf();
+
+    for entry in ignore::WalkBuilder::new(project_root)
+        .hidden(false)
+        .ignore(false)
+        .git_ignore(false)
+        .git_exclude(false)
+        .git_global(false)
+        .parents(false)
+        .filter_entry(move |entry| {
+            should_copy_workspace_entry(&project_root_for_filter, entry.path())
+        })
+        .build()
+    {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(err) => {
+                return Err(std::io::Error::other(err));
+            }
+        };
+        let path = entry.path();
+        if path == project_root {
+            continue;
+        }
+        let relative = match path.strip_prefix(project_root) {
+            Ok(relative) => relative,
+            Err(_) => continue,
+        };
+
+        let dest = root.join(relative);
+        if entry.file_type().is_some_and(|ft| ft.is_dir()) {
+            fs::create_dir_all(&dest)?;
+        } else if entry.file_type().is_some_and(|ft| ft.is_file()) {
+            if let Some(parent) = dest.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::copy(path, dest)?;
+        }
+    }
+
+    Ok(WorkspaceCopy {
+        _tempdir: tempdir,
+        root,
+    })
 }
 
 impl TestRunner {
@@ -649,6 +730,33 @@ mod tests {
         std::fs::write(tmp.path().join("secret.txt"), b"secret").unwrap();
 
         assert!(validate_and_resolve_mutation_path(&root, Path::new("../secret.txt")).is_err());
+    }
+
+    #[test]
+    fn copy_workspace_copies_regular_files_and_skips_internal_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("target/debug")).unwrap();
+        std::fs::create_dir_all(root.join(".git/objects")).unwrap();
+        std::fs::create_dir_all(root.join(".togi")).unwrap();
+        std::fs::write(root.join("Cargo.toml"), b"[package]\n").unwrap();
+        std::fs::write(root.join(".ignore"), b"src/lib.rs\n").unwrap();
+        std::fs::write(root.join("src/lib.rs"), b"pub fn f() {}\n").unwrap();
+        std::fs::write(root.join("target/debug/build-artifact"), b"skip").unwrap();
+        std::fs::write(root.join(".git/HEAD"), b"skip").unwrap();
+        std::fs::write(root.join(".togi/cache"), b"skip").unwrap();
+
+        let copy = copy_workspace(root).unwrap();
+
+        assert_eq!(
+            std::fs::read(copy.root().join("src/lib.rs")).unwrap(),
+            b"pub fn f() {}\n"
+        );
+        assert!(copy.root().join("Cargo.toml").exists());
+        assert!(!copy.root().join("target").exists());
+        assert!(!copy.root().join(".git").exists());
+        assert!(!copy.root().join(".togi").exists());
     }
 
     #[tokio::test]
