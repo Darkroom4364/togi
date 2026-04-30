@@ -80,6 +80,22 @@ pub fn parse_rust(src: &str) -> tree_sitter::Tree {
     parser.parse(src, None).unwrap()
 }
 
+/// Parse Java source code into a tree-sitter tree.
+pub fn parse_java(src: &str) -> tree_sitter::Tree {
+    let mut parser = tree_sitter::Parser::new();
+    let lang = tree_sitter_java::LANGUAGE;
+    parser.set_language(&lang.into()).unwrap();
+    parser.parse(src, None).unwrap()
+}
+
+/// Parse C# source code into a tree-sitter tree.
+pub fn parse_csharp(src: &str) -> tree_sitter::Tree {
+    let mut parser = tree_sitter::Parser::new();
+    let lang = tree_sitter_c_sharp::LANGUAGE;
+    parser.set_language(&lang.into()).unwrap();
+    parser.parse(src, None).unwrap()
+}
+
 /// Parse Ruby source code into a tree-sitter tree.
 pub fn parse_ruby(src: &str) -> tree_sitter::Tree {
     let mut parser = tree_sitter::Parser::new();
