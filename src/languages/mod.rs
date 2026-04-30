@@ -164,16 +164,37 @@ pub(crate) fn should_skip_string_to_empty_in_compiled_context(node: &tree_sitter
     false
 }
 
-/// Language-specific configuration for tree-sitter parsing and node identification
+/// Describes how to parse and mutate one supported language.
+///
+/// The mutator uses this trait to choose the tree-sitter grammar, identify
+/// language-specific node kinds, skip non-production subtrees, and suppress
+/// mutation candidates that would be invalid or noisy for the language.
 pub trait LanguageSupport: Send + Sync {
+    /// Stable language name used in config keys and reports.
     fn name(&self) -> &str;
+
+    /// File extensions handled by this language, without leading dots.
     fn extensions(&self) -> &[&str];
+
+    /// Tree-sitter grammar used for parsing source files.
     fn tree_sitter_language(&self) -> tree_sitter::Language;
+
+    /// Primary binary-expression node kind for this grammar.
     fn binary_expression_node(&self) -> &str;
+
+    /// Primary if-statement or if-expression node kind for this grammar.
     fn if_statement_node(&self) -> &str;
+
+    /// Node texts/kinds that represent boolean true.
     fn boolean_true_literals(&self) -> &[&str];
+
+    /// Node texts/kinds that represent boolean false.
     fn boolean_false_literals(&self) -> &[&str];
+
+    /// Primary return-statement or return-expression node kind.
     fn return_statement_node(&self) -> &str;
+
+    /// Tree-sitter field name used to find operators when available.
     fn operator_field(&self) -> &str;
 
     /// AST node kinds that should suppress mutation of any descendant.

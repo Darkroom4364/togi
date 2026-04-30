@@ -47,7 +47,12 @@ const MUTABLE_NODE_KINDS: &[&str] = &[
     "next",                // Ruby
 ];
 
-/// Find AST nodes that overlap with changed line ranges and are candidates for mutation.
+/// Find the deepest mutation-relevant AST nodes that overlap changed lines.
+///
+/// The mapper walks the parsed tree, ignores nodes outside the diff hunks, and
+/// lets the language implementation skip imports, tests, macros, or other
+/// subtrees. Returned nodes are candidates for operator application; individual
+/// operator candidates may still be filtered later by the mutator.
 pub fn find_mutable_nodes<'a>(
     tree: &'a tree_sitter::Tree,
     source: &'a [u8],
