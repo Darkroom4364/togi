@@ -10,7 +10,7 @@ pub fn sample_report() -> MutationReport {
         results: vec![
             (
                 Mutation {
-                    id: 1,
+                    id: 0,
                     file: PathBuf::from("src/auth.rs"),
                     language: String::new(),
                     line: 47,
@@ -25,7 +25,7 @@ pub fn sample_report() -> MutationReport {
             ),
             (
                 Mutation {
-                    id: 2,
+                    id: 1,
                     file: PathBuf::from("src/handler.rs"),
                     language: String::new(),
                     line: 15,

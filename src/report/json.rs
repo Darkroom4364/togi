@@ -17,6 +17,7 @@ struct JsonReport {
 
 #[derive(Serialize)]
 struct JsonMutation {
+    id: u32,
     file: String,
     line: usize,
     operator: String,
@@ -46,6 +47,7 @@ pub fn to_json_string(report: &MutationReport) -> Result<String> {
         .map(|(m, r)| {
             let survived = matches!(r, MutationResult::Survived);
             JsonMutation {
+                id: m.id + 1,
                 file: m.file.display().to_string(),
                 line: m.line,
                 operator: m.operator.clone(),
@@ -134,6 +136,7 @@ mod tests {
 
         let mutations = value["mutations"].as_array().unwrap();
         assert_eq!(mutations.len(), 2);
+        assert_eq!(mutations[0]["id"], 1);
         assert_eq!(mutations[0]["file"], "src/auth.rs");
         assert_eq!(mutations[0]["line"], 47);
         assert_eq!(mutations[0]["operator"], "binary/lt_to_lte");
@@ -165,11 +168,12 @@ mod tests {
         let mutations = value["mutations"].as_array().unwrap();
         assert_object_keys(
             &mutations[0],
-            &["file", "line", "operator", "description", "result"],
+            &["id", "file", "line", "operator", "description", "result"],
         );
         assert_object_keys(
             &mutations[1],
             &[
+                "id",
                 "file",
                 "line",
                 "operator",

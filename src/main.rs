@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use serde::Deserialize;
 use togi::{ChangedFile, Mutation, MutationReport};
 
 struct CheckConfig {
@@ -114,6 +115,12 @@ async fn main() {
                 }
             }
         }
+        togi::cli::Commands::Explain { mutant_id, report } => {
+            if let Err(e) = explain_mutation(mutant_id, &report) {
+                eprintln!("Error: {e:#}");
+                process::exit(2);
+            }
+        }
         togi::cli::Commands::ListOperators => {
             print_operators();
         }
@@ -130,6 +137,83 @@ async fn main() {
             println!("Created togi.toml (auto-detected from project)");
         }
     }
+}
+
+#[derive(Deserialize)]
+struct ExplainReport {
+    mutations: Vec<ExplainMutation>,
+}
+
+#[derive(Deserialize)]
+struct ExplainMutation {
+    id: u32,
+    file: String,
+    line: usize,
+    operator: String,
+    description: String,
+    result: String,
+    original: Option<String>,
+    replacement: Option<String>,
+    diff: Option<String>,
+}
+
+fn explain_mutation(mutant_id: u32, report_path: &Path) -> anyhow::Result<()> {
+    let content = std::fs::read_to_string(report_path)
+        .map_err(|e| anyhow::anyhow!("could not read {}: {e}", report_path.display()))?;
+    let report: ExplainReport = serde_json::from_str(&content)
+        .map_err(|e| anyhow::anyhow!("could not parse {} as JSON: {e}", report_path.display()))?;
+    let mutation = report
+        .mutations
+        .iter()
+        .find(|m| m.id == mutant_id)
+        .ok_or_else(|| anyhow::anyhow!("mutation id {mutant_id} not found in report"))?;
+
+    println!("Mutation #{}", mutation.id);
+    println!(
+        "{}:{} — {} ({})",
+        mutation.file, mutation.line, mutation.operator, mutation.result
+    );
+    println!("{}", mutation.description);
+
+    if let (Some(original), Some(replacement)) = (&mutation.original, &mutation.replacement) {
+        println!();
+        println!("Change: {original} -> {replacement}");
+    }
+
+    if let Some(diff) = &mutation.diff {
+        println!();
+        println!("{diff}");
+    }
+
+    println!();
+    match mutation.result.as_str() {
+        "survived" => {
+            println!("Why it survived:");
+            println!("  The configured test command completed successfully with this mutation.");
+            println!(
+                "  Add an assertion that distinguishes the original behavior from the mutated one."
+            );
+        }
+        "killed" => {
+            println!("Why it was killed:");
+            println!(
+                "  The configured test command failed with this mutation, so existing tests caught it."
+            );
+        }
+        "timeout" => {
+            println!("Why it timed out:");
+            println!("  The configured test command exceeded the mutation timeout.");
+        }
+        "build_error" => {
+            println!("Why it was not testable:");
+            println!("  The mutation made the project fail its build check.");
+        }
+        other => {
+            println!("Result: {other}");
+        }
+    }
+
+    Ok(())
 }
 
 fn print_operators() {
