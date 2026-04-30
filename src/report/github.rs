@@ -81,6 +81,8 @@ mod tests {
             timeout: 0,
             build_errors: 0,
             duration: Duration::from_secs(0),
+            test_command: None,
+            build_command: vec![],
             results,
         }
     }

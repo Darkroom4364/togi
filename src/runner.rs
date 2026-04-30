@@ -277,6 +277,12 @@ impl TestRunner {
         MutationReport {
             results: all_results,
             duration,
+            test_command: if self.commands.language_commands.is_empty() {
+                Some(self.commands.command.clone())
+            } else {
+                None
+            },
+            build_command: self.commands.build_command.clone(),
             total,
             killed,
             survived,
@@ -887,6 +893,10 @@ mod tests {
 
         let report = runner.run(vec![mutation]).await;
         assert_eq!(report.killed, 1, "should use language-specific command");
+        assert_eq!(
+            report.test_command, None,
+            "mixed language-specific commands should not report the default command as global context"
+        );
     }
 
     #[cfg(unix)]

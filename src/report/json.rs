@@ -12,6 +12,8 @@ struct JsonReport {
     build_errors: usize,
     mutation_score: f64,
     duration_ms: u128,
+    test_command: Option<Vec<String>>,
+    build_command: Vec<String>,
     mutations: Vec<JsonMutation>,
 }
 
@@ -73,6 +75,8 @@ pub fn to_json_string(report: &MutationReport) -> Result<String> {
         build_errors: report.build_errors,
         mutation_score: super::mutation_score(report),
         duration_ms: report.duration.as_millis(),
+        test_command: report.test_command.clone(),
+        build_command: report.build_command.clone(),
         mutations,
     };
 
@@ -118,6 +122,8 @@ mod tests {
         assert_eq!(value["build_errors"], 0);
         assert_eq!(value["mutation_score"], 50.0);
         assert_eq!(value["duration_ms"], 1234);
+        assert_eq!(value["test_command"], serde_json::json!(["cargo", "test"]));
+        assert_eq!(value["build_command"], serde_json::json!([]));
 
         let mutations = value["mutations"].as_array().unwrap();
         assert_eq!(mutations.len(), 2);
@@ -146,6 +152,8 @@ mod tests {
                 "build_errors",
                 "mutation_score",
                 "duration_ms",
+                "test_command",
+                "build_command",
                 "mutations",
             ],
         );
@@ -200,6 +208,8 @@ mod tests {
                 MutationResult::BuildError,
             )],
             duration: Duration::from_millis(100),
+            test_command: None,
+            build_command: vec![],
             total: 1,
             killed: 0,
             survived: 0,
@@ -217,6 +227,8 @@ mod tests {
         let report = MutationReport {
             results: vec![],
             duration: Duration::from_millis(0),
+            test_command: None,
+            build_command: vec![],
             total: 0,
             killed: 0,
             survived: 0,

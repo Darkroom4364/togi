@@ -295,6 +295,8 @@ mod tests {
                 MutationResult::Killed,
             )],
             duration: Duration::from_millis(100),
+            test_command: None,
+            build_command: vec![],
             total: 1,
             killed: 1,
             survived: 0,
