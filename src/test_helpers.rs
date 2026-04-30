@@ -40,6 +40,8 @@ pub fn sample_report() -> MutationReport {
             ),
         ],
         duration: Duration::from_millis(1234),
+        test_command: Some(vec!["cargo".into(), "test".into()]),
+        build_command: vec![],
         total: 2,
         killed: 1,
         survived: 1,

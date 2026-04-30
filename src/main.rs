@@ -141,6 +141,8 @@ async fn main() {
 
 #[derive(Deserialize)]
 struct ExplainReport {
+    test_command: Option<Vec<String>>,
+    build_command: Option<Vec<String>>,
     mutations: Vec<ExplainMutation>,
 }
 
@@ -186,6 +188,13 @@ fn explain_mutation(mutant_id: u32, report_path: &Path) -> anyhow::Result<()> {
     }
 
     println!();
+    if let Some(command) = report.test_command.as_ref().filter(|cmd| !cmd.is_empty()) {
+        println!("Test command: {}", serde_json::to_string(command)?);
+    }
+    if let Some(command) = report.build_command.as_ref().filter(|cmd| !cmd.is_empty()) {
+        println!("Build check: {}", serde_json::to_string(command)?);
+    }
+
     match mutation.result.as_str() {
         "survived" => {
             println!("Why it survived:");

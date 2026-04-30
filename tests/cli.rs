@@ -163,6 +163,8 @@ fn explain_reads_json_report() {
   "build_errors": 0,
   "mutation_score": 0.0,
   "duration_ms": 10,
+  "test_command": ["cargo", "test"],
+  "build_command": ["cargo", "check"],
   "mutations": [
     {
       "id": 1,
@@ -201,6 +203,12 @@ fn explain_reads_json_report() {
         .success()
         .stdout(predicate::str::contains("Mutation #2"))
         .stdout(predicate::str::contains("src/main.go:4"))
+        .stdout(predicate::str::contains(
+            r#"Test command: ["cargo","test"]"#,
+        ))
+        .stdout(predicate::str::contains(
+            r#"Build check: ["cargo","check"]"#,
+        ))
         .stdout(predicate::str::contains("Why it survived"));
 
     togi()

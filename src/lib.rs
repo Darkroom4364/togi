@@ -98,6 +98,8 @@ impl fmt::Display for MutationResult {
 pub struct MutationReport {
     pub results: Vec<(Mutation, MutationResult)>,
     pub duration: Duration,
+    pub test_command: Option<Vec<String>>,
+    pub build_command: Vec<String>,
     pub total: usize,
     pub killed: usize,
     pub survived: usize,

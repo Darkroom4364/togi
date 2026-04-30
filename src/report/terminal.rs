@@ -172,6 +172,8 @@ mod tests {
         MutationReport {
             results,
             duration: Duration::from_millis(500),
+            test_command: None,
+            build_command: vec![],
             total,
             killed,
             survived,
