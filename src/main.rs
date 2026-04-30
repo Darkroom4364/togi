@@ -605,6 +605,7 @@ async fn execute(
             build_command_explicit,
             timeout: Duration::from_secs(config.test.timeout),
             language_timeouts,
+            test_selection: None,
         },
         parallelism: config.test.jobs,
         project_root,

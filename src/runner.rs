@@ -41,6 +41,42 @@ pub struct CommandConfig {
     pub timeout: Duration,
     /// Per-language timeout overrides keyed by `LanguageSupport::name()`.
     pub language_timeouts: HashMap<String, Duration>,
+    /// Optional source-line to test-name map used to narrow test commands.
+    pub test_selection: Option<TestSelectionConfig>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct TestSelectionConfig {
+    tests_by_line: HashMap<(String, usize), Vec<String>>,
+}
+
+impl TestSelectionConfig {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn insert(
+        &mut self,
+        project_root: &Path,
+        file: impl AsRef<Path>,
+        line: usize,
+        tests: Vec<String>,
+    ) {
+        self.tests_by_line.insert(
+            (normalized_cache_path(project_root, file.as_ref()), line),
+            tests,
+        );
+    }
+
+    fn tests_for(&self, project_root: &Path, mutation: &Mutation) -> Option<&[String]> {
+        self.tests_by_line
+            .get(&(
+                normalized_cache_path(project_root, &mutation.file),
+                mutation.line,
+            ))
+            .map(Vec::as_slice)
+            .filter(|tests| !tests.is_empty())
+    }
 }
 
 /// Applies mutations, runs checks, restores files, and aggregates results.
@@ -98,19 +134,78 @@ impl SelectedTestCommand {
     }
 }
 
-fn select_test_command(commands: &CommandConfig, mutation: &Mutation) -> SelectedTestCommand {
+fn select_test_command(
+    project_root: &Path,
+    commands: &CommandConfig,
+    mutation: &Mutation,
+) -> SelectedTestCommand {
+    let mut argv = commands
+        .language_commands
+        .get(mutation.language.as_str())
+        .unwrap_or(&commands.command)
+        .clone();
+
+    if let Some(test_selection) = &commands.test_selection
+        && let Some(tests) = test_selection.tests_for(project_root, mutation)
+    {
+        argv = narrow_go_test_command(argv, tests);
+    }
+
     SelectedTestCommand {
-        argv: commands
-            .language_commands
-            .get(mutation.language.as_str())
-            .unwrap_or(&commands.command)
-            .clone(),
+        argv,
         timeout: commands
             .language_timeouts
             .get(mutation.language.as_str())
             .copied()
             .unwrap_or(commands.timeout),
     }
+}
+
+fn narrow_go_test_command(mut argv: Vec<String>, tests: &[String]) -> Vec<String> {
+    if argv.len() < 2 || argv[0] != "go" || argv[1] != "test" {
+        return argv;
+    }
+
+    let pattern = format!(
+        "^({})$",
+        tests
+            .iter()
+            .map(|test| escape_go_test_regex(test))
+            .collect::<Vec<_>>()
+            .join("|")
+    );
+
+    for i in 2..argv.len() {
+        if argv[i] == "-run" {
+            if i + 1 < argv.len() {
+                argv[i + 1] = pattern;
+            } else {
+                argv.push(pattern);
+            }
+            return argv;
+        }
+        if argv[i].starts_with("-run=") {
+            argv[i] = format!("-run={pattern}");
+            return argv;
+        }
+    }
+
+    argv.splice(2..2, ["-run".to_string(), pattern]);
+    argv
+}
+
+fn escape_go_test_regex(test: &str) -> String {
+    let mut escaped = String::new();
+    for ch in test.chars() {
+        if matches!(
+            ch,
+            '\\' | '.' | '+' | '*' | '?' | '(' | ')' | '|' | '[' | ']' | '{' | '}' | '^' | '$'
+        ) {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    escaped
 }
 
 struct FileGuard {
@@ -303,7 +398,7 @@ impl TestRunner {
 
         for mutation in mutations {
             let workspace_pool = workspace_pool.clone();
-            let selected_test = select_test_command(&self.commands, &mutation);
+            let selected_test = select_test_command(&project_root, &self.commands, &mutation);
             let command = selected_test.argv.clone();
             let timeout = selected_test.timeout;
             let project_root = project_root.clone();
@@ -886,6 +981,7 @@ mod tests {
             build_command_explicit: false,
             timeout: Duration::from_secs(30),
             language_timeouts: HashMap::new(),
+            test_selection: None,
         }
     }
 
@@ -894,7 +990,7 @@ mod tests {
         let commands = test_command_config();
         let mutation = make_test_mutation(Path::new("src/lib.rs"));
 
-        let selected = select_test_command(&commands, &mutation);
+        let selected = select_test_command(Path::new("/repo"), &commands, &mutation);
 
         assert_eq!(selected.argv, vec!["cargo", "test"]);
         assert_eq!(selected.timeout, Duration::from_secs(30));
@@ -913,7 +1009,7 @@ mod tests {
         let mut mutation = make_test_mutation(Path::new("calc.go"));
         mutation.language = "go".into();
 
-        let selected = select_test_command(&commands, &mutation);
+        let selected = select_test_command(Path::new("/repo"), &commands, &mutation);
 
         assert_eq!(selected.argv, vec!["go", "test", "./..."]);
         assert_eq!(selected.timeout, Duration::from_secs(5));
@@ -934,6 +1030,127 @@ mod tests {
             selected.cache_context(&[], false, &HashMap::new()),
             ambiguous.cache_context(&[], false, &HashMap::new())
         );
+    }
+
+    #[test]
+    fn select_test_command_narrows_go_command_when_tests_cover_mutation() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        let file = tmp.path().join("src/calc.go");
+        std::fs::write(&file, b"package calc\n").unwrap();
+
+        let mut selection = TestSelectionConfig::new();
+        selection.insert(
+            tmp.path(),
+            &file,
+            7,
+            vec!["TestAdd".into(), "TestMax+Fast".into()],
+        );
+
+        let mut commands = test_command_config();
+        commands.command = vec!["go".into(), "test".into(), "./...".into()];
+        commands.test_selection = Some(selection);
+
+        let mut mutation = make_test_mutation(Path::new("src/calc.go"));
+        mutation.line = 7;
+
+        let selected = select_test_command(tmp.path(), &commands, &mutation);
+
+        assert_eq!(
+            selected.argv,
+            vec!["go", "test", "-run", "^(TestAdd|TestMax\\+Fast)$", "./..."]
+        );
+    }
+
+    #[test]
+    fn select_test_command_replaces_go_run_flag_value() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut selection = TestSelectionConfig::new();
+        selection.insert(tmp.path(), Path::new("calc.go"), 4, vec!["TestAdd".into()]);
+
+        let mut commands = test_command_config();
+        commands.command = vec![
+            "go".into(),
+            "test".into(),
+            "-count=1".into(),
+            "-run".into(),
+            "OldPattern".into(),
+            "./...".into(),
+        ];
+        commands.test_selection = Some(selection);
+
+        let mut mutation = make_test_mutation(Path::new("calc.go"));
+        mutation.line = 4;
+
+        let selected = select_test_command(tmp.path(), &commands, &mutation);
+
+        assert_eq!(
+            selected.argv,
+            vec!["go", "test", "-count=1", "-run", "^(TestAdd)$", "./..."]
+        );
+    }
+
+    #[test]
+    fn select_test_command_replaces_go_run_equals_flag_value() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut selection = TestSelectionConfig::new();
+        selection.insert(tmp.path(), Path::new("calc.go"), 4, vec!["TestAdd".into()]);
+
+        let mut commands = test_command_config();
+        commands.command = vec![
+            "go".into(),
+            "test".into(),
+            "-count=1".into(),
+            "-run=OldPattern".into(),
+            "./...".into(),
+        ];
+        commands.test_selection = Some(selection);
+
+        let mut mutation = make_test_mutation(Path::new("calc.go"));
+        mutation.line = 4;
+
+        let selected = select_test_command(tmp.path(), &commands, &mutation);
+
+        assert_eq!(
+            selected.argv,
+            vec!["go", "test", "-count=1", "-run=^(TestAdd)$", "./..."]
+        );
+    }
+
+    #[test]
+    fn select_test_command_falls_back_when_no_tests_cover_mutation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut commands = test_command_config();
+        commands.command = vec!["go".into(), "test".into(), "./...".into()];
+        commands.test_selection = Some(TestSelectionConfig::new());
+        let mutation = make_test_mutation(Path::new("src/calc.go"));
+
+        let selected = select_test_command(tmp.path(), &commands, &mutation);
+
+        assert_eq!(selected.argv, vec!["go", "test", "./..."]);
+    }
+
+    #[test]
+    fn select_test_command_falls_back_for_unsupported_command() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut selection = TestSelectionConfig::new();
+        selection.insert(
+            tmp.path(),
+            Path::new("src/lib.rs"),
+            3,
+            vec!["test_name".into()],
+        );
+
+        let mut commands = test_command_config();
+        commands.command = vec!["cargo".into(), "test".into()];
+        commands.test_selection = Some(selection);
+
+        let mut mutation = make_test_mutation(Path::new("src/lib.rs"));
+        mutation.line = 3;
+
+        let selected = select_test_command(tmp.path(), &commands, &mutation);
+
+        assert_eq!(selected.argv, vec!["cargo", "test"]);
     }
 
     #[test]
@@ -1361,6 +1578,7 @@ mod tests {
                 build_command_explicit: false,
                 timeout: Duration::from_secs(5),
                 language_timeouts: HashMap::new(),
+                test_selection: None,
             },
             parallelism: 1,
             project_root: dir.path().to_path_buf(),
@@ -1402,6 +1620,7 @@ mod tests {
                 build_command_explicit: false,
                 timeout: Duration::from_secs(5),
                 language_timeouts: HashMap::new(),
+                test_selection: None,
             },
             parallelism: 2,
             project_root: dir.path().to_path_buf(),
@@ -1440,6 +1659,7 @@ mod tests {
                 build_command_explicit: false,
                 timeout: Duration::from_secs(5),
                 language_timeouts: HashMap::new(),
+                test_selection: None,
             },
             parallelism: 1,
             project_root: dir.path().to_path_buf(),
@@ -1503,6 +1723,7 @@ while [ "$(find "{barrier}" -type f | wc -l)" -lt 4 ]; do sleep 0.1; done"#,
                 build_command_explicit: false,
                 timeout: Duration::from_secs(5),
                 language_timeouts: HashMap::new(),
+                test_selection: None,
             },
             parallelism: 4,
             project_root: dir.path().to_path_buf(),
@@ -1574,6 +1795,7 @@ exit 1"#
                 build_command_explicit: false,
                 timeout: Duration::from_secs(5),
                 language_timeouts: HashMap::new(),
+                test_selection: None,
             },
             parallelism: 4,
             project_root: dir.path().to_path_buf(),
@@ -1624,6 +1846,7 @@ exit 1"#
                 build_command_explicit: false,
                 timeout: Duration::from_secs(5),
                 language_timeouts,
+                test_selection: None,
             },
             parallelism: 2,
             project_root: dir.path().to_path_buf(),

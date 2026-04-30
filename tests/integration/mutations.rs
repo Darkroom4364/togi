@@ -99,6 +99,7 @@ async fn end_to_end_go_fixture_all_killed_with_cache_off() {
             build_command_explicit: false,
             timeout: Duration::from_secs(30),
             language_timeouts: std::collections::HashMap::new(),
+            test_selection: None,
         },
         parallelism: 1,
         project_root: root,
