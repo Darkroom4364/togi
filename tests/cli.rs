@@ -155,9 +155,9 @@ fn check_format_json_outputs_valid_json() {
 fn explain_reads_json_report() {
     let dir = TempDir::new().unwrap();
     let report = r#"{
-  "total": 1,
-  "tested": 1,
-  "killed": 0,
+  "total": 2,
+  "tested": 2,
+  "killed": 1,
   "survived": 1,
   "timeout": 0,
   "build_errors": 0,
@@ -166,6 +166,16 @@ fn explain_reads_json_report() {
   "mutations": [
     {
       "id": 1,
+      "file": "src/main.go",
+      "line": 3,
+      "operator": "plus_to_minus",
+      "description": "Replace + with -",
+      "result": "killed",
+      "original": "+",
+      "replacement": "-"
+    },
+    {
+      "id": 2,
       "file": "src/main.go",
       "line": 4,
       "operator": "gt_to_gte",
@@ -183,15 +193,27 @@ fn explain_reads_json_report() {
     togi()
         .args([
             "explain",
+            "2",
+            "--report",
+            report_path.to_str().expect("report path should be utf-8"),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Mutation #2"))
+        .stdout(predicate::str::contains("src/main.go:4"))
+        .stdout(predicate::str::contains("Why it survived"));
+
+    togi()
+        .args([
+            "explain",
             "1",
             "--report",
             report_path.to_str().expect("report path should be utf-8"),
         ])
         .assert()
         .success()
-        .stdout(predicate::str::contains("Mutation #1"))
-        .stdout(predicate::str::contains("src/main.go:4"))
-        .stdout(predicate::str::contains("Why it survived"));
+        .stdout(predicate::str::contains("Change: + -> -"))
+        .stdout(predicate::str::contains("Why it was killed"));
 }
 
 #[test]

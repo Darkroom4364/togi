@@ -44,37 +44,22 @@ pub fn to_json_string(report: &MutationReport) -> Result<String> {
     let mutations: Vec<JsonMutation> = report
         .results
         .iter()
-        .map(|(m, r)| {
-            let survived = matches!(r, MutationResult::Survived);
-            JsonMutation {
-                id: m.id + 1,
-                file: m.file.display().to_string(),
-                line: m.line,
-                operator: m.operator.clone(),
-                description: m.description.clone(),
-                result: match r {
-                    MutationResult::Killed => "killed".to_string(),
-                    MutationResult::Survived => "survived".to_string(),
-                    MutationResult::Timeout => "timeout".to_string(),
-                    MutationResult::BuildError => "build_error".to_string(),
-                },
-                column: if survived { Some(m.column) } else { None },
-                original: if survived {
-                    Some(m.original.clone())
-                } else {
-                    None
-                },
-                replacement: if survived {
-                    Some(m.replacement.clone())
-                } else {
-                    None
-                },
-                diff: if survived {
-                    super::mutation_diff(m)
-                } else {
-                    None
-                },
-            }
+        .map(|(m, r)| JsonMutation {
+            id: m.id + 1,
+            file: m.file.display().to_string(),
+            line: m.line,
+            operator: m.operator.clone(),
+            description: m.description.clone(),
+            result: match r {
+                MutationResult::Killed => "killed".to_string(),
+                MutationResult::Survived => "survived".to_string(),
+                MutationResult::Timeout => "timeout".to_string(),
+                MutationResult::BuildError => "build_error".to_string(),
+            },
+            column: Some(m.column),
+            original: Some(m.original.clone()),
+            replacement: Some(m.replacement.clone()),
+            diff: super::mutation_diff(m),
         })
         .collect();
 
@@ -168,7 +153,17 @@ mod tests {
         let mutations = value["mutations"].as_array().unwrap();
         assert_object_keys(
             &mutations[0],
-            &["id", "file", "line", "operator", "description", "result"],
+            &[
+                "id",
+                "file",
+                "line",
+                "operator",
+                "description",
+                "result",
+                "column",
+                "original",
+                "replacement",
+            ],
         );
         assert_object_keys(
             &mutations[1],
@@ -235,20 +230,19 @@ mod tests {
     }
 
     #[test]
-    fn json_survived_includes_diff_fields() {
+    fn json_output_includes_mutation_details() {
         let report = sample_report();
         let json_str = to_json_string(&report).unwrap();
         let value: serde_json::Value = serde_json::from_str(&json_str).unwrap();
 
         let mutations = value["mutations"].as_array().unwrap();
 
-        // Killed mutation should NOT have diff fields
-        assert!(mutations[0]["column"].is_null());
-        assert!(mutations[0]["original"].is_null());
-        assert!(mutations[0]["replacement"].is_null());
+        // All mutations should include exact before/after details for `togi explain`.
+        assert_eq!(mutations[0]["column"], 10);
+        assert_eq!(mutations[0]["original"], "<");
+        assert_eq!(mutations[0]["replacement"], "<=");
         assert!(mutations[0]["diff"].is_null());
 
-        // Survived mutation should have original/replacement/column
         assert_eq!(mutations[1]["column"], 5);
         assert_eq!(mutations[1]["original"], "==");
         assert_eq!(mutations[1]["replacement"], "!=");
