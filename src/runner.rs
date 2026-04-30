@@ -68,6 +68,51 @@ pub struct TestRunner {
     pub cancelled: Arc<AtomicBool>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SelectedTestCommand {
+    argv: Vec<String>,
+    timeout: Duration,
+}
+
+impl SelectedTestCommand {
+    fn cache_context(
+        &self,
+        build_command: &[String],
+        build_command_explicit: bool,
+        env: &HashMap<String, String>,
+    ) -> String {
+        let build_str = if build_command_explicit {
+            format!("{build_command:?}")
+        } else {
+            String::new()
+        };
+        let mut env_parts: Vec<String> = env.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        env_parts.sort();
+        format!(
+            "test={:?};build={};timeout={};env={}",
+            self.argv,
+            build_str,
+            self.timeout.as_millis(),
+            env_parts.join(",")
+        )
+    }
+}
+
+fn select_test_command(commands: &CommandConfig, mutation: &Mutation) -> SelectedTestCommand {
+    SelectedTestCommand {
+        argv: commands
+            .language_commands
+            .get(mutation.language.as_str())
+            .unwrap_or(&commands.command)
+            .clone(),
+        timeout: commands
+            .language_timeouts
+            .get(mutation.language.as_str())
+            .copied()
+            .unwrap_or(commands.timeout),
+    }
+}
+
 struct FileGuard {
     path: PathBuf,
     original: Vec<u8>,
@@ -258,18 +303,9 @@ impl TestRunner {
 
         for mutation in mutations {
             let workspace_pool = workspace_pool.clone();
-            let command = self
-                .commands
-                .language_commands
-                .get(mutation.language.as_str())
-                .unwrap_or(&self.commands.command)
-                .clone();
-            let timeout = self
-                .commands
-                .language_timeouts
-                .get(mutation.language.as_str())
-                .copied()
-                .unwrap_or(self.commands.timeout);
+            let selected_test = select_test_command(&self.commands, &mutation);
+            let command = selected_test.argv.clone();
+            let timeout = selected_test.timeout;
             let project_root = project_root.clone();
             let build_command = build_command.clone();
             let counter = counter.clone();
@@ -280,21 +316,8 @@ impl TestRunner {
             let env = self.env.clone();
             let cancelled = self.cancelled.clone();
 
-            let cmd_str = command.join(" ");
-            let build_str = if build_command_explicit {
-                build_command.join(" ")
-            } else {
-                String::new()
-            };
-            let mut env_parts: Vec<String> = env.iter().map(|(k, v)| format!("{k}={v}")).collect();
-            env_parts.sort();
-            let cache_ctx = format!(
-                "{};build={};timeout={};env={}",
-                cmd_str,
-                build_str,
-                timeout.as_millis(),
-                env_parts.join(",")
-            );
+            let cache_ctx =
+                selected_test.cache_context(&build_command, build_command_explicit, &env);
 
             let handle = tokio::spawn(async move {
                 // Stop if cancelled (Ctrl+C) or enough mutations have been tested
@@ -853,6 +876,64 @@ mod tests {
         std::fs::write(&file, b"hello world").unwrap();
         let mutation = make_test_mutation(Path::new("test.txt"));
         (dir, file, mutation)
+    }
+
+    fn test_command_config() -> CommandConfig {
+        CommandConfig {
+            command: vec!["cargo".into(), "test".into()],
+            language_commands: HashMap::new(),
+            build_command: vec![],
+            build_command_explicit: false,
+            timeout: Duration::from_secs(30),
+            language_timeouts: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn select_test_command_uses_default_command_and_timeout() {
+        let commands = test_command_config();
+        let mutation = make_test_mutation(Path::new("src/lib.rs"));
+
+        let selected = select_test_command(&commands, &mutation);
+
+        assert_eq!(selected.argv, vec!["cargo", "test"]);
+        assert_eq!(selected.timeout, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn select_test_command_uses_language_command_and_timeout() {
+        let mut commands = test_command_config();
+        commands.language_commands.insert(
+            "go".into(),
+            vec!["go".into(), "test".into(), "./...".into()],
+        );
+        commands
+            .language_timeouts
+            .insert("go".into(), Duration::from_secs(5));
+        let mut mutation = make_test_mutation(Path::new("calc.go"));
+        mutation.language = "go".into();
+
+        let selected = select_test_command(&commands, &mutation);
+
+        assert_eq!(selected.argv, vec!["go", "test", "./..."]);
+        assert_eq!(selected.timeout, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn selected_test_command_cache_context_preserves_argv_boundaries() {
+        let selected = SelectedTestCommand {
+            argv: vec!["cargo test".into()],
+            timeout: Duration::from_secs(2),
+        };
+        let ambiguous = SelectedTestCommand {
+            argv: vec!["cargo".into(), "test".into()],
+            timeout: Duration::from_secs(2),
+        };
+
+        assert_ne!(
+            selected.cache_context(&[], false, &HashMap::new()),
+            ambiguous.cache_context(&[], false, &HashMap::new())
+        );
     }
 
     #[test]
