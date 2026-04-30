@@ -105,7 +105,7 @@ pub fn generate_mutations(
 
                     file_mutations.push(Mutation {
                         id: 0,
-                        file: file_path.clone(),
+                        file: changed_file.path.clone(),
                         language: lang.name().to_string(),
                         line,
                         column,
@@ -438,6 +438,11 @@ mod tests {
         let mutations = generate_mutations(&changed, tmp.path(), 100, 0, &[]).unwrap();
         let files: std::collections::HashSet<_> =
             mutations.iter().map(|m| m.file.clone()).collect();
+        assert!(
+            files.iter().all(|file| file.is_relative()),
+            "generated mutation paths should stay project-relative: {:?}",
+            files
+        );
         assert!(
             files.len() >= 2,
             "expected mutations from both files, got files: {:?}",
