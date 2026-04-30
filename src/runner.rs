@@ -167,9 +167,14 @@ impl TestRunner {
                         break;
                     }
 
+                    let resolved_mutation = ResolvedMutation::new(&project_root, &mutation);
+
                     // Check cache before running
-                    let file_path = project_root.join(&mutation.file);
-                    let file_content = std::fs::read(&file_path).ok();
+                    let file_content = resolved_mutation
+                        .file_path
+                        .as_ref()
+                        .ok()
+                        .and_then(|file_path| std::fs::read(file_path).ok());
                     let cache_key = file_content
                         .as_ref()
                         .map(|content| CacheKey::new(content, &mutation.description, &cache_ctx));
@@ -211,7 +216,7 @@ impl TestRunner {
                         },
                         timeout,
                         &project_root,
-                        &mutation,
+                        resolved_mutation,
                         show_output,
                         &env,
                     )
@@ -337,53 +342,81 @@ struct BuildCommand<'a> {
     explicit: bool,
 }
 
-async fn run_single_mutation(
-    command: &[String],
-    build_command: BuildCommand<'_>,
-    timeout: Duration,
-    project_root: &Path,
-    mutation: &Mutation,
-    capture_output: bool,
-    env: &HashMap<String, String>,
-) -> MutationOutcome {
-    let file_path = project_root.join(&mutation.file);
+fn mutation_file_path(project_root: &Path, mutation_file: &Path) -> PathBuf {
+    if mutation_file.is_absolute() {
+        mutation_file.to_path_buf()
+    } else {
+        project_root.join(mutation_file)
+    }
+}
 
-    // Validate the resolved path stays within project_root to prevent
-    // path traversal from crafted diffs (e.g. "../../../etc/passwd").
-    // Fail closed: if canonicalization fails, treat it as an escape.
+fn validate_and_resolve_mutation_path(
+    project_root: &Path,
+    mutation_file: &Path,
+) -> Result<PathBuf, ()> {
+    let file_path = mutation_file_path(project_root, mutation_file);
+
     let canonical = match file_path.canonicalize() {
         Ok(p) => p,
         Err(e) => {
             eprintln!(
                 "warning: path traversal blocked: cannot resolve {}: {e}",
-                mutation.file.display()
+                mutation_file.display()
             );
-            return MutationOutcome {
-                result: MutationResult::BuildError,
-                test_output: None,
-            };
+            return Err(());
         }
     };
     let root = match project_root.canonicalize() {
         Ok(p) => p,
         Err(e) => {
             eprintln!("warning: path traversal blocked: cannot resolve project root: {e}");
+            return Err(());
+        }
+    };
+    if !canonical.starts_with(&root) {
+        eprintln!(
+            "warning: path traversal blocked: {} escapes project root",
+            mutation_file.display()
+        );
+        return Err(());
+    }
+
+    Ok(file_path)
+}
+
+struct ResolvedMutation<'a> {
+    mutation: &'a Mutation,
+    file_path: Result<PathBuf, ()>,
+}
+
+impl<'a> ResolvedMutation<'a> {
+    fn new(project_root: &Path, mutation: &'a Mutation) -> Self {
+        Self {
+            mutation,
+            file_path: validate_and_resolve_mutation_path(project_root, &mutation.file),
+        }
+    }
+}
+
+async fn run_single_mutation(
+    command: &[String],
+    build_command: BuildCommand<'_>,
+    timeout: Duration,
+    project_root: &Path,
+    target: ResolvedMutation<'_>,
+    capture_output: bool,
+    env: &HashMap<String, String>,
+) -> MutationOutcome {
+    let mutation = target.mutation;
+    let file_path = match target.file_path {
+        Ok(path) => path,
+        Err(()) => {
             return MutationOutcome {
                 result: MutationResult::BuildError,
                 test_output: None,
             };
         }
     };
-    if !canonical.starts_with(&root) {
-        eprintln!(
-            "warning: path traversal blocked: {} escapes project root",
-            mutation.file.display()
-        );
-        return MutationOutcome {
-            result: MutationResult::BuildError,
-            test_output: None,
-        };
-    }
 
     // Read original content
     let original = match std::fs::read(&file_path) {
@@ -586,9 +619,41 @@ mod tests {
         (dir, file, mutation)
     }
 
+    fn make_relative_test_setup() -> (tempfile::TempDir, PathBuf, Mutation) {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("test.txt");
+        std::fs::write(&file, b"hello world").unwrap();
+        let mutation = make_test_mutation(Path::new("test.txt"));
+        (dir, file, mutation)
+    }
+
+    #[test]
+    fn mutation_file_path_resolves_relative_paths_against_project_root() {
+        let root = Path::new("/repo");
+
+        assert_eq!(
+            mutation_file_path(root, Path::new("src/lib.rs")),
+            PathBuf::from("/repo/src/lib.rs")
+        );
+        assert_eq!(
+            mutation_file_path(root, Path::new("/tmp/src/lib.rs")),
+            PathBuf::from("/tmp/src/lib.rs")
+        );
+    }
+
+    #[test]
+    fn validate_and_resolve_mutation_path_rejects_parent_escape() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("project");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(tmp.path().join("secret.txt"), b"secret").unwrap();
+
+        assert!(validate_and_resolve_mutation_path(&root, Path::new("../secret.txt")).is_err());
+    }
+
     #[tokio::test]
     async fn command_succeeds_returns_survived() {
-        let (dir, file, mutation) = make_test_setup();
+        let (dir, file, mutation) = make_relative_test_setup();
 
         let outcome = run_single_mutation(
             &["true".to_string()],
@@ -598,7 +663,7 @@ mod tests {
             },
             Duration::from_secs(5),
             dir.path(),
-            &mutation,
+            ResolvedMutation::new(dir.path(), &mutation),
             false,
             &HashMap::new(),
         )
@@ -620,7 +685,7 @@ mod tests {
             },
             Duration::from_secs(5),
             dir.path(),
-            &mutation,
+            ResolvedMutation::new(dir.path(), &mutation),
             false,
             &HashMap::new(),
         )
@@ -658,7 +723,7 @@ mod tests {
             },
             Duration::from_secs(5),
             dir.path(),
-            &mutation,
+            ResolvedMutation::new(dir.path(), &mutation),
             false,
             &HashMap::new(),
         )
@@ -681,7 +746,7 @@ mod tests {
             },
             Duration::from_secs(5),
             dir.path(),
-            &mutation,
+            ResolvedMutation::new(dir.path(), &mutation),
             false,
             &HashMap::new(),
         )
@@ -704,7 +769,7 @@ mod tests {
             },
             Duration::from_millis(100),
             dir.path(),
-            &mutation,
+            ResolvedMutation::new(dir.path(), &mutation),
             false,
             &HashMap::new(),
         )
@@ -733,7 +798,7 @@ mod tests {
             },
             Duration::from_secs(5),
             dir.path(),
-            &mutation,
+            ResolvedMutation::new(dir.path(), &mutation),
             false,
             &HashMap::new(),
         )
@@ -757,7 +822,7 @@ mod tests {
             },
             Duration::from_secs(5),
             dir.path(),
-            &mutation,
+            ResolvedMutation::new(dir.path(), &mutation),
             false,
             &HashMap::new(),
         )
@@ -790,7 +855,7 @@ mod tests {
             },
             Duration::from_secs(5),
             dir.path(),
-            &mutation,
+            ResolvedMutation::new(dir.path(), &mutation),
             false,
             &HashMap::new(),
         )
@@ -821,7 +886,7 @@ mod tests {
             },
             Duration::from_secs(5),
             dir.path(),
-            &mutation,
+            ResolvedMutation::new(dir.path(), &mutation),
             false,
             &HashMap::new(),
         )
@@ -843,7 +908,7 @@ mod tests {
             },
             Duration::from_secs(5),
             dir.path(),
-            &mutation,
+            ResolvedMutation::new(dir.path(), &mutation),
             false,
             &HashMap::new(),
         )
