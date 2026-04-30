@@ -136,6 +136,7 @@ fn is_mutable_kind(kind: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_helpers::{parse_csharp, parse_go, parse_java, parse_rust, parse_typescript};
 
     struct StubLang {
         skip_kinds: &'static [&'static str],
@@ -183,18 +184,15 @@ mod tests {
         }
     }
 
-    fn parse_go(source: &[u8]) -> tree_sitter::Tree {
-        let mut parser = tree_sitter::Parser::new();
-        let lang = tree_sitter_go::LANGUAGE;
-        parser.set_language(&lang.into()).unwrap();
-        parser.parse(source, None).unwrap()
+    fn source_str(source: &[u8]) -> &str {
+        std::str::from_utf8(source).unwrap()
     }
 
     #[test]
     fn finds_binary_expression_on_changed_lines() {
         let source = b"package main\n\nfunc add(a, b int) int {\n\treturn a + b\n}\n";
         // Lines: 1=package, 2=empty, 3=func, 4=return a+b, 5=}
-        let tree = parse_go(source);
+        let tree = parse_go(source_str(source));
         let changed = vec![LineRange { start: 3, end: 4 }];
 
         let nodes = find_mutable_nodes(&tree, source, &changed, &StubLang::new());
@@ -207,7 +205,7 @@ mod tests {
     #[test]
     fn no_changed_lines_returns_empty() {
         let source = b"package main\n\nfunc add(a, b int) int {\n\treturn a + b\n}\n";
-        let tree = parse_go(source);
+        let tree = parse_go(source_str(source));
         let changed: Vec<LineRange> = vec![];
 
         let nodes = find_mutable_nodes(&tree, source, &changed, &StubLang::new());
@@ -219,7 +217,7 @@ mod tests {
     fn finds_if_statement_on_changed_line() {
         let source = b"package main\n\nfunc check(x int) int {\n\tif x > 0 {\n\t\treturn 1\n\t}\n\treturn 0\n}\n";
         // Lines: 1=package, 2=empty, 3=func, 4=if x>0, 5=return 1, 6=}, 7=return 0, 8=}
-        let tree = parse_go(source);
+        let tree = parse_go(source_str(source));
         let changed = vec![LineRange { start: 4, end: 4 }];
 
         let nodes = find_mutable_nodes(&tree, source, &changed, &StubLang::new());
@@ -234,7 +232,7 @@ mod tests {
     fn multiple_overlapping_ranges() {
         let source = b"package main\n\nfunc f(a, b int) int {\n\tif a > 0 {\n\t\treturn a + b\n\t}\n\treturn a - b\n}\n";
         // Lines: 1=package, 2=empty, 3=func, 4=if a>0, 5=return a+b, 6=}, 7=return a-b, 8=}
-        let tree = parse_go(source);
+        let tree = parse_go(source_str(source));
         // Two ranges that both touch the function body
         let changed = vec![
             LineRange { start: 4, end: 5 },
@@ -257,7 +255,7 @@ mod tests {
     fn finds_return_statement_on_changed_line() {
         let source = b"package main\n\nfunc f() int {\n\treturn 42\n}\n";
         // Lines: 1=package, 2=empty, 3=func, 4=return 42, 5=}
-        let tree = parse_go(source);
+        let tree = parse_go(source_str(source));
         let changed = vec![LineRange { start: 4, end: 4 }];
 
         let nodes = find_mutable_nodes(&tree, source, &changed, &StubLang::new());
@@ -272,7 +270,7 @@ mod tests {
     fn finds_assignment_on_changed_line() {
         let source = b"package main\n\nfunc f() {\n\tx := 1\n\tx = x + 2\n}\n";
         // Lines: 1=package, 2=empty, 3=func, 4=x:=1, 5=x=x+2, 6=}
-        let tree = parse_go(source);
+        let tree = parse_go(source_str(source));
         let changed = vec![LineRange { start: 5, end: 5 }];
 
         let nodes = find_mutable_nodes(&tree, source, &changed, &StubLang::new());
@@ -287,7 +285,7 @@ mod tests {
     fn nested_if_inside_if() {
         let source = b"package main\n\nfunc f(a, b int) int {\n\tif a > 0 {\n\t\tif b > 0 {\n\t\t\treturn a + b\n\t\t}\n\t}\n\treturn 0\n}\n";
         // Lines: 1=package, 2=empty, 3=func, 4=if a>0, 5=if b>0, 6=return a+b, 7=}, 8=}, 9=return 0, 10=}
-        let tree = parse_go(source);
+        let tree = parse_go(source_str(source));
         // Only the inner if line is changed
         let changed = vec![LineRange { start: 5, end: 6 }];
 
@@ -305,7 +303,7 @@ mod tests {
         let source =
             b"package main\n\nimport \"fmt\"\n\nfunc f(a, b int) {\n\tfmt.Println(a + b)\n}\n";
         // Lines: 1=package, 2=empty, 3=import, 4=empty, 5=func, 6=fmt.Println(a+b), 7=}
-        let tree = parse_go(source);
+        let tree = parse_go(source_str(source));
         let changed = vec![LineRange { start: 6, end: 6 }];
 
         let nodes = find_mutable_nodes(&tree, source, &changed, &StubLang::new());
@@ -324,7 +322,7 @@ mod tests {
     fn comment_only_lines_return_no_mutable_nodes() {
         let source = b"package main\n\n// this is a comment\n// another comment\nfunc f() {}\n";
         // Lines: 1=package, 2=empty, 3=comment, 4=comment, 5=func
-        let tree = parse_go(source);
+        let tree = parse_go(source_str(source));
         let changed = vec![LineRange { start: 3, end: 4 }];
 
         let nodes = find_mutable_nodes(&tree, source, &changed, &StubLang::new());
@@ -340,7 +338,7 @@ mod tests {
     fn package_declaration_returns_no_mutable_nodes() {
         let source = b"package main\n\nfunc f() {\n\treturn\n}\n";
         // Lines: 1=package, 2=empty, 3=func, 4=return, 5=}
-        let tree = parse_go(source);
+        let tree = parse_go(source_str(source));
         // Only the package line is changed
         let changed = vec![LineRange { start: 1, end: 1 }];
 
@@ -353,18 +351,11 @@ mod tests {
         );
     }
 
-    fn parse_rust(source: &[u8]) -> tree_sitter::Tree {
-        let mut parser = tree_sitter::Parser::new();
-        let lang = tree_sitter_rust::LANGUAGE;
-        parser.set_language(&lang.into()).unwrap();
-        parser.parse(source, None).unwrap()
-    }
-
     #[test]
     fn rust_return_expression_on_changed_line() {
         let source = b"fn add(a: i32, b: i32) -> i32 {\n    return a + b;\n}\n";
         // Lines: 1=fn, 2=return a+b, 3=}
-        let tree = parse_rust(source);
+        let tree = parse_rust(source_str(source));
         let changed = vec![LineRange { start: 2, end: 2 }];
 
         let nodes = find_mutable_nodes(&tree, source, &changed, &StubLang::new());
@@ -377,7 +368,7 @@ mod tests {
     #[test]
     fn rust_use_declaration_skipped() {
         let source = b"use std::collections::HashMap;\nfn f() -> bool { true }\n";
-        let tree = parse_rust(source);
+        let tree = parse_rust(source_str(source));
         let changed = vec![LineRange { start: 1, end: 2 }];
 
         let lang = StubLang::with_skip(&["use_declaration"]);
@@ -400,7 +391,7 @@ mod tests {
     #[test]
     fn rust_macro_invocation_skipped() {
         let source = b"fn f() {\n    println!(\"hello\");\n    let x = true;\n}\n";
-        let tree = parse_rust(source);
+        let tree = parse_rust(source_str(source));
         let changed = vec![LineRange { start: 1, end: 4 }];
 
         let lang = StubLang::with_skip(&["macro_invocation"]);
@@ -427,7 +418,7 @@ mod tests {
     #[test]
     fn go_import_skipped() {
         let source = b"package main\n\nimport \"fmt\"\n\nfunc f() bool {\n\treturn true\n}\n";
-        let tree = parse_go(source);
+        let tree = parse_go(source_str(source));
         let changed = vec![LineRange { start: 1, end: 7 }];
 
         let lang = StubLang::with_skip(&["import_spec"]);
@@ -441,31 +432,10 @@ mod tests {
         );
     }
 
-    fn parse_typescript(source: &[u8]) -> tree_sitter::Tree {
-        let mut parser = tree_sitter::Parser::new();
-        let lang = tree_sitter_typescript::LANGUAGE_TYPESCRIPT;
-        parser.set_language(&lang.into()).unwrap();
-        parser.parse(source, None).unwrap()
-    }
-
-    fn parse_java(source: &[u8]) -> tree_sitter::Tree {
-        let mut parser = tree_sitter::Parser::new();
-        let lang = tree_sitter_java::LANGUAGE;
-        parser.set_language(&lang.into()).unwrap();
-        parser.parse(source, None).unwrap()
-    }
-
-    fn parse_csharp(source: &[u8]) -> tree_sitter::Tree {
-        let mut parser = tree_sitter::Parser::new();
-        let lang = tree_sitter_c_sharp::LANGUAGE;
-        parser.set_language(&lang.into()).unwrap();
-        parser.parse(source, None).unwrap()
-    }
-
     #[test]
     fn typescript_import_skipped() {
         let source = b"import { foo } from 'bar';\nconst x = true;\n";
-        let tree = parse_typescript(source);
+        let tree = parse_typescript(source_str(source));
         let changed = vec![LineRange { start: 1, end: 2 }];
 
         let lang = StubLang::with_skip(&["import_statement"]);
@@ -487,7 +457,7 @@ mod tests {
     #[test]
     fn typescript_type_annotation_skipped() {
         let source = b"function f(x: string): boolean { return true; }\n";
-        let tree = parse_typescript(source);
+        let tree = parse_typescript(source_str(source));
         let changed = vec![LineRange { start: 1, end: 1 }];
 
         let lang = StubLang::with_skip(&["type_annotation"]);
@@ -504,7 +474,7 @@ mod tests {
     #[test]
     fn java_import_skipped() {
         let source = b"import java.util.List;\nclass T { boolean f() { return true; } }\n";
-        let tree = parse_java(source);
+        let tree = parse_java(source_str(source));
         let changed = vec![LineRange { start: 1, end: 2 }];
 
         let lang = StubLang::with_skip(&["import_declaration"]);
@@ -521,7 +491,7 @@ mod tests {
     #[test]
     fn csharp_using_skipped() {
         let source = b"using System.Collections;\nclass T { bool F() { return true; } }\n";
-        let tree = parse_csharp(source);
+        let tree = parse_csharp(source_str(source));
         let changed = vec![LineRange { start: 1, end: 2 }];
 
         let lang = StubLang::with_skip(&["using_directive"]);
@@ -539,7 +509,7 @@ mod tests {
     fn rust_nested_if_expression() {
         let source = b"fn f(a: i32, b: i32) -> i32 {\n    if a > 0 {\n        if b > 0 {\n            return a + b;\n        }\n    }\n    0\n}\n";
         // Lines: 1=fn, 2=if a>0, 3=if b>0, 4=return a+b, 5=}, 6=}, 7=0, 8=}
-        let tree = parse_rust(source);
+        let tree = parse_rust(source_str(source));
         let changed = vec![LineRange { start: 3, end: 4 }];
 
         let nodes = find_mutable_nodes(&tree, source, &changed, &StubLang::new());
@@ -552,7 +522,7 @@ mod tests {
     #[test]
     fn rust_cfg_test_module_skipped() {
         let source = b"fn prod() -> bool { true }\n\n#[cfg(test)]\nmod tests {\n    fn test_something() -> bool { true }\n}\n";
-        let tree = parse_rust(source);
+        let tree = parse_rust(source_str(source));
         let changed = vec![LineRange { start: 1, end: 6 }];
         let lang = crate::languages::rust_lang::Rust;
         let nodes = find_mutable_nodes(&tree, source, &changed, &lang);
@@ -578,7 +548,7 @@ mod tests {
     fn rust_test_function_skipped() {
         let source =
             b"fn prod() -> bool { true }\n\n#[test]\nfn test_foo() -> bool {\n    1 + 2 == 3\n}\n";
-        let tree = parse_rust(source);
+        let tree = parse_rust(source_str(source));
         let changed = vec![LineRange { start: 1, end: 6 }];
         let lang = crate::languages::rust_lang::Rust;
         let nodes = find_mutable_nodes(&tree, source, &changed, &lang);
