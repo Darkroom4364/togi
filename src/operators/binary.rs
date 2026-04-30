@@ -1,13 +1,5 @@
-use super::MutationOperator;
+use super::{MutationOperator, is_binary_expr};
 use crate::MutationCandidate;
-
-const BINARY_EXPR_KINDS: &[&str] = &[
-    "binary_expression",
-    "binary_expr",
-    "comparison_expression",
-    "binary_operator", // Python
-    "binary",          // Ruby
-];
 
 pub fn find_operator_child(
     node: &tree_sitter::Node,
@@ -32,10 +24,6 @@ pub fn find_operator_child(
         }
     }
     None
-}
-
-fn is_binary_expr(node: &tree_sitter::Node) -> bool {
-    BINARY_EXPR_KINDS.contains(&node.kind())
 }
 
 macro_rules! binary_operator {

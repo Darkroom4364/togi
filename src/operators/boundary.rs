@@ -1,18 +1,6 @@
-use super::MutationOperator;
 use super::binary::find_operator_child;
+use super::{MutationOperator, is_binary_expr};
 use crate::MutationCandidate;
-
-const BINARY_EXPR_KINDS: &[&str] = &[
-    "binary_expression",
-    "binary_expr",
-    "comparison_expression",
-    "binary_operator", // Python
-    "binary",          // Ruby
-];
-
-fn is_binary_expr(node: &tree_sitter::Node) -> bool {
-    BINARY_EXPR_KINDS.contains(&node.kind())
-}
 
 pub struct PlusToMinus;
 
