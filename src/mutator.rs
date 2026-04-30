@@ -35,9 +35,13 @@ fn byte_offset_to_line_col(source: &[u8], offset: usize) -> (usize, usize) {
     (line, col)
 }
 
-/// Generate mutations for all changed files.
-/// Reads each file, parses it, finds mutable nodes in changed regions,
-/// applies all operators, and returns concrete Mutation structs.
+/// Generate concrete mutations for changed files.
+///
+/// Each changed file is parsed with tree-sitter, mapped to mutable AST nodes,
+/// passed through the selected operators, filtered by language-specific rules,
+/// and converted into [`Mutation`] values with stable ids and byte ranges.
+/// `max_mutations` caps the total output; `max_per_file` caps each file before
+/// global ids are assigned. A value of `0` for `max_per_file` means unlimited.
 pub fn generate_mutations(
     changed_files: &[ChangedFile],
     project_root: &Path,

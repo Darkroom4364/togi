@@ -21,22 +21,45 @@ fn atomic_write(path: &Path, data: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Command configuration: what to run and how long to wait.
+/// Commands and timeouts used while evaluating mutations.
+///
+/// `command` is the default test command. `language_commands` and
+/// `language_timeouts` override it for mutations generated from a specific
+/// language. `build_command`, when explicitly enabled by the CLI/config, runs
+/// before tests to classify uncompilable mutations as build errors.
 pub struct CommandConfig {
+    /// Default test command, stored as argv.
     pub command: Vec<String>,
+    /// Per-language test command overrides keyed by `LanguageSupport::name()`.
     pub language_commands: HashMap<String, Vec<String>>,
+    /// Optional build-check command, stored as argv.
     pub build_command: Vec<String>,
+    /// Whether the build command came from user config/CLI rather than detection.
     pub build_command_explicit: bool,
+    /// Default per-mutation timeout.
     pub timeout: Duration,
+    /// Per-language timeout overrides keyed by `LanguageSupport::name()`.
     pub language_timeouts: HashMap<String, Duration>,
 }
 
+/// Applies mutations, runs checks, restores files, and aggregates results.
+///
+/// The runner mutates files in the project working tree, so it serializes the
+/// active mutation section to avoid one test command observing another active
+/// mutation. It still honors cancellation, cache lookups, output capture, and
+/// per-language command/timeout selection.
 pub struct TestRunner {
+    /// Test/build commands and timeout configuration.
     pub commands: CommandConfig,
+    /// Maximum number of scheduled mutation tasks.
     pub parallelism: usize,
+    /// Repository root where commands run and mutation paths are resolved.
     pub project_root: PathBuf,
+    /// Print every mutation result as it runs.
     pub verbose: bool,
+    /// Capture and print output for survived mutations.
     pub show_output: bool,
+    /// Optional cap on how many non-build-error mutations are tested.
     pub max_tested: Option<usize>,
     /// Extra environment variables passed to every spawned command.
     pub env: HashMap<String, String>,

@@ -5,10 +5,20 @@ pub mod loop_control;
 pub mod removal;
 pub mod unary;
 
-/// A mutation operator that generates candidate mutations from AST nodes
+/// Generates candidate source edits for one mutation operator.
+///
+/// Implementations inspect a tree-sitter node and return zero or more
+/// [`MutationCandidate`](crate::MutationCandidate) values. Candidates are still
+/// language-filtered and converted into concrete [`Mutation`](crate::Mutation)
+/// values before the runner applies them.
 pub trait MutationOperator: Send + Sync {
+    /// Stable CLI/config identifier, such as `lt_to_lte`.
     fn id(&self) -> &str;
+
+    /// Human-readable description used in reports.
     fn description(&self) -> &str;
+
+    /// Return mutation candidates for `node` using byte ranges from `source`.
     fn apply(&self, node: &tree_sitter::Node, source: &[u8]) -> Vec<crate::MutationCandidate>;
 }
 
