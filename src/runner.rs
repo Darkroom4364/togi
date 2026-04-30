@@ -251,14 +251,6 @@ impl TestRunner {
             }
         };
 
-        let mut file_locks: HashMap<PathBuf, Arc<Semaphore>> = HashMap::new();
-        for mutation in &mutations {
-            file_locks
-                .entry(mutation.file.clone())
-                .or_insert_with(|| Arc::new(Semaphore::new(1)));
-        }
-        let file_locks = Arc::new(file_locks);
-
         let project_root = Arc::new(self.project_root.clone());
         let build_command = Arc::new(self.commands.build_command.clone());
         let build_command_explicit = self.commands.build_command_explicit;
@@ -280,10 +272,6 @@ impl TestRunner {
                 .unwrap_or(self.commands.timeout);
             let project_root = project_root.clone();
             let build_command = build_command.clone();
-            let file_lock = file_locks
-                .get(&mutation.file)
-                .expect("mutation file lock missing")
-                .clone();
             let counter = counter.clone();
             let scheduled_counter = scheduled_counter.clone();
             let tested_counter = tested_counter.clone();
@@ -367,7 +355,6 @@ impl TestRunner {
                 }
 
                 let outcome = {
-                    let _file_permit = file_lock.acquire().await.unwrap();
                     let workspace_slot = workspace_pool.acquire().await;
                     let workspace_root = workspace_slot.root().to_path_buf();
                     let workspace_target = ResolvedMutation::new_for_execution(
@@ -1392,16 +1379,17 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn mutations_on_same_file_run_sequentially() {
+    async fn mutations_on_same_file_run_in_isolated_workspaces() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("test.txt");
         std::fs::write(&file, b"hello world").unwrap();
-        let lock_dir = dir.path().join("running.lock.d");
 
         // Each mutation has a unique description so cache can't short-circuit
-        let mutations: Vec<Mutation> = (0..5)
-            .map(|i| Mutation {
-                id: i,
+        let mutations: Vec<Mutation> = ["alpha", "bravo", "charlie", "delta"]
+            .into_iter()
+            .enumerate()
+            .map(|(i, replacement)| Mutation {
+                id: i as u32,
                 file: file.clone(),
                 language: String::new(),
                 line: 1,
@@ -1409,21 +1397,21 @@ mod tests {
                 operator: "test".into(),
                 description: format!("unique mutation {i}"),
                 original: "hello".into(),
-                replacement: "world".into(),
+                replacement: replacement.into(),
                 byte_range: 0..5,
             })
             .collect();
 
-        // Use `mkdir` as the lock — POSIX guarantees it's atomic and fails
-        // with a non-zero exit if the directory already exists. Replaces the
-        // previous `[ -f ] && touch` check, which has a TOCTOU race window.
-        // If sequential execution is honored, every script sees an empty
-        // lock dir, creates it, removes it, and exits 0. If two scripts run
-        // concurrently, exactly one mkdir succeeds and the loser exits 1
-        // (killed) — deterministically, without depending on sleep timing.
+        let barrier = tempfile::tempdir().unwrap();
         let script = format!(
-            "mkdir {lock} 2>/dev/null || exit 1; rmdir {lock}",
-            lock = lock_dir.display()
+            r#"value="$(cat test.txt)"
+case "$value" in
+  "alpha world"|"bravo world"|"charlie world"|"delta world") ;;
+  *) exit 1 ;;
+esac
+printf '%s\n' "$PWD" > "{barrier}/$value"
+while [ "$(find "{barrier}" -type f | wc -l)" -lt 4 ]; do sleep 0.1; done"#,
+            barrier = barrier.path().display()
         );
 
         let runner = TestRunner {
@@ -1435,7 +1423,7 @@ mod tests {
                 timeout: Duration::from_secs(5),
                 language_timeouts: HashMap::new(),
             },
-            parallelism: 4, // high parallelism, but same-file should serialize
+            parallelism: 4,
             project_root: dir.path().to_path_buf(),
             verbose: false,
             show_output: false,
@@ -1445,11 +1433,19 @@ mod tests {
         };
 
         let report = runner.run(mutations).await;
-        assert_eq!(report.total, 5);
-        // All should survive — if any were killed, two ran concurrently
+        assert_eq!(report.total, 4);
+        assert_eq!(report.survived, 4);
+        assert_eq!(report.killed, 0);
+        assert_eq!(report.timeout, 0);
+        assert_eq!(report.build_errors, 0);
+        let roots: std::collections::HashSet<String> = std::fs::read_dir(barrier.path())
+            .unwrap()
+            .map(|entry| std::fs::read_to_string(entry.unwrap().path()).unwrap())
+            .collect();
         assert_eq!(
-            report.killed, 0,
-            "mutations on the same file ran concurrently"
+            roots.len(),
+            4,
+            "expected one distinct workspace root per same-file mutation"
         );
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "hello world");
     }
