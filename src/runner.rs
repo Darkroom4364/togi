@@ -107,6 +107,7 @@ impl TestRunner {
         let mutation_lock = Arc::new(Semaphore::new(1));
         let project_root = Arc::new(self.project_root.clone());
         let build_command = Arc::new(self.commands.build_command.clone());
+        let build_command_explicit = self.commands.build_command_explicit;
         let mut handles = Vec::new();
 
         for (_file, file_mutations) in by_file {
@@ -138,7 +139,11 @@ impl TestRunner {
             let cancelled = self.cancelled.clone();
 
             let cmd_str = command.join(" ");
-            let build_str = build_command.join(" ");
+            let build_str = if build_command_explicit {
+                build_command.join(" ")
+            } else {
+                String::new()
+            };
             let mut env_parts: Vec<String> = env.iter().map(|(k, v)| format!("{k}={v}")).collect();
             env_parts.sort();
             let cache_ctx = format!(
@@ -200,7 +205,10 @@ impl TestRunner {
                     let _mutation_permit = mutation_lock.acquire().await.unwrap();
                     let outcome = run_single_mutation(
                         &command,
-                        &build_command,
+                        BuildCommand {
+                            argv: &build_command,
+                            explicit: build_command_explicit,
+                        },
                         timeout,
                         &project_root,
                         &mutation,
@@ -305,7 +313,11 @@ impl TestRunner {
             } else {
                 None
             },
-            build_command: self.commands.build_command.clone(),
+            build_command: if self.commands.build_command_explicit {
+                self.commands.build_command.clone()
+            } else {
+                vec![]
+            },
             total,
             killed,
             survived,
@@ -320,9 +332,14 @@ struct MutationOutcome {
     test_output: Option<String>,
 }
 
+struct BuildCommand<'a> {
+    argv: &'a [String],
+    explicit: bool,
+}
+
 async fn run_single_mutation(
     command: &[String],
-    build_command: &[String],
+    build_command: BuildCommand<'_>,
     timeout: Duration,
     project_root: &Path,
     mutation: &Mutation,
@@ -405,9 +422,10 @@ async fn run_single_mutation(
         };
     }
 
-    // Build check: skip expensive test if mutation doesn't compile
-    if !build_command.is_empty() {
-        let build_outcome = run_command(build_command, project_root, timeout, false, env).await;
+    // Explicit build check: skip expensive test if mutation doesn't compile.
+    if build_command.explicit && !build_command.argv.is_empty() {
+        let build_outcome =
+            run_command(build_command.argv, project_root, timeout, false, env).await;
         if build_outcome.result != MutationResult::Survived {
             return MutationOutcome {
                 result: MutationResult::BuildError,
@@ -574,7 +592,10 @@ mod tests {
 
         let outcome = run_single_mutation(
             &["true".to_string()],
-            &[],
+            BuildCommand {
+                argv: &[],
+                explicit: false,
+            },
             Duration::from_secs(5),
             dir.path(),
             &mutation,
@@ -593,7 +614,10 @@ mod tests {
 
         let outcome = run_single_mutation(
             &["false".to_string()],
-            &[],
+            BuildCommand {
+                argv: &[],
+                explicit: false,
+            },
             Duration::from_secs(5),
             dir.path(),
             &mutation,
@@ -628,7 +652,10 @@ mod tests {
 
         let outcome = run_single_mutation(
             &["true".to_string()],
-            &[],
+            BuildCommand {
+                argv: &[],
+                explicit: false,
+            },
             Duration::from_secs(5),
             dir.path(),
             &mutation,
@@ -648,7 +675,10 @@ mod tests {
 
         let outcome = run_single_mutation(
             &["nonexistent_binary_xyz_12345".to_string()],
-            &[],
+            BuildCommand {
+                argv: &[],
+                explicit: false,
+            },
             Duration::from_secs(5),
             dir.path(),
             &mutation,
@@ -668,7 +698,10 @@ mod tests {
 
         let outcome = run_single_mutation(
             &["sleep".to_string(), "10".to_string()],
-            &[],
+            BuildCommand {
+                argv: &[],
+                explicit: false,
+            },
             Duration::from_millis(100),
             dir.path(),
             &mutation,
@@ -694,7 +727,10 @@ mod tests {
                 "-c".to_string(),
                 format!("touch {}", marker.display()),
             ],
-            &["false".to_string()], // build fails
+            BuildCommand {
+                argv: &["false".to_string()], // build fails
+                explicit: true,
+            },
             Duration::from_secs(5),
             dir.path(),
             &mutation,
@@ -715,7 +751,10 @@ mod tests {
         // Build succeeds → test runs and fails → Killed
         let outcome = run_single_mutation(
             &["false".to_string()], // test fails = killed
-            &["true".to_string()],  // build succeeds
+            BuildCommand {
+                argv: &["true".to_string()], // build succeeds
+                explicit: true,
+            },
             Duration::from_secs(5),
             dir.path(),
             &mutation,
@@ -725,6 +764,44 @@ mod tests {
         .await;
 
         assert_eq!(outcome.result, MutationResult::Killed);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn non_explicit_build_command_does_not_pre_filter() {
+        let (dir, _file, mutation) = make_test_setup();
+
+        let build_marker = dir.path().join("build_ran.marker");
+        let test_marker = dir.path().join("test_ran.marker");
+
+        let outcome = run_single_mutation(
+            &[
+                "sh".to_string(),
+                "-c".to_string(),
+                format!("touch {}", test_marker.display()),
+            ],
+            BuildCommand {
+                argv: &[
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    format!("touch {}; exit 1", build_marker.display()),
+                ],
+                explicit: false,
+            },
+            Duration::from_secs(5),
+            dir.path(),
+            &mutation,
+            false,
+            &HashMap::new(),
+        )
+        .await;
+
+        assert_eq!(outcome.result, MutationResult::Survived);
+        assert!(
+            !build_marker.exists(),
+            "non-explicit build command should not run"
+        );
+        assert!(test_marker.exists(), "test command should still run");
     }
 
     #[tokio::test]
@@ -738,7 +815,10 @@ mod tests {
 
         let outcome = run_single_mutation(
             &["true".to_string()],
-            &[],
+            BuildCommand {
+                argv: &[],
+                explicit: false,
+            },
             Duration::from_secs(5),
             dir.path(),
             &mutation,
@@ -757,7 +837,10 @@ mod tests {
 
         let outcome = run_single_mutation(
             &["true".to_string()],
-            &[],
+            BuildCommand {
+                argv: &[],
+                explicit: false,
+            },
             Duration::from_secs(5),
             dir.path(),
             &mutation,
