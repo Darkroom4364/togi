@@ -65,6 +65,14 @@ togi check --dry-run
 # JSON output for CI
 togi check --format json
 
+# Explain a mutation from a JSON report
+togi check --format json > togi-report.json
+togi explain 1 --report togi-report.json
+
+# GitHub annotations or HTML report
+togi check --format github
+togi check --format html
+
 # Mutate all supported files (not just the diff)
 togi check --all
 
@@ -83,8 +91,30 @@ togi check --operators=binary,removal
 # Stop on first test failure per mutation
 togi check --fail-fast
 
+# Use a build check before running tests
+togi check --build-cmd "cargo check"
+
+# Only mutate lines covered by an LCOV file
+togi check --coverage-file coverage/lcov.info
+
+# Fail below a mutation score threshold
+togi check --fail-under 80
+
+# Split mutation work across parallel CI jobs
+togi check --shard 1/4
+
+# Save or compare against a baseline
+togi check --save-baseline
+togi check --check-baseline
+
+# Write a PR comment body to a markdown file
+togi check --pr-comment togi-pr-comment.md
+
 # Show each mutation as it runs
 togi check --verbose
+
+# List all operators and categories
+togi list-operators
 
 # Clear mutation cache
 togi clean
@@ -106,10 +136,11 @@ Create a `togi.toml` for customization:
 command = ["go", "test", "./..."]
 timeout = 30
 jobs = 4
-# build_command = ["cargo", "check"]
+build_command = ["go", "build", "./..."]
 
 [test.languages.python]
 command = ["pytest"]
+timeout = 45
 
 [diff]
 base = "origin/main"
@@ -117,8 +148,10 @@ base = "origin/main"
 [mutations]
 max_per_run = 20
 max_per_file = 20
+coverage_file = "coverage/lcov.info"
 operators = ["-string_to_empty"]
 exclude_paths = ["vendor/**"]
+skip_noisy_files = true
 ```
 
 ## Example: finding real test gaps
@@ -176,7 +209,7 @@ Adding a language is ~5-10 lines via the `define_language!` macro.
 
 ## Mutation operators
 
-togi applies 24 targeted mutation operators:
+togi applies 26 targeted mutation operators:
 
 | Category (--operators name) | Mutations |
 |-----------------------------|-----------|
@@ -185,8 +218,33 @@ togi applies 24 targeted mutation operators:
 | `boundary` | `+` to `-`, `-` to `+` |
 | `removal` | Remove if body, remove else branch, remove call statement, remove assignment |
 | `unary` | Remove `!`, remove unary `-` |
+| `loop` | Remove `break`, remove `continue` |
 | `return` | Replace return value with default |
 | `negate` | Negate condition expression |
+
+Run `togi list-operators` to see the exact operator IDs accepted by `--operators`.
+
+## Explaining mutations
+
+Use JSON output as the handoff format for `togi explain`:
+
+```bash
+togi check --format json > togi-report.json
+togi explain 1 --report togi-report.json
+```
+
+The explanation includes the mutation location, operator, result, before/after values, diff when available, and the recorded test/build command context.
+
+## Baselines
+
+Save a passing mutation baseline and fail later runs only when the score regresses:
+
+```bash
+togi check --save-baseline
+togi check --check-baseline
+```
+
+Baselines are stored in `.togi-baseline`.
 
 ## How it works
 
