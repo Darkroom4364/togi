@@ -1,8 +1,9 @@
 //! Incremental mutation cache.
 //!
-//! Caches mutation test results keyed on (file content hash, mutation
-//! description, test command hash) so unchanged mutations can be skipped
-//! on subsequent runs. Results are stored as JSON files in `.togi-cache/`.
+//! Caches mutation test results keyed on (file content hash, mutation identity,
+//! mutation description, test command hash) so unchanged mutations can be
+//! skipped on subsequent runs. Results are stored as JSON files in
+//! `.togi-cache/`.
 
 use crate::MutationResult;
 use std::fs;
@@ -18,6 +19,8 @@ const CACHE_DIR: &str = ".togi-cache";
 pub struct CacheKey {
     /// Hash of the source file content.
     pub file_content_hash: u64,
+    /// Stable mutation identity, including path/range/operator details.
+    pub mutation_identity: String,
     /// The mutation description string (operator + what changed).
     pub mutation_description: String,
     /// Hash of the test command string.
@@ -26,9 +29,15 @@ pub struct CacheKey {
 
 impl CacheKey {
     /// Build a cache key from raw inputs.
-    pub fn new(file_content: &[u8], mutation_description: &str, test_command: &str) -> Self {
+    pub fn new(
+        file_content: &[u8],
+        mutation_identity: &str,
+        mutation_description: &str,
+        test_command: &str,
+    ) -> Self {
         Self {
             file_content_hash: hash_bytes(file_content),
+            mutation_identity: mutation_identity.to_string(),
             mutation_description: mutation_description.to_string(),
             test_command_hash: hash_str(test_command),
         }
@@ -38,6 +47,7 @@ impl CacheKey {
     fn digest(&self) -> String {
         let mut h = SipHasher::new();
         self.file_content_hash.hash(&mut h);
+        self.mutation_identity.hash(&mut h);
         self.mutation_description.hash(&mut h);
         self.test_command_hash.hash(&mut h);
         format!("{:016x}", h.finish())
@@ -103,7 +113,12 @@ mod tests {
     #[test]
     fn store_and_lookup() {
         let tmp = tempfile::tempdir().expect("create tempdir");
-        let key = CacheKey::new(b"fn main() {}", "replace + with -", "cargo test");
+        let key = CacheKey::new(
+            b"fn main() {}",
+            "src/lib.rs:0..1:plus_to_minus",
+            "replace + with -",
+            "cargo test",
+        );
         store(tmp.path(), &key, MutationResult::Killed);
         assert_eq!(lookup(tmp.path(), &key), Some(MutationResult::Killed));
     }
@@ -111,15 +126,26 @@ mod tests {
     #[test]
     fn lookup_miss_returns_none() {
         let tmp = tempfile::tempdir().expect("create tempdir");
-        let key = CacheKey::new(b"code", "desc", "cmd");
+        let key = CacheKey::new(b"code", "src/lib.rs:0..1:op", "desc", "cmd");
         assert_eq!(lookup(tmp.path(), &key), None);
     }
 
     #[test]
     fn different_content_different_key() {
         let tmp = tempfile::tempdir().expect("create tempdir");
-        let k1 = CacheKey::new(b"v1", "desc", "cmd");
-        let k2 = CacheKey::new(b"v2", "desc", "cmd");
+        let k1 = CacheKey::new(b"v1", "src/lib.rs:0..1:op", "desc", "cmd");
+        let k2 = CacheKey::new(b"v2", "src/lib.rs:0..1:op", "desc", "cmd");
+        store(tmp.path(), &k1, MutationResult::Survived);
+        store(tmp.path(), &k2, MutationResult::Killed);
+        assert_eq!(lookup(tmp.path(), &k1), Some(MutationResult::Survived));
+        assert_eq!(lookup(tmp.path(), &k2), Some(MutationResult::Killed));
+    }
+
+    #[test]
+    fn different_mutation_identity_different_key() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let k1 = CacheKey::new(b"same content", "src/a.rs:0..1:op", "desc", "cmd");
+        let k2 = CacheKey::new(b"same content", "src/b.rs:0..1:op", "desc", "cmd");
         store(tmp.path(), &k1, MutationResult::Survived);
         store(tmp.path(), &k2, MutationResult::Killed);
         assert_eq!(lookup(tmp.path(), &k1), Some(MutationResult::Survived));
@@ -129,7 +155,7 @@ mod tests {
     #[test]
     fn clear_removes_cache() {
         let tmp = tempfile::tempdir().expect("create tempdir");
-        let key = CacheKey::new(b"code", "desc", "cmd");
+        let key = CacheKey::new(b"code", "src/lib.rs:0..1:op", "desc", "cmd");
         store(tmp.path(), &key, MutationResult::Timeout);
         assert!(cache_dir(tmp.path()).exists());
         let _ = clear(tmp.path());
@@ -149,7 +175,12 @@ mod tests {
         .iter()
         .enumerate()
         {
-            let key = CacheKey::new(format!("file{i}").as_bytes(), "desc", "cmd");
+            let key = CacheKey::new(
+                format!("file{i}").as_bytes(),
+                &format!("src/lib.rs:{i}..{}:op", i + 1),
+                "desc",
+                "cmd",
+            );
             store(tmp.path(), &key, *result);
             assert_eq!(lookup(tmp.path(), &key), Some(*result));
         }

@@ -45,10 +45,10 @@ pub struct CommandConfig {
 
 /// Applies mutations, runs checks, restores files, and aggregates results.
 ///
-/// The runner mutates files in the project working tree, so it serializes the
-/// active mutation section to avoid one test command observing another active
-/// mutation. It still honors cancellation, cache lookups, output capture, and
-/// per-language command/timeout selection.
+/// The runner evaluates mutations in isolated workspace copies so whole-project
+/// test commands do not observe another active mutation. It still honors
+/// cancellation, cache lookups, output capture, and per-language command/timeout
+/// selection.
 pub struct TestRunner {
     /// Test/build commands and timeout configuration.
     pub commands: CommandConfig,
@@ -85,20 +85,17 @@ impl Drop for FileGuard {
     }
 }
 
-#[allow(dead_code, reason = "prepared for #155 workspace-isolated execution")]
 pub(crate) struct WorkspaceCopy {
     _tempdir: tempfile::TempDir,
     root: PathBuf,
 }
 
 impl WorkspaceCopy {
-    #[allow(dead_code, reason = "prepared for #155 workspace-isolated execution")]
     pub(crate) fn root(&self) -> &Path {
         &self.root
     }
 }
 
-#[allow(dead_code, reason = "prepared for #155 workspace-isolated execution")]
 pub(crate) fn should_skip_workspace_entry(relative: &Path) -> bool {
     relative
         .components()
@@ -114,7 +111,6 @@ fn should_copy_workspace_entry(project_root: &Path, path: &Path) -> bool {
             .is_ok_and(|relative| !should_skip_workspace_entry(relative))
 }
 
-#[allow(dead_code, reason = "prepared for #155 workspace-isolated execution")]
 pub(crate) fn copy_workspace(project_root: &Path) -> std::io::Result<WorkspaceCopy> {
     let tempdir = tempfile::tempdir()?;
     let root = tempdir.path().join("workspace");
@@ -165,7 +161,6 @@ pub(crate) fn copy_workspace(project_root: &Path) -> std::io::Result<WorkspaceCo
     })
 }
 
-#[allow(dead_code, reason = "prepared for #155 workspace-isolated execution")]
 pub(crate) struct WorkspacePool {
     slots: Arc<Vec<WorkspaceCopy>>,
     semaphore: Arc<Semaphore>,
@@ -173,7 +168,6 @@ pub(crate) struct WorkspacePool {
 }
 
 impl WorkspacePool {
-    #[allow(dead_code, reason = "prepared for #155 workspace-isolated execution")]
     pub(crate) fn new(project_root: &Path, slots: usize) -> std::io::Result<Self> {
         let slots = slots.max(1);
         let mut copies = Vec::with_capacity(slots);
@@ -190,12 +184,11 @@ impl WorkspacePool {
         })
     }
 
-    #[allow(dead_code, reason = "prepared for #155 workspace-isolated execution")]
+    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.slots.len()
     }
 
-    #[allow(dead_code, reason = "prepared for #155 workspace-isolated execution")]
     pub(crate) async fn acquire(&self) -> WorkspaceSlot {
         let permit = self.semaphore.clone().acquire_owned().await.unwrap();
         let index = self
@@ -213,7 +206,6 @@ impl WorkspacePool {
     }
 }
 
-#[allow(dead_code, reason = "prepared for #155 workspace-isolated execution")]
 pub(crate) struct WorkspaceSlot {
     slots: Arc<Vec<WorkspaceCopy>>,
     free_slots: Arc<Mutex<VecDeque<usize>>>,
@@ -222,7 +214,6 @@ pub(crate) struct WorkspaceSlot {
 }
 
 impl WorkspaceSlot {
-    #[allow(dead_code, reason = "prepared for #155 workspace-isolated execution")]
     pub(crate) fn root(&self) -> &Path {
         self.slots[self.index].root()
     }
@@ -243,48 +234,58 @@ impl TestRunner {
         let start = Instant::now();
         let total = mutations.len();
         let counter = Arc::new(AtomicUsize::new(0));
+        let scheduled_counter = Arc::new(AtomicUsize::new(0));
         let tested_counter = Arc::new(AtomicUsize::new(0));
         let verbose = self.verbose;
         let is_tty = std::io::stderr().is_terminal();
 
-        // Group mutations by file to serialize mutations on the same file
-        let mut by_file: HashMap<PathBuf, Vec<Mutation>> = HashMap::new();
-        for m in mutations {
-            by_file.entry(m.file.clone()).or_default().push(m);
-        }
+        let workspace_pool = match WorkspacePool::new(&self.project_root, self.parallelism) {
+            Ok(pool) => Arc::new(pool),
+            Err(e) => {
+                eprintln!("warning: could not create isolated mutation workspaces: {e}");
+                let results = mutations
+                    .into_iter()
+                    .map(|mutation| (mutation, MutationResult::BuildError))
+                    .collect();
+                return self.report_from_results(results, start.elapsed());
+            }
+        };
 
-        let semaphore = Arc::new(Semaphore::new(self.parallelism));
-        // The test command usually exercises the whole working tree. Until
-        // mutations run in isolated worktrees, only one mutation can be active
-        // without contaminating another mutation's result.
-        let mutation_lock = Arc::new(Semaphore::new(1));
+        let mut file_locks: HashMap<PathBuf, Arc<Semaphore>> = HashMap::new();
+        for mutation in &mutations {
+            file_locks
+                .entry(mutation.file.clone())
+                .or_insert_with(|| Arc::new(Semaphore::new(1)));
+        }
+        let file_locks = Arc::new(file_locks);
+
         let project_root = Arc::new(self.project_root.clone());
         let build_command = Arc::new(self.commands.build_command.clone());
         let build_command_explicit = self.commands.build_command_explicit;
         let mut handles = Vec::new();
 
-        for (_file, file_mutations) in by_file {
-            let sem = semaphore.clone();
-            let mutation_lock = mutation_lock.clone();
-            let language = file_mutations
-                .first()
-                .map(|m| m.language.as_str())
-                .unwrap_or("");
+        for mutation in mutations {
+            let workspace_pool = workspace_pool.clone();
             let command = self
                 .commands
                 .language_commands
-                .get(language)
+                .get(mutation.language.as_str())
                 .unwrap_or(&self.commands.command)
                 .clone();
             let timeout = self
                 .commands
                 .language_timeouts
-                .get(language)
+                .get(mutation.language.as_str())
                 .copied()
                 .unwrap_or(self.commands.timeout);
             let project_root = project_root.clone();
             let build_command = build_command.clone();
+            let file_lock = file_locks
+                .get(&mutation.file)
+                .expect("mutation file lock missing")
+                .clone();
             let counter = counter.clone();
+            let scheduled_counter = scheduled_counter.clone();
             let tested_counter = tested_counter.clone();
             let max_tested = self.max_tested;
             let show_output = self.show_output;
@@ -308,124 +309,136 @@ impl TestRunner {
             );
 
             let handle = tokio::spawn(async move {
-                let mut results = Vec::new();
-                for mutation in file_mutations {
-                    // Stop if cancelled (Ctrl+C) or enough mutations have been tested
-                    if cancelled.load(Ordering::Relaxed) {
-                        break;
+                // Stop if cancelled (Ctrl+C) or enough mutations have been tested
+                if cancelled.load(Ordering::Relaxed) {
+                    return None;
+                }
+                if let Some(max) = max_tested {
+                    let reserved = scheduled_counter
+                        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                            (current < max).then_some(current + 1)
+                        })
+                        .is_ok();
+                    if !reserved {
+                        return None;
                     }
-                    if let Some(max) = max_tested
-                        && tested_counter.load(Ordering::Acquire) >= max
-                    {
-                        break;
+                }
+
+                let original_target = ResolvedMutation::new(&project_root, &mutation);
+
+                // Check cache before running
+                let file_content = original_target
+                    .file_path
+                    .as_ref()
+                    .ok()
+                    .and_then(|file_path| std::fs::read(file_path).ok());
+                let cache_key = file_content.as_ref().map(|content| {
+                    CacheKey::new(
+                        content,
+                        &cache_identity(&project_root, &mutation),
+                        &mutation.description,
+                        &cache_ctx,
+                    )
+                });
+                if let Some(ref key) = cache_key
+                    && let Some(cached) = cache::lookup(&project_root, key)
+                {
+                    let result = cached;
+                    if result != MutationResult::BuildError {
+                        tested_counter.fetch_add(1, Ordering::Release);
                     }
-
-                    let resolved_mutation = ResolvedMutation::new(&project_root, &mutation);
-
-                    // Check cache before running
-                    let file_content = resolved_mutation
-                        .file_path
-                        .as_ref()
-                        .ok()
-                        .and_then(|file_path| std::fs::read(file_path).ok());
-                    let cache_key = file_content
-                        .as_ref()
-                        .map(|content| CacheKey::new(content, &mutation.description, &cache_ctx));
-                    if let Some(ref key) = cache_key
-                        && let Some(cached) = cache::lookup(&project_root, key)
-                    {
-                        let result = cached;
-                        if result != MutationResult::BuildError {
-                            tested_counter.fetch_add(1, Ordering::Release);
-                        }
-                        let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                        if verbose {
-                            eprintln!(
-                                "  [{}/{}] \u{21bb} cached  {}:{} \u{2014} {}",
-                                n,
-                                total,
-                                mutation.file.display(),
-                                mutation.line,
-                                mutation.operator
-                            );
-                        } else if is_tty {
-                            eprint!("\r  [{}/{}] testing mutations...", n, total);
-                            let _ = std::io::stderr().flush();
-                        } else if n == total || (total >= 4 && n % (total / 4) == 0) {
-                            eprintln!("  [{}/{}] testing mutations...", n, total);
-                        }
-                        results.push((mutation, result));
-                        continue;
+                    let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                    if verbose {
+                        eprintln!(
+                            "  [{}/{}] \u{21bb} cached  {}:{} \u{2014} {}",
+                            n,
+                            total,
+                            mutation.file.display(),
+                            mutation.line,
+                            mutation.operator
+                        );
+                    } else if is_tty {
+                        eprint!("\r  [{}/{}] testing mutations...", n, total);
+                        let _ = std::io::stderr().flush();
+                    } else if n == total || (total >= 4 && n % (total / 4) == 0) {
+                        eprintln!("  [{}/{}] testing mutations...", n, total);
                     }
+                    return Some((mutation, result));
+                }
 
-                    // Semaphore is never closed, so acquire cannot fail
-                    let _permit = sem.acquire().await.unwrap();
-                    let _mutation_permit = mutation_lock.acquire().await.unwrap();
-                    let outcome = run_single_mutation(
+                let outcome = {
+                    let _file_permit = file_lock.acquire().await.unwrap();
+                    let workspace_slot = workspace_pool.acquire().await;
+                    let workspace_root = workspace_slot.root().to_path_buf();
+                    let workspace_target = ResolvedMutation::new_for_execution(
+                        &project_root,
+                        &workspace_root,
+                        &mutation,
+                    );
+                    run_single_mutation(
                         &command,
                         BuildCommand {
                             argv: &build_command,
                             explicit: build_command_explicit,
                         },
                         timeout,
-                        &project_root,
-                        resolved_mutation,
+                        &workspace_root,
+                        workspace_target,
                         show_output,
                         &env,
                     )
-                    .await;
+                    .await
+                };
 
-                    // Store result in cache
-                    if let Some(ref key) = cache_key {
-                        cache::store(&project_root, key, outcome.result);
-                    }
-
-                    if outcome.result != MutationResult::BuildError {
-                        tested_counter.fetch_add(1, Ordering::Release);
-                    }
-                    let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                    if verbose {
-                        let symbol = match outcome.result {
-                            MutationResult::Killed => "\u{2713} killed",
-                            MutationResult::Survived => "\u{2717} survived",
-                            MutationResult::Timeout => "⧖ timeout",
-                            MutationResult::BuildError => "⚠ build error",
-                        };
-                        eprintln!(
-                            "  [{}/{}] {}  {}:{} \u{2014} {}",
-                            n,
-                            total,
-                            symbol,
-                            mutation.file.display(),
-                            mutation.line,
-                            mutation.operator
-                        );
-                    } else {
-                        if is_tty {
-                            eprint!("\r  [{}/{}] testing mutations...", n, total);
-                            let _ = std::io::stderr().flush();
-                        } else if n == total || (total >= 4 && n % (total / 4) == 0) {
-                            eprintln!("  [{}/{}] testing mutations...", n, total);
-                        }
-                    }
-                    if show_output
-                        && outcome.result == MutationResult::Survived
-                        && let Some(output) = &outcome.test_output
-                    {
-                        eprintln!(
-                            "  ┌─ test output for {}:{} ({})",
-                            mutation.file.display(),
-                            mutation.line,
-                            mutation.operator
-                        );
-                        for line in output.lines() {
-                            eprintln!("  │ {}", line);
-                        }
-                        eprintln!("  └─");
-                    }
-                    results.push((mutation, outcome.result));
+                // Store result in cache
+                if let Some(ref key) = cache_key {
+                    cache::store(&project_root, key, outcome.result);
                 }
-                results
+
+                if outcome.result != MutationResult::BuildError {
+                    tested_counter.fetch_add(1, Ordering::Release);
+                }
+                let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                if verbose {
+                    let symbol = match outcome.result {
+                        MutationResult::Killed => "\u{2713} killed",
+                        MutationResult::Survived => "\u{2717} survived",
+                        MutationResult::Timeout => "⧖ timeout",
+                        MutationResult::BuildError => "⚠ build error",
+                    };
+                    eprintln!(
+                        "  [{}/{}] {}  {}:{} \u{2014} {}",
+                        n,
+                        total,
+                        symbol,
+                        mutation.file.display(),
+                        mutation.line,
+                        mutation.operator
+                    );
+                } else {
+                    if is_tty {
+                        eprint!("\r  [{}/{}] testing mutations...", n, total);
+                        let _ = std::io::stderr().flush();
+                    } else if n == total || (total >= 4 && n % (total / 4) == 0) {
+                        eprintln!("  [{}/{}] testing mutations...", n, total);
+                    }
+                }
+                if show_output
+                    && outcome.result == MutationResult::Survived
+                    && let Some(output) = &outcome.test_output
+                {
+                    eprintln!(
+                        "  ┌─ test output for {}:{} ({})",
+                        mutation.file.display(),
+                        mutation.line,
+                        mutation.operator
+                    );
+                    for line in output.lines() {
+                        eprintln!("  │ {}", line);
+                    }
+                    eprintln!("  └─");
+                }
+                Some((mutation, outcome.result))
             });
             handles.push(handle);
         }
@@ -433,18 +446,25 @@ impl TestRunner {
         let mut all_results = Vec::new();
         for handle in handles {
             match handle.await {
-                Ok(results) => all_results.extend(results),
+                Ok(Some(result)) => all_results.push(result),
+                Ok(None) => {}
                 Err(e) => eprintln!("warning: mutation task panicked: {e}"),
             }
         }
-
         // Clear progress line on TTY
         if !verbose && is_tty {
             eprint!("\r                                        \r");
             let _ = std::io::stderr().flush();
         }
 
-        let duration = start.elapsed();
+        self.report_from_results(all_results, start.elapsed())
+    }
+
+    fn report_from_results(
+        &self,
+        all_results: Vec<(Mutation, MutationResult)>,
+        duration: Duration,
+    ) -> MutationReport {
         let total = all_results.len();
         let killed = all_results
             .iter()
@@ -503,6 +523,44 @@ fn mutation_file_path(project_root: &Path, mutation_file: &Path) -> PathBuf {
     }
 }
 
+fn cache_identity(project_root: &Path, mutation: &Mutation) -> String {
+    format!(
+        "{}:{}..{}:{}:{}=>{}",
+        normalized_cache_path(project_root, &mutation.file),
+        mutation.byte_range.start,
+        mutation.byte_range.end,
+        mutation.operator,
+        mutation.original,
+        mutation.replacement
+    )
+}
+
+fn normalized_cache_path(project_root: &Path, mutation_file: &Path) -> String {
+    let relative = if mutation_file.is_absolute() {
+        mutation_file
+            .canonicalize()
+            .ok()
+            .and_then(|path| {
+                project_root
+                    .canonicalize()
+                    .ok()
+                    .and_then(|root| path.strip_prefix(root).ok().map(PathBuf::from))
+            })
+            .unwrap_or_else(|| mutation_file.to_path_buf())
+    } else {
+        mutation_file.to_path_buf()
+    };
+
+    relative
+        .components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(part) => Some(part.to_string_lossy()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 fn validate_and_resolve_mutation_path(
     project_root: &Path,
     mutation_file: &Path,
@@ -547,6 +605,36 @@ impl<'a> ResolvedMutation<'a> {
         Self {
             mutation,
             file_path: validate_and_resolve_mutation_path(project_root, &mutation.file),
+        }
+    }
+
+    fn new_for_execution(
+        original_root: &Path,
+        execution_root: &Path,
+        mutation: &'a Mutation,
+    ) -> Self {
+        let file_path = if mutation.file.is_absolute() {
+            mutation
+                .file
+                .canonicalize()
+                .ok()
+                .and_then(|canonical| {
+                    original_root
+                        .canonicalize()
+                        .ok()
+                        .and_then(|root| canonical.strip_prefix(root).ok().map(PathBuf::from))
+                })
+                .and_then(|relative| {
+                    validate_and_resolve_mutation_path(execution_root, &relative).ok()
+                })
+                .ok_or(())
+        } else {
+            validate_and_resolve_mutation_path(execution_root, &mutation.file)
+        };
+
+        Self {
+            mutation,
+            file_path,
         }
     }
 }
@@ -791,6 +879,23 @@ mod tests {
         assert_eq!(
             mutation_file_path(root, Path::new("/tmp/src/lib.rs")),
             PathBuf::from("/tmp/src/lib.rs")
+        );
+    }
+
+    #[test]
+    fn cache_identity_normalizes_absolute_and_relative_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let file = root.join("src/lib.rs");
+        std::fs::write(&file, b"hello world").unwrap();
+
+        let relative = make_test_mutation(Path::new("src/lib.rs"));
+        let absolute = make_test_mutation(&file);
+
+        assert_eq!(
+            cache_identity(root, &relative),
+            cache_identity(root, &absolute)
         );
     }
 
@@ -1351,7 +1456,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn mutations_on_different_files_do_not_overlap_in_shared_worktree() {
+    async fn mutations_on_different_files_run_in_isolated_workspaces() {
         let dir = tempfile::tempdir().unwrap();
         let first = dir.path().join("first.txt");
         let second = dir.path().join("second.txt");
@@ -1375,11 +1480,14 @@ mod tests {
             })
             .collect();
 
-        let lock_dir = dir.path().join("whole-tree-command.lock.d");
-        let script = format!(
-            "mkdir {lock} 2>/dev/null || exit 1; rmdir {lock}",
-            lock = lock_dir.display()
-        );
+        let script = r#"first=$(cat first.txt); second=$(cat second.txt)
+if { [ "$first" = "world world" ] && [ "$second" = "hello world" ]; } ||
+   { [ "$first" = "hello world" ] && [ "$second" = "world world" ]; }; then
+  exit 0
+fi
+echo "unexpected workspace contents: first=$first second=$second"
+exit 1"#
+            .to_string();
 
         let runner = TestRunner {
             commands: CommandConfig {
@@ -1403,7 +1511,7 @@ mod tests {
         assert_eq!(report.total, 2);
         assert_eq!(
             report.killed, 0,
-            "different-file mutations overlapped in the shared working tree"
+            "each workspace should contain exactly one active mutation"
         );
         assert_eq!(std::fs::read_to_string(&first).unwrap(), "hello world");
         assert_eq!(std::fs::read_to_string(&second).unwrap(), "hello world");
