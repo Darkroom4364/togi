@@ -18,11 +18,22 @@ pub(crate) const IF_STMT_KINDS: &[&str] = &[
     "if_expr",
     "if", // Ruby
 ];
+pub(crate) const BINARY_EXPR_KINDS: &[&str] = &[
+    "binary_expression",
+    "binary_expr",
+    "comparison_expression",
+    "binary_operator", // Python
+    "binary",          // Ruby
+];
 const RETURN_KINDS: &[&str] = &[
     "return_statement",
     "return_expression",
     "return", // Ruby
 ];
+
+pub(crate) fn is_binary_expr(node: &tree_sitter::Node) -> bool {
+    BINARY_EXPR_KINDS.contains(&node.kind())
+}
 
 /// Negate a condition: remove `!` if present, otherwise wrap with `!(...)`
 pub struct NegateCondition;
