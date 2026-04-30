@@ -152,6 +152,49 @@ fn check_format_json_outputs_valid_json() {
 }
 
 #[test]
+fn explain_reads_json_report() {
+    let dir = TempDir::new().unwrap();
+    let report = r#"{
+  "total": 1,
+  "tested": 1,
+  "killed": 0,
+  "survived": 1,
+  "timeout": 0,
+  "build_errors": 0,
+  "mutation_score": 0.0,
+  "duration_ms": 10,
+  "mutations": [
+    {
+      "id": 1,
+      "file": "src/main.go",
+      "line": 4,
+      "operator": "gt_to_gte",
+      "description": "Replace > with >=",
+      "result": "survived",
+      "original": ">",
+      "replacement": ">=",
+      "diff": "--- a/src/main.go\n+++ b/src/main.go\n@@ -1 +1 @@\n-a > b\n+a >= b\n"
+    }
+  ]
+}"#;
+    let report_path = dir.path().join("togi-report.json");
+    fs::write(&report_path, report).unwrap();
+
+    togi()
+        .args([
+            "explain",
+            "1",
+            "--report",
+            report_path.to_str().expect("report path should be utf-8"),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Mutation #1"))
+        .stdout(predicate::str::contains("src/main.go:4"))
+        .stdout(predicate::str::contains("Why it survived"));
+}
+
+#[test]
 fn check_invalid_config_exits_two() {
     let dir = setup_git_repo();
     fs::write(dir.path().join("togi.toml"), "invalid {{{{ toml").unwrap();

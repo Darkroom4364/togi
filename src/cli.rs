@@ -111,6 +111,15 @@ pub enum Commands {
     Init,
     /// Delete the .togi-cache directory
     Clean,
+    /// Explain a mutation from a JSON report
+    Explain {
+        /// Mutation id from `togi check --format json`
+        mutant_id: u32,
+
+        /// JSON report file produced by `togi check --format json`
+        #[arg(short, long, default_value = "togi-report.json")]
+        report: PathBuf,
+    },
     /// List all available mutation operators
     ListOperators,
 }
