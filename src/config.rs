@@ -468,6 +468,26 @@ max_per_run = 50
     }
 
     #[test]
+    fn example_config_matches_schema() {
+        let content = include_str!("../togi.toml.example");
+        let config: Config = toml::from_str(content).unwrap();
+        assert_eq!(config.test.command, vec!["go", "test", "./..."]);
+        assert!(config.test.build_command.is_empty());
+        assert_eq!(config.test.timeout, 30);
+        assert_eq!(config.test.jobs, 4);
+        assert_eq!(config.test.languages["python"].command, vec!["pytest"]);
+        assert_eq!(config.diff.base, "origin/main");
+        assert_eq!(
+            config.mutations.coverage_file,
+            Some("coverage/lcov.info".into())
+        );
+        assert!(config.mutations.skip_noisy_files);
+        let project = &config.projects["api"];
+        assert_eq!(project.path, PathBuf::from("services/api"));
+        assert_eq!(project.test.as_ref().unwrap().timeout, Some(60));
+    }
+
+    #[test]
     fn defaults_when_empty() {
         let config: Config = toml::from_str("").unwrap();
         // Command is empty sentinel when not explicitly configured

@@ -1,10 +1,105 @@
+# togi.toml -- mutation testing configuration
+#
+# All command values are argv arrays. Keep each shell argument as a separate
+# string so togi does not need to re-split a shell command.
+
 [test]
+# Test command to run for each mutation.
+# Type: array of strings
+# Default: auto-detected from project files, or ["make", "test"] if unknown.
 command = ["go", "test", "./..."]
+
+# Optional build command run before the test command. Uncomment to enable.
+# Mutations that fail this command are reported as build errors.
+# Auto-detected build commands are shown by `togi init`, but they are not used
+# as pre-filters unless build_command is set in togi.toml or via --build-cmd.
+# Type: array of strings
+# Default: []
+# build_command = ["go", "build", "./..."]
+
+# Per-mutation timeout in seconds.
+# Type: integer
+# Default: 30
 timeout = 30
+
+# Maximum number of mutation jobs.
+# The shared working tree is protected so only one mutation is active at a time;
+# this still bounds task scheduling and future isolated execution.
+# Type: integer
+# Default: number of available CPUs
 jobs = 4
 
+[test.languages.python]
+# Override the test command for mutations in one language.
+# Language keys use togi's language names, such as go, rust, python,
+# typescript, java, c, cpp, ruby, and csharp.
+# Type: array of strings
+command = ["pytest"]
+
+# Optional per-language timeout in seconds.
+# Type: integer
+# Default: [test].timeout
+timeout = 45
+
 [diff]
+# Git ref used by `togi check` when collecting changed lines.
+# Type: string
+# Default: "origin/main"
 base = "origin/main"
 
 [mutations]
+# Maximum number of mutations to run across the whole invocation.
+# Type: integer
+# Default: 20
+# 0 means unlimited.
 max_per_run = 20
+
+# Maximum number of mutations generated per source file.
+# Type: integer
+# Default: 20
+# 0 means unlimited.
+max_per_file = 20
+
+# Optional LCOV file. When set, togi only keeps mutations on covered lines.
+# Type: string path
+# Default: unset
+coverage_file = "coverage/lcov.info"
+
+# Glob patterns excluded from mutation collection.
+# Type: array of strings
+# Default: []
+exclude_paths = ["vendor/**", "generated/**"]
+
+# Skip common noisy files such as tests, migrations, seeds, and generated paths.
+# Type: boolean
+# Default: true
+skip_noisy_files = true
+
+# Operator filters. Use category names or operator ids; prefix with "-" to
+# exclude. Categories: binary, literal, boundary, removal, unary, loop, negate,
+# return.
+# Type: array of strings
+# Default: []
+operators = ["binary", "-string_to_empty"]
+
+[projects.api]
+# Optional monorepo project metadata. The longest matching path wins when
+# looking up project config.
+# Type: string path
+path = "services/api"
+
+# Optional language hint for the project.
+# Type: string
+# Default: unset
+language = "go"
+
+[projects.api.test]
+# Optional project-specific test command.
+# Type: array of strings
+# Default: unset
+command = ["go", "test", "./services/api/..."]
+
+# Optional project-specific timeout in seconds.
+# Type: integer
+# Default: unset
+timeout = 60
