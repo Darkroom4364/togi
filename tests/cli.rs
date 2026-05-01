@@ -152,6 +152,15 @@ fn check_format_json_outputs_valid_json() {
 }
 
 #[test]
+fn check_help_lists_test_selection_file_flag() {
+    togi()
+        .args(["check", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--test-selection-file"));
+}
+
+#[test]
 fn explain_reads_json_report() {
     let dir = TempDir::new().unwrap();
     let report = r#"{

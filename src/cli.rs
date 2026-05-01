@@ -69,6 +69,10 @@ pub enum Commands {
         #[arg(long)]
         coverage_file: Option<PathBuf>,
 
+        /// JSON source-line to test-name map for targeted test runs
+        #[arg(long)]
+        test_selection_file: Option<PathBuf>,
+
         /// Override build check command (e.g., 'cargo check')
         #[arg(long)]
         build_cmd: Option<String>,
