@@ -1,5 +1,6 @@
 use anyhow::Context;
 use clap::Parser;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::Arc;
@@ -102,6 +103,12 @@ async fn main() {
                 pr_comment,
             };
             if let Err(e) = run_check(cfg, cancelled).await {
+                eprintln!("Error: {e:#}");
+                process::exit(2);
+            }
+        }
+        togi::cli::Commands::TestMap { path, output } => {
+            if let Err(e) = run_test_map(path, output, &cancelled) {
                 eprintln!("Error: {e:#}");
                 process::exit(2);
             }
@@ -685,6 +692,255 @@ fn parse_test_selection_json(
     Ok(selection)
 }
 
+type TestSelectionJson = BTreeMap<String, BTreeMap<String, Vec<String>>>;
+
+fn run_test_map(
+    path: Option<PathBuf>,
+    output: PathBuf,
+    cancelled: &AtomicBool,
+) -> anyhow::Result<()> {
+    let module_root = match path {
+        Some(path) => path,
+        None => get_project_root()?,
+    }
+    .canonicalize()
+    .context("could not resolve test-map path")?;
+    let repo_root = git_root_for_path(&module_root).unwrap_or_else(|_| module_root.clone());
+    let map = generate_go_test_selection_map(&module_root, &repo_root, cancelled)?;
+    let output_path = if output.is_relative() {
+        module_root.join(output)
+    } else {
+        output
+    };
+
+    if let Some(parent) = output_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("could not create {}", parent.display()))?;
+    }
+    let json = serde_json::to_string_pretty(&map)?;
+    std::fs::write(&output_path, format!("{json}\n"))
+        .with_context(|| format!("could not write {}", output_path.display()))?;
+    println!(
+        "Wrote test selection map for {} source files to {}",
+        map.len(),
+        output_path.display()
+    );
+    Ok(())
+}
+
+fn generate_go_test_selection_map(
+    module_root: &Path,
+    repo_root: &Path,
+    cancelled: &AtomicBool,
+) -> anyhow::Result<TestSelectionJson> {
+    let module_path = go_module_path(module_root)?;
+    let tests = go_test_names(module_root)?;
+    let mut map = TestSelectionJson::new();
+
+    for test in tests {
+        if cancelled.load(Ordering::SeqCst) {
+            anyhow::bail!("interrupted");
+        }
+        let profile = run_go_test_coverage(module_root, &test, cancelled)?;
+        add_go_coverage_to_selection_map(
+            &mut map,
+            repo_root,
+            module_root,
+            &module_path,
+            &profile,
+            &test,
+        )?;
+    }
+
+    Ok(map)
+}
+
+fn git_root_for_path(path: &Path) -> anyhow::Result<PathBuf> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .with_context(|| format!("failed to find git root for {}", path.display()))?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "could not find git root for {}: {}",
+            path.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(PathBuf::from(String::from_utf8(output.stdout)?.trim()))
+}
+
+fn go_module_path(project_root: &Path) -> anyhow::Result<String> {
+    let output = std::process::Command::new("go")
+        .args(["list", "-m"])
+        .current_dir(project_root)
+        .output()
+        .context("failed to run go list -m")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "go list -m failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(String::from_utf8(output.stdout)?.trim().to_string())
+}
+
+fn go_test_names(project_root: &Path) -> anyhow::Result<Vec<String>> {
+    let output = std::process::Command::new("go")
+        .args(["test", "-list", ".", "./..."])
+        .current_dir(project_root)
+        .output()
+        .context("failed to list Go tests")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "go test -list failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    Ok(unique_go_test_names(
+        String::from_utf8(output.stdout)?
+            .lines()
+            .filter(|line| line.starts_with("Test"))
+            .map(str::to_string),
+    ))
+}
+
+fn unique_go_test_names(names: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut unique = Vec::new();
+    for name in names {
+        if seen.insert(name.clone()) {
+            unique.push(name);
+        }
+    }
+    unique
+}
+
+fn run_go_test_coverage(
+    project_root: &Path,
+    test: &str,
+    cancelled: &AtomicBool,
+) -> anyhow::Result<String> {
+    if cancelled.load(Ordering::SeqCst) {
+        anyhow::bail!("interrupted");
+    }
+    let tempdir = tempfile::tempdir()?;
+    let profile_path = tempdir.path().join("coverage.out");
+    let output = std::process::Command::new("go")
+        .arg("test")
+        .arg("./...")
+        .arg("-run")
+        .arg(format!("^{}$", escape_go_regex(test)))
+        .arg("-coverpkg")
+        .arg("./...")
+        .arg("-coverprofile")
+        .arg(&profile_path)
+        .current_dir(project_root)
+        .output()
+        .with_context(|| format!("failed to run Go test {test}"))?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "go test -run {test} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    std::fs::read_to_string(&profile_path)
+        .with_context(|| format!("could not read coverage profile for {test}"))
+}
+
+fn add_go_coverage_to_selection_map(
+    map: &mut TestSelectionJson,
+    repo_root: &Path,
+    module_root: &Path,
+    module_path: &str,
+    profile: &str,
+    test: &str,
+) -> anyhow::Result<()> {
+    for line in profile.lines().skip(1) {
+        let Some((location, fields)) = line.split_once(' ') else {
+            continue;
+        };
+        let fields: Vec<&str> = fields.split_whitespace().collect();
+        if fields.len() < 2 || fields[1] == "0" {
+            continue;
+        }
+
+        let Some((file, range)) = location.rsplit_once(':') else {
+            continue;
+        };
+        let Some((start, end)) = range.split_once(',') else {
+            continue;
+        };
+        let start_line = parse_go_cover_line(start)?;
+        let end_line = parse_go_cover_line(end)?;
+        let file = normalize_go_cover_file(repo_root, module_root, module_path, file);
+
+        for line in start_line..=end_line {
+            let tests = map
+                .entry(file.clone())
+                .or_default()
+                .entry(line.to_string())
+                .or_default();
+            if !tests.iter().any(|existing| existing == test) {
+                tests.push(test.to_string());
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn parse_go_cover_line(position: &str) -> anyhow::Result<usize> {
+    position
+        .split_once('.')
+        .map(|(line, _)| line)
+        .unwrap_or(position)
+        .parse::<usize>()
+        .with_context(|| format!("invalid Go coverage position '{position}'"))
+}
+
+fn normalize_go_cover_file(
+    repo_root: &Path,
+    module_root: &Path,
+    module_path: &str,
+    file: &str,
+) -> String {
+    let module_relative = file
+        .strip_prefix(module_path)
+        .and_then(|path| path.strip_prefix('/'))
+        .unwrap_or(file);
+    let repo_relative = module_root.join(module_relative);
+
+    repo_relative
+        .strip_prefix(repo_root)
+        .unwrap_or(Path::new(module_relative))
+        .components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(part) => Some(part.to_string_lossy()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn escape_go_regex(test: &str) -> String {
+    let mut escaped = String::new();
+    for ch in test.chars() {
+        if matches!(
+            ch,
+            '\\' | '.' | '+' | '*' | '?' | '(' | ')' | '|' | '[' | ']' | '{' | '}' | '^' | '$'
+        ) {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    escaped
+}
+
 fn get_project_root() -> anyhow::Result<PathBuf> {
     let output = std::process::Command::new("git")
         .args(["rev-parse", "--show-toplevel"])
@@ -751,5 +1007,70 @@ mod tests {
         let err = parse_test_selection_json(json, root).unwrap_err();
 
         assert_eq!(err.to_string(), "invalid line number '0' for src/calc.go");
+    }
+
+    #[test]
+    fn normalize_go_cover_file_strips_module_path() {
+        assert_eq!(
+            normalize_go_cover_file(
+                Path::new("/repo/module"),
+                Path::new("/repo/module"),
+                "example.com/calc",
+                "example.com/calc/sub/calc.go"
+            ),
+            "sub/calc.go"
+        );
+    }
+
+    #[test]
+    fn normalize_go_cover_file_returns_repo_relative_path_for_nested_module() {
+        assert_eq!(
+            normalize_go_cover_file(
+                Path::new("/repo"),
+                Path::new("/repo/services/api"),
+                "example.com/api",
+                "example.com/api/pkg/file.go"
+            ),
+            "services/api/pkg/file.go"
+        );
+    }
+
+    #[test]
+    fn unique_go_test_names_preserves_first_seen_order() {
+        let names = vec![
+            "TestAdd".to_string(),
+            "TestMax".to_string(),
+            "TestAdd".to_string(),
+            "TestIsPositive".to_string(),
+        ];
+
+        assert_eq!(
+            unique_go_test_names(names),
+            vec!["TestAdd", "TestMax", "TestIsPositive"]
+        );
+    }
+
+    #[test]
+    fn go_coverage_selection_map_includes_only_covered_lines() {
+        let profile = r#"mode: set
+example.com/calc/calc.go:4.24,6.2 1 1
+example.com/calc/calc.go:9.29,10.11 1 0
+"#;
+        let mut map = TestSelectionJson::new();
+
+        add_go_coverage_to_selection_map(
+            &mut map,
+            Path::new("/repo/module"),
+            Path::new("/repo/module"),
+            "example.com/calc",
+            profile,
+            "TestAdd",
+        )
+        .unwrap();
+
+        let file = map.get("calc.go").unwrap();
+        assert_eq!(file.get("4").unwrap(), &vec!["TestAdd".to_string()]);
+        assert_eq!(file.get("6").unwrap(), &vec!["TestAdd".to_string()]);
+        assert!(!file.contains_key("9"));
     }
 }

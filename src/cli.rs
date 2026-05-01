@@ -111,6 +111,16 @@ pub enum Commands {
         #[arg(long)]
         pr_comment: Option<PathBuf>,
     },
+    /// Generate a source-line to test-name map for targeted test runs
+    TestMap {
+        /// Project root to inspect
+        #[arg(long)]
+        path: Option<PathBuf>,
+
+        /// Output JSON file
+        #[arg(short, long, default_value = "coverage/test-selection.json")]
+        output: PathBuf,
+    },
     /// Generate a togi.toml config template
     Init,
     /// Delete the .togi-cache directory
@@ -160,6 +170,17 @@ mod tests {
                 assert_eq!(shard.as_deref(), Some("1/3"));
             }
             _ => panic!("expected Check command"),
+        }
+    }
+
+    #[test]
+    fn test_map_output_argument_is_accepted() {
+        let cli = Cli::try_parse_from(["togi", "test-map", "--output", "map.json"]).unwrap();
+        match cli.command {
+            Commands::TestMap { output, .. } => {
+                assert_eq!(output, PathBuf::from("map.json"));
+            }
+            _ => panic!("expected TestMap command"),
         }
     }
 
