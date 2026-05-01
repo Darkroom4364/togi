@@ -1,3 +1,4 @@
+use anyhow::Context;
 use clap::Parser;
 use std::path::{Path, PathBuf};
 use std::process;
@@ -21,6 +22,7 @@ struct CheckConfig {
     show_output: bool,
     test_cmd: Option<String>,
     coverage_file: Option<PathBuf>,
+    test_selection_file: Option<PathBuf>,
     build_cmd: Option<String>,
     fail_fast: bool,
     no_skip_defaults: bool,
@@ -64,6 +66,7 @@ async fn main() {
             show_output,
             test_cmd,
             coverage_file,
+            test_selection_file,
             build_cmd,
             fail_fast,
             no_skip_defaults,
@@ -87,6 +90,7 @@ async fn main() {
                 show_output,
                 test_cmd,
                 coverage_file,
+                test_selection_file,
                 build_cmd,
                 fail_fast,
                 no_skip_defaults,
@@ -393,6 +397,9 @@ fn resolve_config(cfg: CheckConfig) -> anyhow::Result<(togi::config::Config, boo
     if let Some(path) = cfg.coverage_file {
         config.mutations.coverage_file = Some(path);
     }
+    if let Some(path) = cfg.test_selection_file {
+        config.mutations.test_selection_file = Some(path);
+    }
     if let Some(cmd) = cfg.build_cmd {
         config.test.build_command =
             shell_words::split(&cmd).map_err(|e| anyhow::anyhow!("bad --build-cmd: {e}"))?;
@@ -592,6 +599,10 @@ async fn execute(
             language_timeouts.insert(lang, Duration::from_secs(t));
         }
     }
+    let test_selection = load_test_selection(
+        config.mutations.test_selection_file.as_deref(),
+        &project_root,
+    );
 
     let runner = togi::runner::TestRunner {
         commands: togi::runner::CommandConfig {
@@ -605,7 +616,7 @@ async fn execute(
             build_command_explicit,
             timeout: Duration::from_secs(config.test.timeout),
             language_timeouts,
-            test_selection: None,
+            test_selection,
         },
         parallelism: config.test.jobs,
         project_root,
@@ -621,6 +632,57 @@ async fn execute(
     };
 
     runner.run(mutations).await
+}
+
+fn load_test_selection(
+    path: Option<&Path>,
+    project_root: &Path,
+) -> Option<togi::runner::TestSelectionConfig> {
+    let path = path?;
+    let resolved_path = if path.is_relative() {
+        project_root.join(path)
+    } else {
+        path.to_path_buf()
+    };
+
+    match std::fs::read_to_string(&resolved_path)
+        .with_context(|| {
+            format!(
+                "could not read test selection file {}",
+                resolved_path.display()
+            )
+        })
+        .and_then(|content| parse_test_selection_json(&content, project_root))
+    {
+        Ok(selection) => Some(selection),
+        Err(e) => {
+            eprintln!("warning: {e:#} — running full test commands");
+            None
+        }
+    }
+}
+
+fn parse_test_selection_json(
+    content: &str,
+    project_root: &Path,
+) -> anyhow::Result<togi::runner::TestSelectionConfig> {
+    let raw: std::collections::HashMap<String, std::collections::HashMap<String, Vec<String>>> =
+        serde_json::from_str(content).context("could not parse test selection JSON")?;
+    let mut selection = togi::runner::TestSelectionConfig::new();
+
+    for (file, lines) in raw {
+        for (line, tests) in lines {
+            let line = line
+                .parse::<usize>()
+                .with_context(|| format!("invalid line number '{line}' for {file}"))?;
+            if line == 0 {
+                anyhow::bail!("invalid line number '0' for {file}");
+            }
+            selection.insert(project_root, Path::new(&file), line, tests);
+        }
+    }
+
+    Ok(selection)
 }
 
 fn get_project_root() -> anyhow::Result<PathBuf> {
@@ -645,4 +707,49 @@ fn get_git_diff(base: &str) -> anyhow::Result<String> {
         );
     }
     Ok(String::from_utf8(output.stdout)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_test_selection_json_accepts_file_line_test_map() {
+        let root = Path::new("/repo");
+        let json = r#"{
+            "src/calc.go": {
+                "12": ["TestAdd", "TestMax"]
+            }
+        }"#;
+
+        assert!(parse_test_selection_json(json, root).is_ok());
+    }
+
+    #[test]
+    fn parse_test_selection_json_rejects_non_numeric_line() {
+        let root = Path::new("/repo");
+        let json = r#"{
+            "src/calc.go": {
+                "line": ["TestAdd"]
+            }
+        }"#;
+
+        let err = parse_test_selection_json(json, root).unwrap_err();
+
+        assert!(err.to_string().contains("invalid line number"));
+    }
+
+    #[test]
+    fn parse_test_selection_json_rejects_zero_line() {
+        let root = Path::new("/repo");
+        let json = r#"{
+            "src/calc.go": {
+                "0": ["TestAdd"]
+            }
+        }"#;
+
+        let err = parse_test_selection_json(json, root).unwrap_err();
+
+        assert_eq!(err.to_string(), "invalid line number '0' for src/calc.go");
+    }
 }

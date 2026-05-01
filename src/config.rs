@@ -65,6 +65,7 @@ pub struct MutationConfig {
     #[serde(default = "default_max_per_run")]
     pub max_per_run: usize,
     pub coverage_file: Option<PathBuf>,
+    pub test_selection_file: Option<PathBuf>,
     #[serde(default = "default_max_per_file")]
     pub max_per_file: usize,
     #[serde(default)]
@@ -263,6 +264,7 @@ impl Default for MutationConfig {
             max_per_run: default_max_per_run(),
             max_per_file: default_max_per_file(),
             coverage_file: None,
+            test_selection_file: None,
             exclude_paths: vec![],
             skip_noisy_files: true,
             operators: vec![],
@@ -481,6 +483,10 @@ max_per_run = 50
             config.mutations.coverage_file,
             Some("coverage/lcov.info".into())
         );
+        assert_eq!(
+            config.mutations.test_selection_file,
+            Some("coverage/test-selection.json".into())
+        );
         assert!(config.mutations.skip_noisy_files);
         let project = &config.projects["api"];
         assert_eq!(project.path, PathBuf::from("services/api"));
@@ -501,6 +507,7 @@ max_per_run = 50
         assert_eq!(config.mutations.max_per_file, 20);
         assert!(config.mutations.operators.is_empty());
         assert!(config.mutations.coverage_file.is_none());
+        assert!(config.mutations.test_selection_file.is_none());
         assert!(config.mutations.exclude_paths.is_empty());
         assert!(config.mutations.skip_noisy_files);
         assert!(config.projects.is_empty());
