@@ -563,6 +563,47 @@ mod tests {
     }
 
     #[test]
+    fn go_if_condition_generates_parent_and_child_mutations() {
+        let tmp = TempDir::new().unwrap();
+        let src = "package main\n\nfunc f(x int) int {\n\tif x > 0 {\n\t\treturn 1\n\t} else {\n\t\treturn 0\n\t}\n}\n";
+        let rel = write_test_file(tmp.path(), "main.go", src);
+
+        let changed = vec![ChangedFile {
+            path: rel,
+            hunks: vec![LineRange { start: 4, end: 4 }],
+        }];
+
+        let mutations = generate_mutations(&changed, tmp.path(), 100, 0, &[]).unwrap();
+        let operators: Vec<&str> = mutations.iter().map(|m| m.operator.as_str()).collect();
+
+        assert!(
+            operators.contains(&"gt_to_gte"),
+            "condition binary mutation should be generated, got: {:?}",
+            operators
+        );
+        assert!(
+            operators.contains(&"zero_to_one"),
+            "condition literal mutation should be generated, got: {:?}",
+            operators
+        );
+        assert!(
+            operators.contains(&"negate_condition"),
+            "parent if condition mutation should be generated, got: {:?}",
+            operators
+        );
+        assert!(
+            operators.contains(&"remove_if_body"),
+            "parent if body mutation should be generated, got: {:?}",
+            operators
+        );
+        assert!(
+            operators.contains(&"remove_else"),
+            "parent if else removal mutation should be generated, got: {:?}",
+            operators
+        );
+    }
+
+    #[test]
     fn skips_unsupported_file_types() {
         let tmp = TempDir::new().unwrap();
         let rel = write_test_file(tmp.path(), "notes.txt", "hello world");
