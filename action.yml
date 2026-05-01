@@ -1,5 +1,5 @@
 name: 'togi - Mutation Testing'
-description: 'Fast, diff-targeted mutation testing for your PRs'
+description: 'Diff-targeted mutation testing for pull requests'
 branding:
   icon: 'shield'
   color: 'orange'
