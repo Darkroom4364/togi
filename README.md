@@ -1,12 +1,26 @@
 # togi
 
-togi (鍛 — Japanese for "sharpening"), hone your tests by finding the mutations they miss.
+[![CI](https://github.com/Darkroom4364/togi/actions/workflows/ci.yml/badge.svg)](https://github.com/Darkroom4364/togi/actions/workflows/ci.yml)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
+[![Rust](https://img.shields.io/badge/rust-1.87%2B-orange.svg)](Cargo.toml)
 
-Fast, diff-targeted mutation testing. Multi-language. No LLM. Runs on every PR in seconds.
+togi (鍛 — Japanese for "sharpening") is a fast, diff-targeted mutation testing engine for pull requests.
+
+It finds the test gaps hidden behind green builds: togi mutates the code you changed, runs the relevant tests, and shows the exact mutants your suite failed to kill.
 
 ## What it does
 
-togi mutates the code you changed and checks if your tests catch it. If a mutation survives (tests still pass), you have a test gap.
+Mutation testing is usually too slow to run on every PR. togi is built for the PR loop:
+
+- **Diff-targeted by default**: mutates changed lines instead of the whole repository
+- **Multi-language**: Go, Rust, Python, TypeScript, Java, C, C++, Ruby, and C#
+- **Single binary**: no service, database, or language-specific plugin stack
+- **Zero config start**: auto-detects common test commands, with `togi init` for explicit config
+- **CI-ready reports**: terminal, JSON, GitHub annotations, HTML, and PR comment markdown
+- **Performance controls**: caching, sharding, fail-fast commands, LCOV filtering, and Go test-selection maps
+- **Guardrails**: build pre-checks, baselines, operator filters, noisy-file skips, and path-safe mutation execution
+
+If a mutation survives, your tests still pass after behavior changed. That is a concrete test gap.
 
 ```
 $ togi check --base HEAD~1
@@ -33,7 +47,7 @@ Good mutation testing tools exist, but each makes trade-offs:
 | mutahunter | Multi (LLM) | Yes | No | No |
 | **togi** | **9 languages** | **By default** | **Yes** | **Yes** |
 
-togi's differentiator: multi-language + diff-targeted by default + single binary + zero config. It mutates only changed lines — 5-15 mutations instead of thousands — and runs them in parallel.
+togi's differentiator: multi-language + diff-targeted by default + single binary + zero config. It mutates only changed lines, keeps reports tied to reviewable code, and has the CI mechanics needed for real repositories: cache identity, baselines, coverage filtering, sharding, GitHub annotations, and machine-readable output.
 
 ## Install
 
@@ -97,6 +111,10 @@ togi check --build-cmd "cargo check"
 # Only mutate lines covered by an LCOV file
 togi check --coverage-file coverage/lcov.info
 
+# Generate and use a Go source-line to test-name map
+togi test-map --path . --output coverage/test-selection.json
+togi check --test-selection-file coverage/test-selection.json
+
 # Fail below a mutation score threshold
 togi check --fail-under 80
 
@@ -149,9 +167,63 @@ base = "origin/main"
 max_per_run = 20
 max_per_file = 20
 coverage_file = "coverage/lcov.info"
+test_selection_file = "coverage/test-selection.json"
 operators = ["-string_to_empty"]
 exclude_paths = ["vendor/**"]
 skip_noisy_files = true
+```
+
+## CI workflows
+
+Use togi as a PR gate, a non-blocking annotation job, or a scheduled deeper scan.
+
+### Fast PR gate
+
+```bash
+togi check --base origin/main --fail-under 80
+```
+
+### GitHub annotations
+
+```bash
+togi check --base origin/main --format github
+```
+
+### PR comment body
+
+```bash
+togi check --base origin/main --pr-comment togi-pr-comment.md
+```
+
+### Parallel CI shards
+
+```bash
+togi check --base origin/main --shard 1/4
+togi check --base origin/main --shard 2/4
+togi check --base origin/main --shard 3/4
+togi check --base origin/main --shard 4/4
+```
+
+### Regression baseline
+
+```bash
+togi check --save-baseline
+togi check --check-baseline
+```
+
+Baselines let existing weak spots stay visible without blocking every PR. New regressions still fail the run.
+
+## Coverage and test selection
+
+For large repos, togi can avoid work before the runner starts:
+
+- `--coverage-file coverage/lcov.info` keeps only mutations on covered lines
+- `togi test-map` generates a Go line-to-test map from per-test coverage
+- `--test-selection-file coverage/test-selection.json` narrows each Go mutant to the tests that cover that line
+
+```bash
+togi test-map --path . --output coverage/test-selection.json
+togi check --coverage-file coverage/lcov.info --test-selection-file coverage/test-selection.json
 ```
 
 ## Example: finding real test gaps
@@ -278,9 +350,9 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: Darkroom4364/togi@v1
-        with:
-          base: origin/main
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo install --git https://github.com/Darkroom4364/togi
+      - run: togi check --base origin/main --format github --fail-under 80
 ```
 
 ## License
