@@ -206,7 +206,7 @@ fn sample_diverse(mutations: Vec<Mutation>, cap: usize) -> Vec<Mutation> {
 mod tests {
     use super::*;
     use crate::languages::go::Go;
-    use crate::test_helpers::{find_node_by_kind, parse_go};
+    use crate::test_helpers::{find_node_by_kind, parse_go, parse_python};
     use crate::{ChangedFile, LineRange};
     use std::path::PathBuf;
     use tempfile::TempDir;
@@ -225,6 +225,15 @@ mod tests {
             operator_id: operator_id.to_string(),
             description: String::new(),
         }
+    }
+
+    fn apply_mutation(source: &str, mutation: &Mutation) -> String {
+        let mut mutated = source.as_bytes().to_vec();
+        mutated.splice(
+            mutation.byte_range.clone(),
+            mutation.replacement.as_bytes().iter().copied(),
+        );
+        String::from_utf8(mutated).unwrap()
     }
 
     #[test]
@@ -336,6 +345,107 @@ mod tests {
             .expect("remove_if_body mutation should be generated");
 
         assert_eq!(m.replacement, "pass");
+    }
+
+    #[test]
+    fn python_boolean_literal_replacements_use_python_syntax() {
+        let tmp = TempDir::new().unwrap();
+        let src = "def check(x):\n    if x > 0:\n        return True\n    return False\n";
+        let rel = write_test_file(tmp.path(), "test.py", src);
+
+        let changed = vec![ChangedFile {
+            path: rel,
+            hunks: vec![LineRange { start: 1, end: 4 }],
+        }];
+
+        let mutations = generate_mutations(
+            &changed,
+            tmp.path(),
+            100,
+            0,
+            &["true_to_false".into(), "false_to_true".into()],
+        )
+        .unwrap();
+
+        assert!(
+            mutations.iter().any(|m| m.operator == "true_to_false"
+                && m.original == "True"
+                && m.replacement == "False"),
+            "expected Python True -> False mutation, got: {mutations:?}"
+        );
+        assert!(
+            mutations.iter().any(|m| m.operator == "false_to_true"
+                && m.original == "False"
+                && m.replacement == "True"),
+            "expected Python False -> True mutation, got: {mutations:?}"
+        );
+
+        for mutation in &mutations {
+            let mutated = apply_mutation(src, mutation);
+            let tree = parse_python(&mutated);
+            assert!(
+                !tree.root_node().has_error(),
+                "mutation should parse as Python:\n{mutated}"
+            );
+        }
+    }
+
+    #[test]
+    fn python_negate_condition_uses_python_syntax() {
+        let tmp = TempDir::new().unwrap();
+        let src = "def check(x):\n    if x > 0:\n        return True\n    return False\n";
+        let rel = write_test_file(tmp.path(), "test.py", src);
+
+        let changed = vec![ChangedFile {
+            path: rel,
+            hunks: vec![LineRange { start: 2, end: 2 }],
+        }];
+
+        let mutations =
+            generate_mutations(&changed, tmp.path(), 100, 0, &["negate_condition".into()]).unwrap();
+        let mutation = mutations
+            .iter()
+            .find(|m| m.operator == "negate_condition")
+            .expect("negate_condition mutation should be generated");
+
+        assert_eq!(mutation.original, "x > 0");
+        assert_eq!(mutation.replacement, "not (x > 0)");
+
+        let mutated = apply_mutation(src, mutation);
+        let tree = parse_python(&mutated);
+        assert!(
+            !tree.root_node().has_error(),
+            "mutation should parse as Python:\n{mutated}"
+        );
+    }
+
+    #[test]
+    fn go_negate_condition_keeps_c_family_syntax() {
+        let tmp = TempDir::new().unwrap();
+        let src = "package main\n\nfunc check(x int) bool {\n\tif x > 0 {\n\t\treturn true\n\t}\n\treturn false\n}\n";
+        let rel = write_test_file(tmp.path(), "main.go", src);
+
+        let changed = vec![ChangedFile {
+            path: rel,
+            hunks: vec![LineRange { start: 4, end: 4 }],
+        }];
+
+        let mutations =
+            generate_mutations(&changed, tmp.path(), 100, 0, &["negate_condition".into()]).unwrap();
+        let mutation = mutations
+            .iter()
+            .find(|m| m.operator == "negate_condition")
+            .expect("negate_condition mutation should be generated");
+
+        assert_eq!(mutation.original, "x > 0");
+        assert_eq!(mutation.replacement, "!(x > 0)");
+
+        let mutated = apply_mutation(src, mutation);
+        let tree = parse_go(&mutated);
+        assert!(
+            !tree.root_node().has_error(),
+            "mutation should parse as Go:\n{mutated}"
+        );
     }
 
     #[test]
