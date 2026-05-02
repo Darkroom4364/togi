@@ -160,6 +160,13 @@ build_command = ["go", "build", "./..."]
 command = ["pytest"]
 timeout = 45
 
+[projects.api]
+path = "services/api"
+
+[projects.api.test]
+command = ["go", "test", "./services/api/..."]
+timeout = 60
+
 [diff]
 base = "origin/main"
 
@@ -172,6 +179,10 @@ operators = ["-string_to_empty"]
 exclude_paths = ["vendor/**"]
 skip_noisy_files = true
 ```
+
+Test command precedence is: CLI `--test-cmd` / `--timeout`, matching
+`[projects.*.test]` by longest path prefix, matching `[test.languages.*]`,
+then the global `[test]` command.
 
 ## CI workflows
 

@@ -35,6 +35,15 @@ struct CheckConfig {
     pr_comment: Option<PathBuf>,
 }
 
+struct ExecuteOptions {
+    verbose: bool,
+    show_output: bool,
+    build_command_explicit: bool,
+    force_default_command: bool,
+    force_default_timeout: bool,
+    cancelled: Arc<AtomicBool>,
+}
+
 #[tokio::main]
 async fn main() {
     let cancelled = Arc::new(AtomicBool::new(false));
@@ -269,7 +278,8 @@ async fn run_check(cfg: CheckConfig, cancelled: Arc<AtomicBool>) -> anyhow::Resu
     let check_baseline = cfg.check_baseline;
     let pr_comment = cfg.pr_comment.clone();
 
-    let (mut config, fail_fast, has_explicit_build_cmd) = resolve_config(cfg)?;
+    let (mut config, fail_fast, has_explicit_build_cmd, has_custom_test_cmd, has_cli_timeout) =
+        resolve_config(cfg)?;
     let project_root = get_project_root()?;
     let _lock = togi::lock::acquire(&project_root)?;
 
@@ -323,10 +333,14 @@ async fn run_check(cfg: CheckConfig, cancelled: Arc<AtomicBool>) -> anyhow::Resu
         mutations,
         config,
         project_root,
-        verbose,
-        show_output,
-        has_explicit_build_cmd,
-        cancelled,
+        ExecuteOptions {
+            verbose,
+            show_output,
+            build_command_explicit: has_explicit_build_cmd,
+            force_default_command: has_custom_test_cmd,
+            force_default_timeout: has_custom_test_cmd || has_cli_timeout,
+            cancelled,
+        },
     )
     .await;
 
@@ -383,10 +397,13 @@ async fn run_check(cfg: CheckConfig, cancelled: Arc<AtomicBool>) -> anyhow::Resu
     Ok(())
 }
 
-fn resolve_config(cfg: CheckConfig) -> anyhow::Result<(togi::config::Config, bool, bool)> {
+fn resolve_config(
+    cfg: CheckConfig,
+) -> anyhow::Result<(togi::config::Config, bool, bool, bool, bool)> {
     let mut config = togi::config::Config::load(cfg.config_path.as_deref())?;
     let has_custom_test_cmd = cfg.test_cmd.is_some();
     let has_cli_build_cmd = cfg.build_cmd.is_some();
+    let has_cli_timeout = cfg.timeout.is_some();
 
     if let Some(b) = cfg.base {
         config.diff.base = b;
@@ -421,7 +438,13 @@ fn resolve_config(cfg: CheckConfig) -> anyhow::Result<(togi::config::Config, boo
 
     let has_explicit_build_cmd = has_cli_build_cmd || !config.test.build_command.is_empty();
     let fail_fast = cfg.fail_fast && !has_custom_test_cmd;
-    Ok((config, fail_fast, has_explicit_build_cmd))
+    Ok((
+        config,
+        fail_fast,
+        has_explicit_build_cmd,
+        has_custom_test_cmd,
+        has_cli_timeout,
+    ))
 }
 
 /// Parse a shard spec like "1/4" into (k, n) where k is 1-indexed.
@@ -591,10 +614,7 @@ async fn execute(
     mutations: Vec<Mutation>,
     config: togi::config::Config,
     project_root: PathBuf,
-    verbose: bool,
-    show_output: bool,
-    build_command_explicit: bool,
-    cancelled: Arc<AtomicBool>,
+    options: ExecuteOptions,
 ) -> MutationReport {
     let mut language_commands: std::collections::HashMap<String, Vec<String>> =
         std::collections::HashMap::new();
@@ -606,6 +626,21 @@ async fn execute(
             language_timeouts.insert(lang, Duration::from_secs(t));
         }
     }
+    let project_commands = config
+        .projects
+        .into_values()
+        .map(|project| {
+            let (command, timeout) = project
+                .test
+                .map(|test| (test.command, test.timeout))
+                .unwrap_or((None, None));
+            togi::runner::ProjectCommandConfig {
+                path: project.path,
+                command,
+                timeout: timeout.map(Duration::from_secs),
+            }
+        })
+        .collect();
     let test_selection = load_test_selection(
         config.mutations.test_selection_file.as_deref(),
         &project_root,
@@ -614,28 +649,31 @@ async fn execute(
     let runner = togi::runner::TestRunner {
         commands: togi::runner::CommandConfig {
             command: config.test.command,
+            force_default_command: options.force_default_command,
+            force_default_timeout: options.force_default_timeout,
+            project_commands,
             language_commands,
-            build_command: if build_command_explicit {
+            build_command: if options.build_command_explicit {
                 config.test.build_command
             } else {
                 vec![]
             },
-            build_command_explicit,
+            build_command_explicit: options.build_command_explicit,
             timeout: Duration::from_secs(config.test.timeout),
             language_timeouts,
             test_selection,
         },
         parallelism: config.test.jobs,
         project_root,
-        verbose,
-        show_output,
+        verbose: options.verbose,
+        show_output: options.show_output,
         max_tested: if config.mutations.max_per_run == 0 {
             None
         } else {
             Some(config.mutations.max_per_run)
         },
         env: std::collections::HashMap::new(),
-        cancelled,
+        cancelled: options.cancelled,
     };
 
     runner.run(mutations).await

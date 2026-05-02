@@ -94,6 +94,9 @@ async fn end_to_end_go_fixture_all_killed_with_cache_off() {
     let runner = togi::runner::TestRunner {
         commands: togi::runner::CommandConfig {
             command: vec!["go".into(), "test".into(), "./...".into()],
+            force_default_command: false,
+            force_default_timeout: false,
+            project_commands: vec![],
             language_commands: std::collections::HashMap::new(),
             build_command: vec![],
             build_command_explicit: false,
