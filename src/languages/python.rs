@@ -131,6 +131,21 @@ mod tests {
     }
 
     #[test]
+    fn return_empty_boolean_replacement_uses_python_false_literal() {
+        let py = Python;
+        let mut candidate = MutationCandidate {
+            byte_range: 0..4,
+            replacement: "false".to_string(),
+            operator_id: "return_empty".to_string(),
+            description: String::new(),
+        };
+
+        py.fixup_replacement(&mut candidate);
+
+        assert_eq!(candidate.replacement, "False");
+    }
+
+    #[test]
     fn condition_negation_uses_python_syntax() {
         let py = Python;
         let mut candidate = MutationCandidate {
