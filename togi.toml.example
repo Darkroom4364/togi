@@ -80,6 +80,13 @@ exclude_paths = ["vendor/**", "generated/**"]
 # Default: true
 skip_noisy_files = true
 
+# Respect `.ignore`, `.gitignore`, git excludes, and global gitignore when
+# creating temporary mutation workspaces. Built-in excludes for VCS metadata,
+# togi internals, dependency directories, and build outputs always apply.
+# Type: boolean
+# Default: true
+respect_workspace_ignores = true
+
 # Operator filters. Use category names or operator ids; prefix with "-" to
 # exclude. Categories: binary, literal, boundary, removal, unary, loop, negate,
 # return.

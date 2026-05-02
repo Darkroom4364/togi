@@ -72,6 +72,8 @@ pub struct MutationConfig {
     pub exclude_paths: Vec<String>,
     #[serde(default = "default_true")]
     pub skip_noisy_files: bool,
+    #[serde(default = "default_true")]
+    pub respect_workspace_ignores: bool,
     #[serde(default)]
     pub operators: Vec<String>,
 }
@@ -267,6 +269,7 @@ impl Default for MutationConfig {
             test_selection_file: None,
             exclude_paths: vec![],
             skip_noisy_files: true,
+            respect_workspace_ignores: true,
             operators: vec![],
         }
     }
@@ -421,7 +424,8 @@ impl Config {
              \n\
              [mutations]\n\
              max_per_run = 20\n\
-             # max_per_file = 20  # cap mutations per source file (0 = unlimited)\n",
+             # max_per_file = 20  # cap mutations per source file (0 = unlimited)\n\
+             # respect_workspace_ignores = true  # honor .ignore/.gitignore in mutation workspaces\n",
         );
 
         std::fs::write(path, template)?;
@@ -488,6 +492,7 @@ max_per_run = 50
             Some("coverage/test-selection.json".into())
         );
         assert!(config.mutations.skip_noisy_files);
+        assert!(config.mutations.respect_workspace_ignores);
         let project = &config.projects["api"];
         assert_eq!(project.path, PathBuf::from("services/api"));
         assert_eq!(project.test.as_ref().unwrap().timeout, Some(60));
@@ -510,6 +515,7 @@ max_per_run = 50
         assert!(config.mutations.test_selection_file.is_none());
         assert!(config.mutations.exclude_paths.is_empty());
         assert!(config.mutations.skip_noisy_files);
+        assert!(config.mutations.respect_workspace_ignores);
         assert!(config.projects.is_empty());
     }
 
@@ -874,6 +880,7 @@ language = "go"
 [mutations]
 exclude_paths = ["vendor/**", "*.generated.ts"]
 skip_noisy_files = false
+respect_workspace_ignores = false
 "#;
         let config: Config = toml::from_str(toml_str).unwrap();
         assert_eq!(
@@ -881,6 +888,7 @@ skip_noisy_files = false
             vec!["vendor/**", "*.generated.ts"]
         );
         assert!(!config.mutations.skip_noisy_files);
+        assert!(!config.mutations.respect_workspace_ignores);
     }
 
     #[test]
