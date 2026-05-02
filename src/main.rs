@@ -338,7 +338,7 @@ async fn run_check(cfg: CheckConfig, cancelled: Arc<AtomicBool>) -> anyhow::Resu
             show_output,
             build_command_explicit: has_explicit_build_cmd,
             force_default_command: has_custom_test_cmd,
-            force_default_timeout: has_custom_test_cmd || has_cli_timeout,
+            force_default_timeout: has_cli_timeout,
             cancelled,
         },
     )

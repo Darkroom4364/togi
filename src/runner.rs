@@ -153,13 +153,10 @@ fn select_test_command(
     commands: &CommandConfig,
     mutation: &Mutation,
 ) -> SelectedTestCommand {
-    let project = if commands.force_default_command {
-        None
-    } else {
-        matching_project_command(project_root, commands, mutation)
-    };
+    let project_info = matching_project_command(project_root, commands, mutation);
 
-    let mut argv = project
+    let mut argv = project_info
+        .filter(|_| !commands.force_default_command)
         .and_then(|project| project.command.as_ref())
         .or_else(|| {
             (!commands.force_default_command)
@@ -180,7 +177,7 @@ fn select_test_command(
         timeout: if commands.force_default_timeout {
             commands.timeout
         } else {
-            project
+            project_info
                 .and_then(|project| project.timeout)
                 .or_else(|| {
                     commands
@@ -1179,12 +1176,11 @@ mod tests {
     }
 
     #[test]
-    fn select_test_command_cli_override_ignores_project_and_language() {
+    fn select_test_command_cli_override_keeps_project_timeout() {
         let mut commands = test_command_config();
         commands.command = vec!["make".into(), "ci".into()];
         commands.timeout = Duration::from_secs(30);
         commands.force_default_command = true;
-        commands.force_default_timeout = true;
         commands.language_commands.insert(
             "go".into(),
             vec!["go".into(), "test".into(), "./...".into()],
@@ -1207,7 +1203,7 @@ mod tests {
         let selected = select_test_command(Path::new("/repo"), &commands, &mutation);
 
         assert_eq!(selected.argv, vec!["make", "ci"]);
-        assert_eq!(selected.timeout, Duration::from_secs(30));
+        assert_eq!(selected.timeout, Duration::from_secs(9));
     }
 
     #[test]
