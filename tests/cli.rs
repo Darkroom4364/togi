@@ -160,6 +160,104 @@ fn check_format_json_outputs_valid_json() {
     assert!(value.get("mutations").is_some());
 }
 
+fn write_baseline(dir: &Path, killed: usize, total: usize) {
+    fs::write(
+        dir.join(".togi-baseline"),
+        format!(
+            r#"{{
+  "files": {{
+    "main.go": {{
+      "killed": {killed},
+      "total": {total}
+    }}
+  }},
+  "killed": {killed},
+  "total": {total}
+}}"#
+        ),
+    )
+    .unwrap();
+}
+
+#[test]
+fn check_baseline_allows_existing_survivors() {
+    let dir = setup_git_repo();
+    write_baseline(dir.path(), 0, 1);
+
+    let output = togi()
+        .args([
+            "check",
+            "--base",
+            "HEAD",
+            "--format",
+            "json",
+            "--test-cmd",
+            "true",
+            "--check-baseline",
+        ])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "baseline check failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|e| {
+        panic!(
+            "invalid JSON output: {e}\nstdout: {}",
+            String::from_utf8_lossy(&output.stdout)
+        )
+    });
+    assert!(value["survived"].as_u64().unwrap() > 0);
+}
+
+#[test]
+fn check_baseline_fails_on_regression() {
+    let dir = setup_git_repo();
+    write_baseline(dir.path(), 1, 1);
+
+    togi()
+        .args([
+            "check",
+            "--base",
+            "HEAD",
+            "--test-cmd",
+            "true",
+            "--check-baseline",
+        ])
+        .current_dir(dir.path())
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains(
+            "Mutation score regression detected",
+        ));
+}
+
+#[test]
+fn check_baseline_still_honors_fail_under() {
+    let dir = setup_git_repo();
+    write_baseline(dir.path(), 0, 1);
+
+    togi()
+        .args([
+            "check",
+            "--base",
+            "HEAD",
+            "--test-cmd",
+            "true",
+            "--check-baseline",
+            "--fail-under",
+            "1",
+        ])
+        .current_dir(dir.path())
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("below --fail-under threshold"));
+}
+
 #[test]
 fn check_help_lists_test_selection_file_flag() {
     togi()

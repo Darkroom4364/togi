@@ -389,7 +389,7 @@ async fn run_check(cfg: CheckConfig, cancelled: Arc<AtomicBool>) -> anyhow::Resu
             drop(_lock);
             process::exit(1);
         }
-    } else if report.survived > 0 {
+    } else if report.survived > 0 && !check_baseline {
         drop(_lock);
         process::exit(1);
     }
