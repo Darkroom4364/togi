@@ -20,6 +20,7 @@ pub mod typescript;
 ///   operator_field: "operator"
 ///   skip_subtree_kinds: []
 ///   filter_candidate: function path
+///   condition_negation: function path
 macro_rules! define_language {
     (
         $struct:ident,
@@ -34,6 +35,7 @@ macro_rules! define_language {
         $(, operator_field: $op:expr)?
         $(, skip_subtree_kinds: [$($sk:expr),* $(,)?])?
         $(, filter_candidate: $filter:expr)?
+        $(, condition_negation: $negation:expr)?
         $(, empty_block_replacement: $ebr:expr)?
         $(,)?
     ) => {
@@ -64,6 +66,7 @@ macro_rules! define_language {
             fn skip_subtree_kinds(&self) -> &[&str] {
                 $crate::languages::define_language!(@arr [$($($sk),*)?] ; [])
             }
+            $crate::languages::define_language!(@negation $($negation)?);
             $crate::languages::define_language!(@filter $($filter)?);
             $crate::languages::define_language!(@fixup $($ebr)?);
         }
@@ -86,9 +89,17 @@ macro_rules! define_language {
         }
     };
     (@filter) => {};
+    // Helper: override condition negation formatting if condition_negation is set
+    (@negation $negation:expr) => {
+        fn negate_condition_replacement(&self, condition: &str) -> String {
+            $negation(condition)
+        }
+    };
+    (@negation) => {};
     // Helper: override fixup_replacement if empty_block_replacement is set
     (@fixup $replacement:expr) => {
         fn fixup_replacement(&self, candidate: &mut $crate::MutationCandidate) {
+            $crate::languages::fixup_language_replacement(self, candidate);
             if candidate.operator_id == "remove_if_body" && candidate.replacement == "{}" {
                 candidate.replacement = $replacement.to_string();
             }
@@ -164,6 +175,39 @@ pub(crate) fn should_skip_string_to_empty_in_compiled_context(node: &tree_sitter
     false
 }
 
+pub(crate) fn fixup_language_replacement<L: LanguageSupport + ?Sized>(
+    lang: &L,
+    candidate: &mut crate::MutationCandidate,
+) {
+    match candidate.operator_id.as_str() {
+        "true_to_false" => {
+            if let Some(literal) = lang.boolean_false_literals().first() {
+                candidate.replacement = (*literal).to_string();
+            }
+        }
+        "false_to_true" => {
+            if let Some(literal) = lang.boolean_true_literals().first() {
+                candidate.replacement = (*literal).to_string();
+            }
+        }
+        "return_empty" if candidate.replacement == "false" => {
+            if let Some(literal) = lang.boolean_false_literals().first() {
+                candidate.replacement = (*literal).to_string();
+            }
+        }
+        "negate_condition" => {
+            if let Some(condition) = candidate
+                .replacement
+                .strip_prefix("!(")
+                .and_then(|s| s.strip_suffix(')'))
+            {
+                candidate.replacement = lang.negate_condition_replacement(condition);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Describes how to parse and mutate one supported language.
 ///
 /// The mutator uses this trait to choose the tree-sitter grammar, identify
@@ -197,6 +241,11 @@ pub trait LanguageSupport: Send + Sync {
     /// Tree-sitter field name used to find operators when available.
     fn operator_field(&self) -> &str;
 
+    /// Format a replacement that negates an unnegated condition expression.
+    fn negate_condition_replacement(&self, condition: &str) -> String {
+        format!("!({condition})")
+    }
+
     /// AST node kinds that should suppress mutation of any descendant.
     /// Nodes whose ancestor matches any of these kinds will be skipped.
     fn skip_subtree_kinds(&self) -> &[&str] {
@@ -221,7 +270,9 @@ pub trait LanguageSupport: Send + Sync {
 
     /// Adjust a mutation candidate's replacement for language-specific syntax.
     /// For example, Python replaces `{}` (empty block) with `pass`.
-    fn fixup_replacement(&self, _candidate: &mut crate::MutationCandidate) {}
+    fn fixup_replacement(&self, candidate: &mut crate::MutationCandidate) {
+        fixup_language_replacement(self, candidate);
+    }
 }
 
 /// Returns instances of all supported languages.

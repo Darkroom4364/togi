@@ -6,8 +6,13 @@ crate::languages::define_language!(
     binary_expression: "binary_operator",
     bool_true: ["True"],
     bool_false: ["False"],
+    condition_negation: python_negation,
     empty_block_replacement: "pass",
 );
+
+fn python_negation(condition: &str) -> String {
+    format!("not ({condition})")
+}
 
 #[cfg(test)]
 mod tests {
@@ -100,6 +105,44 @@ mod tests {
         py.fixup_replacement(&mut candidate);
 
         assert_eq!(candidate.replacement, "pass");
+    }
+
+    #[test]
+    fn boolean_replacements_use_python_literals() {
+        let py = Python;
+        let mut true_to_false = MutationCandidate {
+            byte_range: 0..4,
+            replacement: "false".to_string(),
+            operator_id: "true_to_false".to_string(),
+            description: String::new(),
+        };
+        let mut false_to_true = MutationCandidate {
+            byte_range: 0..5,
+            replacement: "true".to_string(),
+            operator_id: "false_to_true".to_string(),
+            description: String::new(),
+        };
+
+        py.fixup_replacement(&mut true_to_false);
+        py.fixup_replacement(&mut false_to_true);
+
+        assert_eq!(true_to_false.replacement, "False");
+        assert_eq!(false_to_true.replacement, "True");
+    }
+
+    #[test]
+    fn condition_negation_uses_python_syntax() {
+        let py = Python;
+        let mut candidate = MutationCandidate {
+            byte_range: 0..5,
+            replacement: "!(x > 0)".to_string(),
+            operator_id: "negate_condition".to_string(),
+            description: String::new(),
+        };
+
+        py.fixup_replacement(&mut candidate);
+
+        assert_eq!(candidate.replacement, "not (x > 0)");
     }
 
     #[test]
