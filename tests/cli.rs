@@ -12,7 +12,8 @@ fn bash_available() -> bool {
     std::process::Command::new("bash")
         .arg("--version")
         .output()
-        .is_ok()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
 }
 
 /// Set up a minimal git repo with a Go file and a diff to test against.
