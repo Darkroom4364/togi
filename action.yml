@@ -48,9 +48,10 @@ runs:
 
     - name: Run togi
       shell: bash
+      env:
+        TOGI_BASE: ${{ inputs.base }}
+        TOGI_TIMEOUT: ${{ inputs.timeout }}
+        TOGI_FORMAT: ${{ inputs.format }}
+        TOGI_TEST_CMD: ${{ inputs.test-cmd }}
       run: |
-        ARGS="check --base ${{ inputs.base }} --timeout ${{ inputs.timeout }} --format ${{ inputs.format }}"
-        if [ -n "${{ inputs.test-cmd }}" ]; then
-          ARGS="$ARGS --test-cmd '${{ inputs.test-cmd }}'"
-        fi
-        togi $ARGS
+        bash "${{ github.action_path }}/.github/scripts/run-togi.sh"

@@ -1,10 +1,18 @@
 use assert_cmd::Command;
 use predicates::prelude::*;
 use std::fs;
+use std::path::Path;
 use tempfile::TempDir;
 
 fn togi() -> Command {
     Command::cargo_bin("togi").unwrap()
+}
+
+fn bash_available() -> bool {
+    std::process::Command::new("bash")
+        .arg("--version")
+        .output()
+        .is_ok()
 }
 
 /// Set up a minimal git repo with a Go file and a diff to test against.
@@ -158,6 +166,63 @@ fn check_help_lists_test_selection_file_flag() {
         .assert()
         .success()
         .stdout(predicate::str::contains("--test-selection-file"));
+}
+
+#[test]
+fn github_action_run_helper_preserves_multiword_test_cmd() {
+    if !bash_available() {
+        eprintln!("skipping action helper test because bash is unavailable");
+        return;
+    }
+
+    assert_action_helper_test_cmd("go test ./...");
+    assert_action_helper_test_cmd("cargo test --workspace --all-features");
+}
+
+fn assert_action_helper_test_cmd(test_cmd: &str) {
+    let dir = TempDir::new().unwrap();
+    let fake_togi = dir.path().join("fake-togi.sh");
+    fs::write(&fake_togi, "#!/usr/bin/env bash\nprintf '<%s>\\n' \"$@\"\n").unwrap();
+    std::process::Command::new("bash")
+        .args(["-c", "chmod +x \"$1\"", "--"])
+        .arg(&fake_togi)
+        .output()
+        .unwrap();
+
+    let helper = Path::new(env!("CARGO_MANIFEST_DIR")).join(".github/scripts/run-togi.sh");
+    let output = std::process::Command::new("bash")
+        .arg(helper)
+        .env("TOGI_BIN", &fake_togi)
+        .env("TOGI_BASE", "HEAD~1")
+        .env("TOGI_TIMEOUT", "45")
+        .env("TOGI_FORMAT", "json")
+        .env("TOGI_TEST_CMD", test_cmd)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "helper failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let args: Vec<String> = stdout.lines().map(String::from).collect();
+    assert_eq!(
+        args,
+        vec![
+            "<check>".to_string(),
+            "<--base>".to_string(),
+            "<HEAD~1>".to_string(),
+            "<--timeout>".to_string(),
+            "<45>".to_string(),
+            "<--format>".to_string(),
+            "<json>".to_string(),
+            "<--test-cmd>".to_string(),
+            format!("<{test_cmd}>"),
+        ]
+    );
 }
 
 #[test]
