@@ -130,7 +130,9 @@ async fn end_to_end_go_fixture_all_killed_with_cache_off() {
     }
 
     // With GOCACHE=off, all mutations are killed because Go recompiles fresh.
-    assert_eq!(report.total, 14);
+    // Parent-level mutation mapping intentionally adds if-body, condition, and
+    // return mutations alongside expression/literal mutations.
+    assert_eq!(report.total, 26);
     assert_eq!(report.killed, report.total);
     assert_eq!(report.build_errors, 0);
 }

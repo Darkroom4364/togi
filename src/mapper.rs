@@ -47,12 +47,15 @@ const MUTABLE_NODE_KINDS: &[&str] = &[
     "next",                // Ruby
 ];
 
-/// Find the deepest mutation-relevant AST nodes that overlap changed lines.
+/// Find mutation-relevant AST nodes that overlap changed lines.
 ///
 /// The mapper walks the parsed tree, ignores nodes outside the diff hunks, and
 /// lets the language implementation skip imports, tests, macros, or other
-/// subtrees. Returned nodes are candidates for operator application; individual
-/// operator candidates may still be filtered later by the mutator.
+/// subtrees. Nodes whose own start line is changed are retained even when they
+/// contain mutable children, so statement/control-flow operators can run
+/// alongside expression/literal operators. Returned nodes are candidates for
+/// operator application; individual operator candidates may still be filtered
+/// later by the mutator.
 pub fn find_mutable_nodes<'a>(
     tree: &'a tree_sitter::Tree,
     source: &'a [u8],
@@ -65,8 +68,8 @@ pub fn find_mutable_nodes<'a>(
     nodes
 }
 
-/// Recursively walk the tree, collecting the deepest mutation-relevant nodes
-/// that overlap with changed lines.
+/// Recursively walk the tree, collecting mutation-relevant nodes that overlap
+/// with changed lines.
 /// Returns `true` if a skipped subtree was encountered, preventing the parent
 /// from being added as a fallback mutable node.
 fn collect_mutable_nodes<'a>(
@@ -108,12 +111,20 @@ fn collect_mutable_nodes<'a>(
         }
     }
 
-    // Only add this node if no relevant children were found, no children were
-    // skipped, and it's a mutable kind
-    if !found_child && !skipped_child && node.is_named() && is_mutable_kind(node.kind()) {
+    // Add this node if it is directly on a changed line, even when it has
+    // mutable children. That lets parent-level operators (if body removal,
+    // condition negation, return replacement, assignment removal) run alongside
+    // expression/literal operators. Keep the old deepest-node fallback for
+    // mutable descendants that overlap changed ranges through their span.
+    let starts_on_changed_line = overlaps(node_start, node_start, changed_lines);
+    if !skipped_child
+        && node.is_named()
+        && is_mutable_kind(node.kind())
+        && (starts_on_changed_line || !found_child)
+    {
         results.push(node);
     }
-    false
+    skipped_child
 }
 
 /// Check if a node's line range overlaps with any changed line range.
@@ -229,8 +240,21 @@ mod tests {
 
         assert!(!nodes.is_empty());
         let kinds: Vec<&str> = nodes.iter().map(|n| n.kind()).collect();
-        // Should find mutable nodes inside the if condition (deepest wins)
-        assert_eq!(kinds, vec!["int_literal"]);
+        assert!(
+            kinds.contains(&"if_statement"),
+            "Should include parent if_statement for parent-level operators, got: {:?}",
+            kinds
+        );
+        assert!(
+            kinds.contains(&"binary_expression"),
+            "Should include condition binary_expression, got: {:?}",
+            kinds
+        );
+        assert!(
+            kinds.contains(&"int_literal"),
+            "Should include condition literal mutation, got: {:?}",
+            kinds
+        );
     }
 
     #[test]
@@ -267,8 +291,16 @@ mod tests {
 
         assert!(!nodes.is_empty());
         let kinds: Vec<&str> = nodes.iter().map(|n| n.kind()).collect();
-        // Deepest mutable node inside `return 42` is the int_literal
-        assert_eq!(kinds, vec!["int_literal"]);
+        assert!(
+            kinds.contains(&"return_statement"),
+            "Should include parent return_statement for return_empty, got: {:?}",
+            kinds
+        );
+        assert!(
+            kinds.contains(&"int_literal"),
+            "Should include return value literal mutation, got: {:?}",
+            kinds
+        );
     }
 
     #[test]
@@ -282,8 +314,21 @@ mod tests {
 
         assert!(!nodes.is_empty());
         let kinds: Vec<&str> = nodes.iter().map(|n| n.kind()).collect();
-        // Deepest mutable node inside `x = x + 2` is the int_literal
-        assert_eq!(kinds, vec!["int_literal"]);
+        assert!(
+            kinds.contains(&"assignment_statement"),
+            "Should include parent assignment_statement for removal operators, got: {:?}",
+            kinds
+        );
+        assert!(
+            kinds.contains(&"binary_expression"),
+            "Should include assignment value binary_expression, got: {:?}",
+            kinds
+        );
+        assert!(
+            kinds.contains(&"int_literal"),
+            "Should include assignment value literal mutation, got: {:?}",
+            kinds
+        );
     }
 
     #[test]
@@ -298,9 +343,32 @@ mod tests {
 
         assert!(!nodes.is_empty());
         let kinds: Vec<&str> = nodes.iter().map(|n| n.kind()).collect();
-        // Should find deepest mutable nodes, not the outer if
-        assert!(kinds.contains(&"binary_expression"));
-        assert!(kinds.contains(&"int_literal"));
+        assert!(
+            kinds.contains(&"if_statement"),
+            "Should include changed inner if_statement, got: {:?}",
+            kinds
+        );
+        assert!(
+            kinds.contains(&"binary_expression"),
+            "Should include changed inner binary_expression, got: {:?}",
+            kinds
+        );
+        assert!(
+            kinds.contains(&"int_literal"),
+            "Should include changed inner int_literal, got: {:?}",
+            kinds
+        );
+        assert!(
+            nodes
+                .iter()
+                .filter(|node| node.kind() == "if_statement")
+                .all(|node| ts_row_to_line(node.start_position().row) >= 5),
+            "Should not include outer if_statement whose start line did not change, got: {:?}",
+            nodes
+                .iter()
+                .map(|node| (node.kind(), ts_row_to_line(node.start_position().row)))
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -367,7 +435,16 @@ mod tests {
 
         assert!(!nodes.is_empty());
         let kinds: Vec<&str> = nodes.iter().map(|n| n.kind()).collect();
-        assert_eq!(kinds, vec!["binary_expression"]);
+        assert!(
+            kinds.contains(&"return_expression"),
+            "Should include parent return_expression for return_empty, got: {:?}",
+            kinds
+        );
+        assert!(
+            kinds.contains(&"binary_expression"),
+            "Should include returned binary_expression, got: {:?}",
+            kinds
+        );
     }
 
     #[test]
