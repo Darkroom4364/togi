@@ -178,6 +178,7 @@ test_selection_file = "coverage/test-selection.json"
 operators = ["-string_to_empty"]
 exclude_paths = ["vendor/**"]
 skip_noisy_files = true
+respect_workspace_ignores = true
 ```
 
 Test command precedence is: CLI `--test-cmd` / `--timeout`, matching
@@ -328,6 +329,15 @@ togi check --check-baseline
 ```
 
 Baselines are stored in `.togi-baseline`.
+
+## Workspace copies
+
+togi runs mutations in temporary workspace copies so parallel jobs do not observe
+each other's edits. These copies respect project ignore rules from `.ignore` and
+`.gitignore`, while always excluding VCS metadata, togi internals, and common
+dependency/build directories such as `node_modules`, `.venv`, `dist`, `build`,
+and `target`. Set `[mutations] respect_workspace_ignores = false` only when a
+test command genuinely needs ignored files copied into the mutation workspace.
 
 ## How it works
 

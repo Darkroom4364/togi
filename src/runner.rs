@@ -112,6 +112,8 @@ pub struct TestRunner {
     pub show_output: bool,
     /// Optional cap on how many non-build-error mutations are tested.
     pub max_tested: Option<usize>,
+    /// Whether workspace copies should honor `.ignore`/`.gitignore` rules.
+    pub respect_workspace_ignores: bool,
     /// Extra environment variables passed to every spawned command.
     pub env: HashMap<String, String>,
     /// Set to true externally (e.g. Ctrl+C handler) to stop spawning new mutations.
@@ -298,11 +300,24 @@ impl WorkspaceCopy {
 }
 
 pub(crate) fn should_skip_workspace_entry(relative: &Path) -> bool {
-    relative
-        .components()
-        .next()
-        .and_then(|component| component.as_os_str().to_str())
-        .is_some_and(|name| matches!(name, ".git" | ".togi" | "target"))
+    relative.components().any(|component| {
+        component.as_os_str().to_str().is_some_and(|name| {
+            matches!(
+                name,
+                ".git"
+                    | ".togi"
+                    | ".togi-cache"
+                    | ".togi.lock"
+                    | ".codex"
+                    | ".claude"
+                    | "target"
+                    | "node_modules"
+                    | ".venv"
+                    | "dist"
+                    | "build"
+            )
+        })
+    })
 }
 
 fn should_copy_workspace_entry(project_root: &Path, path: &Path) -> bool {
@@ -313,23 +328,31 @@ fn should_copy_workspace_entry(project_root: &Path, path: &Path) -> bool {
 }
 
 pub(crate) fn copy_workspace(project_root: &Path) -> std::io::Result<WorkspaceCopy> {
+    copy_workspace_with_options(project_root, true)
+}
+
+fn copy_workspace_with_options(
+    project_root: &Path,
+    respect_ignores: bool,
+) -> std::io::Result<WorkspaceCopy> {
     let tempdir = tempfile::tempdir()?;
     let root = tempdir.path().join("workspace");
     fs::create_dir(&root)?;
     let project_root_for_filter = project_root.to_path_buf();
 
-    for entry in ignore::WalkBuilder::new(project_root)
+    let mut builder = ignore::WalkBuilder::new(project_root);
+    builder
         .hidden(false)
-        .ignore(false)
-        .git_ignore(false)
-        .git_exclude(false)
-        .git_global(false)
-        .parents(false)
+        .ignore(respect_ignores)
+        .git_ignore(respect_ignores)
+        .git_exclude(respect_ignores)
+        .git_global(respect_ignores)
+        .parents(respect_ignores)
         .filter_entry(move |entry| {
             should_copy_workspace_entry(&project_root_for_filter, entry.path())
-        })
-        .build()
-    {
+        });
+
+    for entry in builder.build() {
         let entry = match entry {
             Ok(entry) => entry,
             Err(err) => {
@@ -370,10 +393,23 @@ pub(crate) struct WorkspacePool {
 
 impl WorkspacePool {
     pub(crate) fn new(project_root: &Path, slots: usize) -> std::io::Result<Self> {
+        Self::new_with_options(project_root, slots, true)
+    }
+
+    fn new_with_options(
+        project_root: &Path,
+        slots: usize,
+        respect_ignores: bool,
+    ) -> std::io::Result<Self> {
         let slots = slots.max(1);
         let mut copies = Vec::with_capacity(slots);
         for _ in 0..slots {
-            copies.push(copy_workspace(project_root)?);
+            let copy = if respect_ignores {
+                copy_workspace(project_root)?
+            } else {
+                copy_workspace_with_options(project_root, false)?
+            };
+            copies.push(copy);
         }
 
         let free_slots = (0..slots).collect();
@@ -440,7 +476,12 @@ impl TestRunner {
         let verbose = self.verbose;
         let is_tty = std::io::stderr().is_terminal();
 
-        let workspace_pool = match WorkspacePool::new(&self.project_root, self.parallelism) {
+        let workspace_pool_result = if self.respect_workspace_ignores {
+            WorkspacePool::new(&self.project_root, self.parallelism)
+        } else {
+            WorkspacePool::new_with_options(&self.project_root, self.parallelism, false)
+        };
+        let workspace_pool = match workspace_pool_result {
             Ok(pool) => Arc::new(pool),
             Err(e) => {
                 eprintln!("warning: could not create isolated mutation workspaces: {e}");
@@ -1416,15 +1457,43 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("node_modules/pkg")).unwrap();
+        std::fs::create_dir_all(root.join(".venv")).unwrap();
+        std::fs::create_dir_all(root.join("dist")).unwrap();
+        std::fs::create_dir_all(root.join("build")).unwrap();
+        std::fs::create_dir_all(root.join("services/api/src")).unwrap();
+        std::fs::create_dir_all(root.join("services/api/node_modules/pkg")).unwrap();
+        std::fs::create_dir_all(root.join("services/api/build")).unwrap();
         std::fs::create_dir_all(root.join("target/debug")).unwrap();
         std::fs::create_dir_all(root.join(".git/objects")).unwrap();
         std::fs::create_dir_all(root.join(".togi")).unwrap();
+        std::fs::create_dir_all(root.join(".togi-cache")).unwrap();
+        std::fs::create_dir_all(root.join(".codex")).unwrap();
+        std::fs::create_dir_all(root.join(".claude")).unwrap();
         std::fs::write(root.join("Cargo.toml"), b"[package]\n").unwrap();
-        std::fs::write(root.join(".ignore"), b"src/lib.rs\n").unwrap();
+        std::fs::write(root.join(".ignore"), b"src/ignored_by_ignore.rs\n").unwrap();
+        std::fs::write(root.join(".gitignore"), b"ignored-by-gitignore.txt\n").unwrap();
         std::fs::write(root.join("src/lib.rs"), b"pub fn f() {}\n").unwrap();
+        std::fs::write(
+            root.join("src/ignored_by_ignore.rs"),
+            b"pub fn ignored() {}\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("ignored-by-gitignore.txt"), b"skip").unwrap();
+        std::fs::write(root.join("node_modules/pkg/index.js"), b"skip").unwrap();
+        std::fs::write(root.join(".venv/pyvenv.cfg"), b"skip").unwrap();
+        std::fs::write(root.join("dist/bundle.js"), b"skip").unwrap();
+        std::fs::write(root.join("build/artifact"), b"skip").unwrap();
+        std::fs::write(root.join("services/api/src/lib.rs"), b"pub fn api() {}\n").unwrap();
+        std::fs::write(root.join("services/api/node_modules/pkg/index.js"), b"skip").unwrap();
+        std::fs::write(root.join("services/api/build/artifact"), b"skip").unwrap();
         std::fs::write(root.join("target/debug/build-artifact"), b"skip").unwrap();
         std::fs::write(root.join(".git/HEAD"), b"skip").unwrap();
         std::fs::write(root.join(".togi/cache"), b"skip").unwrap();
+        std::fs::write(root.join(".togi-cache/cache-entry"), b"skip").unwrap();
+        std::fs::write(root.join(".togi.lock"), b"skip").unwrap();
+        std::fs::write(root.join(".codex/session"), b"skip").unwrap();
+        std::fs::write(root.join(".claude/session"), b"skip").unwrap();
 
         let copy = copy_workspace(root).unwrap();
 
@@ -1433,9 +1502,43 @@ mod tests {
             b"pub fn f() {}\n"
         );
         assert!(copy.root().join("Cargo.toml").exists());
+        assert!(!copy.root().join("src/ignored_by_ignore.rs").exists());
+        assert!(!copy.root().join("ignored-by-gitignore.txt").exists());
+        assert!(!copy.root().join("node_modules").exists());
+        assert!(!copy.root().join(".venv").exists());
+        assert!(!copy.root().join("dist").exists());
+        assert!(!copy.root().join("build").exists());
+        assert!(copy.root().join("services/api/src/lib.rs").exists());
+        assert!(!copy.root().join("services/api/node_modules").exists());
+        assert!(!copy.root().join("services/api/build").exists());
         assert!(!copy.root().join("target").exists());
         assert!(!copy.root().join(".git").exists());
         assert!(!copy.root().join(".togi").exists());
+        assert!(!copy.root().join(".togi-cache").exists());
+        assert!(!copy.root().join(".togi.lock").exists());
+        assert!(!copy.root().join(".codex").exists());
+        assert!(!copy.root().join(".claude").exists());
+    }
+
+    #[test]
+    fn copy_workspace_can_include_ignored_files_when_requested() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("target/debug")).unwrap();
+        std::fs::write(root.join(".gitignore"), b"ignored.txt\n").unwrap();
+        std::fs::write(root.join("ignored.txt"), b"copy me").unwrap();
+        std::fs::write(root.join("src/lib.rs"), b"pub fn f() {}\n").unwrap();
+        std::fs::write(root.join("target/debug/build-artifact"), b"skip").unwrap();
+
+        let copy = copy_workspace_with_options(root, false).unwrap();
+
+        assert_eq!(
+            std::fs::read(copy.root().join("ignored.txt")).unwrap(),
+            b"copy me"
+        );
+        assert!(copy.root().join("src/lib.rs").exists());
+        assert!(!copy.root().join("target").exists());
     }
 
     #[tokio::test]
@@ -1805,6 +1908,7 @@ mod tests {
             verbose: false,
             show_output: false,
             max_tested: Some(2),
+            respect_workspace_ignores: true,
             env: HashMap::new(),
             cancelled: Arc::new(AtomicBool::new(false)),
         };
@@ -1850,6 +1954,7 @@ mod tests {
             verbose: false,
             show_output: false,
             max_tested: None,
+            respect_workspace_ignores: true,
             env: HashMap::new(),
             cancelled: Arc::new(AtomicBool::new(false)),
         };
@@ -1892,6 +1997,7 @@ mod tests {
             verbose: false,
             show_output: false,
             max_tested: None,
+            respect_workspace_ignores: true,
             env: HashMap::new(),
             cancelled: Arc::new(AtomicBool::new(false)),
         };
@@ -1959,6 +2065,7 @@ while [ "$(find "{barrier}" -type f | wc -l)" -lt 4 ]; do sleep 0.1; done"#,
             verbose: false,
             show_output: false,
             max_tested: None,
+            respect_workspace_ignores: true,
             env: HashMap::new(),
             cancelled: Arc::new(AtomicBool::new(false)),
         };
@@ -2034,6 +2141,7 @@ exit 1"#
             verbose: false,
             show_output: false,
             max_tested: None,
+            respect_workspace_ignores: true,
             env: HashMap::new(),
             cancelled: Arc::new(AtomicBool::new(false)),
         };
@@ -2088,6 +2196,7 @@ exit 1"#
             verbose: false,
             show_output: false,
             max_tested: None,
+            respect_workspace_ignores: true,
             env: HashMap::new(),
             cancelled: Arc::new(AtomicBool::new(false)),
         };

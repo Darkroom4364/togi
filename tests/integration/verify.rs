@@ -68,6 +68,7 @@ async fn verify_mutation_outcomes_match_independent_replay() {
         verbose: false,
         show_output: false,
         max_tested: None,
+        respect_workspace_ignores: true,
         env: go_env.clone(),
         cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };

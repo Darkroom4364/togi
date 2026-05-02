@@ -672,6 +672,7 @@ async fn execute(
         } else {
             Some(config.mutations.max_per_run)
         },
+        respect_workspace_ignores: config.mutations.respect_workspace_ignores,
         env: std::collections::HashMap::new(),
         cancelled: options.cancelled,
     };

@@ -109,6 +109,7 @@ async fn end_to_end_go_fixture_all_killed_with_cache_off() {
         verbose: false,
         show_output: false,
         max_tested: None,
+        respect_workspace_ignores: true,
         env: go_env,
         cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
