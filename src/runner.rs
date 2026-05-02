@@ -24,13 +24,20 @@ fn atomic_write(path: &Path, data: &[u8]) -> std::io::Result<()> {
 
 /// Commands and timeouts used while evaluating mutations.
 ///
-/// `command` is the default test command. `language_commands` and
-/// `language_timeouts` override it for mutations generated from a specific
-/// language. `build_command`, when explicitly enabled by the CLI/config, runs
-/// before tests to classify uncompilable mutations as build errors.
+/// `command` is the default test command. Project and language commands can
+/// override it for matching mutations unless `force_default_command` is set
+/// by a CLI command override. `build_command`, when explicitly enabled by the
+/// CLI/config, runs before tests to classify uncompilable mutations as build
+/// errors.
 pub struct CommandConfig {
     /// Default test command, stored as argv.
     pub command: Vec<String>,
+    /// True when the default command came from a CLI override and must win.
+    pub force_default_command: bool,
+    /// True when the default timeout came from a CLI override and must win.
+    pub force_default_timeout: bool,
+    /// Per-project test command and timeout overrides, longest path wins.
+    pub project_commands: Vec<ProjectCommandConfig>,
     /// Per-language test command overrides keyed by `LanguageSupport::name()`.
     pub language_commands: HashMap<String, Vec<String>>,
     /// Optional build-check command, stored as argv.
@@ -43,6 +50,13 @@ pub struct CommandConfig {
     pub language_timeouts: HashMap<String, Duration>,
     /// Optional source-line to test-name map used to narrow test commands.
     pub test_selection: Option<TestSelectionConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectCommandConfig {
+    pub path: PathBuf,
+    pub command: Option<Vec<String>>,
+    pub timeout: Option<Duration>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -139,9 +153,16 @@ fn select_test_command(
     commands: &CommandConfig,
     mutation: &Mutation,
 ) -> SelectedTestCommand {
-    let mut argv = commands
-        .language_commands
-        .get(mutation.language.as_str())
+    let project_info = matching_project_command(project_root, commands, mutation);
+
+    let mut argv = project_info
+        .filter(|_| !commands.force_default_command)
+        .and_then(|project| project.command.as_ref())
+        .or_else(|| {
+            (!commands.force_default_command)
+                .then(|| commands.language_commands.get(mutation.language.as_str()))
+                .flatten()
+        })
         .unwrap_or(&commands.command)
         .clone();
 
@@ -153,12 +174,52 @@ fn select_test_command(
 
     SelectedTestCommand {
         argv,
-        timeout: commands
-            .language_timeouts
-            .get(mutation.language.as_str())
-            .copied()
-            .unwrap_or(commands.timeout),
+        timeout: if commands.force_default_timeout {
+            commands.timeout
+        } else {
+            project_info
+                .and_then(|project| project.timeout)
+                .or_else(|| {
+                    commands
+                        .language_timeouts
+                        .get(mutation.language.as_str())
+                        .copied()
+                })
+                .unwrap_or(commands.timeout)
+        },
     }
+}
+
+fn matching_project_command<'a>(
+    project_root: &Path,
+    commands: &'a CommandConfig,
+    mutation: &Mutation,
+) -> Option<&'a ProjectCommandConfig> {
+    let mutation_path = normalized_cache_path(project_root, &mutation.file);
+    let mutation_parts: Vec<&str> = mutation_path
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect();
+
+    commands
+        .project_commands
+        .iter()
+        .filter_map(|project| {
+            let project_path = normalized_cache_path(project_root, &project.path);
+            let project_parts: Vec<&str> = project_path
+                .split('/')
+                .filter(|part| !part.is_empty())
+                .collect();
+            (!project_parts.is_empty()
+                && project_parts.len() <= mutation_parts.len()
+                && mutation_parts
+                    .iter()
+                    .zip(&project_parts)
+                    .all(|(mutation, project)| mutation == project))
+            .then_some((project_parts.len(), project))
+        })
+        .max_by_key(|(len, _)| *len)
+        .map(|(_, project)| project)
 }
 
 fn narrow_go_test_command(mut argv: Vec<String>, tests: &[String]) -> Vec<String> {
@@ -591,7 +652,9 @@ impl TestRunner {
         MutationReport {
             results: all_results,
             duration,
-            test_command: if self.commands.language_commands.is_empty() {
+            test_command: if self.commands.language_commands.is_empty()
+                && self.commands.project_commands.is_empty()
+            {
                 Some(self.commands.command.clone())
             } else {
                 None
@@ -976,6 +1039,9 @@ mod tests {
     fn test_command_config() -> CommandConfig {
         CommandConfig {
             command: vec!["cargo".into(), "test".into()],
+            force_default_command: false,
+            force_default_timeout: false,
+            project_commands: vec![],
             language_commands: HashMap::new(),
             build_command: vec![],
             build_command_explicit: false,
@@ -1013,6 +1079,157 @@ mod tests {
 
         assert_eq!(selected.argv, vec!["go", "test", "./..."]);
         assert_eq!(selected.timeout, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn select_test_command_uses_project_command_and_timeout() {
+        let mut commands = test_command_config();
+        commands.project_commands.push(ProjectCommandConfig {
+            path: PathBuf::from("services/api"),
+            command: Some(vec![
+                "cargo".into(),
+                "test".into(),
+                "-p".into(),
+                "api".into(),
+            ]),
+            timeout: Some(Duration::from_secs(12)),
+        });
+        let mutation = make_test_mutation(Path::new("services/api/src/lib.rs"));
+
+        let selected = select_test_command(Path::new("/repo"), &commands, &mutation);
+
+        assert_eq!(selected.argv, vec!["cargo", "test", "-p", "api"]);
+        assert_eq!(selected.timeout, Duration::from_secs(12));
+    }
+
+    #[test]
+    fn select_test_command_project_longest_prefix_wins() {
+        let mut commands = test_command_config();
+        commands.project_commands.push(ProjectCommandConfig {
+            path: PathBuf::from("services"),
+            command: Some(vec!["make".into(), "test-services".into()]),
+            timeout: Some(Duration::from_secs(10)),
+        });
+        commands.project_commands.push(ProjectCommandConfig {
+            path: PathBuf::from("services/api"),
+            command: Some(vec!["make".into(), "test-api".into()]),
+            timeout: Some(Duration::from_secs(20)),
+        });
+        let mutation = make_test_mutation(Path::new("services/api/src/lib.rs"));
+
+        let selected = select_test_command(Path::new("/repo"), &commands, &mutation);
+
+        assert_eq!(selected.argv, vec!["make", "test-api"]);
+        assert_eq!(selected.timeout, Duration::from_secs(20));
+    }
+
+    #[test]
+    fn select_test_command_project_overrides_language() {
+        let mut commands = test_command_config();
+        commands.language_commands.insert(
+            "go".into(),
+            vec!["go".into(), "test".into(), "./...".into()],
+        );
+        commands
+            .language_timeouts
+            .insert("go".into(), Duration::from_secs(5));
+        commands.project_commands.push(ProjectCommandConfig {
+            path: PathBuf::from("services/api"),
+            command: Some(vec![
+                "go".into(),
+                "test".into(),
+                "./services/api/...".into(),
+            ]),
+            timeout: Some(Duration::from_secs(9)),
+        });
+        let mut mutation = make_test_mutation(Path::new("services/api/calc.go"));
+        mutation.language = "go".into();
+
+        let selected = select_test_command(Path::new("/repo"), &commands, &mutation);
+
+        assert_eq!(selected.argv, vec!["go", "test", "./services/api/..."]);
+        assert_eq!(selected.timeout, Duration::from_secs(9));
+    }
+
+    #[test]
+    fn select_test_command_project_timeout_can_override_language_command() {
+        let mut commands = test_command_config();
+        commands.language_commands.insert(
+            "go".into(),
+            vec!["go".into(), "test".into(), "./...".into()],
+        );
+        commands
+            .language_timeouts
+            .insert("go".into(), Duration::from_secs(5));
+        commands.project_commands.push(ProjectCommandConfig {
+            path: PathBuf::from("services/api"),
+            command: None,
+            timeout: Some(Duration::from_secs(11)),
+        });
+        let mut mutation = make_test_mutation(Path::new("services/api/calc.go"));
+        mutation.language = "go".into();
+
+        let selected = select_test_command(Path::new("/repo"), &commands, &mutation);
+
+        assert_eq!(selected.argv, vec!["go", "test", "./..."]);
+        assert_eq!(selected.timeout, Duration::from_secs(11));
+    }
+
+    #[test]
+    fn select_test_command_cli_override_keeps_project_timeout() {
+        let mut commands = test_command_config();
+        commands.command = vec!["make".into(), "ci".into()];
+        commands.timeout = Duration::from_secs(30);
+        commands.force_default_command = true;
+        commands.language_commands.insert(
+            "go".into(),
+            vec!["go".into(), "test".into(), "./...".into()],
+        );
+        commands
+            .language_timeouts
+            .insert("go".into(), Duration::from_secs(5));
+        commands.project_commands.push(ProjectCommandConfig {
+            path: PathBuf::from("services/api"),
+            command: Some(vec![
+                "go".into(),
+                "test".into(),
+                "./services/api/...".into(),
+            ]),
+            timeout: Some(Duration::from_secs(9)),
+        });
+        let mut mutation = make_test_mutation(Path::new("services/api/calc.go"));
+        mutation.language = "go".into();
+
+        let selected = select_test_command(Path::new("/repo"), &commands, &mutation);
+
+        assert_eq!(selected.argv, vec!["make", "ci"]);
+        assert_eq!(selected.timeout, Duration::from_secs(9));
+    }
+
+    #[test]
+    fn select_test_command_cli_timeout_overrides_project_and_language_timeout() {
+        let mut commands = test_command_config();
+        commands.timeout = Duration::from_secs(30);
+        commands.force_default_timeout = true;
+        commands
+            .language_timeouts
+            .insert("go".into(), Duration::from_secs(5));
+        commands.project_commands.push(ProjectCommandConfig {
+            path: PathBuf::from("services/api"),
+            command: Some(vec![
+                "go".into(),
+                "test".into(),
+                "./services/api/...".into(),
+            ]),
+            timeout: Some(Duration::from_secs(9)),
+        });
+        let mut mutation = make_test_mutation(Path::new("services/api/calc.go"));
+        mutation.language = "go".into();
+
+        let selected = select_test_command(Path::new("/repo"), &commands, &mutation);
+
+        assert_eq!(selected.argv, vec!["go", "test", "./services/api/..."]);
+        assert_eq!(selected.timeout, Duration::from_secs(30));
     }
 
     #[test]
@@ -1573,6 +1790,9 @@ mod tests {
         let runner = TestRunner {
             commands: CommandConfig {
                 command: vec!["true".into()],
+                force_default_command: false,
+                force_default_timeout: false,
+                project_commands: vec![],
                 language_commands: HashMap::new(),
                 build_command: vec![],
                 build_command_explicit: false,
@@ -1615,6 +1835,9 @@ mod tests {
         let runner = TestRunner {
             commands: CommandConfig {
                 command: vec!["true".into()],
+                force_default_command: false,
+                force_default_timeout: false,
+                project_commands: vec![],
                 language_commands: lang_cmds,
                 build_command: vec![],
                 build_command_explicit: false,
@@ -1654,6 +1877,9 @@ mod tests {
         let runner = TestRunner {
             commands: CommandConfig {
                 command: vec!["true".into()], // default would survive
+                force_default_command: false,
+                force_default_timeout: false,
+                project_commands: vec![],
                 language_commands: lang_cmds,
                 build_command: vec![],
                 build_command_explicit: false,
@@ -1718,6 +1944,9 @@ while [ "$(find "{barrier}" -type f | wc -l)" -lt 4 ]; do sleep 0.1; done"#,
         let runner = TestRunner {
             commands: CommandConfig {
                 command: vec!["sh".into(), "-c".into(), script],
+                force_default_command: false,
+                force_default_timeout: false,
+                project_commands: vec![],
                 language_commands: HashMap::new(),
                 build_command: vec![],
                 build_command_explicit: false,
@@ -1790,6 +2019,9 @@ exit 1"#
         let runner = TestRunner {
             commands: CommandConfig {
                 command: vec!["sh".into(), "-c".into(), script],
+                force_default_command: false,
+                force_default_timeout: false,
+                project_commands: vec![],
                 language_commands: HashMap::new(),
                 build_command: vec![],
                 build_command_explicit: false,
@@ -1841,6 +2073,9 @@ exit 1"#
         let runner = TestRunner {
             commands: CommandConfig {
                 command: vec!["sleep".into(), "1".into()],
+                force_default_command: false,
+                force_default_timeout: false,
+                project_commands: vec![],
                 language_commands: HashMap::new(),
                 build_command: vec![],
                 build_command_explicit: false,

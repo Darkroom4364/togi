@@ -89,11 +89,13 @@ operators = ["binary", "-string_to_empty"]
 
 [projects.api]
 # Optional monorepo project metadata. The longest matching path wins when
-# looking up project config.
+# looking up project config. Project test config takes precedence over
+# per-language and global test config unless --test-cmd/--timeout are used.
 # Type: string path
 path = "services/api"
 
-# Optional language hint for the project.
+# Optional language hint for the project. Source files are still parsed by
+# extension; this is metadata for humans and future tooling.
 # Type: string
 # Default: unset
 language = "go"
