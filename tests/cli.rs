@@ -133,6 +133,28 @@ fn check_dry_run_lists_mutations() {
 }
 
 #[test]
+fn check_warns_when_fail_fast_is_ignored_for_custom_test_cmd() {
+    let dir = setup_git_repo();
+
+    togi()
+        .args([
+            "check",
+            "--base",
+            "HEAD",
+            "--dry-run",
+            "--test-cmd",
+            "true",
+            "--fail-fast",
+        ])
+        .current_dir(dir.path())
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "--fail-fast is ignored when --test-cmd is set",
+        ));
+}
+
+#[test]
 fn check_format_json_outputs_valid_json() {
     let dir = setup_git_repo();
 

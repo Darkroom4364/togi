@@ -438,6 +438,11 @@ fn resolve_config(
 
     let has_explicit_build_cmd = has_cli_build_cmd || !config.test.build_command.is_empty();
     let fail_fast = cfg.fail_fast && !has_custom_test_cmd;
+    if cfg.fail_fast && has_custom_test_cmd {
+        eprintln!(
+            "warning: --fail-fast is ignored when --test-cmd is set; include fail-fast flags in the custom command"
+        );
+    }
     Ok((
         config,
         fail_fast,
