@@ -325,6 +325,246 @@ fn assert_action_helper_test_cmd(test_cmd: &str) {
 }
 
 #[test]
+fn github_action_asset_resolver_matches_release_assets() {
+    if !bash_available() {
+        eprintln!("skipping action asset resolver test because bash is unavailable");
+        return;
+    }
+
+    assert_eq!(
+        resolve_action_asset("Linux", "x86_64"),
+        action_asset("togi-linux-x86_64.tar.gz", "togi")
+    );
+    assert_eq!(
+        resolve_action_asset("Darwin", "arm64"),
+        action_asset("togi-macos-arm64.tar.gz", "togi")
+    );
+    assert_eq!(
+        resolve_action_asset("Darwin", "x86_64"),
+        action_asset("togi-macos-x86_64.tar.gz", "togi")
+    );
+    assert_eq!(
+        resolve_action_asset("MINGW64_NT-10.0", "AMD64"),
+        action_asset("togi-windows-x86_64.zip", "togi.exe")
+    );
+}
+
+#[test]
+fn github_action_install_steps_place_binary_and_update_github_path() {
+    if !bash_available() {
+        eprintln!("skipping action install test because bash is unavailable");
+        return;
+    }
+
+    assert_action_installs_asset(&resolve_action_asset("Linux", "x86_64"), false);
+    assert_action_installs_asset(
+        &resolve_action_asset("MINGW64_NT-10.0", "AMD64"),
+        !cfg!(windows),
+    );
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ActionAsset {
+    archive: String,
+    binary: String,
+}
+
+fn action_asset(archive: &str, binary: &str) -> ActionAsset {
+    ActionAsset {
+        archive: archive.to_string(),
+        binary: binary.to_string(),
+    }
+}
+
+fn resolve_action_asset(os: &str, arch: &str) -> ActionAsset {
+    let helper =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join(".github/scripts/resolve-togi-asset.sh");
+    let output = std::process::Command::new("bash")
+        .arg(helper)
+        .env("TOGI_OS", os)
+        .env("TOGI_ARCH", arch)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "resolver failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut archive = None;
+    let mut binary = None;
+    for line in stdout.lines() {
+        if let Some(value) = line.strip_prefix("TOGI_ARCHIVE=") {
+            archive = Some(value.to_string());
+        } else if let Some(value) = line.strip_prefix("TOGI_BINARY=") {
+            binary = Some(value.to_string());
+        } else {
+            panic!("unexpected resolver output line: {line}");
+        }
+    }
+
+    ActionAsset {
+        archive: archive.expect("resolver did not emit TOGI_ARCHIVE"),
+        binary: binary.expect("resolver did not emit TOGI_BINARY"),
+    }
+}
+
+fn assert_action_installs_asset(asset: &ActionAsset, fake_cygpath: bool) {
+    let dir = TempDir::new().unwrap();
+    let payload_dir = dir.path().join("payload");
+    fs::create_dir_all(&payload_dir).unwrap();
+    fs::write(
+        payload_dir.join(&asset.binary),
+        "#!/usr/bin/env bash\nexit 0\n",
+    )
+    .unwrap();
+    create_action_archive(asset, &payload_dir, &dir.path().join(&asset.archive));
+
+    let github_path = dir.path().join("github_path");
+    fs::write(&github_path, "").unwrap();
+
+    let mut command = std::process::Command::new("bash");
+    command
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join(".github/scripts/install-togi-archive.sh"))
+        .env("RUNNER_TEMP", dir.path())
+        .env("TOGI_ARCHIVE", &asset.archive)
+        .env("TOGI_BINARY", &asset.binary)
+        .env("GITHUB_PATH", &github_path);
+
+    if fake_cygpath {
+        let fake_bin = dir.path().join("fake-bin");
+        fs::create_dir_all(&fake_bin).unwrap();
+        let fake_cygpath_path = fake_bin.join("cygpath");
+        fs::write(
+            &fake_cygpath_path,
+            "#!/usr/bin/env bash\ncase \"$1\" in\n  -u) printf '%s\\n' \"$2\" ;;\n  -w) printf 'C:\\\\togi\\\\%s\\n' \"$(basename \"$2\")\" ;;\n  *) exit 1 ;;\nesac\n",
+        )
+        .unwrap();
+        chmod_executable(&fake_cygpath_path);
+
+        let mut paths = vec![fake_bin];
+        paths.extend(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        ));
+        command.env("PATH", std::env::join_paths(paths).unwrap());
+    }
+
+    let output = command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "install helper failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let install_dir = dir.path().join("togi-bin");
+    let installed = install_dir.join(&asset.binary);
+    assert!(
+        installed.exists(),
+        "missing installed binary: {installed:?}"
+    );
+    assert_bash_test_x(&installed);
+
+    let github_path_entry = fs::read_to_string(&github_path).unwrap();
+    let github_path_entry = github_path_entry.trim();
+    if fake_cygpath {
+        assert_eq!(github_path_entry, "C:\\togi\\togi-bin");
+    } else if cfg!(windows) {
+        assert!(
+            github_path_entry.contains("\\togi-bin") && !github_path_entry.starts_with('/'),
+            "expected Windows GITHUB_PATH entry, got {github_path_entry}"
+        );
+    } else {
+        assert_eq!(github_path_entry, install_dir.display().to_string());
+    }
+}
+
+fn create_action_archive(asset: &ActionAsset, payload_dir: &Path, archive_path: &Path) {
+    if asset.archive.ends_with(".tar.gz") {
+        assert_command_success(
+            std::process::Command::new("tar")
+                .arg("czf")
+                .arg(archive_path)
+                .arg("-C")
+                .arg(payload_dir)
+                .arg(&asset.binary)
+                .output()
+                .unwrap(),
+            "tar archive creation",
+        );
+    } else {
+        create_zip_archive(payload_dir, archive_path, &asset.binary);
+    }
+}
+
+fn create_zip_archive(payload_dir: &Path, archive_path: &Path, binary: &str) {
+    if cfg!(windows) {
+        assert_command_success(
+            std::process::Command::new("powershell")
+                .args([
+                    "-NoProfile",
+                    "-Command",
+                    "Compress-Archive -LiteralPath $env:TOGI_TEST_BINARY -DestinationPath $env:TOGI_TEST_ARCHIVE",
+                ])
+                .env("TOGI_TEST_BINARY", payload_dir.join(binary))
+                .env("TOGI_TEST_ARCHIVE", archive_path)
+                .output()
+                .unwrap(),
+            "zip archive creation",
+        );
+    } else {
+        assert_command_success(
+            std::process::Command::new("zip")
+                .arg("-q")
+                .arg(archive_path)
+                .arg(binary)
+                .current_dir(payload_dir)
+                .output()
+                .unwrap(),
+            "zip archive creation",
+        );
+    }
+}
+
+fn chmod_executable(path: &Path) {
+    assert_command_success(
+        std::process::Command::new("bash")
+            .arg("-c")
+            .arg("chmod +x \"$1\"")
+            .arg("chmod")
+            .arg(path)
+            .output()
+            .unwrap(),
+        "chmod +x",
+    );
+}
+
+fn assert_bash_test_x(path: &Path) {
+    assert_command_success(
+        std::process::Command::new("bash")
+            .arg("-c")
+            .arg("path=$1; if command -v cygpath >/dev/null 2>&1; then path=$(cygpath -u \"$path\"); fi; test -x \"$path\"")
+            .arg("test")
+            .arg(path)
+            .output()
+            .unwrap(),
+        "test -x",
+    );
+}
+
+fn assert_command_success(output: std::process::Output, context: &str) {
+    assert!(
+        output.status.success(),
+        "{context} failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn explain_reads_json_report() {
     let dir = TempDir::new().unwrap();
     let report = r#"{
