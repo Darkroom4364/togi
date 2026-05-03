@@ -184,6 +184,8 @@ respect_workspace_ignores = true
 Test command precedence is: CLI `--test-cmd` / `--timeout`, matching
 `[projects.*.test]` by longest path prefix, matching `[test.languages.*]`,
 then the global `[test]` command.
+When `--test-cmd` is set, `--fail-fast` does not modify the custom command;
+include runner-specific fail-fast flags in `--test-cmd` instead.
 
 ## CI workflows
 
