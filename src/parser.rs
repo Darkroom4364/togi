@@ -78,4 +78,25 @@ mod tests {
         assert_eq!(lang.name(), "go");
         assert_eq!(tree.root_node().kind(), "source_file");
     }
+
+    #[test]
+    fn parse_typescript_and_tsx_sources() {
+        let (ts_tree, ts_lang) =
+            parse_file(Path::new("component.ts"), b"const value: number = 1 + 2;\n").unwrap();
+        assert_eq!(ts_lang.name(), "typescript");
+        assert!(!ts_tree.root_node().has_error());
+
+        let tsx_source = br#"
+const View = ({ value }: { value: number }) => {
+    return <div>{value > 0 ? "positive" : "zero"}</div>;
+};
+"#;
+        let (tree, lang) = parse_file(Path::new("component.tsx"), tsx_source).unwrap();
+        assert_eq!(lang.name(), "typescript");
+        assert!(!tree.root_node().has_error());
+        assert!(
+            crate::test_helpers::find_node_by_kind(tree.root_node(), lang.binary_expression_node())
+                .is_some()
+        );
+    }
 }

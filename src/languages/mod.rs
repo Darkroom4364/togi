@@ -287,5 +287,6 @@ pub fn all() -> Vec<Box<dyn LanguageSupport>> {
         Box::new(ruby::Ruby),
         Box::new(rust_lang::Rust),
         Box::new(typescript::TypeScript),
+        Box::new(typescript::Tsx),
     ]
 }
