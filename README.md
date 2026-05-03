@@ -141,6 +141,10 @@ togi clean
 togi init
 ```
 
+Mutation cache entries include the Togi package version and an internal cache
+schema version, so upgrades and operator behavior changes automatically stop
+matching older `.togi-cache` entries.
+
 ## Configuration
 
 Optional. togi works with zero config — it auto-detects your language and test command.
