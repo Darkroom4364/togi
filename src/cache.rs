@@ -1,9 +1,9 @@
 //! Incremental mutation cache.
 //!
-//! Caches mutation test results keyed on (file content hash, mutation identity,
-//! mutation description, test command hash) so unchanged mutations can be
-//! skipped on subsequent runs. Results are stored as JSON files in
-//! `.togi-cache/`.
+//! Caches mutation test results keyed on (Togi version, cache schema version,
+//! file content hash, mutation identity, mutation description, test command
+//! hash) so unchanged mutations can be skipped on subsequent runs. Results are
+//! stored as JSON files in `.togi-cache/`.
 
 use crate::MutationResult;
 use std::fs;
@@ -14,6 +14,11 @@ use siphasher::sip::SipHasher;
 
 /// Directory where cache entries are stored.
 const CACHE_DIR: &str = ".togi-cache";
+
+/// Bump when mutation/operator/cache semantics change without a package version bump.
+const CACHE_SCHEMA_VERSION: &str = "2";
+
+const TOGI_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Components that form a unique cache key.
 pub struct CacheKey {
@@ -45,7 +50,13 @@ impl CacheKey {
 
     /// Compute the hex digest used as the cache filename.
     fn digest(&self) -> String {
+        self.digest_with_versions(CACHE_SCHEMA_VERSION, TOGI_VERSION)
+    }
+
+    fn digest_with_versions(&self, cache_schema_version: &str, togi_version: &str) -> String {
         let mut h = SipHasher::new();
+        cache_schema_version.hash(&mut h);
+        togi_version.hash(&mut h);
         self.file_content_hash.hash(&mut h);
         self.mutation_identity.hash(&mut h);
         self.mutation_description.hash(&mut h);
@@ -150,6 +161,42 @@ mod tests {
         store(tmp.path(), &k2, MutationResult::Killed);
         assert_eq!(lookup(tmp.path(), &k1), Some(MutationResult::Survived));
         assert_eq!(lookup(tmp.path(), &k2), Some(MutationResult::Killed));
+    }
+
+    #[test]
+    fn cache_schema_version_changes_key() {
+        let key = CacheKey::new(b"code", "src/lib.rs:0..1:op", "desc", "cmd");
+
+        assert_ne!(
+            key.digest_with_versions("schema-1", TOGI_VERSION),
+            key.digest_with_versions("schema-2", TOGI_VERSION)
+        );
+    }
+
+    #[test]
+    fn togi_version_changes_key() {
+        let key = CacheKey::new(b"code", "src/lib.rs:0..1:op", "desc", "cmd");
+
+        assert_ne!(
+            key.digest_with_versions(CACHE_SCHEMA_VERSION, "0.1.0"),
+            key.digest_with_versions(CACHE_SCHEMA_VERSION, "0.2.0")
+        );
+    }
+
+    #[test]
+    fn old_schema_entries_do_not_match_current_key() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let key = CacheKey::new(b"code", "src/lib.rs:0..1:op", "desc", "cmd");
+        let old_digest = key.digest_with_versions("old-schema", TOGI_VERSION);
+        let old_path = cache_dir(tmp.path()).join(old_digest);
+        fs::create_dir_all(cache_dir(tmp.path())).unwrap();
+        fs::write(
+            old_path,
+            serde_json::to_string(&MutationResult::Killed).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(lookup(tmp.path(), &key), None);
     }
 
     #[test]
