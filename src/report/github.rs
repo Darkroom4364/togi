@@ -2,13 +2,27 @@ use crate::{Mutation, MutationReport, MutationResult};
 
 /// Format a single GitHub Actions warning annotation for a survived mutation.
 fn format_annotation(mutation: &Mutation) -> String {
+    let message = format!(
+        "Survived mutation: {} ({})",
+        mutation.operator, mutation.description
+    );
     format!(
-        "::warning file={},line={}::Survived mutation: {} ({})",
-        mutation.file.display(),
+        "::warning file={},line={}::{}",
+        escape_property(&mutation.file.display().to_string()),
         mutation.line,
-        mutation.operator,
-        mutation.description
+        escape_data(&message)
     )
+}
+
+fn escape_data(value: &str) -> String {
+    value
+        .replace('%', "%25")
+        .replace('\r', "%0D")
+        .replace('\n', "%0A")
+}
+
+fn escape_property(value: &str) -> String {
+    escape_data(value).replace(':', "%3A").replace(',', "%2C")
 }
 
 /// Collect warning annotations for every survived mutation in `report`,
@@ -37,10 +51,11 @@ pub fn print_report(report: &MutationReport) {
     );
 
     if report.survived > 0 && tested > 0 {
-        eprintln!(
-            "::error::Mutation score {:.1}% — {} mutations survived",
+        let message = format!(
+            "Mutation score {:.1}% — {} mutations survived",
             score, report.survived
         );
+        eprintln!("::error::{}", escape_data(&message));
     }
 }
 
@@ -130,25 +145,18 @@ mod tests {
     }
 
     #[test]
-    fn annotation_preserves_special_chars_in_path_and_message() {
-        // Document current behavior: special chars (commas, colons, percent
-        // signs, newlines) are passed through verbatim. GitHub's worker
-        // command parser may misinterpret these — fixing that is a separate
-        // concern from these tests.
-        let m = mutation(
-            "src/odd,name:thing.rs",
-            10,
-            "op",
-            "msg with %, : and , chars",
-        );
+    fn annotation_escapes_special_chars_in_path_and_message() {
+        let m = mutation("src/odd,name:thing.rs", 10, "op", "msg with %, \r\n chars");
         let line = format_annotation(&m);
-        assert!(
-            line.starts_with("::warning file=src/odd,name:thing.rs,line=10::"),
-            "path passed through verbatim: {line}"
+        assert_eq!(
+            line,
+            "::warning file=src/odd%2Cname%3Athing.rs,line=10::Survived mutation: op (msg with %25, %0D%0A chars)"
         );
-        assert!(
-            line.ends_with("Survived mutation: op (msg with %, : and , chars)"),
-            "message passed through verbatim: {line}"
-        );
+    }
+
+    #[test]
+    fn command_escape_rules_are_position_specific() {
+        assert_eq!(escape_data("a%b\r\nc,d:e"), "a%25b%0D%0Ac,d:e");
+        assert_eq!(escape_property("a%b\r\nc,d:e"), "a%25b%0D%0Ac%2Cd%3Ae");
     }
 }
