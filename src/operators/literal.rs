@@ -1,4 +1,4 @@
-use super::MutationOperator;
+use super::{MutationOperator, mutation_candidate};
 use crate::MutationCandidate;
 
 const TRUE_KINDS: &[&str] = &["true", "True", "TRUE", "boolean_literal"];
@@ -32,12 +32,7 @@ impl MutationOperator for TrueToFalse {
         if TRUE_KINDS.contains(&node.kind()) {
             let text = std::str::from_utf8(&source[node.byte_range()]).unwrap_or("");
             if text == "true" || text == "True" || text == "TRUE" {
-                return vec![MutationCandidate {
-                    byte_range: node.byte_range(),
-                    replacement: "false".to_string(),
-                    operator_id: self.id().to_string(),
-                    description: self.description().to_string(),
-                }];
+                return vec![mutation_candidate(self, node.byte_range(), "false")];
             }
         }
         vec![]
@@ -57,12 +52,7 @@ impl MutationOperator for FalseToTrue {
         if FALSE_KINDS.contains(&node.kind()) {
             let text = std::str::from_utf8(&source[node.byte_range()]).unwrap_or("");
             if text == "false" || text == "False" || text == "FALSE" {
-                return vec![MutationCandidate {
-                    byte_range: node.byte_range(),
-                    replacement: "true".to_string(),
-                    operator_id: self.id().to_string(),
-                    description: self.description().to_string(),
-                }];
+                return vec![mutation_candidate(self, node.byte_range(), "true")];
             }
         }
         vec![]
@@ -82,12 +72,7 @@ impl MutationOperator for ZeroToOne {
         if INT_LITERAL_KINDS.contains(&node.kind()) {
             let text = std::str::from_utf8(&source[node.byte_range()]).unwrap_or("");
             if text == "0" {
-                return vec![MutationCandidate {
-                    byte_range: node.byte_range(),
-                    replacement: "1".to_string(),
-                    operator_id: self.id().to_string(),
-                    description: self.description().to_string(),
-                }];
+                return vec![mutation_candidate(self, node.byte_range(), "1")];
             }
         }
         vec![]
@@ -116,12 +101,7 @@ impl MutationOperator for StringToEmpty {
             } else {
                 "\"\"".to_string()
             };
-            return vec![MutationCandidate {
-                byte_range: node.byte_range(),
-                replacement,
-                operator_id: self.id().to_string(),
-                description: self.description().to_string(),
-            }];
+            return vec![mutation_candidate(self, node.byte_range(), replacement)];
         }
         vec![]
     }
@@ -142,12 +122,11 @@ impl MutationOperator for IncrementNumeric {
         }
         let text = std::str::from_utf8(&source[node.byte_range()]).unwrap_or("");
         if let Ok(n) = text.parse::<i64>() {
-            vec![MutationCandidate {
-                byte_range: node.byte_range(),
-                replacement: (n + 1).to_string(),
-                operator_id: self.id().to_string(),
-                description: self.description().to_string(),
-            }]
+            vec![mutation_candidate(
+                self,
+                node.byte_range(),
+                (n + 1).to_string(),
+            )]
         } else {
             vec![]
         }
@@ -169,12 +148,11 @@ impl MutationOperator for DecrementNumeric {
         }
         let text = std::str::from_utf8(&source[node.byte_range()]).unwrap_or("");
         if let Ok(n) = text.parse::<i64>() {
-            vec![MutationCandidate {
-                byte_range: node.byte_range(),
-                replacement: (n - 1).to_string(),
-                operator_id: self.id().to_string(),
-                description: self.description().to_string(),
-            }]
+            vec![mutation_candidate(
+                self,
+                node.byte_range(),
+                (n - 1).to_string(),
+            )]
         } else {
             vec![]
         }

@@ -9,13 +9,8 @@ pub fn parse_file(
     path: &Path,
     source: &[u8],
 ) -> Result<(tree_sitter::Tree, Box<dyn LanguageSupport>)> {
-    let lang = detect_language(path)?;
     let mut parser = tree_sitter::Parser::new();
-    parser.set_language(&lang.tree_sitter_language())?;
-    let tree = parser
-        .parse(source, None)
-        .ok_or_else(|| anyhow!("failed to parse {}", path.display()))?;
-    Ok((tree, lang))
+    parse_file_with_parser(&mut parser, path, source)
 }
 
 /// Parse with a reusable parser instance (avoids repeated allocation).
