@@ -3,50 +3,6 @@
 use crate::languages::LanguageSupport;
 use crate::{LineRange, ts_row_to_line};
 
-/// Node kinds that are relevant for mutation testing.
-const MUTABLE_NODE_KINDS: &[&str] = &[
-    "binary_expression",
-    "binary_operator", // Python
-    "binary",          // Ruby
-    "if_statement",
-    "if_expression",
-    "if", // Ruby
-    "return_statement",
-    "return_expression",
-    "return", // Ruby
-    "true",
-    "false",
-    "integer_literal",
-    "int_literal",
-    "integer", // Ruby
-    "number",
-    "number_literal",
-    "unary_expression",
-    "unary_expr",
-    "not_operator",
-    "boolean_literal",
-    "interpreted_string_literal",
-    "raw_string_literal",
-    "string",
-    "string_literal",
-    "string_content",
-    "template_string",
-    "expression_statement",
-    "expression_stmt",
-    "assignment_statement",
-    "assignment_expression",
-    "assignment",
-    "augmented_assignment",
-    "augmented_assignment_expression",
-    // Loop control
-    "break_statement",
-    "break_expression", // Rust
-    "break",            // Ruby
-    "continue_statement",
-    "continue_expression", // Rust
-    "next",                // Ruby
-];
-
 /// Find mutation-relevant AST nodes that overlap changed lines.
 ///
 /// The mapper walks the parsed tree, ignores nodes outside the diff hunks, and
@@ -119,7 +75,7 @@ fn collect_mutable_nodes<'a>(
     let starts_on_changed_line = overlaps(node_start, node_start, changed_lines);
     if !skipped_child
         && node.is_named()
-        && is_mutable_kind(node.kind())
+        && lang.is_mutable_node_kind(node.kind())
         && (starts_on_changed_line || !found_child)
     {
         results.push(node);
@@ -144,11 +100,6 @@ fn overlaps(node_start: usize, node_end: usize, changed_lines: &[LineRange]) -> 
     idx < changed_lines.len() && changed_lines[idx].start <= node_end
 }
 
-/// Check if a node kind is relevant for mutation.
-fn is_mutable_kind(kind: &str) -> bool {
-    MUTABLE_NODE_KINDS.contains(&kind)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -156,14 +107,27 @@ mod tests {
 
     struct StubLang {
         skip_kinds: &'static [&'static str],
+        mutable_kinds: Option<&'static [&'static str]>,
     }
 
     impl StubLang {
         fn new() -> Self {
-            Self { skip_kinds: &[] }
+            Self {
+                skip_kinds: &[],
+                mutable_kinds: None,
+            }
         }
         fn with_skip(skip_kinds: &'static [&'static str]) -> Self {
-            Self { skip_kinds }
+            Self {
+                skip_kinds,
+                mutable_kinds: None,
+            }
+        }
+        fn with_mutable(mutable_kinds: &'static [&'static str]) -> Self {
+            Self {
+                skip_kinds: &[],
+                mutable_kinds: Some(mutable_kinds),
+            }
         }
     }
 
@@ -191,6 +155,12 @@ mod tests {
         }
         fn return_statement_node(&self) -> &str {
             "return_statement"
+        }
+        fn is_mutable_node_kind(&self, kind: &str) -> bool {
+            self.mutable_kinds.map_or_else(
+                || crate::languages::is_default_mutable_node_kind(self, kind),
+                |kinds| kinds.contains(&kind),
+            )
         }
         fn operator_field(&self) -> &str {
             "operator"
@@ -299,6 +269,24 @@ mod tests {
         assert!(
             kinds.contains(&"int_literal"),
             "Should include return value literal mutation, got: {:?}",
+            kinds
+        );
+    }
+
+    #[test]
+    fn mutable_node_selection_comes_from_language_support() {
+        let source = b"package main\n\nfunc f() int {\n\treturn 42\n}\n";
+        let tree = parse_go(source_str(source));
+        let changed = vec![LineRange { start: 4, end: 4 }];
+        let lang = StubLang::with_mutable(&["return_statement"]);
+
+        let nodes = find_mutable_nodes(&tree, source, &changed, &lang);
+
+        let kinds: Vec<&str> = nodes.iter().map(|n| n.kind()).collect();
+        assert!(kinds.contains(&"return_statement"));
+        assert!(
+            !kinds.contains(&"int_literal"),
+            "mapper should use language-provided mutable kinds, got: {:?}",
             kinds
         );
     }
@@ -430,8 +418,9 @@ mod tests {
         // Lines: 1=fn, 2=return a+b, 3=}
         let tree = parse_rust(source_str(source));
         let changed = vec![LineRange { start: 2, end: 2 }];
+        let lang = crate::languages::rust_lang::Rust;
 
-        let nodes = find_mutable_nodes(&tree, source, &changed, &StubLang::new());
+        let nodes = find_mutable_nodes(&tree, source, &changed, &lang);
 
         assert!(!nodes.is_empty());
         let kinds: Vec<&str> = nodes.iter().map(|n| n.kind()).collect();
