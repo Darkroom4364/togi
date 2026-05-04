@@ -69,7 +69,7 @@ pub fn generate_mutations(
 
         for node in &nodes {
             for op in &operators {
-                let candidates = op.apply(node, &source);
+                let candidates = op.apply(node, &source, lang.as_ref());
                 for mut candidate in candidates {
                     if lang.should_filter_candidate(&candidate, node, &source) {
                         continue;

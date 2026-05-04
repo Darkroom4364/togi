@@ -12,7 +12,12 @@ impl MutationOperator for RemoveUnaryNot {
     fn description(&self) -> &str {
         "Remove ! operator: !x → x"
     }
-    fn apply(&self, node: &tree_sitter::Node, source: &[u8]) -> Vec<MutationCandidate> {
+    fn apply(
+        &self,
+        node: &tree_sitter::Node,
+        source: &[u8],
+        _lang: &dyn crate::languages::LanguageSupport,
+    ) -> Vec<MutationCandidate> {
         if !UNARY_EXPR_KINDS.contains(&node.kind()) {
             return vec![];
         }
@@ -39,7 +44,12 @@ impl MutationOperator for RemoveUnaryNeg {
     fn description(&self) -> &str {
         "Remove unary -: -x → x"
     }
-    fn apply(&self, node: &tree_sitter::Node, source: &[u8]) -> Vec<MutationCandidate> {
+    fn apply(
+        &self,
+        node: &tree_sitter::Node,
+        source: &[u8],
+        _lang: &dyn crate::languages::LanguageSupport,
+    ) -> Vec<MutationCandidate> {
         if !UNARY_EXPR_KINDS.contains(&node.kind()) {
             return vec![];
         }
@@ -69,7 +79,7 @@ mod tests {
         let src = "package main\nfunc f(x bool) bool { return !x }";
         let tree = parse_go(src);
         let node = find_node_by_kind(tree.root_node(), "unary_expression").unwrap();
-        let candidates = RemoveUnaryNot.apply(&node, src.as_bytes());
+        let candidates = RemoveUnaryNot.apply(&node, src.as_bytes(), &crate::languages::go::Go);
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].replacement, "x");
     }
@@ -79,7 +89,7 @@ mod tests {
         let src = "package main\nfunc f(x int) int { return -x }";
         let tree = parse_go(src);
         let node = find_node_by_kind(tree.root_node(), "unary_expression").unwrap();
-        let candidates = RemoveUnaryNeg.apply(&node, src.as_bytes());
+        let candidates = RemoveUnaryNeg.apply(&node, src.as_bytes(), &crate::languages::go::Go);
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].replacement, "x");
     }
@@ -92,7 +102,8 @@ mod tests {
         parser.set_language(&lang.into()).unwrap();
         let tree = parser.parse(src, None).unwrap();
         let node = find_node_by_kind(tree.root_node(), "not_operator").unwrap();
-        let candidates = RemoveUnaryNot.apply(&node, src.as_bytes());
+        let candidates =
+            RemoveUnaryNot.apply(&node, src.as_bytes(), &crate::languages::python::Python);
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].replacement, "y");
     }
@@ -102,7 +113,7 @@ mod tests {
         let src = "package main\nfunc f(x int) int { return -x }";
         let tree = parse_go(src);
         let node = find_node_by_kind(tree.root_node(), "unary_expression").unwrap();
-        let candidates = RemoveUnaryNot.apply(&node, src.as_bytes());
+        let candidates = RemoveUnaryNot.apply(&node, src.as_bytes(), &crate::languages::go::Go);
         assert!(candidates.is_empty());
     }
 }

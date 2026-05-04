@@ -19,7 +19,12 @@ pub trait MutationOperator: Send + Sync {
     fn description(&self) -> &str;
 
     /// Return mutation candidates for `node` using byte ranges from `source`.
-    fn apply(&self, node: &tree_sitter::Node, source: &[u8]) -> Vec<crate::MutationCandidate>;
+    fn apply(
+        &self,
+        node: &tree_sitter::Node,
+        source: &[u8],
+        lang: &dyn crate::languages::LanguageSupport,
+    ) -> Vec<crate::MutationCandidate>;
 }
 
 pub(crate) fn mutation_candidate(
@@ -35,29 +40,6 @@ pub(crate) fn mutation_candidate(
     }
 }
 
-pub(crate) const IF_STMT_KINDS: &[&str] = &[
-    "if_statement",
-    "if_expression",
-    "if_expr",
-    "if", // Ruby
-];
-pub(crate) const BINARY_EXPR_KINDS: &[&str] = &[
-    "binary_expression",
-    "binary_expr",
-    "comparison_expression",
-    "binary_operator", // Python
-    "binary",          // Ruby
-];
-const RETURN_KINDS: &[&str] = &[
-    "return_statement",
-    "return_expression",
-    "return", // Ruby
-];
-
-pub(crate) fn is_binary_expr(node: &tree_sitter::Node) -> bool {
-    BINARY_EXPR_KINDS.contains(&node.kind())
-}
-
 /// Negate a condition: remove `!` if present, otherwise wrap with `!(...)`
 pub struct NegateCondition;
 
@@ -68,8 +50,13 @@ impl MutationOperator for NegateCondition {
     fn description(&self) -> &str {
         "Negate condition expression"
     }
-    fn apply(&self, node: &tree_sitter::Node, source: &[u8]) -> Vec<crate::MutationCandidate> {
-        if !IF_STMT_KINDS.contains(&node.kind()) {
+    fn apply(
+        &self,
+        node: &tree_sitter::Node,
+        source: &[u8],
+        lang: &dyn crate::languages::LanguageSupport,
+    ) -> Vec<crate::MutationCandidate> {
+        if node.kind() != lang.if_statement_node() {
             return vec![];
         }
         let cond = node.child_by_field_name("condition");
@@ -125,8 +112,13 @@ impl MutationOperator for ReturnEmpty {
     fn description(&self) -> &str {
         "Replace return value with default"
     }
-    fn apply(&self, node: &tree_sitter::Node, source: &[u8]) -> Vec<crate::MutationCandidate> {
-        if !RETURN_KINDS.contains(&node.kind()) {
+    fn apply(
+        &self,
+        node: &tree_sitter::Node,
+        source: &[u8],
+        lang: &dyn crate::languages::LanguageSupport,
+    ) -> Vec<crate::MutationCandidate> {
+        if node.kind() != lang.return_statement_node() {
             return vec![];
         }
         // Find the expression list or value child
@@ -334,6 +326,7 @@ pub fn all_operators() -> Vec<Box<dyn MutationOperator>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::languages::LanguageSupport;
     use crate::test_helpers::{
         find_node_by_kind, parse_go, parse_python, parse_ruby, parse_rust, parse_typescript,
     };
@@ -343,23 +336,25 @@ mod tests {
         parse: fn(&str) -> tree_sitter::Tree,
         node_kind: &str,
         op: &dyn MutationOperator,
+        lang: &dyn LanguageSupport,
     ) -> Vec<crate::MutationCandidate> {
         let tree = parse(src);
         let node = find_node_by_kind(tree.root_node(), node_kind)
             .unwrap_or_else(|| panic!("should find {node_kind} node"));
-        op.apply(&node, src.as_bytes())
+        op.apply(&node, src.as_bytes(), lang)
     }
 
     fn collect_candidates(
         node: tree_sitter::Node,
         source: &[u8],
         op: &dyn MutationOperator,
+        lang: &dyn LanguageSupport,
         out: &mut Vec<crate::MutationCandidate>,
     ) {
-        out.extend(op.apply(&node, source));
+        out.extend(op.apply(&node, source, lang));
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
-            collect_candidates(child, source, op, out);
+            collect_candidates(child, source, op, lang, out);
         }
     }
 
@@ -367,10 +362,11 @@ mod tests {
         src: &str,
         parse: fn(&str) -> tree_sitter::Tree,
         op: &dyn MutationOperator,
+        lang: &dyn LanguageSupport,
     ) -> Vec<crate::MutationCandidate> {
         let tree = parse(src);
         let mut candidates = Vec::new();
-        collect_candidates(tree.root_node(), src.as_bytes(), op, &mut candidates);
+        collect_candidates(tree.root_node(), src.as_bytes(), op, lang, &mut candidates);
         candidates
     }
 
@@ -390,7 +386,7 @@ mod tests {
         let src = "package main\nfunc f(x int) { if x > 0 { return } }";
         let tree = parse_go(src);
         let if_node = find_node_by_kind(tree.root_node(), "if_statement").unwrap();
-        let candidates = NegateCondition.apply(&if_node, src.as_bytes());
+        let candidates = NegateCondition.apply(&if_node, src.as_bytes(), &crate::languages::go::Go);
         assert_single_candidate(&candidates, src, "!(x > 0)", "x > 0");
     }
 
@@ -399,7 +395,7 @@ mod tests {
         let src = "package main\nfunc f(x bool) { if !x { return } }";
         let tree = parse_go(src);
         let if_node = find_node_by_kind(tree.root_node(), "if_statement").unwrap();
-        let candidates = NegateCondition.apply(&if_node, src.as_bytes());
+        let candidates = NegateCondition.apply(&if_node, src.as_bytes(), &crate::languages::go::Go);
         assert_single_candidate(&candidates, src, "x", "!x");
     }
 
@@ -408,7 +404,7 @@ mod tests {
         let src = "package main\nfunc f() { if !foo() { return } }";
         let tree = parse_go(src);
         let if_node = find_node_by_kind(tree.root_node(), "if_statement").unwrap();
-        let candidates = NegateCondition.apply(&if_node, src.as_bytes());
+        let candidates = NegateCondition.apply(&if_node, src.as_bytes(), &crate::languages::go::Go);
         assert_single_candidate(&candidates, src, "foo()", "!foo()");
     }
 
@@ -417,7 +413,7 @@ mod tests {
         let src = "package main\nfunc f(a, b bool) { if !(a) || (b) { return } }";
         let tree = parse_go(src);
         let if_node = find_node_by_kind(tree.root_node(), "if_statement").unwrap();
-        let candidates = NegateCondition.apply(&if_node, src.as_bytes());
+        let candidates = NegateCondition.apply(&if_node, src.as_bytes(), &crate::languages::go::Go);
         assert_single_candidate(&candidates, src, "(a) || (b)", "!(a) || (b)");
     }
 
@@ -426,7 +422,8 @@ mod tests {
         let src = "package main\nfunc f() int { return 42 }";
         let tree = parse_go(src);
         let ret_node = find_node_by_kind(tree.root_node(), "return_statement").unwrap();
-        let candidates = NegateCondition.apply(&ret_node, src.as_bytes());
+        let candidates =
+            NegateCondition.apply(&ret_node, src.as_bytes(), &crate::languages::go::Go);
         assert!(candidates.is_empty());
     }
 
@@ -435,7 +432,7 @@ mod tests {
         let src = "package main\nfunc f() int { return 42 }";
         let tree = parse_go(src);
         let ret_node = find_node_by_kind(tree.root_node(), "return_statement").unwrap();
-        let candidates = ReturnEmpty.apply(&ret_node, src.as_bytes());
+        let candidates = ReturnEmpty.apply(&ret_node, src.as_bytes(), &crate::languages::go::Go);
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].replacement, "0");
     }
@@ -446,7 +443,7 @@ mod tests {
 func f() string { return "hello" }"#;
         let tree = parse_go(src);
         let ret_node = find_node_by_kind(tree.root_node(), "return_statement").unwrap();
-        let candidates = ReturnEmpty.apply(&ret_node, src.as_bytes());
+        let candidates = ReturnEmpty.apply(&ret_node, src.as_bytes(), &crate::languages::go::Go);
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].replacement, r#""""#);
     }
@@ -456,7 +453,7 @@ func f() string { return "hello" }"#;
         let src = "package main\nfunc f() bool { return true }";
         let tree = parse_go(src);
         let ret_node = find_node_by_kind(tree.root_node(), "return_statement").unwrap();
-        let candidates = ReturnEmpty.apply(&ret_node, src.as_bytes());
+        let candidates = ReturnEmpty.apply(&ret_node, src.as_bytes(), &crate::languages::go::Go);
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].replacement, "false");
     }
@@ -466,74 +463,85 @@ func f() string { return "hello" }"#;
         let src = "package main\nfunc f() { return }";
         let tree = parse_go(src);
         let ret_node = find_node_by_kind(tree.root_node(), "return_statement").unwrap();
-        let candidates = ReturnEmpty.apply(&ret_node, src.as_bytes());
+        let candidates = ReturnEmpty.apply(&ret_node, src.as_bytes(), &crate::languages::go::Go);
         assert!(candidates.is_empty());
     }
 
     #[test]
     fn mul_to_div_works_across_binary_node_kinds() {
-        for (src, parse, node_kind) in [
+        for (src, parse, node_kind, lang) in [
             (
                 "package main\nfunc f(a, b int) int { return a * b }",
                 parse_go as fn(&str) -> tree_sitter::Tree,
                 "binary_expression",
+                Box::new(crate::languages::go::Go) as Box<dyn LanguageSupport>,
             ),
             (
                 "fn f(a: i32, b: i32) -> i32 { a * b }",
                 parse_rust as fn(&str) -> tree_sitter::Tree,
                 "binary_expression",
+                Box::new(crate::languages::rust_lang::Rust),
             ),
             (
                 "def f(a, b):\n    return a * b\n",
                 parse_python as fn(&str) -> tree_sitter::Tree,
                 "binary_operator",
+                Box::new(crate::languages::python::Python),
             ),
             (
                 "def f(a, b)\n  a * b\nend\n",
                 parse_ruby as fn(&str) -> tree_sitter::Tree,
                 "binary",
+                Box::new(crate::languages::ruby::Ruby),
             ),
             (
                 "function f(a: number, b: number): number { return a * b; }",
                 parse_typescript as fn(&str) -> tree_sitter::Tree,
                 "binary_expression",
+                Box::new(crate::languages::typescript::TypeScript),
             ),
         ] {
-            let candidates = apply_to_first_node(src, parse, node_kind, &binary::MulToDiv);
+            let candidates =
+                apply_to_first_node(src, parse, node_kind, &binary::MulToDiv, lang.as_ref());
             assert_single_candidate(&candidates, src, "/", "*");
         }
     }
 
     #[test]
     fn true_to_false_works_across_literal_node_kinds() {
-        for (src, parse, original) in [
+        for (src, parse, original, lang) in [
             (
                 "package main\nfunc f() bool { return true }",
                 parse_go as fn(&str) -> tree_sitter::Tree,
                 "true",
+                Box::new(crate::languages::go::Go) as Box<dyn LanguageSupport>,
             ),
             (
                 "fn f() -> bool { true }",
                 parse_rust as fn(&str) -> tree_sitter::Tree,
                 "true",
+                Box::new(crate::languages::rust_lang::Rust),
             ),
             (
                 "def f():\n    return True\n",
                 parse_python as fn(&str) -> tree_sitter::Tree,
                 "True",
+                Box::new(crate::languages::python::Python),
             ),
             (
                 "def f\n  true\nend\n",
                 parse_ruby as fn(&str) -> tree_sitter::Tree,
                 "true",
+                Box::new(crate::languages::ruby::Ruby),
             ),
             (
                 "const value = true;",
                 parse_typescript as fn(&str) -> tree_sitter::Tree,
                 "true",
+                Box::new(crate::languages::typescript::TypeScript),
             ),
         ] {
-            let candidates = apply_to_tree(src, parse, &literal::TrueToFalse);
+            let candidates = apply_to_tree(src, parse, &literal::TrueToFalse, lang.as_ref());
             assert!(
                 candidates.iter().any(|c| {
                     c.replacement == "false" && &src[c.byte_range.clone()] == original
@@ -545,68 +553,80 @@ func f() string { return "hello" }"#;
 
     #[test]
     fn return_empty_works_across_return_node_kinds() {
-        for (src, parse, node_kind) in [
+        for (src, parse, node_kind, lang) in [
             (
                 "package main\nfunc f() int { return 42 }",
                 parse_go as fn(&str) -> tree_sitter::Tree,
                 "return_statement",
+                Box::new(crate::languages::go::Go) as Box<dyn LanguageSupport>,
             ),
             (
                 "fn f() -> i32 { return 42; }",
                 parse_rust as fn(&str) -> tree_sitter::Tree,
                 "return_expression",
+                Box::new(crate::languages::rust_lang::Rust),
             ),
             (
                 "def f():\n    return 42\n",
                 parse_python as fn(&str) -> tree_sitter::Tree,
                 "return_statement",
+                Box::new(crate::languages::python::Python),
             ),
             (
                 "def f\n  return 42\nend\n",
                 parse_ruby as fn(&str) -> tree_sitter::Tree,
                 "return",
+                Box::new(crate::languages::ruby::Ruby),
             ),
             (
                 "function f(): number { return 42; }",
                 parse_typescript as fn(&str) -> tree_sitter::Tree,
                 "return_statement",
+                Box::new(crate::languages::typescript::TypeScript),
             ),
         ] {
-            let candidates = apply_to_first_node(src, parse, node_kind, &ReturnEmpty);
+            let candidates =
+                apply_to_first_node(src, parse, node_kind, &ReturnEmpty, lang.as_ref());
             assert_single_candidate(&candidates, src, "0", "42");
         }
     }
 
     #[test]
     fn remove_if_body_works_across_if_node_kinds() {
-        for (src, parse, node_kind) in [
+        for (src, parse, node_kind, lang) in [
             (
                 "package main\nfunc f(x bool) { if x { println(x) } }",
                 parse_go as fn(&str) -> tree_sitter::Tree,
                 "if_statement",
+                Box::new(crate::languages::go::Go) as Box<dyn LanguageSupport>,
             ),
             (
                 "fn f(x: bool) { if x { call(); } }",
                 parse_rust as fn(&str) -> tree_sitter::Tree,
                 "if_expression",
+                Box::new(crate::languages::rust_lang::Rust),
             ),
             (
                 "def f(x):\n    if x:\n        call()\n",
                 parse_python as fn(&str) -> tree_sitter::Tree,
                 "if_statement",
+                Box::new(crate::languages::python::Python),
             ),
             (
                 "def f(x)\n  if x\n    call\n  end\nend\n",
                 parse_ruby as fn(&str) -> tree_sitter::Tree,
                 "if",
+                Box::new(crate::languages::ruby::Ruby),
             ),
             (
                 "function f(x: boolean) { if (x) { call(); } }",
                 parse_typescript as fn(&str) -> tree_sitter::Tree,
                 "if_statement",
+                Box::new(crate::languages::typescript::TypeScript),
             ),
         ] {
-            let candidates = apply_to_first_node(src, parse, node_kind, &removal::RemoveIfBody);
+            let candidates =
+                apply_to_first_node(src, parse, node_kind, &removal::RemoveIfBody, lang.as_ref());
             assert_eq!(candidates.len(), 1, "{src}");
             assert_eq!(candidates[0].replacement, "{}");
         }
@@ -621,7 +641,12 @@ func f() string { return "hello" }"#;
         fn description(&self) -> &str {
             ""
         }
-        fn apply(&self, _: &tree_sitter::Node, _: &[u8]) -> Vec<crate::MutationCandidate> {
+        fn apply(
+            &self,
+            _: &tree_sitter::Node,
+            _: &[u8],
+            _: &dyn crate::languages::LanguageSupport,
+        ) -> Vec<crate::MutationCandidate> {
             vec![]
         }
     }
