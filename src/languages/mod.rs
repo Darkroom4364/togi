@@ -142,7 +142,6 @@ const STRING_LITERAL_NODE_KINDS: &[&str] = &[
     "raw_string_literal",
     "string",
     "string_literal",
-    "string_content",
     "template_string",
 ];
 
@@ -362,10 +361,6 @@ pub trait LanguageSupport: Send + Sync {
             None
         } else if self.is_integer_literal_node(kind) || matches!(kind, "float_literal" | "float") {
             Some("0".to_string())
-        } else if self.boolean_true_literals().contains(&text)
-            || self.boolean_false_literals().contains(&text)
-        {
-            Some("false".to_string())
         } else if text.starts_with('"') || text.starts_with('\'') || text.starts_with('`') {
             Some("\"\"".to_string())
         } else {

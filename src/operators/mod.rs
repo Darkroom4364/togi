@@ -132,8 +132,18 @@ impl MutationOperator for ReturnEmpty {
         let last = &children[children.len() - 1];
         let value_range = first.start_byte()..last.end_byte();
         let text = std::str::from_utf8(&source[value_range.clone()]).unwrap_or("");
+        let replacement_kind = if first.kind() == "expression_list" {
+            let mut cursor = first.walk();
+            let mut values = first.named_children(&mut cursor);
+            match (values.next(), values.next()) {
+                (Some(value), None) => value.kind(),
+                _ => first.kind(),
+            }
+        } else {
+            first.kind()
+        };
 
-        let Some(replacement) = lang.return_empty_replacement(first.kind(), text) else {
+        let Some(replacement) = lang.return_empty_replacement(replacement_kind, text) else {
             return vec![];
         };
 
