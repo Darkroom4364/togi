@@ -605,7 +605,7 @@ mod tests {
     #[test]
     fn rust_return_empty_allowed_for_primitive() {
         let tmp = TempDir::new().unwrap();
-        // Use a function call as return value — call_expression is not in MUTABLE_NODE_KINDS,
+        // Use a function call as return value; call_expression is not mutable,
         // so the mapper yields the return_expression itself.
         let src = "fn f() -> i32 {\n    return compute();\n}\n";
         let rel = write_test_file(tmp.path(), "lib.rs", src);

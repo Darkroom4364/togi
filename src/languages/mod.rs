@@ -129,6 +129,54 @@ const SIMPLE_RETURN_TYPE_KINDS: &[&str] = &[
     "floating_point_type",
 ];
 
+// Shared operator-family node kinds. Primary binary/if/return kinds come from
+// each LanguageSupport implementation.
+const SHARED_MUTABLE_NODE_KINDS: &[&str] = &[
+    "binary_expr",
+    "comparison_expression",
+    "if_expr",
+    "true",
+    "false",
+    "boolean_literal",
+    "integer_literal",
+    "int_literal",
+    "integer",
+    "number",
+    "number_literal",
+    "unary_expression",
+    "unary_expr",
+    "not_operator",
+    "interpreted_string_literal",
+    "raw_string_literal",
+    "string",
+    "string_literal",
+    "string_content",
+    "template_string",
+    "expression_statement",
+    "expression_stmt",
+    "assignment_statement",
+    "assignment_expression",
+    "assignment",
+    "augmented_assignment",
+    "augmented_assignment_expression",
+    "break_statement",
+    "break_expression",
+    "break",
+    "continue_statement",
+    "continue_expression",
+    "next",
+];
+
+pub(crate) fn is_default_mutable_node_kind<L: LanguageSupport + ?Sized>(
+    lang: &L,
+    kind: &str,
+) -> bool {
+    kind == lang.binary_expression_node()
+        || kind == lang.if_statement_node()
+        || kind == lang.return_statement_node()
+        || SHARED_MUTABLE_NODE_KINDS.contains(&kind)
+}
+
 pub(crate) fn should_skip_return_empty_for_type(
     node: &tree_sitter::Node,
     skip_go_multi_return: bool,
@@ -238,6 +286,11 @@ pub trait LanguageSupport: Send + Sync {
     /// Primary return-statement or return-expression node kind.
     fn return_statement_node(&self) -> &str;
 
+    /// Return true when `kind` is a mutation-relevant AST node kind for this language.
+    fn is_mutable_node_kind(&self, kind: &str) -> bool {
+        is_default_mutable_node_kind(self, kind)
+    }
+
     /// Tree-sitter field name used to find operators when available.
     fn operator_field(&self) -> &str;
 
@@ -289,4 +342,48 @@ pub fn all() -> Vec<Box<dyn LanguageSupport>> {
         Box::new(typescript::TypeScript),
         Box::new(typescript::Tsx),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn supported_language_primary_nodes_are_mutable() {
+        for lang in all() {
+            assert!(
+                lang.is_mutable_node_kind(lang.binary_expression_node()),
+                "{} binary node should be mutable",
+                lang.name()
+            );
+            assert!(
+                lang.is_mutable_node_kind(lang.if_statement_node()),
+                "{} if node should be mutable",
+                lang.name()
+            );
+            assert!(
+                lang.is_mutable_node_kind(lang.return_statement_node()),
+                "{} return node should be mutable",
+                lang.name()
+            );
+        }
+    }
+
+    #[test]
+    fn shared_operator_nodes_are_mutable() {
+        let lang = go::Go;
+
+        for kind in [
+            "int_literal",
+            "boolean_literal",
+            "string_literal",
+            "expression_statement",
+            "assignment_statement",
+            "break_statement",
+            "continue_statement",
+        ] {
+            assert!(lang.is_mutable_node_kind(kind), "{kind} should be mutable");
+        }
+        assert!(!lang.is_mutable_node_kind("identifier"));
+    }
 }
