@@ -1,5 +1,5 @@
+use super::MutationOperator;
 use super::binary::find_operator_child;
-use super::{MutationOperator, is_binary_expr};
 use crate::MutationCandidate;
 
 pub struct PlusToMinus;
@@ -11,11 +11,16 @@ impl MutationOperator for PlusToMinus {
     fn description(&self) -> &str {
         "Replace + with -"
     }
-    fn apply(&self, node: &tree_sitter::Node, source: &[u8]) -> Vec<MutationCandidate> {
-        if !is_binary_expr(node) {
+    fn apply(
+        &self,
+        node: &tree_sitter::Node,
+        source: &[u8],
+        lang: &dyn crate::languages::LanguageSupport,
+    ) -> Vec<MutationCandidate> {
+        if node.kind() != lang.binary_expression_node() {
             return vec![];
         }
-        if let Some(range) = find_operator_child(node, source, "+") {
+        if let Some(range) = find_operator_child(node, source, lang.operator_field(), "+") {
             vec![MutationCandidate {
                 byte_range: range,
                 replacement: "-".to_string(),
@@ -37,11 +42,16 @@ impl MutationOperator for MinusToPlus {
     fn description(&self) -> &str {
         "Replace - with +"
     }
-    fn apply(&self, node: &tree_sitter::Node, source: &[u8]) -> Vec<MutationCandidate> {
-        if !is_binary_expr(node) {
+    fn apply(
+        &self,
+        node: &tree_sitter::Node,
+        source: &[u8],
+        lang: &dyn crate::languages::LanguageSupport,
+    ) -> Vec<MutationCandidate> {
+        if node.kind() != lang.binary_expression_node() {
             return vec![];
         }
-        if let Some(range) = find_operator_child(node, source, "-") {
+        if let Some(range) = find_operator_child(node, source, lang.operator_field(), "-") {
             vec![MutationCandidate {
                 byte_range: range,
                 replacement: "+".to_string(),
@@ -65,7 +75,7 @@ mod tests {
         let src = "package main\nfunc f(a, b int) int { return a + b }";
         let tree = parse_go(src);
         let bin = find_node_by_kind(tree.root_node(), "binary_expression").unwrap();
-        let candidates = PlusToMinus.apply(&bin, src.as_bytes());
+        let candidates = PlusToMinus.apply(&bin, src.as_bytes(), &crate::languages::go::Go);
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].replacement, "-");
     }
@@ -75,7 +85,7 @@ mod tests {
         let src = "package main\nfunc f(a, b int) int { return a - b }";
         let tree = parse_go(src);
         let bin = find_node_by_kind(tree.root_node(), "binary_expression").unwrap();
-        let candidates = MinusToPlus.apply(&bin, src.as_bytes());
+        let candidates = MinusToPlus.apply(&bin, src.as_bytes(), &crate::languages::go::Go);
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].replacement, "+");
     }
@@ -85,7 +95,7 @@ mod tests {
         let src = "package main\nfunc f(a, b int) bool { return a < b }";
         let tree = parse_go(src);
         let bin = find_node_by_kind(tree.root_node(), "binary_expression").unwrap();
-        let candidates = PlusToMinus.apply(&bin, src.as_bytes());
+        let candidates = PlusToMinus.apply(&bin, src.as_bytes(), &crate::languages::go::Go);
         assert!(candidates.is_empty());
     }
 }

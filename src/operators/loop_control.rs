@@ -22,7 +22,12 @@ impl MutationOperator for RemoveBreak {
     fn description(&self) -> &str {
         "Remove break statement from loop"
     }
-    fn apply(&self, node: &tree_sitter::Node, _source: &[u8]) -> Vec<MutationCandidate> {
+    fn apply(
+        &self,
+        node: &tree_sitter::Node,
+        _source: &[u8],
+        _lang: &dyn crate::languages::LanguageSupport,
+    ) -> Vec<MutationCandidate> {
         if !BREAK_KINDS.contains(&node.kind()) {
             return vec![];
         }
@@ -44,7 +49,12 @@ impl MutationOperator for RemoveContinue {
     fn description(&self) -> &str {
         "Remove continue statement from loop"
     }
-    fn apply(&self, node: &tree_sitter::Node, _source: &[u8]) -> Vec<MutationCandidate> {
+    fn apply(
+        &self,
+        node: &tree_sitter::Node,
+        _source: &[u8],
+        _lang: &dyn crate::languages::LanguageSupport,
+    ) -> Vec<MutationCandidate> {
         if !CONTINUE_KINDS.contains(&node.kind()) {
             return vec![];
         }
@@ -69,7 +79,7 @@ mod tests {
         let tree = parse_go(src);
         let node = find_node_by_kind(tree.root_node(), "break_statement")
             .expect("should find break_statement");
-        let candidates = RemoveBreak.apply(&node, src.as_bytes());
+        let candidates = RemoveBreak.apply(&node, src.as_bytes(), &crate::languages::go::Go);
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].replacement, "");
     }
@@ -80,7 +90,7 @@ mod tests {
         let tree = parse_go(src);
         let node = find_node_by_kind(tree.root_node(), "continue_statement")
             .expect("should find continue_statement");
-        let candidates = RemoveBreak.apply(&node, src.as_bytes());
+        let candidates = RemoveBreak.apply(&node, src.as_bytes(), &crate::languages::go::Go);
         assert!(candidates.is_empty());
     }
 
@@ -90,7 +100,7 @@ mod tests {
         let tree = parse_go(src);
         let node = find_node_by_kind(tree.root_node(), "continue_statement")
             .expect("should find continue_statement");
-        let candidates = RemoveContinue.apply(&node, src.as_bytes());
+        let candidates = RemoveContinue.apply(&node, src.as_bytes(), &crate::languages::go::Go);
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].replacement, "");
     }
@@ -101,7 +111,7 @@ mod tests {
         let tree = parse_go(src);
         let node = find_node_by_kind(tree.root_node(), "break_statement")
             .expect("should find break_statement");
-        let candidates = RemoveContinue.apply(&node, src.as_bytes());
+        let candidates = RemoveContinue.apply(&node, src.as_bytes(), &crate::languages::go::Go);
         assert!(candidates.is_empty());
     }
 
@@ -112,7 +122,8 @@ mod tests {
         let tree = parse_rust(src);
         let node = find_node_by_kind(tree.root_node(), "break_expression")
             .expect("should find break_expression");
-        let candidates = RemoveBreak.apply(&node, src.as_bytes());
+        let candidates =
+            RemoveBreak.apply(&node, src.as_bytes(), &crate::languages::rust_lang::Rust);
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].replacement, "");
     }
@@ -123,7 +134,8 @@ mod tests {
         let tree = parse_rust(src);
         let node = find_node_by_kind(tree.root_node(), "continue_expression")
             .expect("should find continue_expression");
-        let candidates = RemoveContinue.apply(&node, src.as_bytes());
+        let candidates =
+            RemoveContinue.apply(&node, src.as_bytes(), &crate::languages::rust_lang::Rust);
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].replacement, "");
     }
@@ -134,7 +146,7 @@ mod tests {
         let src = "loop do\n  break\nend";
         let tree = parse_ruby(src);
         let node = find_node_by_kind(tree.root_node(), "break").expect("should find break");
-        let candidates = RemoveBreak.apply(&node, src.as_bytes());
+        let candidates = RemoveBreak.apply(&node, src.as_bytes(), &crate::languages::ruby::Ruby);
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].replacement, "");
     }
@@ -144,7 +156,7 @@ mod tests {
         let src = "[1,2,3].each do |x|\n  next\nend";
         let tree = parse_ruby(src);
         let node = find_node_by_kind(tree.root_node(), "next").expect("should find next");
-        let candidates = RemoveContinue.apply(&node, src.as_bytes());
+        let candidates = RemoveContinue.apply(&node, src.as_bytes(), &crate::languages::ruby::Ruby);
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].replacement, "");
     }

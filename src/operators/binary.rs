@@ -1,13 +1,13 @@
-use super::{MutationOperator, is_binary_expr};
+use super::MutationOperator;
 use crate::MutationCandidate;
 
 pub fn find_operator_child(
     node: &tree_sitter::Node,
     source: &[u8],
+    operator_field: &str,
     target: &str,
 ) -> Option<std::ops::Range<usize>> {
-    // Try field name "operator" first
-    if let Some(op_node) = node.child_by_field_name("operator") {
+    if let Some(op_node) = node.child_by_field_name(operator_field) {
         let text = &source[op_node.byte_range()];
         if text == target.as_bytes() {
             return Some(op_node.byte_range());
@@ -37,11 +37,17 @@ macro_rules! binary_operator {
             fn description(&self) -> &str {
                 $desc
             }
-            fn apply(&self, node: &tree_sitter::Node, source: &[u8]) -> Vec<MutationCandidate> {
-                if !is_binary_expr(node) {
+            fn apply(
+                &self,
+                node: &tree_sitter::Node,
+                source: &[u8],
+                lang: &dyn crate::languages::LanguageSupport,
+            ) -> Vec<MutationCandidate> {
+                if node.kind() != lang.binary_expression_node() {
                     return vec![];
                 }
-                if let Some(range) = find_operator_child(node, source, $from) {
+                if let Some(range) = find_operator_child(node, source, lang.operator_field(), $from)
+                {
                     vec![MutationCandidate {
                         byte_range: range,
                         replacement: $to.to_string(),
@@ -76,7 +82,7 @@ mod tests {
         let root = tree.root_node();
         let bin =
             find_node_by_kind(root, "binary_expression").expect("should find binary_expression");
-        op.apply(&bin, src.as_bytes())
+        op.apply(&bin, src.as_bytes(), &crate::languages::go::Go)
     }
 
     fn assert_single_candidate(

@@ -1,4 +1,4 @@
-use super::{IF_STMT_KINDS, MutationOperator, mutation_candidate};
+use super::{MutationOperator, mutation_candidate};
 use crate::MutationCandidate;
 
 pub struct RemoveIfBody;
@@ -10,8 +10,13 @@ impl MutationOperator for RemoveIfBody {
     fn description(&self) -> &str {
         "Replace if body with empty block"
     }
-    fn apply(&self, node: &tree_sitter::Node, _source: &[u8]) -> Vec<MutationCandidate> {
-        if !IF_STMT_KINDS.contains(&node.kind()) {
+    fn apply(
+        &self,
+        node: &tree_sitter::Node,
+        _source: &[u8],
+        lang: &dyn crate::languages::LanguageSupport,
+    ) -> Vec<MutationCandidate> {
+        if node.kind() != lang.if_statement_node() {
             return vec![];
         }
         // Look for "consequence" or "body" field
@@ -35,8 +40,13 @@ impl MutationOperator for RemoveElse {
     fn description(&self) -> &str {
         "Remove else clause"
     }
-    fn apply(&self, node: &tree_sitter::Node, _source: &[u8]) -> Vec<MutationCandidate> {
-        if !IF_STMT_KINDS.contains(&node.kind()) {
+    fn apply(
+        &self,
+        node: &tree_sitter::Node,
+        _source: &[u8],
+        lang: &dyn crate::languages::LanguageSupport,
+    ) -> Vec<MutationCandidate> {
+        if node.kind() != lang.if_statement_node() {
             return vec![];
         }
         // Look for "alternative" or "else" field
@@ -87,7 +97,12 @@ impl MutationOperator for RemoveCallStatement {
     fn description(&self) -> &str {
         "Remove void method/function call"
     }
-    fn apply(&self, node: &tree_sitter::Node, _source: &[u8]) -> Vec<MutationCandidate> {
+    fn apply(
+        &self,
+        node: &tree_sitter::Node,
+        _source: &[u8],
+        _lang: &dyn crate::languages::LanguageSupport,
+    ) -> Vec<MutationCandidate> {
         if !EXPR_STMT_KINDS.contains(&node.kind()) {
             return vec![];
         }
@@ -120,7 +135,12 @@ impl MutationOperator for RemoveAssignment {
     fn description(&self) -> &str {
         "Remove assignment statement"
     }
-    fn apply(&self, node: &tree_sitter::Node, _source: &[u8]) -> Vec<MutationCandidate> {
+    fn apply(
+        &self,
+        node: &tree_sitter::Node,
+        _source: &[u8],
+        _lang: &dyn crate::languages::LanguageSupport,
+    ) -> Vec<MutationCandidate> {
         if !ASSIGNMENT_KINDS.contains(&node.kind()) {
             return vec![];
         }
@@ -151,7 +171,7 @@ mod tests {
 func f(x int) { if x > 0 { println("yes") } }"#;
         let tree = parse_go(src);
         let if_node = find_node_by_kind(tree.root_node(), "if_statement").unwrap();
-        let candidates = RemoveIfBody.apply(&if_node, src.as_bytes());
+        let candidates = RemoveIfBody.apply(&if_node, src.as_bytes(), &crate::languages::go::Go);
         assert_single_candidate(&candidates, src, "{}", r#"{ println("yes") }"#);
     }
 
@@ -160,7 +180,7 @@ func f(x int) { if x > 0 { println("yes") } }"#;
         let src = "package main\nfunc f(x int) int { if x > 0 { return 1 } else { return 0 } }";
         let tree = parse_go(src);
         let if_node = find_node_by_kind(tree.root_node(), "if_statement").unwrap();
-        let candidates = RemoveElse.apply(&if_node, src.as_bytes());
+        let candidates = RemoveElse.apply(&if_node, src.as_bytes(), &crate::languages::go::Go);
         assert_single_candidate(&candidates, src, "", "else { return 0 }");
     }
 
@@ -170,7 +190,8 @@ func f(x int) { if x > 0 { println("yes") } }"#;
         let tree = parse_go(src);
         let stmt = find_node_by_kind(tree.root_node(), "expression_statement")
             .expect("should find expression_statement node");
-        let candidates = RemoveCallStatement.apply(&stmt, src.as_bytes());
+        let candidates =
+            RemoveCallStatement.apply(&stmt, src.as_bytes(), &crate::languages::go::Go);
         assert_single_candidate(&candidates, src, "", r#"println("hi")"#);
     }
 
@@ -180,7 +201,7 @@ func f(x int) { if x > 0 { println("yes") } }"#;
         let tree = parse_go(src);
         let bin = find_node_by_kind(tree.root_node(), "binary_expression")
             .expect("should find binary_expression node");
-        let candidates = RemoveCallStatement.apply(&bin, src.as_bytes());
+        let candidates = RemoveCallStatement.apply(&bin, src.as_bytes(), &crate::languages::go::Go);
         assert!(candidates.is_empty());
     }
 
@@ -190,7 +211,7 @@ func f(x int) { if x > 0 { println("yes") } }"#;
         let tree = parse_go(src);
         let stmt = find_node_by_kind(tree.root_node(), "assignment_statement")
             .expect("should find assignment_statement node");
-        let candidates = RemoveAssignment.apply(&stmt, src.as_bytes());
+        let candidates = RemoveAssignment.apply(&stmt, src.as_bytes(), &crate::languages::go::Go);
         assert_single_candidate(&candidates, src, "", "x = 1");
     }
 
@@ -199,7 +220,7 @@ func f(x int) { if x > 0 { println("yes") } }"#;
         let src = "package main\nfunc f() { for i := 0; i < 10; i++ { println(i) } }";
         let tree = parse_go(src);
         let for_node = find_node_by_kind(tree.root_node(), "for_statement").unwrap();
-        let candidates = RemoveIfBody.apply(&for_node, src.as_bytes());
+        let candidates = RemoveIfBody.apply(&for_node, src.as_bytes(), &crate::languages::go::Go);
         assert!(candidates.is_empty());
     }
 
@@ -208,7 +229,7 @@ func f(x int) { if x > 0 { println("yes") } }"#;
         let src = "package main\nfunc f(x int) { if x > 0 { println(x) } }";
         let tree = parse_go(src);
         let if_node = find_node_by_kind(tree.root_node(), "if_statement").unwrap();
-        let candidates = RemoveElse.apply(&if_node, src.as_bytes());
+        let candidates = RemoveElse.apply(&if_node, src.as_bytes(), &crate::languages::go::Go);
         assert!(candidates.is_empty());
     }
 }

@@ -28,7 +28,12 @@ impl MutationOperator for TrueToFalse {
     fn description(&self) -> &str {
         "Replace true with false"
     }
-    fn apply(&self, node: &tree_sitter::Node, source: &[u8]) -> Vec<MutationCandidate> {
+    fn apply(
+        &self,
+        node: &tree_sitter::Node,
+        source: &[u8],
+        _lang: &dyn crate::languages::LanguageSupport,
+    ) -> Vec<MutationCandidate> {
         if TRUE_KINDS.contains(&node.kind()) {
             let text = std::str::from_utf8(&source[node.byte_range()]).unwrap_or("");
             if text == "true" || text == "True" || text == "TRUE" {
@@ -48,7 +53,12 @@ impl MutationOperator for FalseToTrue {
     fn description(&self) -> &str {
         "Replace false with true"
     }
-    fn apply(&self, node: &tree_sitter::Node, source: &[u8]) -> Vec<MutationCandidate> {
+    fn apply(
+        &self,
+        node: &tree_sitter::Node,
+        source: &[u8],
+        _lang: &dyn crate::languages::LanguageSupport,
+    ) -> Vec<MutationCandidate> {
         if FALSE_KINDS.contains(&node.kind()) {
             let text = std::str::from_utf8(&source[node.byte_range()]).unwrap_or("");
             if text == "false" || text == "False" || text == "FALSE" {
@@ -68,7 +78,12 @@ impl MutationOperator for ZeroToOne {
     fn description(&self) -> &str {
         "Replace 0 with 1"
     }
-    fn apply(&self, node: &tree_sitter::Node, source: &[u8]) -> Vec<MutationCandidate> {
+    fn apply(
+        &self,
+        node: &tree_sitter::Node,
+        source: &[u8],
+        _lang: &dyn crate::languages::LanguageSupport,
+    ) -> Vec<MutationCandidate> {
         if INT_LITERAL_KINDS.contains(&node.kind()) {
             let text = std::str::from_utf8(&source[node.byte_range()]).unwrap_or("");
             if text == "0" {
@@ -88,7 +103,12 @@ impl MutationOperator for StringToEmpty {
     fn description(&self) -> &str {
         "Replace string literal with empty string"
     }
-    fn apply(&self, node: &tree_sitter::Node, source: &[u8]) -> Vec<MutationCandidate> {
+    fn apply(
+        &self,
+        node: &tree_sitter::Node,
+        source: &[u8],
+        _lang: &dyn crate::languages::LanguageSupport,
+    ) -> Vec<MutationCandidate> {
         if STRING_LITERAL_KINDS.contains(&node.kind()) {
             let text = std::str::from_utf8(&source[node.byte_range()]).unwrap_or("");
             if text == "\"\"" || text == "''" || text == "``" {
@@ -116,7 +136,12 @@ impl MutationOperator for IncrementNumeric {
     fn description(&self) -> &str {
         "Replace n with n+1"
     }
-    fn apply(&self, node: &tree_sitter::Node, source: &[u8]) -> Vec<MutationCandidate> {
+    fn apply(
+        &self,
+        node: &tree_sitter::Node,
+        source: &[u8],
+        _lang: &dyn crate::languages::LanguageSupport,
+    ) -> Vec<MutationCandidate> {
         if !INT_LITERAL_KINDS.contains(&node.kind()) {
             return vec![];
         }
@@ -142,7 +167,12 @@ impl MutationOperator for DecrementNumeric {
     fn description(&self) -> &str {
         "Replace n with n-1"
     }
-    fn apply(&self, node: &tree_sitter::Node, source: &[u8]) -> Vec<MutationCandidate> {
+    fn apply(
+        &self,
+        node: &tree_sitter::Node,
+        source: &[u8],
+        _lang: &dyn crate::languages::LanguageSupport,
+    ) -> Vec<MutationCandidate> {
         if !INT_LITERAL_KINDS.contains(&node.kind()) {
             return vec![];
         }
@@ -182,7 +212,7 @@ mod tests {
         op: &dyn MutationOperator,
         out: &mut Vec<MutationCandidate>,
     ) {
-        out.extend(op.apply(&node, source));
+        out.extend(op.apply(&node, source, &crate::languages::go::Go));
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
             collect_all_candidates(child, source, op, out);
@@ -194,7 +224,7 @@ mod tests {
         let src = "package main\nfunc f() bool { return true }";
         let tree = parse_go(src);
         let node = find_node_by_kind(tree.root_node(), "true").expect("should find true node");
-        let candidates = TrueToFalse.apply(&node, src.as_bytes());
+        let candidates = TrueToFalse.apply(&node, src.as_bytes(), &crate::languages::go::Go);
         assert_single_candidate(&candidates, src, "false", "true");
     }
 
@@ -203,7 +233,7 @@ mod tests {
         let src = "package main\nfunc f() bool { return false }";
         let tree = parse_go(src);
         let node = find_node_by_kind(tree.root_node(), "false").expect("should find false node");
-        let candidates = FalseToTrue.apply(&node, src.as_bytes());
+        let candidates = FalseToTrue.apply(&node, src.as_bytes(), &crate::languages::go::Go);
         assert_single_candidate(&candidates, src, "true", "false");
     }
 
@@ -213,7 +243,7 @@ mod tests {
         let tree = parse_go(src);
         let node = find_node_by_kind(tree.root_node(), "int_literal")
             .expect("should find int_literal node");
-        let candidates = ZeroToOne.apply(&node, src.as_bytes());
+        let candidates = ZeroToOne.apply(&node, src.as_bytes(), &crate::languages::go::Go);
         assert_single_candidate(&candidates, src, "1", "0");
     }
 
@@ -223,7 +253,7 @@ mod tests {
         let tree = parse_go(src);
         let node = find_node_by_kind(tree.root_node(), "int_literal")
             .expect("should find int_literal node");
-        let candidates = ZeroToOne.apply(&node, src.as_bytes());
+        let candidates = ZeroToOne.apply(&node, src.as_bytes(), &crate::languages::go::Go);
         assert!(candidates.is_empty());
     }
 
@@ -248,7 +278,7 @@ func f() string { return "hello" }"#;
         let tree = parse_go(src);
         let node = find_node_by_kind(tree.root_node(), "interpreted_string_literal")
             .expect("should find interpreted_string_literal node");
-        let candidates = StringToEmpty.apply(&node, src.as_bytes());
+        let candidates = StringToEmpty.apply(&node, src.as_bytes(), &crate::languages::go::Go);
         assert_single_candidate(&candidates, src, r#""""#, r#""hello""#);
     }
 
@@ -258,7 +288,7 @@ func f() string { return "hello" }"#;
         let tree = parse_go(src);
         let node = find_node_by_kind(tree.root_node(), "raw_string_literal")
             .expect("should find raw_string_literal node");
-        let candidates = StringToEmpty.apply(&node, src.as_bytes());
+        let candidates = StringToEmpty.apply(&node, src.as_bytes(), &crate::languages::go::Go);
         assert_single_candidate(&candidates, src, "``", "`hello`");
     }
 
@@ -269,7 +299,7 @@ func f() string { return "" }"#;
         let tree = parse_go(src);
         let node = find_node_by_kind(tree.root_node(), "interpreted_string_literal")
             .expect("should find interpreted_string_literal node");
-        let candidates = StringToEmpty.apply(&node, src.as_bytes());
+        let candidates = StringToEmpty.apply(&node, src.as_bytes(), &crate::languages::go::Go);
         assert!(candidates.is_empty());
     }
 
@@ -279,7 +309,7 @@ func f() string { return "" }"#;
         let tree = parse_go(src);
         let node = find_node_by_kind(tree.root_node(), "int_literal")
             .expect("should find int_literal node");
-        let candidates = IncrementNumeric.apply(&node, src.as_bytes());
+        let candidates = IncrementNumeric.apply(&node, src.as_bytes(), &crate::languages::go::Go);
         assert_single_candidate(&candidates, src, "42", "41");
     }
 
@@ -289,7 +319,7 @@ func f() string { return "" }"#;
         let tree = parse_go(src);
         let node = find_node_by_kind(tree.root_node(), "int_literal")
             .expect("should find int_literal node");
-        let candidates = DecrementNumeric.apply(&node, src.as_bytes());
+        let candidates = DecrementNumeric.apply(&node, src.as_bytes(), &crate::languages::go::Go);
         assert_single_candidate(&candidates, src, "40", "41");
     }
 
@@ -300,7 +330,15 @@ func f() string { return "" }"#;
         let node = find_node_by_kind(tree.root_node(), "float_literal")
             .expect("should find float_literal node");
 
-        assert!(IncrementNumeric.apply(&node, src.as_bytes()).is_empty());
-        assert!(DecrementNumeric.apply(&node, src.as_bytes()).is_empty());
+        assert!(
+            IncrementNumeric
+                .apply(&node, src.as_bytes(), &crate::languages::go::Go)
+                .is_empty()
+        );
+        assert!(
+            DecrementNumeric
+                .apply(&node, src.as_bytes(), &crate::languages::go::Go)
+                .is_empty()
+        );
     }
 }
