@@ -1,4 +1,4 @@
-use super::{IF_STMT_KINDS, MutationOperator};
+use super::{IF_STMT_KINDS, MutationOperator, mutation_candidate};
 use crate::MutationCandidate;
 
 pub struct RemoveIfBody;
@@ -19,12 +19,7 @@ impl MutationOperator for RemoveIfBody {
             .child_by_field_name("consequence")
             .or_else(|| node.child_by_field_name("body"));
         if let Some(body_node) = body {
-            vec![MutationCandidate {
-                byte_range: body_node.byte_range(),
-                replacement: "{}".to_string(),
-                operator_id: self.id().to_string(),
-                description: self.description().to_string(),
-            }]
+            vec![mutation_candidate(self, body_node.byte_range(), "{}")]
         } else {
             vec![]
         }
@@ -64,12 +59,11 @@ impl MutationOperator for RemoveElse {
                     }
                 }
             }
-            vec![MutationCandidate {
-                byte_range: else_kw_start..else_node.end_byte(),
-                replacement: String::new(),
-                operator_id: self.id().to_string(),
-                description: self.description().to_string(),
-            }]
+            vec![mutation_candidate(
+                self,
+                else_kw_start..else_node.end_byte(),
+                String::new(),
+            )]
         } else {
             vec![]
         }
@@ -102,12 +96,7 @@ impl MutationOperator for RemoveCallStatement {
             .named_children(&mut cursor)
             .any(|child| CALL_EXPR_KINDS.contains(&child.kind()));
         if has_call {
-            vec![MutationCandidate {
-                byte_range: node.byte_range(),
-                replacement: String::new(),
-                operator_id: self.id().to_string(),
-                description: self.description().to_string(),
-            }]
+            vec![mutation_candidate(self, node.byte_range(), String::new())]
         } else {
             vec![]
         }
@@ -135,12 +124,7 @@ impl MutationOperator for RemoveAssignment {
         if !ASSIGNMENT_KINDS.contains(&node.kind()) {
             return vec![];
         }
-        vec![MutationCandidate {
-            byte_range: node.byte_range(),
-            replacement: String::new(),
-            operator_id: self.id().to_string(),
-            description: self.description().to_string(),
-        }]
+        vec![mutation_candidate(self, node.byte_range(), String::new())]
     }
 }
 

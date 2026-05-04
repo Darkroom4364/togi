@@ -1,24 +1,10 @@
 // Combine mapper + operators to generate mutations
 
-use crate::languages::LanguageSupport;
 use crate::mapper::find_mutable_nodes;
 use crate::operators::{self};
-use crate::{ChangedFile, Mutation, MutationCandidate};
+use crate::{ChangedFile, Mutation};
 use anyhow::Result;
 use std::path::Path;
-
-/// Check if a mutation candidate should be filtered out for the given language.
-fn should_filter(
-    candidate: &MutationCandidate,
-    node: &tree_sitter::Node,
-    source: &[u8],
-    lang: &dyn LanguageSupport,
-) -> bool {
-    if lang.should_filter_candidate(candidate, node, source) {
-        return true;
-    }
-    false
-}
 
 /// Convert a byte offset in source to (line, column), both 1-indexed.
 fn byte_offset_to_line_col(source: &[u8], offset: usize) -> (usize, usize) {
@@ -85,7 +71,7 @@ pub fn generate_mutations(
             for op in &operators {
                 let candidates = op.apply(node, &source);
                 for mut candidate in candidates {
-                    if should_filter(&candidate, node, &source, lang.as_ref()) {
+                    if lang.should_filter_candidate(&candidate, node, &source) {
                         continue;
                     }
                     lang.fixup_replacement(&mut candidate);
@@ -205,9 +191,10 @@ fn sample_diverse(mutations: Vec<Mutation>, cap: usize) -> Vec<Mutation> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::languages::LanguageSupport;
     use crate::languages::go::Go;
     use crate::test_helpers::{find_node_by_kind, parse_go, parse_python};
-    use crate::{ChangedFile, LineRange};
+    use crate::{ChangedFile, LineRange, MutationCandidate};
     use std::path::PathBuf;
     use tempfile::TempDir;
 
@@ -244,12 +231,7 @@ mod tests {
         let bin = find_node_by_kind(tree.root_node(), "binary_expression")
             .expect("should find binary_expression node");
 
-        assert!(should_filter(
-            &candidate("mul_to_div"),
-            &bin,
-            src.as_bytes(),
-            &lang
-        ));
+        assert!(lang.should_filter_candidate(&candidate("mul_to_div"), &bin, src.as_bytes()));
     }
 
     #[test]
@@ -260,12 +242,7 @@ mod tests {
         let bin = find_node_by_kind(tree.root_node(), "binary_expression")
             .expect("should find binary_expression node");
 
-        assert!(!should_filter(
-            &candidate("mul_to_div"),
-            &bin,
-            src.as_bytes(),
-            &lang
-        ));
+        assert!(!lang.should_filter_candidate(&candidate("mul_to_div"), &bin, src.as_bytes()));
     }
 
     #[test]
@@ -276,12 +253,7 @@ mod tests {
         let bin = find_node_by_kind(tree.root_node(), "binary_expression")
             .expect("should find binary_expression node");
 
-        assert!(should_filter(
-            &candidate("div_to_mul"),
-            &bin,
-            src.as_bytes(),
-            &lang
-        ));
+        assert!(lang.should_filter_candidate(&candidate("div_to_mul"), &bin, src.as_bytes()));
     }
 
     #[test]

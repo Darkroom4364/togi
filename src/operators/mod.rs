@@ -22,6 +22,19 @@ pub trait MutationOperator: Send + Sync {
     fn apply(&self, node: &tree_sitter::Node, source: &[u8]) -> Vec<crate::MutationCandidate>;
 }
 
+pub(crate) fn mutation_candidate(
+    operator: &dyn MutationOperator,
+    byte_range: std::ops::Range<usize>,
+    replacement: impl Into<String>,
+) -> crate::MutationCandidate {
+    crate::MutationCandidate {
+        byte_range,
+        replacement: replacement.into(),
+        operator_id: operator.id().to_string(),
+        description: operator.description().to_string(),
+    }
+}
+
 pub(crate) const IF_STMT_KINDS: &[&str] = &[
     "if_statement",
     "if_expression",
