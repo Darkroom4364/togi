@@ -1,24 +1,6 @@
 use super::{MutationOperator, mutation_candidate};
 use crate::MutationCandidate;
 
-const TRUE_KINDS: &[&str] = &["true", "True", "TRUE", "boolean_literal"];
-const FALSE_KINDS: &[&str] = &["false", "False", "FALSE", "boolean_literal"];
-const INT_LITERAL_KINDS: &[&str] = &[
-    "integer_literal",
-    "int_literal",
-    "integer", // Ruby
-    "number",
-    "number_literal",
-];
-const STRING_LITERAL_KINDS: &[&str] = &[
-    "interpreted_string_literal",
-    "raw_string_literal",
-    "string",
-    "string_literal",
-    "string_content",
-    "template_string",
-];
-
 pub struct TrueToFalse;
 
 impl MutationOperator for TrueToFalse {
@@ -32,11 +14,11 @@ impl MutationOperator for TrueToFalse {
         &self,
         node: &tree_sitter::Node,
         source: &[u8],
-        _lang: &dyn crate::languages::LanguageSupport,
+        lang: &dyn crate::languages::LanguageSupport,
     ) -> Vec<MutationCandidate> {
-        if TRUE_KINDS.contains(&node.kind()) {
+        if lang.is_boolean_true_literal_node(node.kind()) {
             let text = std::str::from_utf8(&source[node.byte_range()]).unwrap_or("");
-            if text == "true" || text == "True" || text == "TRUE" {
+            if lang.boolean_true_literals().contains(&text) {
                 return vec![mutation_candidate(self, node.byte_range(), "false")];
             }
         }
@@ -57,11 +39,11 @@ impl MutationOperator for FalseToTrue {
         &self,
         node: &tree_sitter::Node,
         source: &[u8],
-        _lang: &dyn crate::languages::LanguageSupport,
+        lang: &dyn crate::languages::LanguageSupport,
     ) -> Vec<MutationCandidate> {
-        if FALSE_KINDS.contains(&node.kind()) {
+        if lang.is_boolean_false_literal_node(node.kind()) {
             let text = std::str::from_utf8(&source[node.byte_range()]).unwrap_or("");
-            if text == "false" || text == "False" || text == "FALSE" {
+            if lang.boolean_false_literals().contains(&text) {
                 return vec![mutation_candidate(self, node.byte_range(), "true")];
             }
         }
@@ -82,9 +64,9 @@ impl MutationOperator for ZeroToOne {
         &self,
         node: &tree_sitter::Node,
         source: &[u8],
-        _lang: &dyn crate::languages::LanguageSupport,
+        lang: &dyn crate::languages::LanguageSupport,
     ) -> Vec<MutationCandidate> {
-        if INT_LITERAL_KINDS.contains(&node.kind()) {
+        if lang.is_integer_literal_node(node.kind()) {
             let text = std::str::from_utf8(&source[node.byte_range()]).unwrap_or("");
             if text == "0" {
                 return vec![mutation_candidate(self, node.byte_range(), "1")];
@@ -107,9 +89,9 @@ impl MutationOperator for StringToEmpty {
         &self,
         node: &tree_sitter::Node,
         source: &[u8],
-        _lang: &dyn crate::languages::LanguageSupport,
+        lang: &dyn crate::languages::LanguageSupport,
     ) -> Vec<MutationCandidate> {
-        if STRING_LITERAL_KINDS.contains(&node.kind()) {
+        if lang.is_string_literal_node(node.kind()) {
             let text = std::str::from_utf8(&source[node.byte_range()]).unwrap_or("");
             if text == "\"\"" || text == "''" || text == "``" {
                 return vec![];
@@ -140,9 +122,9 @@ impl MutationOperator for IncrementNumeric {
         &self,
         node: &tree_sitter::Node,
         source: &[u8],
-        _lang: &dyn crate::languages::LanguageSupport,
+        lang: &dyn crate::languages::LanguageSupport,
     ) -> Vec<MutationCandidate> {
-        if !INT_LITERAL_KINDS.contains(&node.kind()) {
+        if !lang.is_integer_literal_node(node.kind()) {
             return vec![];
         }
         let text = std::str::from_utf8(&source[node.byte_range()]).unwrap_or("");
@@ -171,9 +153,9 @@ impl MutationOperator for DecrementNumeric {
         &self,
         node: &tree_sitter::Node,
         source: &[u8],
-        _lang: &dyn crate::languages::LanguageSupport,
+        lang: &dyn crate::languages::LanguageSupport,
     ) -> Vec<MutationCandidate> {
-        if !INT_LITERAL_KINDS.contains(&node.kind()) {
+        if !lang.is_integer_literal_node(node.kind()) {
             return vec![];
         }
         let text = std::str::from_utf8(&source[node.byte_range()]).unwrap_or("");

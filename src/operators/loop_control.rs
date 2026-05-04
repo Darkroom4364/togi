@@ -1,18 +1,6 @@
 use super::MutationOperator;
 use crate::MutationCandidate;
 
-const BREAK_KINDS: &[&str] = &[
-    "break_statement",
-    "break_expression", // Rust
-    "break",            // Ruby
-];
-
-const CONTINUE_KINDS: &[&str] = &[
-    "continue_statement",
-    "continue_expression", // Rust
-    "next",                // Ruby
-];
-
 pub struct RemoveBreak;
 
 impl MutationOperator for RemoveBreak {
@@ -26,9 +14,9 @@ impl MutationOperator for RemoveBreak {
         &self,
         node: &tree_sitter::Node,
         _source: &[u8],
-        _lang: &dyn crate::languages::LanguageSupport,
+        lang: &dyn crate::languages::LanguageSupport,
     ) -> Vec<MutationCandidate> {
-        if !BREAK_KINDS.contains(&node.kind()) {
+        if !lang.is_break_node(node.kind()) {
             return vec![];
         }
         vec![MutationCandidate {
@@ -53,9 +41,9 @@ impl MutationOperator for RemoveContinue {
         &self,
         node: &tree_sitter::Node,
         _source: &[u8],
-        _lang: &dyn crate::languages::LanguageSupport,
+        lang: &dyn crate::languages::LanguageSupport,
     ) -> Vec<MutationCandidate> {
-        if !CONTINUE_KINDS.contains(&node.kind()) {
+        if !lang.is_continue_node(node.kind()) {
             return vec![];
         }
         vec![MutationCandidate {

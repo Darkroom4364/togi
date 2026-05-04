@@ -1,8 +1,6 @@
 use super::MutationOperator;
 use crate::MutationCandidate;
 
-const UNARY_EXPR_KINDS: &[&str] = &["unary_expression", "unary_expr", "not_operator"];
-
 pub struct RemoveUnaryNot;
 
 impl MutationOperator for RemoveUnaryNot {
@@ -16,9 +14,9 @@ impl MutationOperator for RemoveUnaryNot {
         &self,
         node: &tree_sitter::Node,
         source: &[u8],
-        _lang: &dyn crate::languages::LanguageSupport,
+        lang: &dyn crate::languages::LanguageSupport,
     ) -> Vec<MutationCandidate> {
-        if !UNARY_EXPR_KINDS.contains(&node.kind()) {
+        if !lang.is_unary_expression_node(node.kind()) {
             return vec![];
         }
         let text = std::str::from_utf8(&source[node.byte_range()]).unwrap_or("");
@@ -48,9 +46,9 @@ impl MutationOperator for RemoveUnaryNeg {
         &self,
         node: &tree_sitter::Node,
         source: &[u8],
-        _lang: &dyn crate::languages::LanguageSupport,
+        lang: &dyn crate::languages::LanguageSupport,
     ) -> Vec<MutationCandidate> {
-        if !UNARY_EXPR_KINDS.contains(&node.kind()) {
+        if !lang.is_unary_expression_node(node.kind()) {
             return vec![];
         }
         let text = std::str::from_utf8(&source[node.byte_range()]).unwrap_or("");
