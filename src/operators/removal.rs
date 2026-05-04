@@ -80,14 +80,6 @@ impl MutationOperator for RemoveElse {
     }
 }
 
-const EXPR_STMT_KINDS: &[&str] = &["expression_statement", "expression_stmt"];
-const CALL_EXPR_KINDS: &[&str] = &[
-    "call_expression",
-    "call",
-    "method_invocation",
-    "invocation_expression",
-];
-
 pub struct RemoveCallStatement;
 
 impl MutationOperator for RemoveCallStatement {
@@ -101,15 +93,15 @@ impl MutationOperator for RemoveCallStatement {
         &self,
         node: &tree_sitter::Node,
         _source: &[u8],
-        _lang: &dyn crate::languages::LanguageSupport,
+        lang: &dyn crate::languages::LanguageSupport,
     ) -> Vec<MutationCandidate> {
-        if !EXPR_STMT_KINDS.contains(&node.kind()) {
+        if !lang.is_expression_statement_node(node.kind()) {
             return vec![];
         }
         let mut cursor = node.walk();
         let has_call = node
             .named_children(&mut cursor)
-            .any(|child| CALL_EXPR_KINDS.contains(&child.kind()));
+            .any(|child| lang.is_call_expression_node(child.kind()));
         if has_call {
             vec![mutation_candidate(self, node.byte_range(), String::new())]
         } else {
@@ -117,14 +109,6 @@ impl MutationOperator for RemoveCallStatement {
         }
     }
 }
-
-const ASSIGNMENT_KINDS: &[&str] = &[
-    "assignment_statement",
-    "assignment_expression",
-    "assignment",
-    "augmented_assignment",
-    "augmented_assignment_expression",
-];
 
 pub struct RemoveAssignment;
 
@@ -139,9 +123,9 @@ impl MutationOperator for RemoveAssignment {
         &self,
         node: &tree_sitter::Node,
         _source: &[u8],
-        _lang: &dyn crate::languages::LanguageSupport,
+        lang: &dyn crate::languages::LanguageSupport,
     ) -> Vec<MutationCandidate> {
-        if !ASSIGNMENT_KINDS.contains(&node.kind()) {
+        if !lang.is_assignment_node(node.kind()) {
             return vec![];
         }
         vec![mutation_candidate(self, node.byte_range(), String::new())]

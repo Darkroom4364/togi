@@ -132,35 +132,19 @@ impl MutationOperator for ReturnEmpty {
         let last = &children[children.len() - 1];
         let value_range = first.start_byte()..last.end_byte();
         let text = std::str::from_utf8(&source[value_range.clone()]).unwrap_or("");
-
-        // Use tree-sitter node kind of the first child for more accurate replacement
-        let first_kind = first.kind();
-        let replacement = match first_kind {
-            // String literals
-            "interpreted_string_literal"
-            | "raw_string_literal"
-            | "string"
-            | "string_literal"
-            | "template_string" => "\"\"".to_string(),
-            // Boolean literals
-            "true" | "false" | "boolean" => "false".to_string(),
-            // Null/nil/None
-            "null" | "nil" | "none" | "None" => return vec![], // already a zero-value, skip
-            // Numeric literals
-            "integer_literal" | "int_literal" | "float_literal" | "number" | "integer"
-            | "float" => "0".to_string(),
-            // Fallback: use text-based heuristic
-            _ => {
-                if text == "nil" || text == "null" || text == "None" {
-                    return vec![]; // Already a zero-value, mutation not useful
-                } else if text == "true" || text == "false" {
-                    "false".to_string()
-                } else if text.starts_with('"') || text.starts_with('\'') || text.starts_with('`') {
-                    "\"\"".to_string()
-                } else {
-                    "0".to_string()
-                }
+        let replacement_kind = if first.kind() == "expression_list" {
+            let mut cursor = first.walk();
+            let mut values = first.named_children(&mut cursor);
+            match (values.next(), values.next()) {
+                (Some(value), None) => value.kind(),
+                _ => first.kind(),
             }
+        } else {
+            first.kind()
+        };
+
+        let Some(replacement) = lang.return_empty_replacement(replacement_kind, text) else {
+            return vec![];
         };
 
         vec![crate::MutationCandidate {

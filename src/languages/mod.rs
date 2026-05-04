@@ -15,8 +15,8 @@ pub mod typescript;
 ///   binary_expression: "binary_expression"
 ///   if_statement: "if_statement"
 ///   return_statement: "return_statement"
-///   bool_true: ["true"]
-///   bool_false: ["false"]
+///   bool_true: ["true", "True", "TRUE"]
+///   bool_false: ["false", "False", "FALSE"]
 ///   operator_field: "operator"
 ///   skip_subtree_kinds: []
 ///   filter_candidate: function path
@@ -55,10 +55,10 @@ macro_rules! define_language {
                 $crate::languages::define_language!(@first $($ret)? ; "return_statement")
             }
             fn boolean_true_literals(&self) -> &[&str] {
-                $crate::languages::define_language!(@arr [$($($bt),*)?] ; ["true"])
+                $crate::languages::define_language!(@arr [$($($bt),*)?] ; ["true", "True", "TRUE"])
             }
             fn boolean_false_literals(&self) -> &[&str] {
-                $crate::languages::define_language!(@arr [$($($bf),*)?] ; ["false"])
+                $crate::languages::define_language!(@arr [$($($bf),*)?] ; ["false", "False", "FALSE"])
             }
             fn operator_field(&self) -> &str {
                 $crate::languages::define_language!(@first $($op)? ; "operator")
@@ -129,42 +129,39 @@ const SIMPLE_RETURN_TYPE_KINDS: &[&str] = &[
     "floating_point_type",
 ];
 
-// Shared operator-family node kinds. Primary binary/if/return kinds come from
-// each LanguageSupport implementation.
-const SHARED_MUTABLE_NODE_KINDS: &[&str] = &[
-    "binary_expr",
-    "comparison_expression",
-    "if_expr",
-    "true",
-    "false",
-    "boolean_literal",
+const INTEGER_LITERAL_NODE_KINDS: &[&str] = &[
     "integer_literal",
     "int_literal",
     "integer",
     "number",
     "number_literal",
-    "unary_expression",
-    "unary_expr",
-    "not_operator",
+];
+
+const STRING_LITERAL_NODE_KINDS: &[&str] = &[
     "interpreted_string_literal",
     "raw_string_literal",
     "string",
     "string_literal",
-    "string_content",
     "template_string",
-    "expression_statement",
-    "expression_stmt",
+];
+
+const UNARY_EXPRESSION_NODE_KINDS: &[&str] = &["unary_expression", "unary_expr", "not_operator"];
+
+const EXPRESSION_STATEMENT_NODE_KINDS: &[&str] = &["expression_statement", "expression_stmt"];
+
+const CALL_EXPRESSION_NODE_KINDS: &[&str] = &[
+    "call_expression",
+    "call",
+    "method_invocation",
+    "invocation_expression",
+];
+
+const ASSIGNMENT_NODE_KINDS: &[&str] = &[
     "assignment_statement",
     "assignment_expression",
     "assignment",
     "augmented_assignment",
     "augmented_assignment_expression",
-    "break_statement",
-    "break_expression",
-    "break",
-    "continue_statement",
-    "continue_expression",
-    "next",
 ];
 
 pub(crate) fn is_default_mutable_node_kind<L: LanguageSupport + ?Sized>(
@@ -174,7 +171,18 @@ pub(crate) fn is_default_mutable_node_kind<L: LanguageSupport + ?Sized>(
     kind == lang.binary_expression_node()
         || kind == lang.if_statement_node()
         || kind == lang.return_statement_node()
-        || SHARED_MUTABLE_NODE_KINDS.contains(&kind)
+        || kind == "binary_expr"
+        || kind == "comparison_expression"
+        || kind == "if_expr"
+        || lang.is_boolean_true_literal_node(kind)
+        || lang.is_boolean_false_literal_node(kind)
+        || lang.is_integer_literal_node(kind)
+        || lang.is_string_literal_node(kind)
+        || lang.is_unary_expression_node(kind)
+        || lang.is_expression_statement_node(kind)
+        || lang.is_assignment_node(kind)
+        || lang.is_break_node(kind)
+        || lang.is_continue_node(kind)
 }
 
 pub(crate) fn should_skip_return_empty_for_type(
@@ -285,6 +293,80 @@ pub trait LanguageSupport: Send + Sync {
 
     /// Primary return-statement or return-expression node kind.
     fn return_statement_node(&self) -> &str;
+
+    /// Return true when `kind` can hold a boolean true literal for this grammar.
+    fn is_boolean_true_literal_node(&self, kind: &str) -> bool {
+        matches!(kind, "true" | "True" | "TRUE" | "boolean_literal")
+            || self.boolean_true_literals().contains(&kind)
+    }
+
+    /// Return true when `kind` can hold a boolean false literal for this grammar.
+    fn is_boolean_false_literal_node(&self, kind: &str) -> bool {
+        matches!(kind, "false" | "False" | "FALSE" | "boolean_literal")
+            || self.boolean_false_literals().contains(&kind)
+    }
+
+    /// Return true when `kind` can hold an integer-style numeric literal.
+    fn is_integer_literal_node(&self, kind: &str) -> bool {
+        INTEGER_LITERAL_NODE_KINDS.contains(&kind)
+    }
+
+    /// Return true when `kind` can hold a string literal.
+    fn is_string_literal_node(&self, kind: &str) -> bool {
+        STRING_LITERAL_NODE_KINDS.contains(&kind)
+    }
+
+    /// Return true when `kind` is a unary expression node.
+    fn is_unary_expression_node(&self, kind: &str) -> bool {
+        UNARY_EXPRESSION_NODE_KINDS.contains(&kind)
+    }
+
+    /// Return true when `kind` is a loop break node.
+    fn is_break_node(&self, kind: &str) -> bool {
+        matches!(kind, "break_statement" | "break_expression" | "break")
+    }
+
+    /// Return true when `kind` is a loop continue node.
+    fn is_continue_node(&self, kind: &str) -> bool {
+        matches!(kind, "continue_statement" | "continue_expression" | "next")
+    }
+
+    /// Return true when `kind` is an expression statement node.
+    fn is_expression_statement_node(&self, kind: &str) -> bool {
+        EXPRESSION_STATEMENT_NODE_KINDS.contains(&kind)
+    }
+
+    /// Return true when `kind` is a call expression node.
+    fn is_call_expression_node(&self, kind: &str) -> bool {
+        CALL_EXPRESSION_NODE_KINDS.contains(&kind)
+    }
+
+    /// Return true when `kind` is an assignment node.
+    fn is_assignment_node(&self, kind: &str) -> bool {
+        ASSIGNMENT_NODE_KINDS.contains(&kind)
+    }
+
+    /// Return the replacement for a return value, or None if it is already empty.
+    fn return_empty_replacement(&self, kind: &str, text: &str) -> Option<String> {
+        if self.is_string_literal_node(kind) {
+            Some("\"\"".to_string())
+        } else if self.is_boolean_true_literal_node(kind)
+            || self.is_boolean_false_literal_node(kind)
+            || kind == "boolean"
+        {
+            Some("false".to_string())
+        } else if matches!(kind, "null" | "nil" | "none" | "None")
+            || matches!(text, "nil" | "null" | "None")
+        {
+            None
+        } else if self.is_integer_literal_node(kind) || matches!(kind, "float_literal" | "float") {
+            Some("0".to_string())
+        } else if text.starts_with('"') || text.starts_with('\'') || text.starts_with('`') {
+            Some("\"\"".to_string())
+        } else {
+            Some("0".to_string())
+        }
+    }
 
     /// Return true when `kind` is a mutation-relevant AST node kind for this language.
     fn is_mutable_node_kind(&self, kind: &str) -> bool {
