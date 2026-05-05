@@ -12,6 +12,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const CAPTURED_OUTPUT_LIMIT: usize = 1024 * 1024;
+const OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Write mutation workspace content. Workspaces are disposable temp copies, so
 /// durable temp-file + fsync writes would only add hot-loop I/O overhead.
@@ -1081,11 +1082,12 @@ fn run_command(
         }
     };
 
-    let stdout = match recv_output_reader(stdout_reader, started, timeout_dur) {
+    let drain_duration = OUTPUT_DRAIN_TIMEOUT;
+    let stdout = match recv_output_reader(stdout_reader, drain_duration) {
         Ok(bytes) => bytes,
         Err(result) => return result,
     };
-    let stderr = match recv_output_reader(stderr_reader, started, timeout_dur) {
+    let stderr = match recv_output_reader(stderr_reader, drain_duration) {
         Ok(bytes) => bytes,
         Err(result) => return result,
     };
@@ -1158,8 +1160,7 @@ where
 
 fn recv_output_reader(
     reader: Option<mpsc::Receiver<CapturedOutput>>,
-    started: Instant,
-    timeout_dur: Duration,
+    drain_duration: Duration,
 ) -> Result<CapturedOutput, MutationOutcome> {
     let Some(reader) = reader else {
         return Ok(CapturedOutput {
@@ -1167,16 +1168,12 @@ fn recv_output_reader(
             truncated: false,
         });
     };
-    let Some(remaining) = timeout_dur.checked_sub(started.elapsed()) else {
-        return Err(MutationOutcome {
+    reader
+        .recv_timeout(drain_duration)
+        .map_err(|_| MutationOutcome {
             result: MutationResult::Timeout,
             test_output: None,
-        });
-    };
-    reader.recv_timeout(remaining).map_err(|_| MutationOutcome {
-        result: MutationResult::Timeout,
-        test_output: None,
-    })
+        })
 }
 
 fn append_truncation_notice(output: &mut String, truncated: bool, stream: &str) {

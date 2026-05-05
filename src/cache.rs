@@ -6,7 +6,9 @@
 //! stored as JSON files in `.togi-cache/`.
 
 use crate::MutationResult;
+use std::collections::hash_map::DefaultHasher;
 use std::fs;
+use std::hash::Hasher;
 use std::path::{Path, PathBuf};
 
 /// Directory where cache entries are stored.
@@ -51,7 +53,7 @@ impl CacheKey {
     }
 
     fn digest_with_versions(&self, cache_schema_version: &str, togi_version: &str) -> String {
-        let mut hash = FNV_OFFSET;
+        let mut hash = 0;
         update_hash_str(&mut hash, cache_schema_version);
         update_hash_str(&mut hash, togi_version);
         update_hash_bytes(&mut hash, &self.file_content_hash.to_le_bytes());
@@ -102,13 +104,10 @@ fn entry_path(project_root: &Path, key: &CacheKey) -> PathBuf {
     cache_dir(project_root).join(key.digest())
 }
 
-const FNV_OFFSET: u64 = 0xcbf29ce484222325;
-const FNV_PRIME: u64 = 0x100000001b3;
-
 fn hash_bytes(data: &[u8]) -> u64 {
-    let mut hash = FNV_OFFSET;
-    update_hash_bytes(&mut hash, data);
-    hash
+    let mut hasher = DefaultHasher::new();
+    hasher.write(data);
+    hasher.finish()
 }
 
 fn hash_str(s: &str) -> u64 {
@@ -121,10 +120,10 @@ fn update_hash_str(hash: &mut u64, value: &str) {
 }
 
 fn update_hash_bytes(hash: &mut u64, bytes: &[u8]) {
-    for byte in bytes {
-        *hash ^= u64::from(*byte);
-        *hash = hash.wrapping_mul(FNV_PRIME);
-    }
+    let mut hasher = DefaultHasher::new();
+    hasher.write(&(*hash).to_le_bytes());
+    hasher.write(bytes);
+    *hash = hasher.finish();
 }
 
 #[cfg(test)]

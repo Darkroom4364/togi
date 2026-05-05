@@ -150,6 +150,9 @@ pub fn mutation_diff(mutation: &Mutation) -> Option<String> {
     if !original_line.is_char_boundary(byte_start) || !original_line.is_char_boundary(byte_end) {
         return None;
     }
+    if &original_line[byte_start..byte_end] != mutation.original.as_str() {
+        return None;
+    }
     let mutated_line = format!(
         "{}{}{}",
         &original_line[..byte_start],
@@ -298,6 +301,14 @@ mod tests {
         let content = "日本語\n";
         // column 2 (1-indexed) → byte_start 1, which is mid-character
         let m = make_mutation(tmp.path(), "t.rs", content, 1, 2, "x", "y");
+        assert!(mutation_diff(&m).is_none());
+    }
+
+    #[test]
+    fn mutation_diff_original_mismatch_returns_none() {
+        let tmp = TempDir::new().unwrap();
+        let content = "a = true\n";
+        let m = make_mutation(tmp.path(), "t.rs", content, 1, 5, "false", "true");
         assert!(mutation_diff(&m).is_none());
     }
 
