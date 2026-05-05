@@ -1,5 +1,4 @@
 use crate::{MutationReport, MutationResult};
-use colored::Colorize;
 use std::fmt::Write;
 
 pub fn print_report(report: &MutationReport) {
@@ -28,7 +27,7 @@ fn format_report(report: &MutationReport, color: bool) -> String {
                     detail,
                     "              {}",
                     if color {
-                        "Your tests don't catch this mutation.".red().to_string()
+                        red("Your tests don't catch this mutation.")
                     } else {
                         "Your tests don't catch this mutation.".to_string()
                     }
@@ -38,11 +37,11 @@ fn format_report(report: &MutationReport, color: bool) -> String {
                     for diff_line in diff.lines() {
                         if color {
                             if diff_line.starts_with('-') {
-                                writeln!(detail, "              {}", diff_line.red())
+                                writeln!(detail, "              {}", red(diff_line))
                             } else if diff_line.starts_with('+') {
-                                writeln!(detail, "              {}", diff_line.green())
+                                writeln!(detail, "              {}", green(diff_line))
                             } else {
-                                writeln!(detail, "              {}", diff_line.dimmed())
+                                writeln!(detail, "              {}", dim(diff_line))
                             }
                         } else {
                             writeln!(detail, "              {diff_line}")
@@ -58,9 +57,9 @@ fn format_report(report: &MutationReport, color: bool) -> String {
 
         if color {
             let tag_colored = match result {
-                MutationResult::Killed => tag.green().to_string(),
-                MutationResult::Survived => tag.red().to_string(),
-                MutationResult::Timeout | MutationResult::BuildError => tag.yellow().to_string(),
+                MutationResult::Killed => green(tag),
+                MutationResult::Survived => red(tag),
+                MutationResult::Timeout | MutationResult::BuildError => yellow(tag),
             };
             writeln!(
                 out,
@@ -68,8 +67,8 @@ fn format_report(report: &MutationReport, color: bool) -> String {
                 tag_colored,
                 file,
                 line,
-                "—".dimmed(),
-                operator.dimmed(),
+                dim("—"),
+                dim(operator),
                 desc
             )
         } else {
@@ -110,6 +109,26 @@ fn format_report(report: &MutationReport, color: bool) -> String {
     }
 
     out
+}
+
+fn ansi(code: &str, text: &str) -> String {
+    format!("\x1b[{code}m{text}\x1b[0m")
+}
+
+fn green(text: &str) -> String {
+    ansi("32", text)
+}
+
+fn red(text: &str) -> String {
+    ansi("31", text)
+}
+
+fn yellow(text: &str) -> String {
+    ansi("33", text)
+}
+
+fn dim(text: &str) -> String {
+    ansi("2", text)
 }
 
 /// Guidance text when every mutation is a build error.

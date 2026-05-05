@@ -68,10 +68,10 @@ fn generates_mutations_for_go_fixture() {
 
 /// End-to-end test: generate mutations and run them against the Go test suite.
 /// Requires `go` to be installed. Run with: cargo test -- --ignored
-#[tokio::test]
+#[test]
 #[ignore]
-async fn end_to_end_go_fixture_all_killed_with_cache_off() {
-    let _fixture_guard = crate::go_fixture_lock().await;
+fn end_to_end_go_fixture_all_killed_with_cache_off() {
+    let _fixture_guard = crate::go_fixture_lock();
     let root = fixture_path();
     togi::cache::clear(&root).expect("failed to clear togi cache");
 
@@ -114,7 +114,7 @@ async fn end_to_end_go_fixture_all_killed_with_cache_off() {
         cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
 
-    let report = runner.run(mutations).await;
+    let report = runner.run(mutations);
 
     println!(
         "Results: {} total, {} killed, {} survived, {} timeout, {} build errors",

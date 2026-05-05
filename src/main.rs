@@ -44,8 +44,7 @@ struct ExecuteOptions {
     cancelled: Arc<AtomicBool>,
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
     let cancelled = Arc::new(AtomicBool::new(false));
     let cancelled_handler = cancelled.clone();
 
@@ -111,7 +110,7 @@ async fn main() {
                 check_baseline,
                 pr_comment,
             };
-            if let Err(e) = run_check(cfg, cancelled).await {
+            if let Err(e) = run_check(cfg, cancelled) {
                 eprintln!("Error: {e:#}");
                 process::exit(2);
             }
@@ -265,7 +264,7 @@ fn print_operators() {
     }
 }
 
-async fn run_check(cfg: CheckConfig, cancelled: Arc<AtomicBool>) -> anyhow::Result<()> {
+fn run_check(cfg: CheckConfig, cancelled: Arc<AtomicBool>) -> anyhow::Result<()> {
     let all = cfg.all;
     let paths = cfg.paths.clone();
     let dry_run = cfg.dry_run;
@@ -341,8 +340,7 @@ async fn run_check(cfg: CheckConfig, cancelled: Arc<AtomicBool>) -> anyhow::Resu
             force_default_timeout: has_cli_timeout,
             cancelled,
         },
-    )
-    .await;
+    );
 
     togi::report::print_report(&report, output_format)?;
 
@@ -615,7 +613,7 @@ fn print_dry_run(mutations: &[Mutation]) {
     }
 }
 
-async fn execute(
+fn execute(
     mutations: Vec<Mutation>,
     config: togi::config::Config,
     project_root: PathBuf,
@@ -682,7 +680,7 @@ async fn execute(
         cancelled: options.cancelled,
     };
 
-    runner.run(mutations).await
+    runner.run(mutations)
 }
 
 fn load_test_selection(

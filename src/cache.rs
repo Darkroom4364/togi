@@ -7,10 +7,7 @@
 
 use crate::MutationResult;
 use std::fs;
-use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-
-use siphasher::sip::SipHasher;
 
 /// Directory where cache entries are stored.
 const CACHE_DIR: &str = ".togi-cache";
@@ -54,14 +51,14 @@ impl CacheKey {
     }
 
     fn digest_with_versions(&self, cache_schema_version: &str, togi_version: &str) -> String {
-        let mut h = SipHasher::new();
-        cache_schema_version.hash(&mut h);
-        togi_version.hash(&mut h);
-        self.file_content_hash.hash(&mut h);
-        self.mutation_identity.hash(&mut h);
-        self.mutation_description.hash(&mut h);
-        self.test_command_hash.hash(&mut h);
-        format!("{:016x}", h.finish())
+        let mut hash = FNV_OFFSET;
+        update_hash_str(&mut hash, cache_schema_version);
+        update_hash_str(&mut hash, togi_version);
+        update_hash_bytes(&mut hash, &self.file_content_hash.to_le_bytes());
+        update_hash_str(&mut hash, &self.mutation_identity);
+        update_hash_str(&mut hash, &self.mutation_description);
+        update_hash_bytes(&mut hash, &self.test_command_hash.to_le_bytes());
+        format!("{hash:016x}")
     }
 }
 
@@ -105,16 +102,29 @@ fn entry_path(project_root: &Path, key: &CacheKey) -> PathBuf {
     cache_dir(project_root).join(key.digest())
 }
 
+const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+const FNV_PRIME: u64 = 0x100000001b3;
+
 fn hash_bytes(data: &[u8]) -> u64 {
-    let mut h = SipHasher::new();
-    data.hash(&mut h);
-    h.finish()
+    let mut hash = FNV_OFFSET;
+    update_hash_bytes(&mut hash, data);
+    hash
 }
 
 fn hash_str(s: &str) -> u64 {
-    let mut h = SipHasher::new();
-    s.hash(&mut h);
-    h.finish()
+    hash_bytes(s.as_bytes())
+}
+
+fn update_hash_str(hash: &mut u64, value: &str) {
+    update_hash_bytes(hash, &(value.len() as u64).to_le_bytes());
+    update_hash_bytes(hash, value.as_bytes());
+}
+
+fn update_hash_bytes(hash: &mut u64, bytes: &[u8]) {
+    for byte in bytes {
+        *hash ^= u64::from(*byte);
+        *hash = hash.wrapping_mul(FNV_PRIME);
+    }
 }
 
 #[cfg(test)]

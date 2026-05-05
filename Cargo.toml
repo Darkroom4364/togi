@@ -14,9 +14,6 @@ categories = ["development-tools::testing", "command-line-utilities"]
 # CLI
 clap = { version = "4", features = ["derive"] }
 
-# Async runtime
-tokio = { version = "1", features = ["rt-multi-thread", "process", "time", "sync", "macros"] }
-
 # Parsing
 tree-sitter = "0.26"
 tree-sitter-go = "0.25"
@@ -29,24 +26,17 @@ tree-sitter-cpp = "0.23"
 tree-sitter-ruby = "0.23"
 tree-sitter-c-sharp = "0.23"
 
-# Diff parsing
-diffy = "0.5"
-
 # Config
 serde = { version = "1", features = ["derive"] }
 toml = "1.1"
 
 # Output
-colored = "3"
 serde_json = "1"
 
 # Filesystem
 tempfile = "3"
 globset = "0.4"
 ignore = "0.4"
-
-# Byte counting
-bytecount = "0.6"
 
 # Shell parsing
 shell-words = "1"
@@ -56,9 +46,6 @@ anyhow = "1"
 
 # Signal handling
 ctrlc = "3"
-
-# Hashing
-siphasher = "1"
 
 # Platform
 [target.'cfg(unix)'.dependencies]

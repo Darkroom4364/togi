@@ -4,6 +4,7 @@ pub mod json;
 pub mod terminal;
 
 use crate::{Mutation, MutationReport};
+use std::fmt::Write;
 use std::fs;
 
 /// Compute mutation score as a percentage, excluding build errors from the denominator.
@@ -160,32 +161,27 @@ pub fn mutation_diff(mutation: &Mutation) -> Option<String> {
     let start = line_idx.saturating_sub(ctx);
     let end = (line_idx + ctx + 1).min(lines.len());
 
-    let mut original_block = String::new();
-    let mut mutated_block = String::new();
+    let file_display = mutation.file.display().to_string();
+    let hunk_start = start + 1;
+    let hunk_len = end - start;
+    let mut diff = String::new();
+    writeln!(diff, "--- a/{file_display}").ok()?;
+    writeln!(diff, "+++ b/{file_display}").ok()?;
+    writeln!(
+        diff,
+        "@@ -{hunk_start},{hunk_len} +{hunk_start},{hunk_len} @@"
+    )
+    .ok()?;
     for (i, line) in lines.iter().enumerate().take(end).skip(start) {
         if i == line_idx {
-            original_block.push_str(original_line);
-            original_block.push('\n');
-            mutated_block.push_str(&mutated_line);
-            mutated_block.push('\n');
+            writeln!(diff, "-{original_line}").ok()?;
+            writeln!(diff, "+{mutated_line}").ok()?;
         } else {
-            original_block.push_str(line);
-            original_block.push('\n');
-            mutated_block.push_str(line);
-            mutated_block.push('\n');
+            writeln!(diff, " {line}").ok()?;
         }
     }
 
-    let file_display = mutation.file.display().to_string();
-    let original_name = format!("a/{}", file_display);
-    let modified_name = format!("b/{}", file_display);
-    let diff = diffy::DiffOptions::new()
-        .set_context_len(ctx)
-        .set_original_filename(original_name)
-        .set_modified_filename(modified_name)
-        .create_patch(&original_block, &mutated_block);
-
-    Some(diff.to_string())
+    Some(diff)
 }
 
 #[cfg(test)]

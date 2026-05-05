@@ -1,8 +1,7 @@
 //! Mutation verification: replay each mutation independently and confirm
 //! togi's reported outcome matches the actual test result.
 //!
-//! Sets GOCACHE=off because Go's build cache can return stale binaries
-//! when source files change rapidly via atomic rename.
+//! Sets GOCACHE=off so Go recompiles each mutated workspace.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -25,10 +24,10 @@ fn classify_result(status: std::process::ExitStatus) -> MutationResult {
 /// and assert the outcomes match.
 ///
 /// Requires `go` to be installed. Run with: cargo test -- --ignored
-#[tokio::test]
+#[test]
 #[ignore]
-async fn verify_mutation_outcomes_match_independent_replay() {
-    let _fixture_guard = crate::go_fixture_lock().await;
+fn verify_mutation_outcomes_match_independent_replay() {
+    let _fixture_guard = crate::go_fixture_lock();
     let root = fixture_path();
     let calc_path = root.join("calc.go");
 
@@ -73,7 +72,7 @@ async fn verify_mutation_outcomes_match_independent_replay() {
         cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
 
-    let report = runner.run(mutations).await;
+    let report = runner.run(mutations);
 
     // Verify runner restored the file
     let after_run = std::fs::read(&calc_path).expect("failed to re-read calc.go");

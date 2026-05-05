@@ -4,22 +4,19 @@ use crate::cache::{self, CacheKey};
 use crate::{Mutation, MutationReport, MutationResult};
 use std::collections::{HashMap, VecDeque};
 use std::fs;
-use std::io::{IsTerminal, Write};
+use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex, mpsc};
+use std::thread;
 use std::time::{Duration, Instant};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-/// Write `data` to `path` atomically: write to a temp file in the same
-/// directory, fsync, then rename over the target.
-fn atomic_write(path: &Path, data: &[u8]) -> std::io::Result<()> {
-    let dir = path.parent().unwrap_or(Path::new("."));
-    let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
-    tmp.write_all(data)?;
-    tmp.as_file().sync_all()?;
-    tmp.persist(path)?;
-    Ok(())
+const CAPTURED_OUTPUT_LIMIT: usize = 1024 * 1024;
+
+/// Write mutation workspace content. Workspaces are disposable temp copies, so
+/// durable temp-file + fsync writes would only add hot-loop I/O overhead.
+fn write_workspace_file(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    fs::write(path, data)
 }
 
 /// Commands and timeouts used while evaluating mutations.
@@ -278,7 +275,7 @@ struct FileGuard {
 
 impl Drop for FileGuard {
     fn drop(&mut self) {
-        if let Err(e) = atomic_write(&self.path, &self.original) {
+        if let Err(e) = write_workspace_file(&self.path, &self.original) {
             eprintln!(
                 "error: failed to restore {}: {} — file may be corrupted, check git status",
                 self.path.display(),
@@ -387,8 +384,7 @@ fn copy_workspace_with_options(
 
 pub(crate) struct WorkspacePool {
     slots: Arc<Vec<WorkspaceCopy>>,
-    semaphore: Arc<Semaphore>,
-    free_slots: Arc<Mutex<VecDeque<usize>>>,
+    free_slots: Arc<(Mutex<VecDeque<usize>>, Condvar)>,
 }
 
 impl WorkspacePool {
@@ -416,38 +412,37 @@ impl WorkspacePool {
 
         Ok(Self {
             slots: Arc::new(copies),
-            semaphore: Arc::new(Semaphore::new(slots)),
-            free_slots: Arc::new(Mutex::new(free_slots)),
+            free_slots: Arc::new((Mutex::new(free_slots), Condvar::new())),
         })
     }
 
-    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.slots.len()
     }
 
-    pub(crate) async fn acquire(&self) -> WorkspaceSlot {
-        let permit = self.semaphore.clone().acquire_owned().await.unwrap();
-        let index = self
-            .free_slots
-            .lock()
-            .expect("workspace free-list mutex poisoned")
-            .pop_front()
-            .expect("workspace semaphore permit without a free slot");
+    pub(crate) fn acquire(&self) -> WorkspaceSlot {
+        let (lock, cvar) = &*self.free_slots;
+        let mut free_slots = lock.lock().expect("workspace free-list mutex poisoned");
+        let index = loop {
+            if let Some(index) = free_slots.pop_front() {
+                break index;
+            }
+            free_slots = cvar
+                .wait(free_slots)
+                .expect("workspace free-list mutex poisoned");
+        };
         WorkspaceSlot {
             slots: self.slots.clone(),
             free_slots: self.free_slots.clone(),
             index,
-            _permit: permit,
         }
     }
 }
 
 pub(crate) struct WorkspaceSlot {
     slots: Arc<Vec<WorkspaceCopy>>,
-    free_slots: Arc<Mutex<VecDeque<usize>>>,
+    free_slots: Arc<(Mutex<VecDeque<usize>>, Condvar)>,
     index: usize,
-    _permit: OwnedSemaphorePermit,
 }
 
 impl WorkspaceSlot {
@@ -458,18 +453,196 @@ impl WorkspaceSlot {
 
 impl Drop for WorkspaceSlot {
     fn drop(&mut self) {
-        self.free_slots
-            .lock()
+        let (lock, cvar) = &*self.free_slots;
+        lock.lock()
             .expect("workspace free-list mutex poisoned")
             .push_back(self.index);
+        cvar.notify_one();
+    }
+}
+
+struct QueuedMutation {
+    index: usize,
+    mutation: Mutation,
+}
+
+struct RunShared<'a> {
+    workspace_pool: &'a WorkspacePool,
+    project_root: &'a Path,
+    commands: &'a CommandConfig,
+    build_command: &'a [String],
+    build_command_explicit: bool,
+    env: &'a HashMap<String, String>,
+    total: usize,
+    verbose: bool,
+    is_tty: bool,
+    show_output: bool,
+    max_tested: Option<usize>,
+    counter: &'a AtomicUsize,
+    scheduled_counter: &'a AtomicUsize,
+    tested_counter: &'a AtomicUsize,
+    cancelled: &'a AtomicBool,
+}
+
+fn run_queued_mutation(
+    queued: QueuedMutation,
+    shared: RunShared<'_>,
+) -> Option<(usize, Mutation, MutationResult)> {
+    let QueuedMutation { index, mutation } = queued;
+
+    // Stop if cancelled (Ctrl+C) or enough mutations have been tested.
+    if shared.cancelled.load(Ordering::Relaxed) {
+        return None;
+    }
+    if let Some(max) = shared.max_tested {
+        let reserved = shared
+            .scheduled_counter
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                (current < max).then_some(current + 1)
+            })
+            .is_ok();
+        if !reserved {
+            return None;
+        }
+    }
+
+    let selected_test = select_test_command(shared.project_root, shared.commands, &mutation);
+    let cache_ctx = selected_test.cache_context(
+        shared.build_command,
+        shared.build_command_explicit,
+        shared.env,
+    );
+
+    let original_target = ResolvedMutation::new(shared.project_root, &mutation);
+
+    // Check cache before acquiring a workspace slot.
+    let file_content = original_target
+        .file_path
+        .as_ref()
+        .ok()
+        .and_then(|file_path| fs::read(file_path).ok());
+    let cache_key = file_content.as_ref().map(|content| {
+        CacheKey::new(
+            content,
+            &cache_identity(shared.project_root, &mutation),
+            &mutation.description,
+            &cache_ctx,
+        )
+    });
+    if let Some(ref key) = cache_key
+        && let Some(result) = cache::lookup(shared.project_root, key)
+    {
+        record_progress(&shared, &mutation, result, None, true);
+        return Some((index, mutation, result));
+    }
+
+    let outcome = {
+        let workspace_slot = shared.workspace_pool.acquire();
+        let workspace_root = workspace_slot.root().to_path_buf();
+        let workspace_target =
+            ResolvedMutation::new_for_execution(shared.project_root, &workspace_root, &mutation);
+        run_single_mutation(
+            &selected_test.argv,
+            BuildCommand {
+                argv: shared.build_command,
+                explicit: shared.build_command_explicit,
+            },
+            selected_test.timeout,
+            &workspace_root,
+            workspace_target,
+            shared.show_output,
+            shared.env,
+        )
+    };
+
+    if let Some(ref key) = cache_key {
+        cache::store(shared.project_root, key, outcome.result);
+    }
+
+    let result = outcome.result;
+    record_progress(
+        &shared,
+        &mutation,
+        result,
+        outcome.test_output.as_deref(),
+        false,
+    );
+    Some((index, mutation, result))
+}
+
+#[allow(clippy::manual_is_multiple_of)]
+fn record_progress(
+    shared: &RunShared<'_>,
+    mutation: &Mutation,
+    result: MutationResult,
+    test_output: Option<&str>,
+    cached: bool,
+) {
+    if result != MutationResult::BuildError {
+        shared.tested_counter.fetch_add(1, Ordering::Release);
+    }
+
+    let n = shared.counter.fetch_add(1, Ordering::Relaxed) + 1;
+    if shared.verbose {
+        if cached {
+            eprintln!(
+                "  [{}/{}] \u{21bb} cached  {}:{} \u{2014} {}",
+                n,
+                shared.total,
+                mutation.file.display(),
+                mutation.line,
+                mutation.operator
+            );
+        } else {
+            let symbol = match result {
+                MutationResult::Killed => "\u{2713} killed",
+                MutationResult::Survived => "\u{2717} survived",
+                MutationResult::Timeout => "⧖ timeout",
+                MutationResult::BuildError => "⚠ build error",
+            };
+            eprintln!(
+                "  [{}/{}] {}  {}:{} \u{2014} {}",
+                n,
+                shared.total,
+                symbol,
+                mutation.file.display(),
+                mutation.line,
+                mutation.operator
+            );
+        }
+    } else if shared.is_tty {
+        eprint!("\r  [{}/{}] testing mutations...", n, shared.total);
+        let _ = std::io::stderr().flush();
+    } else if n == shared.total || (shared.total >= 4 && n % (shared.total / 4) == 0) {
+        eprintln!("  [{}/{}] testing mutations...", n, shared.total);
+    }
+
+    if shared.show_output
+        && result == MutationResult::Survived
+        && let Some(output) = test_output
+    {
+        eprintln!(
+            "  ┌─ test output for {}:{} ({})",
+            mutation.file.display(),
+            mutation.line,
+            mutation.operator
+        );
+        for line in output.lines() {
+            eprintln!("  │ {}", line);
+        }
+        eprintln!("  └─");
     }
 }
 
 impl TestRunner {
     #[allow(clippy::manual_is_multiple_of)]
-    pub async fn run(&self, mutations: Vec<Mutation>) -> MutationReport {
+    pub fn run(&self, mutations: Vec<Mutation>) -> MutationReport {
         let start = Instant::now();
         let total = mutations.len();
+        if total == 0 {
+            return self.report_from_results(Vec::new(), start.elapsed());
+        }
+
         let counter = Arc::new(AtomicUsize::new(0));
         let scheduled_counter = Arc::new(AtomicUsize::new(0));
         let tested_counter = Arc::new(AtomicUsize::new(0));
@@ -496,168 +669,82 @@ impl TestRunner {
         let project_root = Arc::new(self.project_root.clone());
         let build_command = Arc::new(self.commands.build_command.clone());
         let build_command_explicit = self.commands.build_command_explicit;
-        let mut handles = Vec::new();
+        let queue = Arc::new(Mutex::new(
+            mutations.into_iter().enumerate().collect::<VecDeque<_>>(),
+        ));
+        let results = Arc::new(Mutex::new(Vec::new()));
+        let worker_count = workspace_pool.len().min(total).max(1);
 
-        for mutation in mutations {
-            let workspace_pool = workspace_pool.clone();
-            let selected_test = select_test_command(&project_root, &self.commands, &mutation);
-            let command = selected_test.argv.clone();
-            let timeout = selected_test.timeout;
-            let project_root = project_root.clone();
-            let build_command = build_command.clone();
-            let counter = counter.clone();
-            let scheduled_counter = scheduled_counter.clone();
-            let tested_counter = tested_counter.clone();
-            let max_tested = self.max_tested;
-            let show_output = self.show_output;
-            let env = self.env.clone();
-            let cancelled = self.cancelled.clone();
+        thread::scope(|scope| {
+            for _ in 0..worker_count {
+                let queue = queue.clone();
+                let results = results.clone();
+                let workspace_pool = workspace_pool.clone();
+                let project_root = project_root.clone();
+                let build_command = build_command.clone();
+                let counter = counter.clone();
+                let scheduled_counter = scheduled_counter.clone();
+                let tested_counter = tested_counter.clone();
+                let cancelled = self.cancelled.clone();
+                let commands = &self.commands;
+                let env = &self.env;
+                let max_tested = self.max_tested;
+                let show_output = self.show_output;
 
-            let cache_ctx =
-                selected_test.cache_context(&build_command, build_command_explicit, &env);
+                scope.spawn(move || {
+                    loop {
+                        if cancelled.load(Ordering::Relaxed) {
+                            break;
+                        }
 
-            let handle = tokio::spawn(async move {
-                // Stop if cancelled (Ctrl+C) or enough mutations have been tested
-                if cancelled.load(Ordering::Relaxed) {
-                    return None;
-                }
-                if let Some(max) = max_tested {
-                    let reserved = scheduled_counter
-                        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                            (current < max).then_some(current + 1)
-                        })
-                        .is_ok();
-                    if !reserved {
-                        return None;
+                        let Some((index, mutation)) = queue
+                            .lock()
+                            .expect("mutation queue mutex poisoned")
+                            .pop_front()
+                        else {
+                            break;
+                        };
+
+                        if let Some(result) = run_queued_mutation(
+                            QueuedMutation { index, mutation },
+                            RunShared {
+                                workspace_pool: workspace_pool.as_ref(),
+                                project_root: project_root.as_ref().as_path(),
+                                commands,
+                                build_command: build_command.as_ref().as_slice(),
+                                build_command_explicit,
+                                env,
+                                total,
+                                verbose,
+                                is_tty,
+                                show_output,
+                                max_tested,
+                                counter: &counter,
+                                scheduled_counter: &scheduled_counter,
+                                tested_counter: &tested_counter,
+                                cancelled: &cancelled,
+                            },
+                        ) {
+                            results
+                                .lock()
+                                .expect("mutation results mutex poisoned")
+                                .push(result);
+                        }
                     }
-                }
-
-                let original_target = ResolvedMutation::new(&project_root, &mutation);
-
-                // Check cache before running
-                let file_content = original_target
-                    .file_path
-                    .as_ref()
-                    .ok()
-                    .and_then(|file_path| std::fs::read(file_path).ok());
-                let cache_key = file_content.as_ref().map(|content| {
-                    CacheKey::new(
-                        content,
-                        &cache_identity(&project_root, &mutation),
-                        &mutation.description,
-                        &cache_ctx,
-                    )
                 });
-                if let Some(ref key) = cache_key
-                    && let Some(cached) = cache::lookup(&project_root, key)
-                {
-                    let result = cached;
-                    if result != MutationResult::BuildError {
-                        tested_counter.fetch_add(1, Ordering::Release);
-                    }
-                    let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                    if verbose {
-                        eprintln!(
-                            "  [{}/{}] \u{21bb} cached  {}:{} \u{2014} {}",
-                            n,
-                            total,
-                            mutation.file.display(),
-                            mutation.line,
-                            mutation.operator
-                        );
-                    } else if is_tty {
-                        eprint!("\r  [{}/{}] testing mutations...", n, total);
-                        let _ = std::io::stderr().flush();
-                    } else if n == total || (total >= 4 && n % (total / 4) == 0) {
-                        eprintln!("  [{}/{}] testing mutations...", n, total);
-                    }
-                    return Some((mutation, result));
-                }
-
-                let outcome = {
-                    let workspace_slot = workspace_pool.acquire().await;
-                    let workspace_root = workspace_slot.root().to_path_buf();
-                    let workspace_target = ResolvedMutation::new_for_execution(
-                        &project_root,
-                        &workspace_root,
-                        &mutation,
-                    );
-                    run_single_mutation(
-                        &command,
-                        BuildCommand {
-                            argv: &build_command,
-                            explicit: build_command_explicit,
-                        },
-                        timeout,
-                        &workspace_root,
-                        workspace_target,
-                        show_output,
-                        &env,
-                    )
-                    .await
-                };
-
-                // Store result in cache
-                if let Some(ref key) = cache_key {
-                    cache::store(&project_root, key, outcome.result);
-                }
-
-                if outcome.result != MutationResult::BuildError {
-                    tested_counter.fetch_add(1, Ordering::Release);
-                }
-                let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                if verbose {
-                    let symbol = match outcome.result {
-                        MutationResult::Killed => "\u{2713} killed",
-                        MutationResult::Survived => "\u{2717} survived",
-                        MutationResult::Timeout => "⧖ timeout",
-                        MutationResult::BuildError => "⚠ build error",
-                    };
-                    eprintln!(
-                        "  [{}/{}] {}  {}:{} \u{2014} {}",
-                        n,
-                        total,
-                        symbol,
-                        mutation.file.display(),
-                        mutation.line,
-                        mutation.operator
-                    );
-                } else {
-                    if is_tty {
-                        eprint!("\r  [{}/{}] testing mutations...", n, total);
-                        let _ = std::io::stderr().flush();
-                    } else if n == total || (total >= 4 && n % (total / 4) == 0) {
-                        eprintln!("  [{}/{}] testing mutations...", n, total);
-                    }
-                }
-                if show_output
-                    && outcome.result == MutationResult::Survived
-                    && let Some(output) = &outcome.test_output
-                {
-                    eprintln!(
-                        "  ┌─ test output for {}:{} ({})",
-                        mutation.file.display(),
-                        mutation.line,
-                        mutation.operator
-                    );
-                    for line in output.lines() {
-                        eprintln!("  │ {}", line);
-                    }
-                    eprintln!("  └─");
-                }
-                Some((mutation, outcome.result))
-            });
-            handles.push(handle);
-        }
-
-        let mut all_results = Vec::new();
-        for handle in handles {
-            match handle.await {
-                Ok(Some(result)) => all_results.push(result),
-                Ok(None) => {}
-                Err(e) => eprintln!("warning: mutation task panicked: {e}"),
             }
-        }
+        });
+
+        let mut indexed_results = Arc::try_unwrap(results)
+            .expect("all result handles should be dropped")
+            .into_inner()
+            .expect("mutation results mutex poisoned");
+        indexed_results.sort_by_key(|(index, _, _)| *index);
+        let all_results = indexed_results
+            .into_iter()
+            .map(|(_, mutation, result)| (mutation, result))
+            .collect();
+
         // Clear progress line on TTY
         if !verbose && is_tty {
             eprint!("\r                                        \r");
@@ -848,7 +935,7 @@ impl<'a> ResolvedMutation<'a> {
     }
 }
 
-async fn run_single_mutation(
+fn run_single_mutation(
     command: &[String],
     build_command: BuildCommand<'_>,
     timeout: Duration,
@@ -897,7 +984,7 @@ async fn run_single_mutation(
     }
     mutated.splice(range, mutation.replacement.as_bytes().iter().copied());
 
-    if let Err(e) = atomic_write(&file_path, &mutated) {
+    if let Err(e) = write_workspace_file(&file_path, &mutated) {
         eprintln!("warning: could not write {}: {e}", file_path.display());
         return MutationOutcome {
             result: MutationResult::BuildError,
@@ -907,8 +994,7 @@ async fn run_single_mutation(
 
     // Explicit build check: skip expensive test if mutation doesn't compile.
     if build_command.explicit && !build_command.argv.is_empty() {
-        let build_outcome =
-            run_command(build_command.argv, project_root, timeout, false, env).await;
+        let build_outcome = run_command(build_command.argv, project_root, timeout, false, env);
         if build_outcome.result != MutationResult::Survived {
             return MutationOutcome {
                 result: MutationResult::BuildError,
@@ -918,10 +1004,10 @@ async fn run_single_mutation(
     }
 
     // Run test command; guard will restore the file on drop
-    run_command(command, project_root, timeout, capture_output, env).await
+    run_command(command, project_root, timeout, capture_output, env)
 }
 
-async fn run_command(
+fn run_command(
     command: &[String],
     cwd: &Path,
     timeout_dur: Duration,
@@ -935,7 +1021,7 @@ async fn run_command(
         };
     }
 
-    let mut cmd = tokio::process::Command::new(&command[0]);
+    let mut cmd = std::process::Command::new(&command[0]);
     cmd.args(&command[1..]).current_dir(cwd).envs(env);
 
     if capture_output {
@@ -946,8 +1032,7 @@ async fn run_command(
         cmd.stderr(std::process::Stdio::null());
     }
 
-    cmd.kill_on_drop(true);
-    let child = match cmd.spawn() {
+    let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
             eprintln!("warning: could not spawn command {:?}: {e}", &command[0]);
@@ -958,40 +1043,152 @@ async fn run_command(
         }
     };
 
-    match tokio::time::timeout(timeout_dur, child.wait_with_output()).await {
-        Ok(Ok(output)) => {
-            let result = if output.status.success() {
-                MutationResult::Survived
-            } else {
-                MutationResult::Killed
-            };
-            let test_output = if capture_output {
-                let mut combined = String::from_utf8_lossy(&output.stdout).into_owned();
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                if !stderr.is_empty() {
-                    if !combined.is_empty() {
-                        combined.push('\n');
-                    }
-                    combined.push_str(&stderr);
+    let stdout_reader = if capture_output {
+        child.stdout.take().map(spawn_output_reader)
+    } else {
+        None
+    };
+    let stderr_reader = if capture_output {
+        child.stderr.take().map(spawn_output_reader)
+    } else {
+        None
+    };
+
+    let started = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if started.elapsed() >= timeout_dur {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return MutationOutcome {
+                        result: MutationResult::Timeout,
+                        test_output: None,
+                    };
                 }
-                Some(combined)
-            } else {
-                None
-            };
-            MutationOutcome {
-                result,
-                test_output,
+                let remaining = timeout_dur.saturating_sub(started.elapsed());
+                thread::sleep(remaining.min(Duration::from_millis(10)));
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return MutationOutcome {
+                    result: MutationResult::BuildError,
+                    test_output: None,
+                };
             }
         }
-        Ok(Err(_)) => MutationOutcome {
-            result: MutationResult::BuildError,
-            test_output: None,
-        },
-        Err(_) => MutationOutcome {
+    };
+
+    let stdout = match recv_output_reader(stdout_reader, started, timeout_dur) {
+        Ok(bytes) => bytes,
+        Err(result) => return result,
+    };
+    let stderr = match recv_output_reader(stderr_reader, started, timeout_dur) {
+        Ok(bytes) => bytes,
+        Err(result) => return result,
+    };
+
+    let result = if status.success() {
+        MutationResult::Survived
+    } else {
+        MutationResult::Killed
+    };
+    let test_output = if capture_output {
+        let mut combined = String::from_utf8_lossy(&stdout.bytes).into_owned();
+        append_truncation_notice(&mut combined, stdout.truncated, "stdout");
+
+        let stderr_text = String::from_utf8_lossy(&stderr.bytes);
+        if !stderr_text.is_empty() {
+            if !combined.is_empty() {
+                combined.push('\n');
+            }
+            combined.push_str(&stderr_text);
+        }
+        append_truncation_notice(&mut combined, stderr.truncated, "stderr");
+        Some(combined)
+    } else {
+        None
+    };
+
+    MutationOutcome {
+        result,
+        test_output,
+    }
+}
+
+struct CapturedOutput {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+fn spawn_output_reader<R>(mut reader: R) -> mpsc::Receiver<CapturedOutput>
+where
+    R: Read + Send + 'static,
+{
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let mut truncated = false;
+        let mut buffer = [0; 8192];
+
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(n) => {
+                    let available = CAPTURED_OUTPUT_LIMIT.saturating_sub(bytes.len());
+                    let keep = n.min(available);
+                    if keep > 0 {
+                        bytes.extend_from_slice(&buffer[..keep]);
+                    }
+                    if keep < n {
+                        truncated = true;
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
+
+        let _ = tx.send(CapturedOutput { bytes, truncated });
+    });
+    rx
+}
+
+fn recv_output_reader(
+    reader: Option<mpsc::Receiver<CapturedOutput>>,
+    started: Instant,
+    timeout_dur: Duration,
+) -> Result<CapturedOutput, MutationOutcome> {
+    let Some(reader) = reader else {
+        return Ok(CapturedOutput {
+            bytes: Vec::new(),
+            truncated: false,
+        });
+    };
+    let Some(remaining) = timeout_dur.checked_sub(started.elapsed()) else {
+        return Err(MutationOutcome {
             result: MutationResult::Timeout,
             test_output: None,
-        },
+        });
+    };
+    reader.recv_timeout(remaining).map_err(|_| MutationOutcome {
+        result: MutationResult::Timeout,
+        test_output: None,
+    })
+}
+
+fn append_truncation_notice(output: &mut String, truncated: bool, stream: &str) {
+    if !truncated {
+        return;
     }
+    if !output.is_empty() && !output.ends_with('\n') {
+        output.push('\n');
+    }
+    output.push_str(&format!(
+        "[{stream} truncated after {CAPTURED_OUTPUT_LIMIT} bytes]"
+    ));
 }
 
 #[cfg(test)]
@@ -1541,8 +1738,8 @@ mod tests {
         assert!(!copy.root().join("target").exists());
     }
 
-    #[tokio::test]
-    async fn workspace_pool_creates_slots_and_reuses_after_drop() {
+    #[test]
+    fn workspace_pool_creates_slots_and_reuses_after_drop() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         std::fs::create_dir_all(root.join("src")).unwrap();
@@ -1551,8 +1748,8 @@ mod tests {
         let pool = WorkspacePool::new(root, 2).unwrap();
         assert_eq!(pool.len(), 2);
 
-        let first = pool.acquire().await;
-        let second = pool.acquire().await;
+        let first = pool.acquire();
+        let second = pool.acquire();
         assert_ne!(first.root(), second.root());
         assert!(first.root().join("src/lib.rs").exists());
         assert!(second.root().join("src/lib.rs").exists());
@@ -1561,7 +1758,7 @@ mod tests {
         let second_root = second.root().to_path_buf();
         drop(second);
 
-        let third = pool.acquire().await;
+        let third = pool.acquire();
         assert_eq!(third.root(), second_root.as_path());
         assert_ne!(third.root(), first_root.as_path());
     }
@@ -1576,8 +1773,8 @@ mod tests {
         assert_eq!(pool.len(), 1);
     }
 
-    #[tokio::test]
-    async fn command_succeeds_returns_survived() {
+    #[test]
+    fn command_succeeds_returns_survived() {
         let (dir, file, mutation) = make_relative_test_setup();
 
         let outcome = run_single_mutation(
@@ -1591,15 +1788,14 @@ mod tests {
             ResolvedMutation::new(dir.path(), &mutation),
             false,
             &HashMap::new(),
-        )
-        .await;
+        );
 
         assert_eq!(outcome.result, MutationResult::Survived);
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "hello world");
     }
 
-    #[tokio::test]
-    async fn command_fails_returns_killed() {
+    #[test]
+    fn command_fails_returns_killed() {
         let (dir, file, mutation) = make_test_setup();
 
         let outcome = run_single_mutation(
@@ -1613,15 +1809,14 @@ mod tests {
             ResolvedMutation::new(dir.path(), &mutation),
             false,
             &HashMap::new(),
-        )
-        .await;
+        );
 
         assert_eq!(outcome.result, MutationResult::Killed);
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "hello world");
     }
 
-    #[tokio::test]
-    async fn empty_replacement_splices_correctly() {
+    #[test]
+    fn empty_replacement_splices_correctly() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("test.txt");
         std::fs::write(&file, b"hello world").unwrap();
@@ -1651,16 +1846,15 @@ mod tests {
             ResolvedMutation::new(dir.path(), &mutation),
             false,
             &HashMap::new(),
-        )
-        .await;
+        );
 
         assert_eq!(outcome.result, MutationResult::Survived);
         // File should be restored to original
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "hello world");
     }
 
-    #[tokio::test]
-    async fn command_not_found_returns_build_error() {
+    #[test]
+    fn command_not_found_returns_build_error() {
         let (dir, file, mutation) = make_test_setup();
 
         let outcome = run_single_mutation(
@@ -1674,16 +1868,15 @@ mod tests {
             ResolvedMutation::new(dir.path(), &mutation),
             false,
             &HashMap::new(),
-        )
-        .await;
+        );
 
         assert_eq!(outcome.result, MutationResult::BuildError);
         // File should be restored
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "hello world");
     }
 
-    #[tokio::test]
-    async fn command_timeout_returns_timeout() {
+    #[test]
+    fn command_timeout_returns_timeout() {
         let (dir, file, mutation) = make_test_setup();
 
         let outcome = run_single_mutation(
@@ -1697,16 +1890,15 @@ mod tests {
             ResolvedMutation::new(dir.path(), &mutation),
             false,
             &HashMap::new(),
-        )
-        .await;
+        );
 
         assert_eq!(outcome.result, MutationResult::Timeout);
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "hello world");
     }
 
     #[cfg(unix)]
-    #[tokio::test]
-    async fn build_check_failure_skips_test() {
+    #[test]
+    fn build_check_failure_skips_test() {
         let (dir, file, mutation) = make_test_setup();
 
         let marker = dir.path().join("test_ran.marker");
@@ -1726,16 +1918,15 @@ mod tests {
             ResolvedMutation::new(dir.path(), &mutation),
             false,
             &HashMap::new(),
-        )
-        .await;
+        );
 
         assert_eq!(outcome.result, MutationResult::BuildError);
         assert!(!marker.exists(), "test command should not have run");
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "hello world");
     }
 
-    #[tokio::test]
-    async fn build_check_success_runs_test() {
+    #[test]
+    fn build_check_success_runs_test() {
         let (dir, _file, mutation) = make_test_setup();
 
         // Build succeeds → test runs and fails → Killed
@@ -1750,15 +1941,14 @@ mod tests {
             ResolvedMutation::new(dir.path(), &mutation),
             false,
             &HashMap::new(),
-        )
-        .await;
+        );
 
         assert_eq!(outcome.result, MutationResult::Killed);
     }
 
     #[cfg(unix)]
-    #[tokio::test]
-    async fn non_explicit_build_command_does_not_pre_filter() {
+    #[test]
+    fn non_explicit_build_command_does_not_pre_filter() {
         let (dir, _file, mutation) = make_test_setup();
 
         let build_marker = dir.path().join("build_ran.marker");
@@ -1783,8 +1973,7 @@ mod tests {
             ResolvedMutation::new(dir.path(), &mutation),
             false,
             &HashMap::new(),
-        )
-        .await;
+        );
 
         assert_eq!(outcome.result, MutationResult::Survived);
         assert!(
@@ -1794,8 +1983,8 @@ mod tests {
         assert!(test_marker.exists(), "test command should still run");
     }
 
-    #[tokio::test]
-    async fn out_of_range_byte_range_returns_build_error() {
+    #[test]
+    fn out_of_range_byte_range_returns_build_error() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("test.txt");
         std::fs::write(&file, b"hi").unwrap();
@@ -1814,14 +2003,13 @@ mod tests {
             ResolvedMutation::new(dir.path(), &mutation),
             false,
             &HashMap::new(),
-        )
-        .await;
+        );
 
         assert_eq!(outcome.result, MutationResult::BuildError);
     }
 
-    #[tokio::test]
-    async fn missing_file_returns_build_error() {
+    #[test]
+    fn missing_file_returns_build_error() {
         let dir = tempfile::tempdir().unwrap();
         let mutation = make_test_mutation(&dir.path().join("nonexistent.txt"));
 
@@ -1836,29 +2024,27 @@ mod tests {
             ResolvedMutation::new(dir.path(), &mutation),
             false,
             &HashMap::new(),
-        )
-        .await;
+        );
 
         assert_eq!(outcome.result, MutationResult::BuildError);
     }
 
-    #[tokio::test]
-    async fn empty_command_returns_build_error() {
+    #[test]
+    fn empty_command_returns_build_error() {
         let outcome = run_command(
             &[],
             &PathBuf::from("."),
             Duration::from_secs(5),
             false,
             &HashMap::new(),
-        )
-        .await;
+        );
 
         assert_eq!(outcome.result, MutationResult::BuildError);
     }
 
     #[cfg(unix)]
-    #[tokio::test]
-    async fn capture_output_collects_stdout_stderr() {
+    #[test]
+    fn capture_output_collects_stdout_stderr() {
         let outcome = run_command(
             &[
                 "sh".to_string(),
@@ -1869,8 +2055,7 @@ mod tests {
             Duration::from_secs(5),
             true,
             &HashMap::new(),
-        )
-        .await;
+        );
 
         assert_eq!(outcome.result, MutationResult::Survived);
         let output = outcome.test_output.unwrap();
@@ -1878,8 +2063,36 @@ mod tests {
         assert!(output.contains("err"), "should capture stderr");
     }
 
-    #[tokio::test]
-    async fn max_tested_limits_mutations() {
+    #[cfg(unix)]
+    #[test]
+    fn capture_output_truncates_and_drains_large_stdout() {
+        let bytes_to_write = CAPTURED_OUTPUT_LIMIT + 256 * 1024;
+        let outcome = run_command(
+            &[
+                "sh".to_string(),
+                "-c".to_string(),
+                format!("yes x | head -c {bytes_to_write}"),
+            ],
+            &PathBuf::from("."),
+            Duration::from_secs(5),
+            true,
+            &HashMap::new(),
+        );
+
+        assert_eq!(outcome.result, MutationResult::Survived);
+        let output = outcome.test_output.unwrap();
+        assert!(
+            output.contains("[stdout truncated after"),
+            "large stdout should be marked as truncated"
+        );
+        assert!(
+            output.len() < CAPTURED_OUTPUT_LIMIT + 128,
+            "captured output should stay close to the configured cap"
+        );
+    }
+
+    #[test]
+    fn max_tested_limits_mutations() {
         let (dir, file, _) = make_test_setup();
 
         let mutations: Vec<Mutation> = (0..5)
@@ -1913,12 +2126,12 @@ mod tests {
             cancelled: Arc::new(AtomicBool::new(false)),
         };
 
-        let report = runner.run(mutations).await;
+        let report = runner.run(mutations);
         assert_eq!(report.total, 2, "should stop after max_tested");
     }
 
-    #[tokio::test]
-    async fn report_aggregates_results_correctly() {
+    #[test]
+    fn report_aggregates_results_correctly() {
         let dir = tempfile::tempdir().unwrap();
 
         let survived_file = dir.path().join("survived.txt");
@@ -1959,7 +2172,7 @@ mod tests {
             cancelled: Arc::new(AtomicBool::new(false)),
         };
 
-        let report = runner.run(vec![m_survived, m_killed]).await;
+        let report = runner.run(vec![m_survived, m_killed]);
         assert_eq!(report.total, 2);
         assert_eq!(report.killed, 1);
         assert_eq!(report.survived, 1);
@@ -1967,8 +2180,8 @@ mod tests {
         assert_eq!(report.build_errors, 0);
     }
 
-    #[tokio::test]
-    async fn language_commands_override_default() {
+    #[test]
+    fn language_commands_override_default() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("test.txt");
         std::fs::write(&file, b"hello world").unwrap();
@@ -2002,7 +2215,7 @@ mod tests {
             cancelled: Arc::new(AtomicBool::new(false)),
         };
 
-        let report = runner.run(vec![mutation]).await;
+        let report = runner.run(vec![mutation]);
         assert_eq!(report.killed, 1, "should use language-specific command");
         assert_eq!(
             report.test_command, None,
@@ -2011,8 +2224,8 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[tokio::test]
-    async fn mutations_on_same_file_run_in_isolated_workspaces() {
+    #[test]
+    fn mutations_on_same_file_run_in_isolated_workspaces() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("test.txt");
         std::fs::write(&file, b"hello world").unwrap();
@@ -2070,7 +2283,7 @@ while [ "$(find "{barrier}" -type f | wc -l)" -lt 4 ]; do sleep 0.1; done"#,
             cancelled: Arc::new(AtomicBool::new(false)),
         };
 
-        let report = runner.run(mutations).await;
+        let report = runner.run(mutations);
         assert_eq!(report.total, 4);
         assert_eq!(report.survived, 4);
         assert_eq!(report.killed, 0);
@@ -2089,8 +2302,8 @@ while [ "$(find "{barrier}" -type f | wc -l)" -lt 4 ]; do sleep 0.1; done"#,
     }
 
     #[cfg(unix)]
-    #[tokio::test]
-    async fn mutations_on_different_files_run_in_isolated_workspaces() {
+    #[test]
+    fn mutations_on_different_files_run_in_isolated_workspaces() {
         let dir = tempfile::tempdir().unwrap();
         let first = dir.path().join("first.txt");
         let second = dir.path().join("second.txt");
@@ -2146,7 +2359,7 @@ exit 1"#
             cancelled: Arc::new(AtomicBool::new(false)),
         };
 
-        let report = runner.run(mutations).await;
+        let report = runner.run(mutations);
         assert_eq!(report.total, 2);
         assert_eq!(
             report.killed, 0,
@@ -2156,8 +2369,8 @@ exit 1"#
         assert_eq!(std::fs::read_to_string(&second).unwrap(), "hello world");
     }
 
-    #[tokio::test]
-    async fn per_language_timeout_overrides_default() {
+    #[test]
+    fn per_language_timeout_overrides_default() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("test.txt");
         std::fs::write(&file, b"hello world").unwrap();
@@ -2201,7 +2414,7 @@ exit 1"#
             cancelled: Arc::new(AtomicBool::new(false)),
         };
 
-        let report = runner.run(vec![m_slow, m_fast]).await;
+        let report = runner.run(vec![m_slow, m_fast]);
         let slow_result = report
             .results
             .iter()
