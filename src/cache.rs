@@ -6,7 +6,6 @@
 //! stored as JSON files in `.togi-cache/`.
 
 use crate::MutationResult;
-use std::collections::hash_map::DefaultHasher;
 use std::fs;
 use std::hash::Hasher;
 use std::path::{Path, PathBuf};
@@ -53,13 +52,14 @@ impl CacheKey {
     }
 
     fn digest_with_versions(&self, cache_schema_version: &str, togi_version: &str) -> String {
-        let mut hash = 0;
-        update_hash_str(&mut hash, cache_schema_version);
-        update_hash_str(&mut hash, togi_version);
-        update_hash_bytes(&mut hash, &self.file_content_hash.to_le_bytes());
-        update_hash_str(&mut hash, &self.mutation_identity);
-        update_hash_str(&mut hash, &self.mutation_description);
-        update_hash_bytes(&mut hash, &self.test_command_hash.to_le_bytes());
+        let mut hasher = Fnv64Hasher::default();
+        update_hash_str(&mut hasher, cache_schema_version);
+        update_hash_str(&mut hasher, togi_version);
+        update_hash_bytes(&mut hasher, &self.file_content_hash.to_le_bytes());
+        update_hash_str(&mut hasher, &self.mutation_identity);
+        update_hash_str(&mut hasher, &self.mutation_description);
+        update_hash_bytes(&mut hasher, &self.test_command_hash.to_le_bytes());
+        let hash = hasher.finish();
         format!("{hash:016x}")
     }
 }
@@ -104,8 +104,34 @@ fn entry_path(project_root: &Path, key: &CacheKey) -> PathBuf {
     cache_dir(project_root).join(key.digest())
 }
 
+const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+const FNV_PRIME: u64 = 0x100000001b3;
+
+struct Fnv64Hasher {
+    hash: u64,
+}
+
+impl Default for Fnv64Hasher {
+    fn default() -> Self {
+        Self { hash: FNV_OFFSET }
+    }
+}
+
+impl Hasher for Fnv64Hasher {
+    fn finish(&self) -> u64 {
+        self.hash
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.hash ^= u64::from(*byte);
+            self.hash = self.hash.wrapping_mul(FNV_PRIME);
+        }
+    }
+}
+
 fn hash_bytes(data: &[u8]) -> u64 {
-    let mut hasher = DefaultHasher::new();
+    let mut hasher = Fnv64Hasher::default();
     hasher.write(data);
     hasher.finish()
 }
@@ -114,16 +140,13 @@ fn hash_str(s: &str) -> u64 {
     hash_bytes(s.as_bytes())
 }
 
-fn update_hash_str(hash: &mut u64, value: &str) {
-    update_hash_bytes(hash, &(value.len() as u64).to_le_bytes());
-    update_hash_bytes(hash, value.as_bytes());
+fn update_hash_str(hasher: &mut impl Hasher, value: &str) {
+    update_hash_bytes(hasher, &(value.len() as u64).to_le_bytes());
+    update_hash_bytes(hasher, value.as_bytes());
 }
 
-fn update_hash_bytes(hash: &mut u64, bytes: &[u8]) {
-    let mut hasher = DefaultHasher::new();
-    hasher.write(&(*hash).to_le_bytes());
+fn update_hash_bytes(hasher: &mut impl Hasher, bytes: &[u8]) {
     hasher.write(bytes);
-    *hash = hasher.finish();
 }
 
 #[cfg(test)]

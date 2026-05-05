@@ -324,4 +324,13 @@ mod tests {
             _ => None,
         }));
     }
+
+    #[test]
+    fn clicolor_force_overrides_no_color_when_not_terminal() {
+        assert!(color_enabled_from_env(false, |name| match name {
+            "NO_COLOR" => Some("1".to_string()),
+            "CLICOLOR_FORCE" => Some("1".to_string()),
+            _ => None,
+        }));
+    }
 }

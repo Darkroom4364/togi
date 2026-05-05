@@ -1036,12 +1036,13 @@ fn run_command(
 
     let mut cmd = std::process::Command::new(&command[0]);
     cmd.args(&command[1..]).current_dir(cwd).envs(env);
+    configure_command_for_process_tree(&mut cmd);
 
     let mut stdout_capture = None;
     let mut stderr_capture = None;
     if capture_output {
-        let stdout_file = match tempfile::NamedTempFile::new() {
-            Ok(file) => file,
+        stdout_capture = match OutputCapture::new("stdout") {
+            Ok(capture) => Some(capture),
             Err(e) => {
                 eprintln!("warning: could not create stdout capture file: {e}");
                 return MutationOutcome {
@@ -1050,8 +1051,8 @@ fn run_command(
                 };
             }
         };
-        let stderr_file = match tempfile::NamedTempFile::new() {
-            Ok(file) => file,
+        stderr_capture = match OutputCapture::new("stderr") {
+            Ok(capture) => Some(capture),
             Err(e) => {
                 eprintln!("warning: could not create stderr capture file: {e}");
                 return MutationOutcome {
@@ -1060,30 +1061,8 @@ fn run_command(
                 };
             }
         };
-        let stdout_handle = match stdout_file.reopen() {
-            Ok(file) => file,
-            Err(e) => {
-                eprintln!("warning: could not open stdout capture file: {e}");
-                return MutationOutcome {
-                    result: MutationResult::BuildError,
-                    test_output: None,
-                };
-            }
-        };
-        let stderr_handle = match stderr_file.reopen() {
-            Ok(file) => file,
-            Err(e) => {
-                eprintln!("warning: could not open stderr capture file: {e}");
-                return MutationOutcome {
-                    result: MutationResult::BuildError,
-                    test_output: None,
-                };
-            }
-        };
-        cmd.stdout(std::process::Stdio::from(stdout_handle));
-        cmd.stderr(std::process::Stdio::from(stderr_handle));
-        stdout_capture = Some(stdout_file);
-        stderr_capture = Some(stderr_file);
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
     } else {
         cmd.stdout(std::process::Stdio::null());
         cmd.stderr(std::process::Stdio::null());
@@ -1100,14 +1079,59 @@ fn run_command(
         }
     };
 
+    if capture_output {
+        let Some(stdout) = child.stdout.take() else {
+            terminate_process_tree(child.id());
+            let _ = child.wait();
+            return MutationOutcome {
+                result: MutationResult::BuildError,
+                test_output: None,
+            };
+        };
+        if let Some(capture) = stdout_capture.as_mut()
+            && let Err(e) = capture.start(stdout)
+        {
+            eprintln!("warning: could not open stdout capture file: {e}");
+            terminate_process_tree(child.id());
+            let _ = child.wait();
+            return MutationOutcome {
+                result: MutationResult::BuildError,
+                test_output: None,
+            };
+        }
+
+        let Some(stderr) = child.stderr.take() else {
+            terminate_process_tree(child.id());
+            let _ = child.wait();
+            finish_capture_threads(&mut stdout_capture, &mut stderr_capture);
+            return MutationOutcome {
+                result: MutationResult::BuildError,
+                test_output: None,
+            };
+        };
+        if let Some(capture) = stderr_capture.as_mut()
+            && let Err(e) = capture.start(stderr)
+        {
+            eprintln!("warning: could not open stderr capture file: {e}");
+            terminate_process_tree(child.id());
+            let _ = child.wait();
+            finish_capture_threads(&mut stdout_capture, &mut stderr_capture);
+            return MutationOutcome {
+                result: MutationResult::BuildError,
+                test_output: None,
+            };
+        }
+    }
+
     let started = Instant::now();
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) => {
                 if started.elapsed() >= timeout_dur {
-                    let _ = child.kill();
+                    terminate_process_tree(child.id());
                     let _ = child.wait();
+                    finish_capture_threads(&mut stdout_capture, &mut stderr_capture);
                     return MutationOutcome {
                         result: MutationResult::Timeout,
                         test_output: None,
@@ -1117,8 +1141,9 @@ fn run_command(
                 thread::sleep(remaining.min(Duration::from_millis(10)));
             }
             Err(_) => {
-                let _ = child.kill();
+                terminate_process_tree(child.id());
                 let _ = child.wait();
+                finish_capture_threads(&mut stdout_capture, &mut stderr_capture);
                 return MutationOutcome {
                     result: MutationResult::BuildError,
                     test_output: None,
@@ -1127,26 +1152,24 @@ fn run_command(
         }
     };
 
+    if capture_output {
+        terminate_process_tree(child.id());
+    }
+
     let result = if status.success() {
         MutationResult::Survived
     } else {
         MutationResult::Killed
     };
     let test_output = if capture_output {
-        let stdout = read_captured_output(
-            stdout_capture
-                .as_ref()
-                .expect("stdout capture file should exist")
-                .path(),
-            "stdout",
-        );
-        let stderr = read_captured_output(
-            stderr_capture
-                .as_ref()
-                .expect("stderr capture file should exist")
-                .path(),
-            "stderr",
-        );
+        let stdout = stdout_capture
+            .as_mut()
+            .expect("stdout capture file should exist")
+            .finish();
+        let stderr = stderr_capture
+            .as_mut()
+            .expect("stderr capture file should exist")
+            .finish();
         let mut combined = String::from_utf8_lossy(&stdout.bytes).into_owned();
         append_truncation_notice(&mut combined, stdout.truncated, "stdout");
 
@@ -1169,12 +1192,141 @@ fn run_command(
     }
 }
 
+#[cfg(unix)]
+fn configure_command_for_process_tree(cmd: &mut std::process::Command) {
+    use std::os::unix::process::CommandExt;
+    cmd.process_group(0);
+}
+
+#[cfg(windows)]
+fn configure_command_for_process_tree(cmd: &mut std::process::Command) {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    cmd.creation_flags(CREATE_NEW_PROCESS_GROUP);
+}
+
+#[cfg(not(any(unix, windows)))]
+fn configure_command_for_process_tree(_cmd: &mut std::process::Command) {}
+
+#[cfg(unix)]
+fn terminate_process_tree(pid: u32) {
+    let pgid = pid as libc::pid_t;
+    unsafe {
+        let _ = libc::killpg(pgid, libc::SIGKILL);
+    }
+}
+
+#[cfg(windows)]
+fn terminate_process_tree(pid: u32) {
+    let _ = std::process::Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+}
+
+#[cfg(not(any(unix, windows)))]
+fn terminate_process_tree(_pid: u32) {}
+
+struct OutputCapture {
+    file: tempfile::NamedTempFile,
+    reader: Option<thread::JoinHandle<bool>>,
+    stream: &'static str,
+}
+
+impl OutputCapture {
+    fn new(stream: &'static str) -> std::io::Result<Self> {
+        Ok(Self {
+            file: tempfile::NamedTempFile::new()?,
+            reader: None,
+            stream,
+        })
+    }
+
+    fn start<R>(&mut self, reader: R) -> std::io::Result<()>
+    where
+        R: Read + Send + 'static,
+    {
+        let writer = self.file.reopen()?;
+        self.reader = Some(spawn_output_capture(reader, writer, self.stream));
+        Ok(())
+    }
+
+    fn finish(&mut self) -> CapturedOutput {
+        let truncated = match self.reader.take() {
+            Some(reader) => match reader.join() {
+                Ok(truncated) => truncated,
+                Err(_) => {
+                    eprintln!("warning: {} capture thread panicked", self.stream);
+                    true
+                }
+            },
+            None => false,
+        };
+        read_captured_output(self.file.path(), self.stream, truncated)
+    }
+}
+
+fn finish_capture_threads(
+    stdout_capture: &mut Option<OutputCapture>,
+    stderr_capture: &mut Option<OutputCapture>,
+) {
+    if let Some(capture) = stdout_capture.as_mut() {
+        let _ = capture.finish();
+    }
+    if let Some(capture) = stderr_capture.as_mut() {
+        let _ = capture.finish();
+    }
+}
+
 struct CapturedOutput {
     bytes: Vec<u8>,
     truncated: bool,
 }
 
-fn read_captured_output(path: &Path, stream: &str) -> CapturedOutput {
+fn spawn_output_capture<R>(
+    mut reader: R,
+    mut writer: fs::File,
+    stream: &'static str,
+) -> thread::JoinHandle<bool>
+where
+    R: Read + Send + 'static,
+{
+    thread::spawn(move || {
+        let mut written = 0usize;
+        let mut truncated = false;
+        let mut buffer = [0; 8192];
+
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(n) => {
+                    let available = CAPTURED_OUTPUT_LIMIT.saturating_sub(written);
+                    let keep = n.min(available);
+                    if keep > 0 {
+                        if let Err(e) = writer.write_all(&buffer[..keep]) {
+                            eprintln!("warning: could not write {stream} capture output: {e}");
+                            break;
+                        }
+                        written += keep;
+                    }
+                    if keep < n {
+                        truncated = true;
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => {
+                    eprintln!("warning: could not read {stream} capture output: {e}");
+                    break;
+                }
+            }
+        }
+        let _ = writer.flush();
+        truncated
+    })
+}
+
+fn read_captured_output(path: &Path, stream: &str, already_truncated: bool) -> CapturedOutput {
     let mut file = match fs::File::open(path) {
         Ok(file) => file,
         Err(e) => {
@@ -1194,7 +1346,7 @@ fn read_captured_output(path: &Path, stream: &str) -> CapturedOutput {
             truncated: false,
         };
     }
-    let truncated = bytes.len() > CAPTURED_OUTPUT_LIMIT;
+    let truncated = already_truncated || bytes.len() > CAPTURED_OUTPUT_LIMIT;
     if truncated {
         bytes.truncate(CAPTURED_OUTPUT_LIMIT);
     }

@@ -30,6 +30,7 @@ fn classify_result(status: std::process::ExitStatus) -> MutationResult {
 fn verify_mutation_outcomes_match_independent_replay() {
     let _fixture_guard = crate::go_fixture_lock();
     let root = fixture_path();
+    togi::cache::clear(&root).expect("failed to clear togi cache");
     let calc_path = root.join("calc.go");
 
     let changed = vec![ChangedFile {
