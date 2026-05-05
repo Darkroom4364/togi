@@ -5,14 +5,14 @@ use crate::{Mutation, MutationReport, MutationResult};
 use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::io::{IsTerminal, Read, Write};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, mpsc};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 const CAPTURED_OUTPUT_LIMIT: usize = 1024 * 1024;
-const OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Write mutation workspace content. Workspaces are disposable temp copies, so
 /// durable temp-file + fsync writes would only add hot-loop I/O overhead.
@@ -698,38 +698,50 @@ impl TestRunner {
                             break;
                         }
 
-                        let Some((index, mutation)) = queue
-                            .lock()
-                            .expect("mutation queue mutex poisoned")
-                            .pop_front()
-                        else {
+                        let next = match queue.lock() {
+                            Ok(mut queue) => queue.pop_front(),
+                            Err(_) => {
+                                eprintln!("warning: mutation queue mutex poisoned");
+                                break;
+                            }
+                        };
+                        let Some((index, mutation)) = next else {
                             break;
                         };
 
-                        if let Some(result) = run_queued_mutation(
-                            QueuedMutation { index, mutation },
-                            RunShared {
-                                workspace_pool: workspace_pool.as_ref(),
-                                project_root: project_root.as_ref().as_path(),
-                                commands,
-                                build_command: build_command.as_ref().as_slice(),
-                                build_command_explicit,
-                                env,
-                                total,
-                                verbose,
-                                is_tty,
-                                show_output,
-                                max_tested,
-                                counter: &counter,
-                                scheduled_counter: &scheduled_counter,
-                                tested_counter: &tested_counter,
-                                cancelled: &cancelled,
+                        let outcome = catch_unwind(AssertUnwindSafe(|| {
+                            run_queued_mutation(
+                                QueuedMutation { index, mutation },
+                                RunShared {
+                                    workspace_pool: workspace_pool.as_ref(),
+                                    project_root: project_root.as_ref().as_path(),
+                                    commands,
+                                    build_command: build_command.as_ref().as_slice(),
+                                    build_command_explicit,
+                                    env,
+                                    total,
+                                    verbose,
+                                    is_tty,
+                                    show_output,
+                                    max_tested,
+                                    counter: &counter,
+                                    scheduled_counter: &scheduled_counter,
+                                    tested_counter: &tested_counter,
+                                    cancelled: &cancelled,
+                                },
+                            )
+                        }));
+
+                        match outcome {
+                            Ok(Some(result)) => match results.lock() {
+                                Ok(mut results) => results.push(result),
+                                Err(_) => {
+                                    eprintln!("warning: mutation results mutex poisoned");
+                                    break;
+                                }
                             },
-                        ) {
-                            results
-                                .lock()
-                                .expect("mutation results mutex poisoned")
-                                .push(result);
+                            Ok(None) => {}
+                            Err(_) => eprintln!("warning: mutation task panicked"),
                         }
                     }
                 });
@@ -1025,9 +1037,53 @@ fn run_command(
     let mut cmd = std::process::Command::new(&command[0]);
     cmd.args(&command[1..]).current_dir(cwd).envs(env);
 
+    let mut stdout_capture = None;
+    let mut stderr_capture = None;
     if capture_output {
-        cmd.stdout(std::process::Stdio::piped());
-        cmd.stderr(std::process::Stdio::piped());
+        let stdout_file = match tempfile::NamedTempFile::new() {
+            Ok(file) => file,
+            Err(e) => {
+                eprintln!("warning: could not create stdout capture file: {e}");
+                return MutationOutcome {
+                    result: MutationResult::BuildError,
+                    test_output: None,
+                };
+            }
+        };
+        let stderr_file = match tempfile::NamedTempFile::new() {
+            Ok(file) => file,
+            Err(e) => {
+                eprintln!("warning: could not create stderr capture file: {e}");
+                return MutationOutcome {
+                    result: MutationResult::BuildError,
+                    test_output: None,
+                };
+            }
+        };
+        let stdout_handle = match stdout_file.reopen() {
+            Ok(file) => file,
+            Err(e) => {
+                eprintln!("warning: could not open stdout capture file: {e}");
+                return MutationOutcome {
+                    result: MutationResult::BuildError,
+                    test_output: None,
+                };
+            }
+        };
+        let stderr_handle = match stderr_file.reopen() {
+            Ok(file) => file,
+            Err(e) => {
+                eprintln!("warning: could not open stderr capture file: {e}");
+                return MutationOutcome {
+                    result: MutationResult::BuildError,
+                    test_output: None,
+                };
+            }
+        };
+        cmd.stdout(std::process::Stdio::from(stdout_handle));
+        cmd.stderr(std::process::Stdio::from(stderr_handle));
+        stdout_capture = Some(stdout_file);
+        stderr_capture = Some(stderr_file);
     } else {
         cmd.stdout(std::process::Stdio::null());
         cmd.stderr(std::process::Stdio::null());
@@ -1042,17 +1098,6 @@ fn run_command(
                 test_output: None,
             };
         }
-    };
-
-    let stdout_reader = if capture_output {
-        child.stdout.take().map(spawn_output_reader)
-    } else {
-        None
-    };
-    let stderr_reader = if capture_output {
-        child.stderr.take().map(spawn_output_reader)
-    } else {
-        None
     };
 
     let started = Instant::now();
@@ -1082,22 +1127,26 @@ fn run_command(
         }
     };
 
-    let drain_duration = OUTPUT_DRAIN_TIMEOUT;
-    let stdout = match recv_output_reader(stdout_reader, drain_duration) {
-        Ok(bytes) => bytes,
-        Err(result) => return result,
-    };
-    let stderr = match recv_output_reader(stderr_reader, drain_duration) {
-        Ok(bytes) => bytes,
-        Err(result) => return result,
-    };
-
     let result = if status.success() {
         MutationResult::Survived
     } else {
         MutationResult::Killed
     };
     let test_output = if capture_output {
+        let stdout = read_captured_output(
+            stdout_capture
+                .as_ref()
+                .expect("stdout capture file should exist")
+                .path(),
+            "stdout",
+        );
+        let stderr = read_captured_output(
+            stderr_capture
+                .as_ref()
+                .expect("stderr capture file should exist")
+                .path(),
+            "stderr",
+        );
         let mut combined = String::from_utf8_lossy(&stdout.bytes).into_owned();
         append_truncation_notice(&mut combined, stdout.truncated, "stdout");
 
@@ -1125,55 +1174,31 @@ struct CapturedOutput {
     truncated: bool,
 }
 
-fn spawn_output_reader<R>(mut reader: R) -> mpsc::Receiver<CapturedOutput>
-where
-    R: Read + Send + 'static,
-{
-    let (tx, rx) = mpsc::channel();
-    thread::spawn(move || {
-        let mut bytes = Vec::new();
-        let mut truncated = false;
-        let mut buffer = [0; 8192];
-
-        loop {
-            match reader.read(&mut buffer) {
-                Ok(0) => break,
-                Ok(n) => {
-                    let available = CAPTURED_OUTPUT_LIMIT.saturating_sub(bytes.len());
-                    let keep = n.min(available);
-                    if keep > 0 {
-                        bytes.extend_from_slice(&buffer[..keep]);
-                    }
-                    if keep < n {
-                        truncated = true;
-                    }
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(_) => break,
-            }
+fn read_captured_output(path: &Path, stream: &str) -> CapturedOutput {
+    let mut file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(e) => {
+            eprintln!("warning: could not read {stream} capture file: {e}");
+            return CapturedOutput {
+                bytes: Vec::new(),
+                truncated: false,
+            };
         }
-
-        let _ = tx.send(CapturedOutput { bytes, truncated });
-    });
-    rx
-}
-
-fn recv_output_reader(
-    reader: Option<mpsc::Receiver<CapturedOutput>>,
-    drain_duration: Duration,
-) -> Result<CapturedOutput, MutationOutcome> {
-    let Some(reader) = reader else {
-        return Ok(CapturedOutput {
+    };
+    let mut bytes = Vec::new();
+    let mut limited = std::io::Read::by_ref(&mut file).take((CAPTURED_OUTPUT_LIMIT + 1) as u64);
+    if let Err(e) = limited.read_to_end(&mut bytes) {
+        eprintln!("warning: could not read {stream} capture output: {e}");
+        return CapturedOutput {
             bytes: Vec::new(),
             truncated: false,
-        });
-    };
-    reader
-        .recv_timeout(drain_duration)
-        .map_err(|_| MutationOutcome {
-            result: MutationResult::Timeout,
-            test_output: None,
-        })
+        };
+    }
+    let truncated = bytes.len() > CAPTURED_OUTPUT_LIMIT;
+    if truncated {
+        bytes.truncate(CAPTURED_OUTPUT_LIMIT);
+    }
+    CapturedOutput { bytes, truncated }
 }
 
 fn append_truncation_notice(output: &mut String, truncated: bool, stream: &str) {
@@ -2085,6 +2110,56 @@ mod tests {
         assert!(
             output.len() < CAPTURED_OUTPUT_LIMIT + 128,
             "captured output should stay close to the configured cap"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn capture_output_does_not_timeout_when_background_writer_holds_stdout() {
+        let started = Instant::now();
+        let outcome = run_command(
+            &[
+                "sh".to_string(),
+                "-c".to_string(),
+                "printf out; (sleep 1; printf late) &".to_string(),
+            ],
+            &PathBuf::from("."),
+            Duration::from_secs(5),
+            true,
+            &HashMap::new(),
+        );
+
+        assert_eq!(outcome.result, MutationResult::Survived);
+        assert!(
+            started.elapsed() < Duration::from_millis(900),
+            "finished child should not wait for background writer EOF"
+        );
+        assert!(
+            outcome.test_output.unwrap().contains("out"),
+            "captured output should include immediate stdout"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn capture_output_timeout_returns_promptly_with_background_writer() {
+        let started = Instant::now();
+        let outcome = run_command(
+            &[
+                "sh".to_string(),
+                "-c".to_string(),
+                "(sleep 1; printf late) & sleep 10".to_string(),
+            ],
+            &PathBuf::from("."),
+            Duration::from_millis(100),
+            true,
+            &HashMap::new(),
+        );
+
+        assert_eq!(outcome.result, MutationResult::Timeout);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "timeout path should not wait for descendant-held stdout"
         );
     }
 

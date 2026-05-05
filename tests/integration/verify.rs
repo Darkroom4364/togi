@@ -1,7 +1,8 @@
 //! Mutation verification: replay each mutation independently and confirm
 //! togi's reported outcome matches the actual test result.
 //!
-//! Sets GOCACHE=off so Go recompiles each mutated workspace.
+//! Uses `-count=1` with a temporary GOCACHE so Go reruns tests while keeping
+//! the required build cache enabled.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -42,12 +43,28 @@ fn verify_mutation_outcomes_match_independent_replay() {
     // Capture pristine fixture before runner.run() touches it
     let original = std::fs::read(&calc_path).expect("failed to read calc.go");
 
-    // Disable Go build+test caching via runner env (no process-wide set_var)
+    // Force fresh test execution while keeping Go's required build cache enabled.
+    let go_cache = tempfile::tempdir().expect("failed to create temporary Go cache");
     let go_env: std::collections::HashMap<String, String> = [
         ("GOFLAGS".into(), "-count=1".into()),
-        ("GOCACHE".into(), "off".into()),
+        (
+            "GOCACHE".into(),
+            go_cache.path().to_string_lossy().into_owned(),
+        ),
     ]
     .into();
+    let baseline = Command::new("go")
+        .args(["test", "./..."])
+        .envs(&go_env)
+        .current_dir(&root)
+        .output()
+        .expect("failed to run baseline go test");
+    assert!(
+        baseline.status.success(),
+        "baseline go test failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&baseline.stdout),
+        String::from_utf8_lossy(&baseline.stderr)
+    );
 
     let runner = togi::runner::TestRunner {
         commands: togi::runner::CommandConfig {

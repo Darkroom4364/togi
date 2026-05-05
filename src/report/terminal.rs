@@ -1,8 +1,9 @@
 use crate::{MutationReport, MutationResult};
 use std::fmt::Write;
+use std::io::IsTerminal;
 
 pub fn print_report(report: &MutationReport) {
-    print!("{}", format_report(report, true));
+    print!("{}", format_report(report, should_colorize()));
 }
 
 pub fn format_report_plain(report: &MutationReport) -> String {
@@ -129,6 +130,25 @@ fn yellow(text: &str) -> String {
 
 fn dim(text: &str) -> String {
     ansi("2", text)
+}
+
+fn should_colorize() -> bool {
+    color_enabled_from_env(std::io::stdout().is_terminal(), |name| {
+        std::env::var(name).ok()
+    })
+}
+
+fn color_enabled_from_env(is_terminal: bool, env: impl Fn(&str) -> Option<String>) -> bool {
+    if env("CLICOLOR_FORCE").is_some_and(|value| value != "0") {
+        return true;
+    }
+    if env("NO_COLOR").is_some() {
+        return false;
+    }
+    if env("CLICOLOR").is_some_and(|value| value == "0") {
+        return false;
+    }
+    is_terminal
 }
 
 /// Guidance text when every mutation is a build error.
@@ -275,5 +295,33 @@ mod tests {
         ]);
         let output = format_report_plain(&report);
         assert!(!output.contains("All mutations caused build errors"));
+    }
+
+    #[test]
+    fn color_is_disabled_when_stdout_is_not_terminal() {
+        assert!(!color_enabled_from_env(false, |_| None));
+    }
+
+    #[test]
+    fn no_color_disables_color() {
+        assert!(!color_enabled_from_env(true, |name| {
+            (name == "NO_COLOR").then(|| "1".to_string())
+        }));
+    }
+
+    #[test]
+    fn clicolor_zero_disables_color() {
+        assert!(!color_enabled_from_env(true, |name| {
+            (name == "CLICOLOR").then(|| "0".to_string())
+        }));
+    }
+
+    #[test]
+    fn clicolor_force_overrides_no_color() {
+        assert!(color_enabled_from_env(true, |name| match name {
+            "NO_COLOR" => Some("1".to_string()),
+            "CLICOLOR_FORCE" => Some("1".to_string()),
+            _ => None,
+        }));
     }
 }

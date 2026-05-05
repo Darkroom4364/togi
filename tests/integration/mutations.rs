@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::process::Command;
 use std::time::Duration;
 use togi::{ChangedFile, LineRange};
 
@@ -70,7 +71,7 @@ fn generates_mutations_for_go_fixture() {
 /// Requires `go` to be installed. Run with: cargo test -- --ignored
 #[test]
 #[ignore]
-fn end_to_end_go_fixture_all_killed_with_cache_off() {
+fn end_to_end_go_fixture_reports_expected_outcomes_with_fresh_tests() {
     let _fixture_guard = crate::go_fixture_lock();
     let root = fixture_path();
     togi::cache::clear(&root).expect("failed to clear togi cache");
@@ -84,12 +85,28 @@ fn end_to_end_go_fixture_all_killed_with_cache_off() {
     let mutations = togi::mutator::generate_mutations(&changed, &root, 200, 0, &[]).unwrap();
     assert!(!mutations.is_empty());
 
-    // Disable Go caching via runner env (no process-wide set_var)
+    // Force fresh test execution while keeping Go's required build cache enabled.
+    let go_cache = tempfile::tempdir().expect("failed to create temporary Go cache");
     let go_env: std::collections::HashMap<String, String> = [
         ("GOFLAGS".into(), "-count=1".into()),
-        ("GOCACHE".into(), "off".into()),
+        (
+            "GOCACHE".into(),
+            go_cache.path().to_string_lossy().into_owned(),
+        ),
     ]
     .into();
+    let baseline = Command::new("go")
+        .args(["test", "./..."])
+        .envs(&go_env)
+        .current_dir(&root)
+        .output()
+        .expect("failed to run baseline go test");
+    assert!(
+        baseline.status.success(),
+        "baseline go test failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&baseline.stdout),
+        String::from_utf8_lossy(&baseline.stderr)
+    );
 
     let runner = togi::runner::TestRunner {
         commands: togi::runner::CommandConfig {
@@ -133,10 +150,13 @@ fn end_to_end_go_fixture_all_killed_with_cache_off() {
         );
     }
 
-    // With GOCACHE=off, all mutations are killed because Go recompiles fresh.
     // Parent-level mutation mapping intentionally adds if-body, condition, and
-    // return mutations alongside expression/literal mutations.
+    // return mutations alongside expression/literal mutations. The fixture's
+    // tests intentionally do not kill every generated mutation; these counts
+    // prove Go actually ran instead of failing before test execution.
     assert_eq!(report.total, 26);
-    assert_eq!(report.killed, report.total);
+    assert_eq!(report.killed, 10);
+    assert_eq!(report.survived, 16);
+    assert_eq!(report.timeout, 0);
     assert_eq!(report.build_errors, 0);
 }
