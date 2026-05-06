@@ -1330,14 +1330,14 @@ impl WindowsJobHandle {
         }
 
         let job = Self { handle };
-        let mut info = WindowsJobBasicLimitInformation::default();
-        info.limit_flags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let mut info = WindowsJobExtendedLimitInformation::default();
+        info.basic_limit_information.limit_flags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
         let configured = unsafe {
             SetInformationJobObject(
                 job.handle,
-                JOB_OBJECT_BASIC_LIMIT_INFORMATION_CLASS,
+                JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS,
                 &info as *const _ as *const std::ffi::c_void,
-                size_of::<WindowsJobBasicLimitInformation>() as u32,
+                size_of::<WindowsJobExtendedLimitInformation>() as u32,
             )
         };
         if configured == 0 {
@@ -1376,7 +1376,7 @@ type WindowsHandle = *mut std::ffi::c_void;
 #[cfg(windows)]
 const INVALID_HANDLE_VALUE: WindowsHandle = -1isize as WindowsHandle;
 #[cfg(windows)]
-const JOB_OBJECT_BASIC_LIMIT_INFORMATION_CLASS: i32 = 2;
+const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS: i32 = 9;
 #[cfg(windows)]
 const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x0000_2000;
 
@@ -1393,6 +1393,30 @@ struct WindowsJobBasicLimitInformation {
     affinity: usize,
     priority_class: u32,
     scheduling_class: u32,
+}
+
+#[cfg(windows)]
+#[repr(C)]
+#[derive(Default)]
+struct WindowsIoCounters {
+    read_operation_count: u64,
+    write_operation_count: u64,
+    other_operation_count: u64,
+    read_transfer_count: u64,
+    write_transfer_count: u64,
+    other_transfer_count: u64,
+}
+
+#[cfg(windows)]
+#[repr(C)]
+#[derive(Default)]
+struct WindowsJobExtendedLimitInformation {
+    basic_limit_information: WindowsJobBasicLimitInformation,
+    io_info: WindowsIoCounters,
+    process_memory_limit: usize,
+    job_memory_limit: usize,
+    peak_process_memory_used: usize,
+    peak_job_memory_used: usize,
 }
 
 #[cfg(windows)]

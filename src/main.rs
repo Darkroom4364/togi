@@ -347,8 +347,7 @@ fn run_check(cfg: CheckConfig, cancelled: Arc<AtomicBool>) -> anyhow::Result<()>
 
     if outcome.cancelled {
         eprintln!("Interrupted; skipping baseline and PR comment updates.");
-        drop(_lock);
-        process::exit(130);
+        exit_with(_lock, 130);
     }
 
     let current = togi::baseline::from_report(&report, &project_root_ref);
@@ -386,20 +385,22 @@ fn run_check(cfg: CheckConfig, cancelled: Arc<AtomicBool>) -> anyhow::Result<()>
 
     let score = togi::report::mutation_score(&report);
     if should_fail {
-        drop(_lock);
-        process::exit(1);
+        exit_with(_lock, 1);
     } else if let Some(threshold) = fail_under {
         if score < threshold {
             eprintln!("Mutation score {score:.1}% is below --fail-under threshold {threshold:.1}%");
-            drop(_lock);
-            process::exit(1);
+            exit_with(_lock, 1);
         }
     } else if report.survived > 0 && !check_baseline {
-        drop(_lock);
-        process::exit(1);
+        exit_with(_lock, 1);
     }
 
     Ok(())
+}
+
+fn exit_with(lock: togi::lock::LockGuard, code: i32) -> ! {
+    drop(lock);
+    process::exit(code);
 }
 
 fn resolve_config(
