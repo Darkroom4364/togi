@@ -90,7 +90,8 @@ fn verify_mutation_outcomes_match_independent_replay() {
         cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
 
-    let report = runner.run(mutations);
+    togi::cache::clear(&root).expect("failed to clear togi cache before verification run");
+    let report = runner.run(mutations).report;
 
     // Verify runner restored the file
     let after_run = std::fs::read(&calc_path).expect("failed to re-read calc.go");

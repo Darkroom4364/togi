@@ -131,7 +131,7 @@ fn end_to_end_go_fixture_reports_expected_outcomes_with_fresh_tests() {
         cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
 
-    let report = runner.run(mutations);
+    let report = runner.run(mutations).report;
 
     println!(
         "Results: {} total, {} killed, {} survived, {} timeout, {} build errors",

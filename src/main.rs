@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use serde::Deserialize;
-use togi::{ChangedFile, Mutation, MutationReport};
+use togi::{ChangedFile, Mutation};
 
 struct CheckConfig {
     all: bool,
@@ -328,7 +328,7 @@ fn run_check(cfg: CheckConfig, cancelled: Arc<AtomicBool>) -> anyhow::Result<()>
     eprintln!("Running {} mutations...", mutations.len());
 
     let project_root_ref = project_root.clone();
-    let report = execute(
+    let outcome = execute(
         mutations,
         config,
         project_root,
@@ -342,7 +342,14 @@ fn run_check(cfg: CheckConfig, cancelled: Arc<AtomicBool>) -> anyhow::Result<()>
         },
     );
 
+    let report = outcome.report;
     togi::report::print_report(&report, output_format)?;
+
+    if outcome.cancelled {
+        eprintln!("Interrupted; skipping baseline and PR comment updates.");
+        drop(_lock);
+        process::exit(130);
+    }
 
     let current = togi::baseline::from_report(&report, &project_root_ref);
     let mut should_fail = false;
@@ -618,7 +625,7 @@ fn execute(
     config: togi::config::Config,
     project_root: PathBuf,
     options: ExecuteOptions,
-) -> MutationReport {
+) -> togi::runner::RunOutcome {
     let mut language_commands: std::collections::HashMap<String, Vec<String>> =
         std::collections::HashMap::new();
     let mut language_timeouts: std::collections::HashMap<String, Duration> =

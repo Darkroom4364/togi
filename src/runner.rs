@@ -118,6 +118,16 @@ pub struct TestRunner {
     pub cancelled: Arc<AtomicBool>,
 }
 
+/// Result of a runner invocation.
+///
+/// `report` contains the completed mutation results. `cancelled` is true when
+/// the runner observed cancellation before or during execution.
+#[derive(Debug)]
+pub struct RunOutcome {
+    pub report: MutationReport,
+    pub cancelled: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SelectedTestCommand {
     argv: Vec<String>,
@@ -478,33 +488,20 @@ struct RunShared<'a> {
     verbose: bool,
     is_tty: bool,
     show_output: bool,
-    max_tested: Option<usize>,
     counter: &'a AtomicUsize,
-    scheduled_counter: &'a AtomicUsize,
-    tested_counter: &'a AtomicUsize,
     cancelled: &'a AtomicBool,
 }
 
 fn run_queued_mutation(
     queued: QueuedMutation,
+    reservation: TestSlotReservation,
     shared: RunShared<'_>,
 ) -> Option<(usize, Mutation, MutationResult)> {
     let QueuedMutation { index, mutation } = queued;
 
-    // Stop if cancelled (Ctrl+C) or enough mutations have been tested.
+    // Stop if cancelled (Ctrl+C).
     if shared.cancelled.load(Ordering::Relaxed) {
         return None;
-    }
-    if let Some(max) = shared.max_tested {
-        let reserved = shared
-            .scheduled_counter
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                (current < max).then_some(current + 1)
-            })
-            .is_ok();
-        if !reserved {
-            return None;
-        }
     }
 
     let selected_test = select_test_command(shared.project_root, shared.commands, &mutation);
@@ -533,6 +530,7 @@ fn run_queued_mutation(
     if let Some(ref key) = cache_key
         && let Some(result) = cache::lookup(shared.project_root, key)
     {
+        reservation.release();
         record_progress(&shared, &mutation, result, None, true);
         return Some((index, mutation, result));
     }
@@ -553,8 +551,18 @@ fn run_queued_mutation(
             workspace_target,
             shared.show_output,
             shared.env,
+            shared.cancelled,
         )
     };
+
+    if outcome.cancelled {
+        return None;
+    }
+    if outcome.result == MutationResult::BuildError {
+        reservation.release();
+    } else {
+        reservation.commit();
+    }
 
     if let Some(ref key) = cache_key {
         cache::store(shared.project_root, key, outcome.result);
@@ -571,6 +579,47 @@ fn run_queued_mutation(
     Some((index, mutation, result))
 }
 
+struct TestSlotReservation {
+    counter: Option<Arc<AtomicUsize>>,
+}
+
+impl TestSlotReservation {
+    fn try_reserve(max_tested: Option<usize>, counter: &Arc<AtomicUsize>) -> Option<Self> {
+        let Some(max) = max_tested else {
+            return Some(Self { counter: None });
+        };
+
+        counter
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                (current < max).then_some(current + 1)
+            })
+            .ok()
+            .map(|_| Self {
+                counter: Some(counter.clone()),
+            })
+    }
+
+    fn commit(mut self) {
+        self.counter = None;
+    }
+
+    fn release(mut self) {
+        self.release_inner();
+    }
+
+    fn release_inner(&mut self) {
+        if let Some(counter) = self.counter.take() {
+            counter.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+}
+
+impl Drop for TestSlotReservation {
+    fn drop(&mut self) {
+        self.release_inner();
+    }
+}
+
 #[allow(clippy::manual_is_multiple_of)]
 fn record_progress(
     shared: &RunShared<'_>,
@@ -579,10 +628,6 @@ fn record_progress(
     test_output: Option<&str>,
     cached: bool,
 ) {
-    if result != MutationResult::BuildError {
-        shared.tested_counter.fetch_add(1, Ordering::Release);
-    }
-
     let n = shared.counter.fetch_add(1, Ordering::Relaxed) + 1;
     if shared.verbose {
         if cached {
@@ -637,23 +682,26 @@ fn record_progress(
 
 impl TestRunner {
     #[allow(clippy::manual_is_multiple_of)]
-    pub fn run(&self, mutations: Vec<Mutation>) -> MutationReport {
+    pub fn run(&self, mutations: Vec<Mutation>) -> RunOutcome {
         let start = Instant::now();
         let total = mutations.len();
         if total == 0 {
-            return self.report_from_results(Vec::new(), start.elapsed());
+            return self.outcome_from_results(Vec::new(), start.elapsed());
+        }
+        if self.cancelled.load(Ordering::Acquire) {
+            return self.outcome_from_results(Vec::new(), start.elapsed());
         }
 
         let counter = Arc::new(AtomicUsize::new(0));
-        let scheduled_counter = Arc::new(AtomicUsize::new(0));
         let tested_counter = Arc::new(AtomicUsize::new(0));
         let verbose = self.verbose;
         let is_tty = std::io::stderr().is_terminal();
+        let workspace_slots = workspace_pool_slot_count(self.parallelism, total);
 
         let workspace_pool_result = if self.respect_workspace_ignores {
-            WorkspacePool::new(&self.project_root, self.parallelism)
+            WorkspacePool::new(&self.project_root, workspace_slots)
         } else {
-            WorkspacePool::new_with_options(&self.project_root, self.parallelism, false)
+            WorkspacePool::new_with_options(&self.project_root, workspace_slots, false)
         };
         let workspace_pool = match workspace_pool_result {
             Ok(pool) => Arc::new(pool),
@@ -663,7 +711,7 @@ impl TestRunner {
                     .into_iter()
                     .map(|mutation| (mutation, MutationResult::BuildError))
                     .collect();
-                return self.report_from_results(results, start.elapsed());
+                return self.outcome_from_results(results, start.elapsed());
             }
         };
 
@@ -684,7 +732,6 @@ impl TestRunner {
                 let project_root = project_root.clone();
                 let build_command = build_command.clone();
                 let counter = counter.clone();
-                let scheduled_counter = scheduled_counter.clone();
                 let tested_counter = tested_counter.clone();
                 let cancelled = self.cancelled.clone();
                 let commands = &self.commands;
@@ -698,6 +745,11 @@ impl TestRunner {
                             break;
                         }
 
+                        let Some(reservation) =
+                            TestSlotReservation::try_reserve(max_tested, &tested_counter)
+                        else {
+                            break;
+                        };
                         let next = match queue.lock() {
                             Ok(mut queue) => queue.pop_front(),
                             Err(_) => {
@@ -712,6 +764,7 @@ impl TestRunner {
                         let outcome = catch_unwind(AssertUnwindSafe(|| {
                             run_queued_mutation(
                                 QueuedMutation { index, mutation },
+                                reservation,
                                 RunShared {
                                     workspace_pool: workspace_pool.as_ref(),
                                     project_root: project_root.as_ref().as_path(),
@@ -723,10 +776,7 @@ impl TestRunner {
                                     verbose,
                                     is_tty,
                                     show_output,
-                                    max_tested,
                                     counter: &counter,
-                                    scheduled_counter: &scheduled_counter,
-                                    tested_counter: &tested_counter,
                                     cancelled: &cancelled,
                                 },
                             )
@@ -764,7 +814,18 @@ impl TestRunner {
             let _ = std::io::stderr().flush();
         }
 
-        self.report_from_results(all_results, start.elapsed())
+        self.outcome_from_results(all_results, start.elapsed())
+    }
+
+    fn outcome_from_results(
+        &self,
+        all_results: Vec<(Mutation, MutationResult)>,
+        duration: Duration,
+    ) -> RunOutcome {
+        RunOutcome {
+            report: self.report_from_results(all_results, duration),
+            cancelled: self.cancelled.load(Ordering::Acquire),
+        }
     }
 
     fn report_from_results(
@@ -814,9 +875,37 @@ impl TestRunner {
     }
 }
 
+fn workspace_pool_slot_count(parallelism: usize, total: usize) -> usize {
+    debug_assert!(total > 0);
+    parallelism.max(1).min(total)
+}
+
 struct MutationOutcome {
     result: MutationResult,
     test_output: Option<String>,
+    cancelled: bool,
+}
+
+impl MutationOutcome {
+    fn new(result: MutationResult, test_output: Option<String>) -> Self {
+        Self {
+            result,
+            test_output,
+            cancelled: false,
+        }
+    }
+
+    fn build_error() -> Self {
+        Self::new(MutationResult::BuildError, None)
+    }
+
+    fn cancelled() -> Self {
+        Self {
+            result: MutationResult::BuildError,
+            test_output: None,
+            cancelled: true,
+        }
+    }
 }
 
 struct BuildCommand<'a> {
@@ -948,6 +1037,7 @@ impl<'a> ResolvedMutation<'a> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_single_mutation(
     command: &[String],
     build_command: BuildCommand<'_>,
@@ -956,15 +1046,17 @@ fn run_single_mutation(
     target: ResolvedMutation<'_>,
     capture_output: bool,
     env: &HashMap<String, String>,
+    cancelled: &AtomicBool,
 ) -> MutationOutcome {
+    if cancelled.load(Ordering::Acquire) {
+        return MutationOutcome::cancelled();
+    }
+
     let mutation = target.mutation;
     let file_path = match target.file_path {
         Ok(path) => path,
         Err(()) => {
-            return MutationOutcome {
-                result: MutationResult::BuildError,
-                test_output: None,
-            };
+            return MutationOutcome::build_error();
         }
     };
 
@@ -973,10 +1065,7 @@ fn run_single_mutation(
         Ok(content) => content,
         Err(e) => {
             eprintln!("warning: could not read {}: {e}", file_path.display());
-            return MutationOutcome {
-                result: MutationResult::BuildError,
-                test_output: None,
-            };
+            return MutationOutcome::build_error();
         }
     };
 
@@ -990,34 +1079,46 @@ fn run_single_mutation(
     let mut mutated = original.clone();
     let range = mutation.byte_range.clone();
     if range.start > range.end || range.end > mutated.len() {
-        return MutationOutcome {
-            result: MutationResult::BuildError,
-            test_output: None,
-        };
+        return MutationOutcome::build_error();
     }
     mutated.splice(range, mutation.replacement.as_bytes().iter().copied());
 
     if let Err(e) = write_workspace_file(&file_path, &mutated) {
         eprintln!("warning: could not write {}: {e}", file_path.display());
-        return MutationOutcome {
-            result: MutationResult::BuildError,
-            test_output: None,
-        };
+        return MutationOutcome::build_error();
     }
 
     // Explicit build check: skip expensive test if mutation doesn't compile.
     if build_command.explicit && !build_command.argv.is_empty() {
-        let build_outcome = run_command(build_command.argv, project_root, timeout, false, env);
+        let build_outcome = run_command(
+            build_command.argv,
+            project_root,
+            timeout,
+            false,
+            env,
+            cancelled,
+        );
+        if build_outcome.cancelled {
+            return build_outcome;
+        }
         if build_outcome.result != MutationResult::Survived {
-            return MutationOutcome {
-                result: MutationResult::BuildError,
-                test_output: None,
-            };
+            return MutationOutcome::build_error();
         }
     }
 
+    if cancelled.load(Ordering::Acquire) {
+        return MutationOutcome::cancelled();
+    }
+
     // Run test command; guard will restore the file on drop
-    run_command(command, project_root, timeout, capture_output, env)
+    run_command(
+        command,
+        project_root,
+        timeout,
+        capture_output,
+        env,
+        cancelled,
+    )
 }
 
 fn run_command(
@@ -1026,12 +1127,14 @@ fn run_command(
     timeout_dur: Duration,
     capture_output: bool,
     env: &HashMap<String, String>,
+    cancelled: &AtomicBool,
 ) -> MutationOutcome {
+    if cancelled.load(Ordering::Acquire) {
+        return MutationOutcome::cancelled();
+    }
+
     if command.is_empty() {
-        return MutationOutcome {
-            result: MutationResult::BuildError,
-            test_output: None,
-        };
+        return MutationOutcome::build_error();
     }
 
     let mut cmd = std::process::Command::new(&command[0]);
@@ -1045,20 +1148,14 @@ fn run_command(
             Ok(capture) => Some(capture),
             Err(e) => {
                 eprintln!("warning: could not create stdout capture file: {e}");
-                return MutationOutcome {
-                    result: MutationResult::BuildError,
-                    test_output: None,
-                };
+                return MutationOutcome::build_error();
             }
         };
         stderr_capture = match OutputCapture::new("stderr") {
             Ok(capture) => Some(capture),
             Err(e) => {
                 eprintln!("warning: could not create stderr capture file: {e}");
-                return MutationOutcome {
-                    result: MutationResult::BuildError,
-                    test_output: None,
-                };
+                return MutationOutcome::build_error();
             }
         };
         cmd.stdout(std::process::Stdio::piped());
@@ -1068,58 +1165,44 @@ fn run_command(
         cmd.stderr(std::process::Stdio::null());
     }
 
+    if cancelled.load(Ordering::Acquire) {
+        return MutationOutcome::cancelled();
+    }
+
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
             eprintln!("warning: could not spawn command {:?}: {e}", &command[0]);
-            return MutationOutcome {
-                result: MutationResult::BuildError,
-                test_output: None,
-            };
+            return MutationOutcome::build_error();
         }
     };
+    let mut process_tree = ProcessTreeGuard::attach(&child);
 
     if capture_output {
         let Some(stdout) = child.stdout.take() else {
-            terminate_process_tree(child.id());
-            let _ = child.wait();
-            return MutationOutcome {
-                result: MutationResult::BuildError,
-                test_output: None,
-            };
+            terminate_and_wait(&mut child, &mut process_tree);
+            return MutationOutcome::build_error();
         };
         if let Some(capture) = stdout_capture.as_mut()
             && let Err(e) = capture.start(stdout)
         {
             eprintln!("warning: could not open stdout capture file: {e}");
-            terminate_process_tree(child.id());
-            let _ = child.wait();
-            return MutationOutcome {
-                result: MutationResult::BuildError,
-                test_output: None,
-            };
+            terminate_and_wait(&mut child, &mut process_tree);
+            return MutationOutcome::build_error();
         }
 
         let Some(stderr) = child.stderr.take() else {
-            terminate_process_tree(child.id());
-            let _ = child.wait();
+            terminate_and_wait(&mut child, &mut process_tree);
             finish_capture_threads(&mut stdout_capture, &mut stderr_capture);
-            return MutationOutcome {
-                result: MutationResult::BuildError,
-                test_output: None,
-            };
+            return MutationOutcome::build_error();
         };
         if let Some(capture) = stderr_capture.as_mut()
             && let Err(e) = capture.start(stderr)
         {
             eprintln!("warning: could not open stderr capture file: {e}");
-            terminate_process_tree(child.id());
-            let _ = child.wait();
+            terminate_and_wait(&mut child, &mut process_tree);
             finish_capture_threads(&mut stdout_capture, &mut stderr_capture);
-            return MutationOutcome {
-                result: MutationResult::BuildError,
-                test_output: None,
-            };
+            return MutationOutcome::build_error();
         }
     }
 
@@ -1128,33 +1211,28 @@ fn run_command(
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) => {
-                if started.elapsed() >= timeout_dur {
-                    terminate_process_tree(child.id());
-                    let _ = child.wait();
+                if cancelled.load(Ordering::Acquire) {
+                    terminate_and_wait(&mut child, &mut process_tree);
                     finish_capture_threads(&mut stdout_capture, &mut stderr_capture);
-                    return MutationOutcome {
-                        result: MutationResult::Timeout,
-                        test_output: None,
-                    };
+                    return MutationOutcome::cancelled();
+                }
+                if started.elapsed() >= timeout_dur {
+                    terminate_and_wait(&mut child, &mut process_tree);
+                    finish_capture_threads(&mut stdout_capture, &mut stderr_capture);
+                    return MutationOutcome::new(MutationResult::Timeout, None);
                 }
                 let remaining = timeout_dur.saturating_sub(started.elapsed());
                 thread::sleep(remaining.min(Duration::from_millis(10)));
             }
             Err(_) => {
-                terminate_process_tree(child.id());
-                let _ = child.wait();
+                terminate_and_wait(&mut child, &mut process_tree);
                 finish_capture_threads(&mut stdout_capture, &mut stderr_capture);
-                return MutationOutcome {
-                    result: MutationResult::BuildError,
-                    test_output: None,
-                };
+                return MutationOutcome::build_error();
             }
         }
     };
 
-    if capture_output {
-        terminate_process_tree(child.id());
-    }
+    process_tree.terminate(child.id());
 
     let result = if status.success() {
         MutationResult::Survived
@@ -1186,10 +1264,162 @@ fn run_command(
         None
     };
 
-    MutationOutcome {
-        result,
-        test_output,
+    MutationOutcome::new(result, test_output)
+}
+
+fn terminate_and_wait(child: &mut std::process::Child, process_tree: &mut ProcessTreeGuard) {
+    process_tree.terminate(child.id());
+    let _ = child.wait();
+}
+
+#[cfg(unix)]
+struct ProcessTreeGuard;
+
+#[cfg(unix)]
+impl ProcessTreeGuard {
+    fn attach(_child: &std::process::Child) -> Self {
+        Self
     }
+
+    fn terminate(&mut self, pid: u32) {
+        terminate_process_tree(pid);
+    }
+}
+
+#[cfg(windows)]
+struct ProcessTreeGuard {
+    job: Option<WindowsJobHandle>,
+}
+
+#[cfg(windows)]
+impl ProcessTreeGuard {
+    fn attach(child: &std::process::Child) -> Self {
+        match WindowsJobHandle::new_kill_on_close().and_then(|job| {
+            job.assign(child)?;
+            Ok(job)
+        }) {
+            Ok(job) => Self { job: Some(job) },
+            Err(e) => {
+                eprintln!("warning: could not attach command to Windows job object: {e}");
+                Self { job: None }
+            }
+        }
+    }
+
+    fn terminate(&mut self, pid: u32) {
+        if self.job.take().is_none() {
+            terminate_process_tree(pid);
+        }
+    }
+}
+
+#[cfg(windows)]
+struct WindowsJobHandle {
+    handle: WindowsHandle,
+}
+
+#[cfg(windows)]
+impl WindowsJobHandle {
+    fn new_kill_on_close() -> std::io::Result<Self> {
+        use std::mem::size_of;
+        use std::ptr::null;
+
+        let handle = unsafe { CreateJobObjectW(null(), null()) };
+        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        let job = Self { handle };
+        let mut info = WindowsJobBasicLimitInformation::default();
+        info.limit_flags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let configured = unsafe {
+            SetInformationJobObject(
+                job.handle,
+                JOB_OBJECT_BASIC_LIMIT_INFORMATION_CLASS,
+                &info as *const _ as *const std::ffi::c_void,
+                size_of::<WindowsJobBasicLimitInformation>() as u32,
+            )
+        };
+        if configured == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        Ok(job)
+    }
+
+    fn assign(&self, child: &std::process::Child) -> std::io::Result<()> {
+        use std::os::windows::io::AsRawHandle;
+
+        let assigned = unsafe {
+            AssignProcessToJobObject(self.handle, child.as_raw_handle() as WindowsHandle)
+        };
+        if assigned == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+impl Drop for WindowsJobHandle {
+    fn drop(&mut self) {
+        unsafe {
+            CloseHandle(self.handle);
+        }
+    }
+}
+
+#[cfg(windows)]
+type WindowsHandle = *mut std::ffi::c_void;
+
+#[cfg(windows)]
+const INVALID_HANDLE_VALUE: WindowsHandle = -1isize as WindowsHandle;
+#[cfg(windows)]
+const JOB_OBJECT_BASIC_LIMIT_INFORMATION_CLASS: i32 = 2;
+#[cfg(windows)]
+const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x0000_2000;
+
+#[cfg(windows)]
+#[repr(C)]
+#[derive(Default)]
+struct WindowsJobBasicLimitInformation {
+    per_process_user_time_limit: i64,
+    per_job_user_time_limit: i64,
+    limit_flags: u32,
+    minimum_working_set_size: usize,
+    maximum_working_set_size: usize,
+    active_process_limit: u32,
+    affinity: usize,
+    priority_class: u32,
+    scheduling_class: u32,
+}
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn CreateJobObjectW(job_attributes: *const std::ffi::c_void, name: *const u16)
+    -> WindowsHandle;
+    fn SetInformationJobObject(
+        job: WindowsHandle,
+        information_class: i32,
+        information: *const std::ffi::c_void,
+        information_length: u32,
+    ) -> i32;
+    fn AssignProcessToJobObject(job: WindowsHandle, process: WindowsHandle) -> i32;
+    fn CloseHandle(handle: WindowsHandle) -> i32;
+}
+
+#[cfg(not(any(unix, windows)))]
+struct ProcessTreeGuard;
+
+#[cfg(not(any(unix, windows)))]
+impl ProcessTreeGuard {
+    fn attach(_child: &std::process::Child) -> Self {
+        Self
+    }
+
+    fn terminate(&mut self, _pid: u32) {}
 }
 
 #[cfg(unix)]
@@ -1948,6 +2178,14 @@ mod tests {
     }
 
     #[test]
+    fn workspace_pool_slot_count_is_bounded_by_total_mutations() {
+        assert_eq!(workspace_pool_slot_count(0, 3), 1);
+        assert_eq!(workspace_pool_slot_count(1, 3), 1);
+        assert_eq!(workspace_pool_slot_count(2, 5), 2);
+        assert_eq!(workspace_pool_slot_count(8, 3), 3);
+    }
+
+    #[test]
     fn command_succeeds_returns_survived() {
         let (dir, file, mutation) = make_relative_test_setup();
 
@@ -1962,6 +2200,7 @@ mod tests {
             ResolvedMutation::new(dir.path(), &mutation),
             false,
             &HashMap::new(),
+            &AtomicBool::new(false),
         );
 
         assert_eq!(outcome.result, MutationResult::Survived);
@@ -1983,6 +2222,7 @@ mod tests {
             ResolvedMutation::new(dir.path(), &mutation),
             false,
             &HashMap::new(),
+            &AtomicBool::new(false),
         );
 
         assert_eq!(outcome.result, MutationResult::Killed);
@@ -2020,6 +2260,7 @@ mod tests {
             ResolvedMutation::new(dir.path(), &mutation),
             false,
             &HashMap::new(),
+            &AtomicBool::new(false),
         );
 
         assert_eq!(outcome.result, MutationResult::Survived);
@@ -2042,6 +2283,7 @@ mod tests {
             ResolvedMutation::new(dir.path(), &mutation),
             false,
             &HashMap::new(),
+            &AtomicBool::new(false),
         );
 
         assert_eq!(outcome.result, MutationResult::BuildError);
@@ -2064,6 +2306,7 @@ mod tests {
             ResolvedMutation::new(dir.path(), &mutation),
             false,
             &HashMap::new(),
+            &AtomicBool::new(false),
         );
 
         assert_eq!(outcome.result, MutationResult::Timeout);
@@ -2092,6 +2335,7 @@ mod tests {
             ResolvedMutation::new(dir.path(), &mutation),
             false,
             &HashMap::new(),
+            &AtomicBool::new(false),
         );
 
         assert_eq!(outcome.result, MutationResult::BuildError);
@@ -2115,6 +2359,7 @@ mod tests {
             ResolvedMutation::new(dir.path(), &mutation),
             false,
             &HashMap::new(),
+            &AtomicBool::new(false),
         );
 
         assert_eq!(outcome.result, MutationResult::Killed);
@@ -2147,6 +2392,7 @@ mod tests {
             ResolvedMutation::new(dir.path(), &mutation),
             false,
             &HashMap::new(),
+            &AtomicBool::new(false),
         );
 
         assert_eq!(outcome.result, MutationResult::Survived);
@@ -2177,6 +2423,7 @@ mod tests {
             ResolvedMutation::new(dir.path(), &mutation),
             false,
             &HashMap::new(),
+            &AtomicBool::new(false),
         );
 
         assert_eq!(outcome.result, MutationResult::BuildError);
@@ -2198,6 +2445,7 @@ mod tests {
             ResolvedMutation::new(dir.path(), &mutation),
             false,
             &HashMap::new(),
+            &AtomicBool::new(false),
         );
 
         assert_eq!(outcome.result, MutationResult::BuildError);
@@ -2211,6 +2459,7 @@ mod tests {
             Duration::from_secs(5),
             false,
             &HashMap::new(),
+            &AtomicBool::new(false),
         );
 
         assert_eq!(outcome.result, MutationResult::BuildError);
@@ -2229,6 +2478,7 @@ mod tests {
             Duration::from_secs(5),
             true,
             &HashMap::new(),
+            &AtomicBool::new(false),
         );
 
         assert_eq!(outcome.result, MutationResult::Survived);
@@ -2251,6 +2501,7 @@ mod tests {
             Duration::from_secs(5),
             true,
             &HashMap::new(),
+            &AtomicBool::new(false),
         );
 
         assert_eq!(outcome.result, MutationResult::Survived);
@@ -2279,6 +2530,7 @@ mod tests {
             Duration::from_secs(5),
             true,
             &HashMap::new(),
+            &AtomicBool::new(false),
         );
 
         assert_eq!(outcome.result, MutationResult::Survived);
@@ -2306,6 +2558,7 @@ mod tests {
             Duration::from_millis(100),
             true,
             &HashMap::new(),
+            &AtomicBool::new(false),
         );
 
         assert_eq!(outcome.result, MutationResult::Timeout);
@@ -2313,6 +2566,83 @@ mod tests {
             started.elapsed() < Duration::from_secs(1),
             "timeout path should not wait for descendant-held stdout"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn no_capture_normal_completion_terminates_background_descendants() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("descendant.marker");
+        let mut env = HashMap::new();
+        env.insert("MARKER".to_string(), marker.display().to_string());
+
+        let outcome = run_command(
+            &[
+                "sh".to_string(),
+                "-c".to_string(),
+                "(sleep 0.5; touch \"$MARKER\") &".to_string(),
+            ],
+            dir.path(),
+            Duration::from_secs(5),
+            false,
+            &env,
+            &AtomicBool::new(false),
+        );
+
+        assert_eq!(outcome.result, MutationResult::Survived);
+        thread::sleep(Duration::from_millis(800));
+        assert!(
+            !marker.exists(),
+            "background descendant should be killed even when output is not captured"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runner_cancellation_stops_promptly_and_returns_cancelled() {
+        let (dir, file, mutation) = make_test_setup();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancel_from_thread = cancelled.clone();
+
+        let runner = TestRunner {
+            commands: CommandConfig {
+                command: vec!["sleep".into(), "10".into()],
+                force_default_command: false,
+                force_default_timeout: false,
+                project_commands: vec![],
+                language_commands: HashMap::new(),
+                build_command: vec![],
+                build_command_explicit: false,
+                timeout: Duration::from_secs(30),
+                language_timeouts: HashMap::new(),
+                test_selection: None,
+            },
+            parallelism: 1,
+            project_root: dir.path().to_path_buf(),
+            verbose: false,
+            show_output: false,
+            max_tested: None,
+            respect_workspace_ignores: true,
+            env: HashMap::new(),
+            cancelled,
+        };
+
+        let canceller = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(100));
+            cancel_from_thread.store(true, Ordering::Release);
+        });
+
+        let started = Instant::now();
+        let outcome = runner.run(vec![mutation]);
+        canceller.join().unwrap();
+
+        assert!(outcome.cancelled);
+        assert_eq!(outcome.report.total, 0);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "runner should not wait for the command timeout after cancellation"
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "hello world");
     }
 
     #[test]
@@ -2323,6 +2653,7 @@ mod tests {
             .map(|i| {
                 let mut m = make_test_mutation(&file);
                 m.id = i;
+                m.description = format!("max tested limit {i}");
                 m
             })
             .collect();
@@ -2350,8 +2681,305 @@ mod tests {
             cancelled: Arc::new(AtomicBool::new(false)),
         };
 
-        let report = runner.run(mutations);
+        let report = runner.run(mutations).report;
         assert_eq!(report.total, 2, "should stop after max_tested");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn max_tested_reservation_caps_execution_before_commands_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+
+        let mutations: Vec<Mutation> = (0..4)
+            .map(|i| {
+                let file = dir.path().join(format!("test{i}.txt"));
+                std::fs::write(&file, b"hello world").unwrap();
+                let mut mutation = make_test_mutation(&file);
+                mutation.id = i;
+                mutation.description = format!("max reservation {i}");
+                mutation
+            })
+            .collect();
+
+        let script = r#"
+lock="$STATE_DIR/lock"
+while ! mkdir "$lock" 2>/dev/null; do sleep 0.01; done
+runs=0
+if [ -f "$STATE_DIR/runs" ]; then runs=$(cat "$STATE_DIR/runs"); fi
+runs=$((runs + 1))
+printf '%s\n' "$runs" > "$STATE_DIR/runs"
+rmdir "$lock"
+sleep 0.2
+"#;
+        let mut env = HashMap::new();
+        env.insert("STATE_DIR".to_string(), state.path().display().to_string());
+
+        let runner = TestRunner {
+            commands: CommandConfig {
+                command: vec!["sh".into(), "-c".into(), script.into()],
+                force_default_command: false,
+                force_default_timeout: false,
+                project_commands: vec![],
+                language_commands: HashMap::new(),
+                build_command: vec![],
+                build_command_explicit: false,
+                timeout: Duration::from_secs(5),
+                language_timeouts: HashMap::new(),
+                test_selection: None,
+            },
+            parallelism: 4,
+            project_root: dir.path().to_path_buf(),
+            verbose: false,
+            show_output: false,
+            max_tested: Some(1),
+            respect_workspace_ignores: true,
+            env,
+            cancelled: Arc::new(AtomicBool::new(false)),
+        };
+
+        let report = runner.run(mutations).report;
+        let runs: usize = std::fs::read_to_string(state.path().join("runs"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+
+        assert_eq!(report.total, 1);
+        assert_eq!(report.survived, 1);
+        assert_eq!(
+            runs, 1,
+            "max_tested should reserve before execution, not after commands finish"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn max_tested_cache_hits_release_reservation_for_uncached_execution() {
+        fn run_case(cached_result: MutationResult) {
+            let dir = tempfile::tempdir().unwrap();
+            let state = tempfile::tempdir().unwrap();
+            let cached_file = dir.path().join("cached.txt");
+            let uncached_file = dir.path().join("uncached.txt");
+            std::fs::write(&cached_file, b"hello world").unwrap();
+            std::fs::write(&uncached_file, b"hello world").unwrap();
+
+            let mut cached_mutation = make_test_mutation(&cached_file);
+            cached_mutation.id = 1;
+            cached_mutation.description = format!("cached {cached_result}");
+            let mut uncached_mutation = make_test_mutation(&uncached_file);
+            uncached_mutation.id = 2;
+            uncached_mutation.description = "uncached execution".into();
+
+            let script = r#"
+lock="$STATE_DIR/lock"
+while ! mkdir "$lock" 2>/dev/null; do sleep 0.01; done
+runs=0
+if [ -f "$STATE_DIR/runs" ]; then runs=$(cat "$STATE_DIR/runs"); fi
+runs=$((runs + 1))
+printf '%s\n' "$runs" > "$STATE_DIR/runs"
+rmdir "$lock"
+"#;
+            let mut env = HashMap::new();
+            env.insert("STATE_DIR".to_string(), state.path().display().to_string());
+            let commands = CommandConfig {
+                command: vec!["sh".into(), "-c".into(), script.into()],
+                force_default_command: false,
+                force_default_timeout: false,
+                project_commands: vec![],
+                language_commands: HashMap::new(),
+                build_command: vec![],
+                build_command_explicit: false,
+                timeout: Duration::from_secs(5),
+                language_timeouts: HashMap::new(),
+                test_selection: None,
+            };
+
+            let selected = select_test_command(dir.path(), &commands, &cached_mutation);
+            let cache_ctx = selected.cache_context(
+                &commands.build_command,
+                commands.build_command_explicit,
+                &env,
+            );
+            let cached_content = std::fs::read(&cached_file).unwrap();
+            let key = CacheKey::new(
+                &cached_content,
+                &cache_identity(dir.path(), &cached_mutation),
+                &cached_mutation.description,
+                &cache_ctx,
+            );
+            cache::store(dir.path(), &key, cached_result);
+
+            let runner = TestRunner {
+                commands,
+                parallelism: 2,
+                project_root: dir.path().to_path_buf(),
+                verbose: false,
+                show_output: false,
+                max_tested: Some(1),
+                respect_workspace_ignores: true,
+                env,
+                cancelled: Arc::new(AtomicBool::new(false)),
+            };
+
+            let report = runner.run(vec![cached_mutation, uncached_mutation]).report;
+            let runs: usize = std::fs::read_to_string(state.path().join("runs"))
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+
+            assert_eq!(report.total, 2);
+            assert_eq!(report.results[0].1, cached_result);
+            assert_eq!(report.results[1].1, MutationResult::Survived);
+            assert_eq!(
+                runs, 1,
+                "cache hits should not consume the max_tested execution budget"
+            );
+        }
+
+        run_case(MutationResult::Survived);
+        run_case(MutationResult::Killed);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn max_tested_does_not_count_build_errors() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let mutations: Vec<Mutation> = ["first.txt", "second.txt", "third.txt"]
+            .into_iter()
+            .enumerate()
+            .map(|(i, file_name)| {
+                let file = dir.path().join(file_name);
+                std::fs::write(&file, b"hello world").unwrap();
+                let mut mutation = make_test_mutation(&file);
+                mutation.id = i as u32;
+                mutation.description = format!("build classification {i}");
+                if i < 2 {
+                    mutation.replacement = "build_error".into();
+                } else {
+                    mutation.replacement = "ok".into();
+                }
+                mutation
+            })
+            .collect();
+
+        let runner = TestRunner {
+            commands: CommandConfig {
+                command: vec!["true".into()],
+                force_default_command: false,
+                force_default_timeout: false,
+                project_commands: vec![],
+                language_commands: HashMap::new(),
+                build_command: vec![
+                    "sh".into(),
+                    "-c".into(),
+                    "grep -q build_error *.txt && exit 1; exit 0".into(),
+                ],
+                build_command_explicit: true,
+                timeout: Duration::from_secs(5),
+                language_timeouts: HashMap::new(),
+                test_selection: None,
+            },
+            parallelism: 4,
+            project_root: dir.path().to_path_buf(),
+            verbose: false,
+            show_output: false,
+            max_tested: Some(1),
+            respect_workspace_ignores: true,
+            env: HashMap::new(),
+            cancelled: Arc::new(AtomicBool::new(false)),
+        };
+
+        let report = runner.run(mutations).report;
+
+        assert_eq!(report.total, 3);
+        assert_eq!(report.build_errors, 2);
+        assert_eq!(report.survived, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_queue_preserves_report_order_and_caps_concurrency() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+
+        let mutations: Vec<Mutation> = (0..5)
+            .map(|i| {
+                let file = dir.path().join(format!("test{i}.txt"));
+                std::fs::write(&file, b"hello world").unwrap();
+                let mut mutation = make_test_mutation(&file);
+                mutation.id = (100 - i) as u32;
+                mutation.description = format!("queue mutation {i}");
+                mutation
+            })
+            .collect();
+        let expected_ids: Vec<u32> = mutations.iter().map(|mutation| mutation.id).collect();
+
+        let script = r#"
+lock="$STATE_DIR/lock"
+while ! mkdir "$lock" 2>/dev/null; do sleep 0.01; done
+active=0
+if [ -f "$STATE_DIR/active" ]; then active=$(cat "$STATE_DIR/active"); fi
+active=$((active + 1))
+printf '%s\n' "$active" > "$STATE_DIR/active"
+max=0
+if [ -f "$STATE_DIR/max" ]; then max=$(cat "$STATE_DIR/max"); fi
+if [ "$active" -gt "$max" ]; then printf '%s\n' "$active" > "$STATE_DIR/max"; fi
+rmdir "$lock"
+sleep 0.15
+while ! mkdir "$lock" 2>/dev/null; do sleep 0.01; done
+active=$(cat "$STATE_DIR/active")
+active=$((active - 1))
+printf '%s\n' "$active" > "$STATE_DIR/active"
+rmdir "$lock"
+"#;
+        let mut env = HashMap::new();
+        env.insert("STATE_DIR".to_string(), state.path().display().to_string());
+
+        let runner = TestRunner {
+            commands: CommandConfig {
+                command: vec!["sh".into(), "-c".into(), script.into()],
+                force_default_command: false,
+                force_default_timeout: false,
+                project_commands: vec![],
+                language_commands: HashMap::new(),
+                build_command: vec![],
+                build_command_explicit: false,
+                timeout: Duration::from_secs(5),
+                language_timeouts: HashMap::new(),
+                test_selection: None,
+            },
+            parallelism: 2,
+            project_root: dir.path().to_path_buf(),
+            verbose: false,
+            show_output: false,
+            max_tested: None,
+            respect_workspace_ignores: true,
+            env,
+            cancelled: Arc::new(AtomicBool::new(false)),
+        };
+
+        let report = runner.run(mutations).report;
+        let actual_ids: Vec<u32> = report
+            .results
+            .iter()
+            .map(|(mutation, _)| mutation.id)
+            .collect();
+        let max_active: usize = std::fs::read_to_string(state.path().join("max"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+
+        assert_eq!(report.total, 5);
+        assert_eq!(report.survived, 5);
+        assert_eq!(actual_ids, expected_ids);
+        assert!(
+            max_active <= 2,
+            "runner should not execute more commands concurrently than parallelism"
+        );
     }
 
     #[test]
@@ -2396,7 +3024,7 @@ mod tests {
             cancelled: Arc::new(AtomicBool::new(false)),
         };
 
-        let report = runner.run(vec![m_survived, m_killed]);
+        let report = runner.run(vec![m_survived, m_killed]).report;
         assert_eq!(report.total, 2);
         assert_eq!(report.killed, 1);
         assert_eq!(report.survived, 1);
@@ -2439,7 +3067,7 @@ mod tests {
             cancelled: Arc::new(AtomicBool::new(false)),
         };
 
-        let report = runner.run(vec![mutation]);
+        let report = runner.run(vec![mutation]).report;
         assert_eq!(report.killed, 1, "should use language-specific command");
         assert_eq!(
             report.test_command, None,
@@ -2507,7 +3135,7 @@ while [ "$(find "{barrier}" -type f | wc -l)" -lt 4 ]; do sleep 0.1; done"#,
             cancelled: Arc::new(AtomicBool::new(false)),
         };
 
-        let report = runner.run(mutations);
+        let report = runner.run(mutations).report;
         assert_eq!(report.total, 4);
         assert_eq!(report.survived, 4);
         assert_eq!(report.killed, 0);
@@ -2583,7 +3211,7 @@ exit 1"#
             cancelled: Arc::new(AtomicBool::new(false)),
         };
 
-        let report = runner.run(mutations);
+        let report = runner.run(mutations).report;
         assert_eq!(report.total, 2);
         assert_eq!(
             report.killed, 0,
@@ -2638,7 +3266,7 @@ exit 1"#
             cancelled: Arc::new(AtomicBool::new(false)),
         };
 
-        let report = runner.run(vec![m_slow, m_fast]);
+        let report = runner.run(vec![m_slow, m_fast]).report;
         let slow_result = report
             .results
             .iter()
