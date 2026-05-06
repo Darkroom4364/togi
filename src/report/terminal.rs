@@ -1,9 +1,9 @@
 use crate::{MutationReport, MutationResult};
-use colored::Colorize;
 use std::fmt::Write;
+use std::io::IsTerminal;
 
 pub fn print_report(report: &MutationReport) {
-    print!("{}", format_report(report, true));
+    print!("{}", format_report(report, should_colorize()));
 }
 
 pub fn format_report_plain(report: &MutationReport) -> String {
@@ -28,7 +28,7 @@ fn format_report(report: &MutationReport, color: bool) -> String {
                     detail,
                     "              {}",
                     if color {
-                        "Your tests don't catch this mutation.".red().to_string()
+                        red("Your tests don't catch this mutation.")
                     } else {
                         "Your tests don't catch this mutation.".to_string()
                     }
@@ -38,11 +38,11 @@ fn format_report(report: &MutationReport, color: bool) -> String {
                     for diff_line in diff.lines() {
                         if color {
                             if diff_line.starts_with('-') {
-                                writeln!(detail, "              {}", diff_line.red())
+                                writeln!(detail, "              {}", red(diff_line))
                             } else if diff_line.starts_with('+') {
-                                writeln!(detail, "              {}", diff_line.green())
+                                writeln!(detail, "              {}", green(diff_line))
                             } else {
-                                writeln!(detail, "              {}", diff_line.dimmed())
+                                writeln!(detail, "              {}", dim(diff_line))
                             }
                         } else {
                             writeln!(detail, "              {diff_line}")
@@ -58,9 +58,9 @@ fn format_report(report: &MutationReport, color: bool) -> String {
 
         if color {
             let tag_colored = match result {
-                MutationResult::Killed => tag.green().to_string(),
-                MutationResult::Survived => tag.red().to_string(),
-                MutationResult::Timeout | MutationResult::BuildError => tag.yellow().to_string(),
+                MutationResult::Killed => green(tag),
+                MutationResult::Survived => red(tag),
+                MutationResult::Timeout | MutationResult::BuildError => yellow(tag),
             };
             writeln!(
                 out,
@@ -68,8 +68,8 @@ fn format_report(report: &MutationReport, color: bool) -> String {
                 tag_colored,
                 file,
                 line,
-                "—".dimmed(),
-                operator.dimmed(),
+                dim("—"),
+                dim(operator),
                 desc
             )
         } else {
@@ -110,6 +110,45 @@ fn format_report(report: &MutationReport, color: bool) -> String {
     }
 
     out
+}
+
+fn ansi(code: &str, text: &str) -> String {
+    format!("\x1b[{code}m{text}\x1b[0m")
+}
+
+fn green(text: &str) -> String {
+    ansi("32", text)
+}
+
+fn red(text: &str) -> String {
+    ansi("31", text)
+}
+
+fn yellow(text: &str) -> String {
+    ansi("33", text)
+}
+
+fn dim(text: &str) -> String {
+    ansi("2", text)
+}
+
+fn should_colorize() -> bool {
+    color_enabled_from_env(std::io::stdout().is_terminal(), |name| {
+        std::env::var(name).ok()
+    })
+}
+
+fn color_enabled_from_env(is_terminal: bool, env: impl Fn(&str) -> Option<String>) -> bool {
+    if env("CLICOLOR_FORCE").is_some_and(|value| value != "0") {
+        return true;
+    }
+    if env("NO_COLOR").is_some() {
+        return false;
+    }
+    if env("CLICOLOR").is_some_and(|value| value == "0") {
+        return false;
+    }
+    is_terminal
 }
 
 /// Guidance text when every mutation is a build error.
@@ -256,5 +295,42 @@ mod tests {
         ]);
         let output = format_report_plain(&report);
         assert!(!output.contains("All mutations caused build errors"));
+    }
+
+    #[test]
+    fn color_is_disabled_when_stdout_is_not_terminal() {
+        assert!(!color_enabled_from_env(false, |_| None));
+    }
+
+    #[test]
+    fn no_color_disables_color() {
+        assert!(!color_enabled_from_env(true, |name| {
+            (name == "NO_COLOR").then(|| "1".to_string())
+        }));
+    }
+
+    #[test]
+    fn clicolor_zero_disables_color() {
+        assert!(!color_enabled_from_env(true, |name| {
+            (name == "CLICOLOR").then(|| "0".to_string())
+        }));
+    }
+
+    #[test]
+    fn clicolor_force_overrides_no_color() {
+        assert!(color_enabled_from_env(true, |name| match name {
+            "NO_COLOR" => Some("1".to_string()),
+            "CLICOLOR_FORCE" => Some("1".to_string()),
+            _ => None,
+        }));
+    }
+
+    #[test]
+    fn clicolor_force_overrides_no_color_when_not_terminal() {
+        assert!(color_enabled_from_env(false, |name| match name {
+            "NO_COLOR" => Some("1".to_string()),
+            "CLICOLOR_FORCE" => Some("1".to_string()),
+            _ => None,
+        }));
     }
 }

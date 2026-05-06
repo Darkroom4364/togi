@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use serde::Deserialize;
-use togi::{ChangedFile, Mutation, MutationReport};
+use togi::{ChangedFile, Mutation};
 
 struct CheckConfig {
     all: bool,
@@ -44,8 +44,7 @@ struct ExecuteOptions {
     cancelled: Arc<AtomicBool>,
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
     let cancelled = Arc::new(AtomicBool::new(false));
     let cancelled_handler = cancelled.clone();
 
@@ -111,7 +110,7 @@ async fn main() {
                 check_baseline,
                 pr_comment,
             };
-            if let Err(e) = run_check(cfg, cancelled).await {
+            if let Err(e) = run_check(cfg, cancelled) {
                 eprintln!("Error: {e:#}");
                 process::exit(2);
             }
@@ -265,7 +264,7 @@ fn print_operators() {
     }
 }
 
-async fn run_check(cfg: CheckConfig, cancelled: Arc<AtomicBool>) -> anyhow::Result<()> {
+fn run_check(cfg: CheckConfig, cancelled: Arc<AtomicBool>) -> anyhow::Result<()> {
     let all = cfg.all;
     let paths = cfg.paths.clone();
     let dry_run = cfg.dry_run;
@@ -329,7 +328,7 @@ async fn run_check(cfg: CheckConfig, cancelled: Arc<AtomicBool>) -> anyhow::Resu
     eprintln!("Running {} mutations...", mutations.len());
 
     let project_root_ref = project_root.clone();
-    let report = execute(
+    let outcome = execute(
         mutations,
         config,
         project_root,
@@ -341,10 +340,15 @@ async fn run_check(cfg: CheckConfig, cancelled: Arc<AtomicBool>) -> anyhow::Resu
             force_default_timeout: has_cli_timeout,
             cancelled,
         },
-    )
-    .await;
+    );
 
+    let report = outcome.report;
     togi::report::print_report(&report, output_format)?;
+
+    if outcome.cancelled {
+        eprintln!("Interrupted; skipping baseline and PR comment updates.");
+        exit_with(_lock, 130);
+    }
 
     let current = togi::baseline::from_report(&report, &project_root_ref);
     let mut should_fail = false;
@@ -381,20 +385,22 @@ async fn run_check(cfg: CheckConfig, cancelled: Arc<AtomicBool>) -> anyhow::Resu
 
     let score = togi::report::mutation_score(&report);
     if should_fail {
-        drop(_lock);
-        process::exit(1);
+        exit_with(_lock, 1);
     } else if let Some(threshold) = fail_under {
         if score < threshold {
             eprintln!("Mutation score {score:.1}% is below --fail-under threshold {threshold:.1}%");
-            drop(_lock);
-            process::exit(1);
+            exit_with(_lock, 1);
         }
     } else if report.survived > 0 && !check_baseline {
-        drop(_lock);
-        process::exit(1);
+        exit_with(_lock, 1);
     }
 
     Ok(())
+}
+
+fn exit_with(lock: togi::lock::LockGuard, code: i32) -> ! {
+    drop(lock);
+    process::exit(code);
 }
 
 fn resolve_config(
@@ -615,12 +621,12 @@ fn print_dry_run(mutations: &[Mutation]) {
     }
 }
 
-async fn execute(
+fn execute(
     mutations: Vec<Mutation>,
     config: togi::config::Config,
     project_root: PathBuf,
     options: ExecuteOptions,
-) -> MutationReport {
+) -> togi::runner::RunOutcome {
     let mut language_commands: std::collections::HashMap<String, Vec<String>> =
         std::collections::HashMap::new();
     let mut language_timeouts: std::collections::HashMap<String, Duration> =
@@ -682,7 +688,7 @@ async fn execute(
         cancelled: options.cancelled,
     };
 
-    runner.run(mutations).await
+    runner.run(mutations)
 }
 
 fn load_test_selection(

@@ -1,7 +1,11 @@
 use assert_cmd::Command;
 use predicates::prelude::*;
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::path::Path;
+#[cfg(unix)]
+use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 fn togi() -> Command {
@@ -278,6 +282,162 @@ fn check_baseline_still_honors_fail_under() {
         .assert()
         .code(1)
         .stderr(predicate::str::contains("below --fail-under threshold"));
+}
+
+#[cfg(unix)]
+#[test]
+fn interrupted_check_exits_130_without_writing_side_effects() {
+    let dir = setup_git_repo();
+    let marker = dir.path().join("test-command-started");
+    let release = dir.path().join("test-command-release");
+    let stdout_path = dir.path().join("togi-stdout.log");
+    let stderr_path = dir.path().join("togi-stderr.log");
+    let pr_comment_path = dir.path().join("togi-pr-comment.md");
+    let baseline_path = dir.path().join(".togi-baseline");
+    let slow_test = dir.path().join("slow-test.sh");
+
+    fs::write(
+        &slow_test,
+        format!(
+            "#!/bin/sh\n\
+             marker={}\n\
+             release={}\n\
+             printf started > \"$marker\"\n\
+             while [ ! -f \"$release\" ]; do\n\
+             \tsleep 0.05\n\
+             done\n",
+            shell_quote(&marker),
+            shell_quote(&release)
+        ),
+    )
+    .unwrap();
+
+    let stdout = fs::File::create(&stdout_path).unwrap();
+    let stderr = fs::File::create(&stderr_path).unwrap();
+    let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("togi"))
+        .args([
+            "check",
+            "--base",
+            "HEAD",
+            "--test-cmd",
+            &format!("sh {}", shell_quote(&slow_test)),
+            "--timeout",
+            "5",
+            "--jobs",
+            "1",
+            "--save-baseline",
+            "--pr-comment",
+            pr_comment_path
+                .to_str()
+                .expect("PR comment path should be utf-8"),
+        ])
+        .current_dir(dir.path())
+        .process_group(0)
+        .stdout(stdout)
+        .stderr(stderr)
+        .spawn()
+        .unwrap();
+
+    if !wait_for_path(&marker, Duration::from_secs(10)) {
+        send_signal_to_process_group(child.id(), libc::SIGKILL);
+        let _ = child.wait();
+        panic!(
+            "test command did not start\nstdout:\n{}\nstderr:\n{}",
+            read_log(&stdout_path),
+            read_log(&stderr_path)
+        );
+    }
+
+    send_signal_to_process_group(child.id(), libc::SIGINT);
+    let _ = wait_for_file_contains(&stderr_path, "Interrupted", Duration::from_secs(1));
+    fs::write(&release, "").unwrap();
+
+    let status = wait_for_child(&mut child, Duration::from_secs(10)).unwrap_or_else(|message| {
+        send_signal_to_process_group(child.id(), libc::SIGKILL);
+        let _ = child.wait();
+        panic!(
+            "{message}\nstdout:\n{}\nstderr:\n{}",
+            read_log(&stdout_path),
+            read_log(&stderr_path)
+        );
+    });
+
+    assert_eq!(
+        status.code(),
+        Some(130),
+        "interrupted check should exit 130\nstatus: {status:?}\nstdout:\n{}\nstderr:\n{}",
+        read_log(&stdout_path),
+        read_log(&stderr_path)
+    );
+    assert!(
+        !baseline_path.exists(),
+        "interrupted check wrote {}",
+        baseline_path.display()
+    );
+    assert!(
+        !pr_comment_path.exists(),
+        "interrupted check wrote {}",
+        pr_comment_path.display()
+    );
+}
+
+#[cfg(unix)]
+fn shell_quote(path: &Path) -> String {
+    let value = path.to_str().expect("test path should be utf-8");
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+#[cfg(unix)]
+fn wait_for_path(path: &Path, timeout: Duration) -> bool {
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        if path.exists() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    false
+}
+
+#[cfg(unix)]
+fn wait_for_file_contains(path: &Path, needle: &str, timeout: Duration) -> bool {
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        if fs::read_to_string(path).is_ok_and(|content| content.contains(needle)) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    false
+}
+
+#[cfg(unix)]
+fn wait_for_child(
+    child: &mut std::process::Child,
+    timeout: Duration,
+) -> Result<std::process::ExitStatus, String> {
+    let start = Instant::now();
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            return Ok(status);
+        }
+        if start.elapsed() >= timeout {
+            return Err(format!("togi did not exit within {timeout:?}"));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(unix)]
+fn send_signal_to_process_group(pid: u32, signal: libc::c_int) {
+    unsafe {
+        let _ = libc::killpg(pid as libc::pid_t, signal);
+    }
+}
+
+#[cfg(unix)]
+fn read_log(path: &Path) -> String {
+    fs::read_to_string(path).unwrap_or_default()
 }
 
 #[test]

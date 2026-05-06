@@ -63,7 +63,7 @@ pub fn collect_all_supported_files(
                 continue;
             }
         };
-        let newlines = bytecount::count(&bytes, b'\n');
+        let newlines = bytes.iter().filter(|byte| **byte == b'\n').count();
         let line_count = if bytes.is_empty() {
             0
         } else if bytes.last() == Some(&b'\n') {

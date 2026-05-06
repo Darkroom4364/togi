@@ -1,8 +1,8 @@
 //! Mutation verification: replay each mutation independently and confirm
 //! togi's reported outcome matches the actual test result.
 //!
-//! Sets GOCACHE=off because Go's build cache can return stale binaries
-//! when source files change rapidly via atomic rename.
+//! Uses `-count=1` with a temporary GOCACHE so Go reruns tests while keeping
+//! the required build cache enabled.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -25,11 +25,12 @@ fn classify_result(status: std::process::ExitStatus) -> MutationResult {
 /// and assert the outcomes match.
 ///
 /// Requires `go` to be installed. Run with: cargo test -- --ignored
-#[tokio::test]
+#[test]
 #[ignore]
-async fn verify_mutation_outcomes_match_independent_replay() {
-    let _fixture_guard = crate::go_fixture_lock().await;
+fn verify_mutation_outcomes_match_independent_replay() {
+    let _fixture_guard = crate::go_fixture_lock();
     let root = fixture_path();
+    togi::cache::clear(&root).expect("failed to clear togi cache");
     let calc_path = root.join("calc.go");
 
     let changed = vec![ChangedFile {
@@ -43,12 +44,28 @@ async fn verify_mutation_outcomes_match_independent_replay() {
     // Capture pristine fixture before runner.run() touches it
     let original = std::fs::read(&calc_path).expect("failed to read calc.go");
 
-    // Disable Go build+test caching via runner env (no process-wide set_var)
+    // Force fresh test execution while keeping Go's required build cache enabled.
+    let go_cache = tempfile::tempdir().expect("failed to create temporary Go cache");
     let go_env: std::collections::HashMap<String, String> = [
         ("GOFLAGS".into(), "-count=1".into()),
-        ("GOCACHE".into(), "off".into()),
+        (
+            "GOCACHE".into(),
+            go_cache.path().to_string_lossy().into_owned(),
+        ),
     ]
     .into();
+    let baseline = Command::new("go")
+        .args(["test", "./..."])
+        .envs(&go_env)
+        .current_dir(&root)
+        .output()
+        .expect("failed to run baseline go test");
+    assert!(
+        baseline.status.success(),
+        "baseline go test failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&baseline.stdout),
+        String::from_utf8_lossy(&baseline.stderr)
+    );
 
     let runner = togi::runner::TestRunner {
         commands: togi::runner::CommandConfig {
@@ -73,7 +90,8 @@ async fn verify_mutation_outcomes_match_independent_replay() {
         cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
 
-    let report = runner.run(mutations).await;
+    togi::cache::clear(&root).expect("failed to clear togi cache before verification run");
+    let report = runner.run(mutations).report;
 
     // Verify runner restored the file
     let after_run = std::fs::read(&calc_path).expect("failed to re-read calc.go");
