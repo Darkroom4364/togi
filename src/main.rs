@@ -359,8 +359,10 @@ fn run_check(cfg: CheckConfig, cancelled: Arc<AtomicBool>) -> anyhow::Result<()>
     }
 
     let mut baseline_score: Option<f64> = None;
+    let mut loaded_baseline = false;
     if check_baseline {
-        if let Some(baseline) = togi::baseline::load_baseline(&project_root_ref) {
+        if let Some(baseline) = togi::baseline::load_baseline(&project_root_ref)? {
+            loaded_baseline = true;
             baseline_score = Some(baseline.killed as f64 / baseline.total.max(1) as f64 * 100.0);
             if togi::baseline::check_regression(&current, &baseline) {
                 let regressions = togi::baseline::per_file_regressions(&current, &baseline);
@@ -391,7 +393,7 @@ fn run_check(cfg: CheckConfig, cancelled: Arc<AtomicBool>) -> anyhow::Result<()>
             eprintln!("Mutation score {score:.1}% is below --fail-under threshold {threshold:.1}%");
             exit_with(_lock, 1);
         }
-    } else if report.survived > 0 && !check_baseline {
+    } else if report.survived > 0 && !loaded_baseline {
         exit_with(_lock, 1);
     }
 
@@ -1003,8 +1005,9 @@ fn get_project_root() -> anyhow::Result<PathBuf> {
 }
 
 fn get_git_diff(base: &str) -> anyhow::Result<String> {
+    validate_diff_base(base)?;
     let output = std::process::Command::new("git")
-        .args(["diff", base])
+        .args(["diff", "--no-ext-diff", base])
         .output()?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1013,6 +1016,16 @@ fn get_git_diff(base: &str) -> anyhow::Result<String> {
         );
     }
     Ok(String::from_utf8(output.stdout)?)
+}
+
+fn validate_diff_base(base: &str) -> anyhow::Result<()> {
+    if base.trim().is_empty() {
+        anyhow::bail!("diff base cannot be empty");
+    }
+    if base.starts_with('-') {
+        anyhow::bail!("diff base must be a ref, commit, or tag, not an option: {base}");
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1029,6 +1042,13 @@ mod tests {
         }"#;
 
         assert!(parse_test_selection_json(json, root).is_ok());
+    }
+
+    #[test]
+    fn validate_diff_base_rejects_option_like_values() {
+        let err = validate_diff_base("--output=/tmp/togi.diff").unwrap_err();
+
+        assert!(err.to_string().contains("not an option"));
     }
 
     #[test]

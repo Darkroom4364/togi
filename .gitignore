@@ -4,5 +4,6 @@
 .DS_Store
 .togi.lock
 .togi-cache/
+.codex/
 .claude/
 togi.toml

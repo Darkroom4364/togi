@@ -263,7 +263,7 @@ mod tests {
     #[test]
     fn html_contains_mutation_details() {
         let html = generate_report(&sample_report()).unwrap();
-        assert!(html.contains("binary/lt_to_lte"));
+        assert!(html.contains("lt_to_lte"));
         assert!(html.contains("changed &lt; to &lt;="));
         assert!(html.contains("killed"));
         assert!(html.contains("survived"));

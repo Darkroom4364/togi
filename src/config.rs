@@ -17,6 +17,7 @@ pub struct Config {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProjectConfig {
     pub path: PathBuf,
     #[serde(default)]
@@ -26,6 +27,7 @@ pub struct ProjectConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProjectTestConfig {
     #[serde(default)]
     pub command: Option<Vec<String>>,
@@ -34,6 +36,7 @@ pub struct ProjectTestConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LanguageTestConfig {
     pub command: Vec<String>,
     #[serde(default)]
@@ -41,6 +44,7 @@ pub struct LanguageTestConfig {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TestConfig {
     #[serde(default = "default_test_command")]
     pub command: Vec<String>,
@@ -55,12 +59,14 @@ pub struct TestConfig {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DiffConfig {
     #[serde(default = "default_base")]
     pub base: String,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MutationConfig {
     #[serde(default = "default_max_per_run")]
     pub max_per_run: usize,
@@ -471,6 +477,36 @@ max_per_run = 50
         assert_eq!(config.test.jobs, 8);
         assert_eq!(config.diff.base, "origin/develop");
         assert_eq!(config.mutations.max_per_run, 50);
+    }
+
+    #[test]
+    fn rejects_unknown_nested_config_fields() {
+        let cases = [
+            r#"
+[test]
+commnad = ["make", "test"]
+"#,
+            r#"
+[test.languages.python]
+command = ["pytest"]
+timeuot = 10
+"#,
+            r#"
+[mutations]
+max_per_rnu = 10
+"#,
+            r#"
+[projects.api]
+path = "services/api"
+
+[projects.api.test]
+commnad = ["cargo", "test"]
+"#,
+        ];
+
+        for case in cases {
+            assert!(toml::from_str::<Config>(case).is_err(), "{case}");
+        }
     }
 
     #[test]

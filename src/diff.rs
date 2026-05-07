@@ -278,13 +278,13 @@ pub fn parse_diff(input: &str) -> Vec<ChangedFile> {
             in_hunk = false;
 
             // Flush previous file
-            if let Some(path) = current_path.take()
-                && !current_hunks.is_empty()
-            {
-                files.push(ChangedFile {
-                    path,
-                    hunks: current_hunks,
-                });
+            if let Some(path) = current_path.take() {
+                if !current_hunks.is_empty() {
+                    files.push(ChangedFile {
+                        path,
+                        hunks: current_hunks,
+                    });
+                }
             }
             current_hunks = Vec::new();
 
@@ -304,6 +304,8 @@ pub fn parse_diff(input: &str) -> Vec<ChangedFile> {
             if let Some(new_spec) = parse_hunk_header(line) {
                 new_line = new_spec;
             }
+        } else if in_hunk && line.starts_with("\\ ") {
+            // Diff metadata such as "\ No newline at end of file" is not a source line.
         } else if in_hunk {
             if line.starts_with('+') {
                 // Added line — track it
@@ -325,13 +327,13 @@ pub fn parse_diff(input: &str) -> Vec<ChangedFile> {
 
     // Flush final state
     flush_range(&mut current_hunks, &mut range_start, range_end);
-    if let Some(path) = current_path.take()
-        && !current_hunks.is_empty()
-    {
-        files.push(ChangedFile {
-            path,
-            hunks: current_hunks,
-        });
+    if let Some(path) = current_path.take() {
+        if !current_hunks.is_empty() {
+            files.push(ChangedFile {
+                path,
+                hunks: current_hunks,
+            });
+        }
     }
 
     files
@@ -421,6 +423,22 @@ index 1111111..2222222 100644
         let files = parse_diff(diff);
         // No added lines → no hunks → file not included
         assert!(files.is_empty());
+    }
+
+    #[test]
+    fn ignores_no_newline_marker_when_tracking_added_lines() {
+        let diff = "diff --git a/main.go b/main.go\n\
+--- a/main.go\n\
++++ b/main.go\n\
+@@ -1 +1 @@\n\
+-old\n\
+\\ No newline at end of file\n\
++new\n\
+\\ No newline at end of file\n";
+        let files = parse_diff(diff);
+
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].hunks, vec![LineRange { start: 1, end: 1 }]);
     }
 
     #[test]

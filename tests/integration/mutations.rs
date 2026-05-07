@@ -150,13 +150,13 @@ fn end_to_end_go_fixture_reports_expected_outcomes_with_fresh_tests() {
         );
     }
 
-    // Parent-level mutation mapping intentionally adds if-body, condition, and
-    // return mutations alongside expression/literal mutations. The fixture's
-    // tests intentionally do not kill every generated mutation; these counts
-    // prove Go actually ran instead of failing before test execution.
-    assert_eq!(report.total, 26);
-    assert_eq!(report.killed, 10);
-    assert_eq!(report.survived, 16);
+    // Parent-level mutation mapping intentionally adds if-body and condition
+    // mutations alongside expression/literal mutations. The fixture's tests
+    // intentionally do not kill every generated mutation; these counts prove
+    // Go actually ran instead of failing before test execution.
+    assert_eq!(report.total, 21);
+    assert_eq!(report.killed, 8);
+    assert_eq!(report.survived, 13);
     assert_eq!(report.timeout, 0);
     assert_eq!(report.build_errors, 0);
 }

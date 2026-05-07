@@ -135,6 +135,7 @@ const INTEGER_LITERAL_NODE_KINDS: &[&str] = &[
     "integer",
     "number",
     "number_literal",
+    "decimal_integer_literal",
 ];
 
 const STRING_LITERAL_NODE_KINDS: &[&str] = &[
@@ -264,6 +265,33 @@ pub(crate) fn fixup_language_replacement<L: LanguageSupport + ?Sized>(
     }
 }
 
+fn looks_like_boolean_expression(kind: &str, text: &str, binary_expression_kind: &str) -> bool {
+    if kind != binary_expression_kind
+        && !matches!(
+            kind,
+            "binary_expression"
+                | "binary_operator"
+                | "comparison_expression"
+                | "comparison_operator"
+                | "binary"
+        )
+    {
+        return false;
+    }
+
+    let spaced = format!(" {text} ");
+    text.contains("==")
+        || text.contains("!=")
+        || text.contains("<=")
+        || text.contains(">=")
+        || (text.contains('<') && !text.contains("<<"))
+        || (text.contains('>') && !text.contains(">>"))
+        || text.contains("&&")
+        || text.contains("||")
+        || spaced.contains(" and ")
+        || spaced.contains(" or ")
+}
+
 /// Describes how to parse and mutate one supported language.
 ///
 /// The mutator uses this trait to choose the tree-sitter grammar, identify
@@ -363,8 +391,10 @@ pub trait LanguageSupport: Send + Sync {
             Some("0".to_string())
         } else if text.starts_with('"') || text.starts_with('\'') || text.starts_with('`') {
             Some("\"\"".to_string())
+        } else if looks_like_boolean_expression(kind, text, self.binary_expression_node()) {
+            Some("false".to_string())
         } else {
-            Some("0".to_string())
+            None
         }
     }
 

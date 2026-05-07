@@ -25,9 +25,9 @@ If a mutation survives, your tests still pass after behavior changed. That is a 
 ```
 $ togi check --base HEAD~1
 
-  ✓ KILLED  src/auth.rs:47  — binary/lt_to_lte: changed < to <=
-  ✗ SURVIVED  src/handler.rs:15  — binary/eq_to_neq: changed == to !=
-  ✓ KILLED  src/handler.rs:31  — removal/if_body: removed if body
+  ✓ KILLED  src/auth.rs:47  - lt_to_lte: changed < to <=
+  ✗ SURVIVED  src/handler.rs:15  - eq_to_neq: changed == to !=
+  ✓ KILLED  src/handler.rs:31  - remove_if_body: removed if body
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Results: 2/3 mutations killed (1 survived)

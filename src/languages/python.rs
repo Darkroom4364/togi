@@ -6,6 +6,7 @@ crate::languages::define_language!(
     binary_expression: "binary_operator",
     bool_true: ["True"],
     bool_false: ["False"],
+    filter_candidate: should_filter_candidate,
     condition_negation: python_negation,
     empty_block_replacement: "pass",
 );
@@ -14,12 +15,44 @@ fn python_negation(condition: &str) -> String {
     format!("not ({condition})")
 }
 
+fn should_filter_candidate(
+    candidate: &crate::MutationCandidate,
+    node: &tree_sitter::Node,
+    _source: &[u8],
+) -> bool {
+    if !matches!(
+        candidate.operator_id.as_str(),
+        "remove_call_statement" | "remove_assignment" | "remove_break" | "remove_continue"
+    ) || !candidate.replacement.is_empty()
+    {
+        return false;
+    }
+
+    removal_would_empty_python_block(node)
+}
+
+fn removal_would_empty_python_block(node: &tree_sitter::Node) -> bool {
+    let mut parent = node.parent();
+    while let Some(p) = parent {
+        if p.kind() == "block" {
+            let mut cursor = p.walk();
+            let mut named = p.named_children(&mut cursor);
+            let Some(only_child) = named.next() else {
+                return false;
+            };
+            return named.next().is_none() && only_child == *node;
+        }
+        parent = p.parent();
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::MutationCandidate;
     use crate::languages::LanguageSupport;
-    use crate::test_helpers::{walk_for_kind, walk_for_two_kinds};
+    use crate::test_helpers::{find_node_by_kind, parse_python, walk_for_kind, walk_for_two_kinds};
 
     #[test]
     fn test_python_extension_detection() {
@@ -173,5 +206,45 @@ mod tests {
         py.fixup_replacement(&mut candidate);
 
         assert_eq!(candidate.replacement, "{}");
+    }
+
+    #[test]
+    fn removal_candidate_is_skipped_when_it_would_empty_a_block() {
+        let src = "def f():\n    call()\n";
+        let tree = parse_python(src);
+        let statement = find_node_by_kind(tree.root_node(), "expression_statement")
+            .expect("should find expression_statement node");
+        let candidate = MutationCandidate {
+            byte_range: statement.byte_range(),
+            replacement: String::new(),
+            operator_id: "remove_call_statement".to_string(),
+            description: String::new(),
+        };
+
+        assert!(should_filter_candidate(
+            &candidate,
+            &statement,
+            src.as_bytes()
+        ));
+    }
+
+    #[test]
+    fn removal_candidate_is_not_skipped_when_block_has_multiple_statements() {
+        let src = "def f():\n    call()\n    other()\n";
+        let tree = parse_python(src);
+        let statement = find_node_by_kind(tree.root_node(), "expression_statement")
+            .expect("should find expression_statement node");
+        let candidate = MutationCandidate {
+            byte_range: statement.byte_range(),
+            replacement: String::new(),
+            operator_id: "remove_call_statement".to_string(),
+            description: String::new(),
+        };
+
+        assert!(!should_filter_candidate(
+            &candidate,
+            &statement,
+            src.as_bytes()
+        ));
     }
 }

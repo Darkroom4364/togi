@@ -26,12 +26,19 @@ pub fn parse_lcov(content: &str, project_root: &Path) -> CoverageMap {
         } else if let Some(da) = line.strip_prefix("DA:") {
             if let Some(ref file) = current_file {
                 let mut parts = da.split(',');
-                if let (Some(line_str), Some(count_str)) = (parts.next(), parts.next())
-                    && let (Ok(line_no), Ok(count)) =
-                        (line_str.parse::<usize>(), count_str.parse::<u64>())
-                {
-                    if count > 0 {
-                        map.entry(file.clone()).or_default().insert(line_no);
+                if let (Some(line_str), Some(count_str)) = (parts.next(), parts.next()) {
+                    match (line_str.parse::<usize>(), count_str.parse::<u64>()) {
+                        (Ok(line_no), Ok(count)) => {
+                            if count > 0 {
+                                map.entry(file.clone()).or_default().insert(line_no);
+                            }
+                        }
+                        _ => {
+                            eprintln!(
+                                "warning: malformed DA record at line {} in coverage file: {line}",
+                                line_num + 1
+                            );
+                        }
                     }
                 } else {
                     eprintln!(

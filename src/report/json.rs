@@ -130,7 +130,7 @@ mod tests {
         assert_eq!(mutations[0]["id"], 1);
         assert_eq!(mutations[0]["file"], "src/auth.rs");
         assert_eq!(mutations[0]["line"], 47);
-        assert_eq!(mutations[0]["operator"], "binary/lt_to_lte");
+        assert_eq!(mutations[0]["operator"], "lt_to_lte");
         assert_eq!(mutations[0]["result"], "killed");
         assert_eq!(mutations[1]["result"], "survived");
     }

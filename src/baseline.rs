@@ -1,5 +1,7 @@
+use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::io::ErrorKind;
 use std::path::Path;
 
 const BASELINE_FILE: &str = ".togi-baseline";
@@ -56,20 +58,17 @@ pub fn save_baseline(baseline: &Baseline, dir: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Load a previously saved baseline from `dir`, returning `None` if the file doesn't exist.
-pub fn load_baseline(dir: &Path) -> Option<Baseline> {
+/// Load a previously saved baseline from `dir`, returning `Ok(None)` if the file doesn't exist.
+pub fn load_baseline(dir: &Path) -> anyhow::Result<Option<Baseline>> {
     let path = dir.join(BASELINE_FILE);
-    if !path.exists() {
-        return None;
-    }
-    let data = std::fs::read_to_string(&path).ok()?;
-    match serde_json::from_str(&data) {
-        Ok(b) => Some(b),
-        Err(e) => {
-            eprintln!("warning: failed to parse {}: {}", path.display(), e);
-            None
-        }
-    }
+    let data = match std::fs::read_to_string(&path) {
+        Ok(data) => data,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("could not read {}", path.display())),
+    };
+    let baseline = serde_json::from_str(&data)
+        .with_context(|| format!("invalid baseline at {}", path.display()))?;
+    Ok(Some(baseline))
 }
 
 /// Returns `true` if the current overall score is a regression compared to the baseline.
@@ -192,7 +191,7 @@ mod tests {
         };
 
         save_baseline(&baseline, dir.path()).unwrap();
-        let loaded = load_baseline(dir.path()).unwrap();
+        let loaded = load_baseline(dir.path()).unwrap().unwrap();
 
         assert_eq!(loaded.killed, 3);
         assert_eq!(loaded.total, 5);
@@ -202,7 +201,15 @@ mod tests {
     #[test]
     fn load_returns_none_when_missing() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(load_baseline(dir.path()).is_none());
+        assert!(load_baseline(dir.path()).unwrap().is_none());
+    }
+
+    #[test]
+    fn load_returns_error_when_baseline_is_invalid() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(BASELINE_FILE), "not json").unwrap();
+
+        assert!(load_baseline(dir.path()).is_err());
     }
 
     fn make_baseline_with_files(files: Vec<(&str, usize, usize)>) -> Baseline {
