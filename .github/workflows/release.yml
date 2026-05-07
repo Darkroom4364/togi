@@ -61,7 +61,7 @@ jobs:
         with:
           merge-multiple: true
       - name: Generate checksums
-        run: sha256sum *.tar.gz *.zip > checksums.txt
+        run: sha256sum ./*.tar.gz ./*.zip > checksums.txt
       - name: Attest release artifacts
         uses: actions/attest-build-provenance@v3
         with:

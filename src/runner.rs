@@ -177,10 +177,10 @@ fn select_test_command(
         .unwrap_or(&commands.command)
         .clone();
 
-    if let Some(test_selection) = &commands.test_selection
-        && let Some(tests) = test_selection.tests_for(project_root, mutation)
-    {
-        argv = narrow_go_test_command(argv, tests);
+    if let Some(test_selection) = &commands.test_selection {
+        if let Some(tests) = test_selection.tests_for(project_root, mutation) {
+            argv = narrow_go_test_command(argv, tests);
+        }
     }
 
     SelectedTestCommand {
@@ -401,6 +401,8 @@ fn git_cache_context_fingerprint(project_root: &Path) -> Option<u64> {
 }
 
 fn git_cache_context_is_dirty(project_root: &Path) -> Option<bool> {
+    // No -M/--find-renames here: porcelain v1 -z then stays in the
+    // single-token "XY path\0" form this parser expects.
     let output = std::process::Command::new("git")
         .args([
             "status",
@@ -809,12 +811,12 @@ fn run_queued_mutation(
             &cache_ctx,
         )
     });
-    if let Some(ref key) = cache_key
-        && let Some(result) = cache::lookup(shared.project_root, key)
-    {
-        reservation.release();
-        record_progress(&shared, &mutation, result, None, true);
-        return Some((index, mutation, result));
+    if let Some(ref key) = cache_key {
+        if let Some(result) = cache::lookup(shared.project_root, key) {
+            reservation.release();
+            record_progress(&shared, &mutation, result, None, true);
+            return Some((index, mutation, result));
+        }
     }
 
     let outcome = {
@@ -958,20 +960,19 @@ fn record_progress(
         eprintln!("  [{}/{}] testing mutations...", n, shared.total);
     }
 
-    if shared.show_output
-        && result == MutationResult::Survived
-        && let Some(output) = test_output
-    {
-        eprintln!(
-            "  ┌─ test output for {}:{} ({})",
-            mutation.file.display(),
-            mutation.line,
-            mutation.operator
-        );
-        for line in output.lines() {
-            eprintln!("  │ {}", line);
+    if shared.show_output && result == MutationResult::Survived {
+        if let Some(output) = test_output {
+            eprintln!(
+                "  ┌─ test output for {}:{} ({})",
+                mutation.file.display(),
+                mutation.line,
+                mutation.operator
+            );
+            for line in output.lines() {
+                eprintln!("  │ {}", line);
+            }
+            eprintln!("  └─");
         }
-        eprintln!("  └─");
     }
 }
 
@@ -1485,12 +1486,12 @@ fn run_command(
             terminate_and_wait(&mut child, &mut process_tree);
             return MutationOutcome::build_error();
         };
-        if let Some(capture) = stdout_capture.as_mut()
-            && let Err(e) = capture.start(stdout)
-        {
-            eprintln!("warning: could not open stdout capture file: {e}");
-            terminate_and_wait(&mut child, &mut process_tree);
-            return MutationOutcome::build_error();
+        if let Some(capture) = stdout_capture.as_mut() {
+            if let Err(e) = capture.start(stdout) {
+                eprintln!("warning: could not open stdout capture file: {e}");
+                terminate_and_wait(&mut child, &mut process_tree);
+                return MutationOutcome::build_error();
+            }
         }
 
         let Some(stderr) = child.stderr.take() else {
@@ -1498,13 +1499,13 @@ fn run_command(
             finish_capture_threads(&mut stdout_capture, &mut stderr_capture);
             return MutationOutcome::build_error();
         };
-        if let Some(capture) = stderr_capture.as_mut()
-            && let Err(e) = capture.start(stderr)
-        {
-            eprintln!("warning: could not open stderr capture file: {e}");
-            terminate_and_wait(&mut child, &mut process_tree);
-            finish_capture_threads(&mut stdout_capture, &mut stderr_capture);
-            return MutationOutcome::build_error();
+        if let Some(capture) = stderr_capture.as_mut() {
+            if let Err(e) = capture.start(stderr) {
+                eprintln!("warning: could not open stderr capture file: {e}");
+                terminate_and_wait(&mut child, &mut process_tree);
+                finish_capture_threads(&mut stdout_capture, &mut stderr_capture);
+                return MutationOutcome::build_error();
+            }
         }
     }
 

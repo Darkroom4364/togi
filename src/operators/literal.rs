@@ -315,6 +315,17 @@ func f() string { return "" }"#;
     }
 
     #[test]
+    fn decrement_numeric_skips_i64_min() {
+        let src = "package main\nfunc f() int { return -9223372036854775808 }";
+        let tree = parse_go(src);
+        let node = find_node_by_kind(tree.root_node(), "int_literal")
+            .expect("should find int_literal node");
+        let candidates = DecrementNumeric.apply(&node, src.as_bytes(), &crate::languages::go::Go);
+
+        assert!(candidates.is_empty());
+    }
+
+    #[test]
     fn numeric_mutators_skip_float_literals() {
         let src = "package main\nfunc f() float64 { return 4.5 }";
         let tree = parse_go(src);

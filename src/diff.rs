@@ -278,13 +278,13 @@ pub fn parse_diff(input: &str) -> Vec<ChangedFile> {
             in_hunk = false;
 
             // Flush previous file
-            if let Some(path) = current_path.take()
-                && !current_hunks.is_empty()
-            {
-                files.push(ChangedFile {
-                    path,
-                    hunks: current_hunks,
-                });
+            if let Some(path) = current_path.take() {
+                if !current_hunks.is_empty() {
+                    files.push(ChangedFile {
+                        path,
+                        hunks: current_hunks,
+                    });
+                }
             }
             current_hunks = Vec::new();
 
@@ -327,13 +327,13 @@ pub fn parse_diff(input: &str) -> Vec<ChangedFile> {
 
     // Flush final state
     flush_range(&mut current_hunks, &mut range_start, range_end);
-    if let Some(path) = current_path.take()
-        && !current_hunks.is_empty()
-    {
-        files.push(ChangedFile {
-            path,
-            hunks: current_hunks,
-        });
+    if let Some(path) = current_path.take() {
+        if !current_hunks.is_empty() {
+            files.push(ChangedFile {
+                path,
+                hunks: current_hunks,
+            });
+        }
     }
 
     files

@@ -44,7 +44,14 @@ runs:
         }
         validate_version "$VERSION"
         if [ "$VERSION" = "latest" ]; then
-          VERSION=$(curl -fsSL https://api.github.com/repos/Darkroom4364/togi/releases/latest | grep '"tag_name"' | sed -E 's/.*"([^"]+)".*/\1/')
+          if command -v jq >/dev/null 2>&1; then
+            VERSION=$(curl -fsSL https://api.github.com/repos/Darkroom4364/togi/releases/latest | jq -er .tag_name)
+          elif command -v gh >/dev/null 2>&1; then
+            VERSION=$(gh api repos/Darkroom4364/togi/releases/latest -q .tag_name)
+          else
+            echo "Resolving latest Togi version requires gh or jq" >&2
+            exit 1
+          fi
           validate_version "$VERSION"
         fi
         if [ -z "$VERSION" ]; then
@@ -76,7 +83,7 @@ runs:
         curl -fL "https://github.com/Darkroom4364/togi/releases/download/${VERSION}/${TOGI_ARCHIVE}" -o "$TOGI_ARCHIVE_PATH"
         CHECKSUMS_PATH="${TEMP_ROOT}/togi-checksums.txt"
         curl -fL "https://github.com/Darkroom4364/togi/releases/download/${VERSION}/checksums.txt" -o "$CHECKSUMS_PATH"
-        EXPECTED_SHA=$(awk -v file="$TOGI_ARCHIVE" '$2 == file { print $1 }' "$CHECKSUMS_PATH")
+        EXPECTED_SHA=$(awk -v file="$TOGI_ARCHIVE" '$2 == file || $2 == "./" file { print $1 }' "$CHECKSUMS_PATH")
         if [ -z "$EXPECTED_SHA" ]; then
           echo "No checksum found for ${TOGI_ARCHIVE}" >&2
           exit 1

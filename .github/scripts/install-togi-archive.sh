@@ -28,13 +28,40 @@ validate_archive_entries() {
   '
 }
 
+validate_tar_entry_types() {
+  awk '
+    substr($0, 1, 1) == "l" || substr($0, 1, 1) == "h" {
+      printf "Unsafe archive link entry: %s\n", $0 > "/dev/stderr"
+      exit 1
+    }
+  '
+}
+
+validate_zip_entry_types() {
+  awk '
+    /^[dlh-][rwxStTs-]{9}/ {
+      type = substr($0, 1, 1)
+      if (type == "l" || type == "h") {
+        printf "Unsafe archive link entry: %s\n", $0 > "/dev/stderr"
+        exit 1
+      }
+    }
+  '
+}
+
 case "$TOGI_ARCHIVE" in
   *.tar.gz)
     tar tzf "$ARCHIVE_PATH" | validate_archive_entries
+    tar tvzf "$ARCHIVE_PATH" | validate_tar_entry_types
     tar xzf "$ARCHIVE_PATH" -C "$EXTRACT_DIR"
     ;;
   *.zip)
     unzip -Z1 "$ARCHIVE_PATH" | validate_archive_entries
+    if command -v zipinfo >/dev/null 2>&1; then
+      zipinfo -l "$ARCHIVE_PATH" | validate_zip_entry_types
+    else
+      unzip -Z -l "$ARCHIVE_PATH" | validate_zip_entry_types
+    fi
     unzip -q "$ARCHIVE_PATH" -d "$EXTRACT_DIR"
     ;;
   *)

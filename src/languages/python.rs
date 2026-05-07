@@ -40,9 +40,7 @@ fn removal_would_empty_python_block(node: &tree_sitter::Node) -> bool {
             let Some(only_child) = named.next() else {
                 return false;
             };
-            return named.next().is_none()
-                && only_child.kind() == node.kind()
-                && only_child.byte_range() == node.byte_range();
+            return named.next().is_none() && only_child == *node;
         }
         parent = p.parent();
     }
@@ -224,6 +222,26 @@ mod tests {
         };
 
         assert!(should_filter_candidate(
+            &candidate,
+            &statement,
+            src.as_bytes()
+        ));
+    }
+
+    #[test]
+    fn removal_candidate_is_not_skipped_when_block_has_multiple_statements() {
+        let src = "def f():\n    call()\n    other()\n";
+        let tree = parse_python(src);
+        let statement = find_node_by_kind(tree.root_node(), "expression_statement")
+            .expect("should find expression_statement node");
+        let candidate = MutationCandidate {
+            byte_range: statement.byte_range(),
+            replacement: String::new(),
+            operator_id: "remove_call_statement".to_string(),
+            description: String::new(),
+        };
+
+        assert!(!should_filter_candidate(
             &candidate,
             &statement,
             src.as_bytes()
