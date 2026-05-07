@@ -10,17 +10,11 @@ use std::os::unix::io::AsRawFd;
 
 const LOCK_FILE: &str = ".togi.lock";
 
-/// RAII lock guard. Removes the lock file on drop.
+/// RAII lock guard. Keeps the lock file open to hold the advisory lock.
 /// Holds the open file to keep the `flock` advisory lock active.
 pub struct LockGuard {
-    path: PathBuf,
+    _path: PathBuf,
     _file: File,
-}
-
-impl Drop for LockGuard {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
-    }
 }
 
 /// Try to acquire an exclusive non-blocking flock. Returns true on success.
@@ -82,7 +76,10 @@ pub fn acquire(project_root: &Path) -> Result<LockGuard> {
                     f.write_all(pid.to_string().as_bytes()).with_context(|| {
                         format!("failed to write lock file: {}", path.display())
                     })?;
-                    return Ok(LockGuard { path, _file: f });
+                    return Ok(LockGuard {
+                        _path: path,
+                        _file: f,
+                    });
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
                 Err(e) => {
@@ -123,7 +120,10 @@ pub fn acquire(project_root: &Path) -> Result<LockGuard> {
     file.write_all(pid.to_string().as_bytes())
         .with_context(|| format!("failed to write lock file: {}", path.display()))?;
 
-    Ok(LockGuard { path, _file: file })
+    Ok(LockGuard {
+        _path: path,
+        _file: file,
+    })
 }
 
 #[cfg(test)]
@@ -140,8 +140,9 @@ mod tests {
             let _guard = acquire(dir.path()).unwrap();
             assert!(lock_path.exists());
         }
-        // Lock removed after drop
-        assert!(!lock_path.exists());
+        // The file stays behind; the advisory lock is released when the guard drops.
+        assert!(lock_path.exists());
+        let _guard = acquire(dir.path()).unwrap();
     }
 
     #[test]

@@ -128,7 +128,21 @@ impl MutationOperator for RemoveAssignment {
         if !lang.is_assignment_node(node.kind()) {
             return vec![];
         }
-        vec![mutation_candidate(self, node.byte_range(), String::new())]
+        let range = if matches!(
+            node.kind(),
+            "assignment_statement" | "augmented_assignment" | "assignment"
+        ) {
+            node.byte_range()
+        } else if let Some(parent) = node.parent() {
+            if lang.is_expression_statement_node(parent.kind()) {
+                parent.byte_range()
+            } else {
+                return vec![];
+            }
+        } else {
+            return vec![];
+        };
+        vec![mutation_candidate(self, range, String::new())]
     }
 }
 
@@ -136,7 +150,7 @@ impl MutationOperator for RemoveAssignment {
 mod tests {
     use super::*;
 
-    use crate::test_helpers::{find_node_by_kind, parse_go};
+    use crate::test_helpers::{find_node_by_kind, parse_go, parse_typescript};
 
     fn assert_single_candidate(
         candidates: &[MutationCandidate],
@@ -197,6 +211,21 @@ func f(x int) { if x > 0 { println("yes") } }"#;
             .expect("should find assignment_statement node");
         let candidates = RemoveAssignment.apply(&stmt, src.as_bytes(), &crate::languages::go::Go);
         assert_single_candidate(&candidates, src, "", "x = 1");
+    }
+
+    #[test]
+    fn remove_assignment_skips_expression_context() {
+        let src = "function f() { if ((x = 1) > 0) { return true; } }";
+        let tree = parse_typescript(src);
+        let assignment = find_node_by_kind(tree.root_node(), "assignment_expression")
+            .expect("should find assignment_expression node");
+        let candidates = RemoveAssignment.apply(
+            &assignment,
+            src.as_bytes(),
+            &crate::languages::typescript::TypeScript,
+        );
+
+        assert!(candidates.is_empty());
     }
 
     #[test]

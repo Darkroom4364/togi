@@ -104,11 +104,11 @@ mod tests {
 
     #[test]
     fn annotation_format_for_survived_mutation() {
-        let m = mutation("src/auth.rs", 47, "binary/lt_to_lte", "changed < to <=");
+        let m = mutation("src/auth.rs", 47, "lt_to_lte", "changed < to <=");
         let line = format_annotation(&m);
         assert_eq!(
             line,
-            "::warning file=src/auth.rs,line=47::Survived mutation: binary/lt_to_lte (changed < to <=)"
+            "::warning file=src/auth.rs,line=47::Survived mutation: lt_to_lte (changed < to <=)"
         );
     }
 

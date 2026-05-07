@@ -605,9 +605,7 @@ mod tests {
     #[test]
     fn rust_return_empty_allowed_for_primitive() {
         let tmp = TempDir::new().unwrap();
-        // Use a function call as return value; call_expression is not mutable,
-        // so the mapper yields the return_expression itself.
-        let src = "fn f() -> i32 {\n    return compute();\n}\n";
+        let src = "fn f() -> i32 {\n    return 42;\n}\n";
         let rel = write_test_file(tmp.path(), "lib.rs", src);
 
         let changed = vec![ChangedFile {
@@ -620,6 +618,27 @@ mod tests {
         assert!(
             has_return_empty,
             "return_empty should be allowed for i32 return type, got: {:?}",
+            mutations.iter().map(|m| &m.operator).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn return_empty_skips_unknown_call_return_value() {
+        let tmp = TempDir::new().unwrap();
+        let src = "fn f() -> bool {\n    return ready();\n}\n";
+        let rel = write_test_file(tmp.path(), "lib.rs", src);
+
+        let changed = vec![ChangedFile {
+            path: rel,
+            hunks: vec![LineRange { start: 1, end: 3 }],
+        }];
+
+        let mutations = generate_mutations(&changed, tmp.path(), 100, 0, &[]).unwrap();
+        let has_return_empty = mutations.iter().any(|m| m.operator == "return_empty");
+
+        assert!(
+            !has_return_empty,
+            "return_empty should skip call return values until it can derive a typed default, got: {:?}",
             mutations.iter().map(|m| &m.operator).collect::<Vec<_>>()
         );
     }
@@ -802,12 +821,12 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         // return_empty mutation: the operator targets the return value,
         // not the return keyword.
-        let src = "package main\n\nfunc value() int { return 42 }\n\nfunc f() int {\n\treturn value()\n}\n";
+        let src = "package main\n\nfunc f() int {\n\treturn 42\n}\n";
         let rel = write_test_file(tmp.path(), "main.go", src);
 
         let changed = vec![ChangedFile {
             path: rel,
-            hunks: vec![LineRange { start: 6, end: 6 }],
+            hunks: vec![LineRange { start: 4, end: 4 }],
         }];
 
         let mutations = generate_mutations(&changed, tmp.path(), 100, 0, &[]).unwrap();

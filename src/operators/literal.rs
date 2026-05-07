@@ -129,11 +129,10 @@ impl MutationOperator for IncrementNumeric {
         }
         let text = std::str::from_utf8(&source[node.byte_range()]).unwrap_or("");
         if let Ok(n) = text.parse::<i64>() {
-            vec![mutation_candidate(
-                self,
-                node.byte_range(),
-                (n + 1).to_string(),
-            )]
+            n.checked_add(1)
+                .map(|n| mutation_candidate(self, node.byte_range(), n.to_string()))
+                .into_iter()
+                .collect()
         } else {
             vec![]
         }
@@ -160,11 +159,10 @@ impl MutationOperator for DecrementNumeric {
         }
         let text = std::str::from_utf8(&source[node.byte_range()]).unwrap_or("");
         if let Ok(n) = text.parse::<i64>() {
-            vec![mutation_candidate(
-                self,
-                node.byte_range(),
-                (n - 1).to_string(),
-            )]
+            n.checked_sub(1)
+                .map(|n| mutation_candidate(self, node.byte_range(), n.to_string()))
+                .into_iter()
+                .collect()
         } else {
             vec![]
         }
@@ -293,6 +291,17 @@ func f() string { return "" }"#;
             .expect("should find int_literal node");
         let candidates = IncrementNumeric.apply(&node, src.as_bytes(), &crate::languages::go::Go);
         assert_single_candidate(&candidates, src, "42", "41");
+    }
+
+    #[test]
+    fn increment_numeric_skips_i64_max() {
+        let src = "package main\nfunc f() int { return 9223372036854775807 }";
+        let tree = parse_go(src);
+        let node = find_node_by_kind(tree.root_node(), "int_literal")
+            .expect("should find int_literal node");
+        let candidates = IncrementNumeric.apply(&node, src.as_bytes(), &crate::languages::go::Go);
+
+        assert!(candidates.is_empty());
     }
 
     #[test]

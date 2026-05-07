@@ -15,9 +15,28 @@ ARCHIVE_PATH="${TOGI_ARCHIVE_PATH:-${TEMP_ROOT}/${TOGI_ARCHIVE}}"
 rm -rf "$INSTALL_DIR" "$EXTRACT_DIR"
 mkdir -p "$INSTALL_DIR" "$EXTRACT_DIR"
 
+validate_archive_entries() {
+  awk '
+    {
+      path = $0
+      gsub(/\\/, "/", path)
+      if (path == "" || path ~ /^\// || path ~ /(^|\/)\.\.($|\/)/) {
+        printf "Unsafe archive entry: %s\n", $0 > "/dev/stderr"
+        exit 1
+      }
+    }
+  '
+}
+
 case "$TOGI_ARCHIVE" in
-  *.tar.gz) tar xzf "$ARCHIVE_PATH" -C "$EXTRACT_DIR" ;;
-  *.zip) unzip -q "$ARCHIVE_PATH" -d "$EXTRACT_DIR" ;;
+  *.tar.gz)
+    tar tzf "$ARCHIVE_PATH" | validate_archive_entries
+    tar xzf "$ARCHIVE_PATH" -C "$EXTRACT_DIR"
+    ;;
+  *.zip)
+    unzip -Z1 "$ARCHIVE_PATH" | validate_archive_entries
+    unzip -q "$ARCHIVE_PATH" -d "$EXTRACT_DIR"
+    ;;
   *)
     echo "Unsupported Togi archive format: ${TOGI_ARCHIVE}" >&2
     exit 1

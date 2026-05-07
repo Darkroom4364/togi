@@ -24,6 +24,9 @@ pub fn parse_file_with_parser(
     let tree = parser
         .parse(source, None)
         .ok_or_else(|| anyhow!("failed to parse {}", path.display()))?;
+    if tree.root_node().has_error() {
+        return Err(anyhow!("parse errors in {}", path.display()));
+    }
     Ok((tree, lang))
 }
 
@@ -72,6 +75,16 @@ mod tests {
         let (tree, lang) = parse_file(Path::new("main.go"), source).unwrap();
         assert_eq!(lang.name(), "go");
         assert_eq!(tree.root_node().kind(), "source_file");
+    }
+
+    #[test]
+    fn parse_file_rejects_sources_with_parse_errors() {
+        let result = parse_file(Path::new("main.go"), b"package main\nfunc main( {\n");
+
+        match result {
+            Ok(_) => panic!("invalid source should be rejected"),
+            Err(err) => assert!(err.to_string().contains("parse errors")),
+        }
     }
 
     #[test]

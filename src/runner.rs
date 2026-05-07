@@ -4,6 +4,7 @@ use crate::cache::{self, CacheKey};
 use crate::{Mutation, MutationReport, MutationResult};
 use std::collections::{HashMap, VecDeque};
 use std::fs;
+use std::hash::Hasher;
 use std::io::{IsTerminal, Read, Write};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
@@ -335,6 +336,264 @@ fn should_copy_workspace_entry(project_root: &Path, path: &Path) -> bool {
             .is_ok_and(|relative| !should_skip_workspace_entry(relative))
 }
 
+fn cache_context_fingerprint(project_root: &Path) -> u64 {
+    git_cache_context_fingerprint(project_root)
+        .unwrap_or_else(|| filesystem_cache_context_fingerprint(project_root))
+}
+
+fn filesystem_cache_context_fingerprint(project_root: &Path) -> u64 {
+    let mut files = Vec::new();
+    collect_cache_context_files(project_root, project_root, &mut files);
+    files.sort_by_key(|path| normalized_cache_path(project_root, path));
+
+    let mut hasher = StableCacheHasher::default();
+    update_cache_hash(&mut hasher, b"filesystem");
+    for relative in files {
+        let path_key = normalized_cache_path(project_root, &relative);
+        update_cache_hash(&mut hasher, path_key.as_bytes());
+        if let Ok(content) = fs::read(project_root.join(&relative)) {
+            update_cache_hash(&mut hasher, &content);
+        }
+    }
+    hasher.finish()
+}
+
+fn git_cache_context_fingerprint(project_root: &Path) -> Option<u64> {
+    if git_cache_context_is_dirty(project_root)? {
+        return None;
+    }
+
+    let output = std::process::Command::new("git")
+        .args(["ls-files", "-z", "-s", "--"])
+        .current_dir(project_root)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let mut files = Vec::new();
+    for entry in output.stdout.split(|byte| *byte == 0) {
+        if entry.is_empty() {
+            continue;
+        }
+        let tab = entry.iter().position(|byte| *byte == b'\t')?;
+        let metadata = String::from_utf8_lossy(&entry[..tab]);
+        let mut fields = metadata.split_whitespace();
+        let _mode = fields.next()?;
+        let object_id = fields.next()?.to_string();
+        let relative = PathBuf::from(String::from_utf8_lossy(&entry[tab + 1..]).into_owned());
+        if is_cache_context_file(&relative) {
+            files.push((relative, object_id));
+        }
+    }
+
+    files.sort_by_key(|(path, _)| normalized_cache_path(project_root, path));
+
+    let mut hasher = StableCacheHasher::default();
+    update_cache_hash(&mut hasher, b"git-index");
+    for (relative, object_id) in files {
+        let path_key = normalized_cache_path(project_root, &relative);
+        update_cache_hash(&mut hasher, path_key.as_bytes());
+        update_cache_hash(&mut hasher, object_id.as_bytes());
+    }
+    Some(hasher.finish())
+}
+
+fn git_cache_context_is_dirty(project_root: &Path) -> Option<bool> {
+    let output = std::process::Command::new("git")
+        .args([
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--",
+        ])
+        .current_dir(project_root)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    for entry in output.stdout.split(|byte| *byte == 0) {
+        if entry.len() <= 3 || entry[2] != b' ' {
+            continue;
+        }
+        let relative = PathBuf::from(String::from_utf8_lossy(&entry[3..]).into_owned());
+        if is_cache_context_file(&relative) {
+            return Some(true);
+        }
+    }
+    Some(false)
+}
+
+fn collect_cache_context_files(project_root: &Path, dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        let relative = path.strip_prefix(project_root).unwrap_or(&path);
+        if should_skip_workspace_entry(relative) {
+            continue;
+        }
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+
+        if file_type.is_dir() {
+            collect_cache_context_files(project_root, &path, out);
+        } else if file_type.is_file() && is_cache_context_file(relative) {
+            out.push(relative.to_path_buf());
+        }
+    }
+}
+
+fn is_cache_context_file(relative: &Path) -> bool {
+    let path_key = normalized_cache_path(Path::new(""), relative).to_ascii_lowercase();
+    let file_name = relative
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    if matches!(
+        path_key.as_str(),
+        "togi.toml"
+            | "cargo.toml"
+            | "cargo.lock"
+            | "go.mod"
+            | "go.sum"
+            | "package.json"
+            | "package-lock.json"
+            | "pnpm-lock.yaml"
+            | "yarn.lock"
+            | "bun.lock"
+            | "bun.lockb"
+            | "pyproject.toml"
+            | "setup.py"
+            | "setup.cfg"
+            | "pytest.ini"
+            | "tox.ini"
+            | "pom.xml"
+            | "build.gradle"
+            | "build.gradle.kts"
+            | "gemfile"
+            | "gemfile.lock"
+            | "cmakelists.txt"
+    ) {
+        return true;
+    }
+
+    if path_key.starts_with(".github/workflows/")
+        && (file_name.ends_with(".yml") || file_name.ends_with(".yaml"))
+    {
+        return true;
+    }
+
+    let in_test_dir = relative.components().any(|component| {
+        component.as_os_str().to_str().is_some_and(|part| {
+            matches!(
+                part.to_ascii_lowercase().as_str(),
+                "test" | "tests" | "spec" | "specs" | "__tests__" | "__specs__"
+            )
+        })
+    });
+    if in_test_dir {
+        return has_test_context_extension(&file_name);
+    }
+
+    file_name.starts_with("test_")
+        || file_name.ends_with("_test.go")
+        || file_name.ends_with("_test.rs")
+        || file_name.ends_with("_test.py")
+        || file_name.contains(".test.")
+        || file_name.contains(".spec.")
+        || file_name.ends_with("test.java")
+        || file_name.ends_with("tests.java")
+}
+
+fn has_test_context_extension(file_name: &str) -> bool {
+    matches!(
+        Path::new(file_name)
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or(""),
+        "go" | "rs"
+            | "py"
+            | "ts"
+            | "tsx"
+            | "js"
+            | "jsx"
+            | "java"
+            | "c"
+            | "cc"
+            | "cpp"
+            | "cxx"
+            | "h"
+            | "hpp"
+            | "cs"
+            | "rb"
+            | "toml"
+            | "json"
+            | "yaml"
+            | "yml"
+            | "xml"
+    )
+}
+
+const STABLE_HASH_OFFSET: u64 = 0xcbf29ce484222325;
+const STABLE_HASH_PRIME: u64 = 0x100000001b3;
+
+struct StableCacheHasher {
+    hash: u64,
+}
+
+impl Default for StableCacheHasher {
+    fn default() -> Self {
+        Self {
+            hash: STABLE_HASH_OFFSET,
+        }
+    }
+}
+
+impl Hasher for StableCacheHasher {
+    fn finish(&self) -> u64 {
+        self.hash
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.hash ^= u64::from(*byte);
+            self.hash = self.hash.wrapping_mul(STABLE_HASH_PRIME);
+        }
+    }
+}
+
+fn update_cache_hash(hasher: &mut impl Hasher, bytes: &[u8]) {
+    hasher.write(&(bytes.len() as u64).to_le_bytes());
+    hasher.write(bytes);
+}
+
+fn source_content_cache(project_root: &Path, mutations: &[Mutation]) -> HashMap<String, Vec<u8>> {
+    let mut contents = HashMap::new();
+    for mutation in mutations {
+        let key = normalized_cache_path(project_root, &mutation.file);
+        if contents.contains_key(&key) {
+            continue;
+        }
+        let Ok(file_path) = validate_and_resolve_mutation_path(project_root, &mutation.file) else {
+            continue;
+        };
+        if let Ok(content) = fs::read(file_path) {
+            contents.insert(key, content);
+        }
+    }
+    contents
+}
+
 pub(crate) fn copy_workspace(project_root: &Path) -> std::io::Result<WorkspaceCopy> {
     copy_workspace_with_options(project_root, true)
 }
@@ -346,6 +605,31 @@ fn copy_workspace_with_options(
     let tempdir = tempfile::tempdir()?;
     let root = tempdir.path().join("workspace");
     fs::create_dir(&root)?;
+    populate_workspace(project_root, &root, respect_ignores)?;
+
+    Ok(WorkspaceCopy {
+        _tempdir: tempdir,
+        root,
+    })
+}
+
+fn reset_workspace(
+    project_root: &Path,
+    workspace_root: &Path,
+    respect_ignores: bool,
+) -> std::io::Result<()> {
+    if workspace_root.exists() {
+        fs::remove_dir_all(workspace_root)?;
+    }
+    fs::create_dir(workspace_root)?;
+    populate_workspace(project_root, workspace_root, respect_ignores)
+}
+
+fn populate_workspace(
+    project_root: &Path,
+    root: &Path,
+    respect_ignores: bool,
+) -> std::io::Result<()> {
     let project_root_for_filter = project_root.to_path_buf();
 
     let mut builder = ignore::WalkBuilder::new(project_root);
@@ -387,10 +671,7 @@ fn copy_workspace_with_options(
         }
     }
 
-    Ok(WorkspaceCopy {
-        _tempdir: tempdir,
-        root,
-    })
+    Ok(())
 }
 
 pub(crate) struct WorkspacePool {
@@ -490,6 +771,9 @@ struct RunShared<'a> {
     show_output: bool,
     counter: &'a AtomicUsize,
     cancelled: &'a AtomicBool,
+    respect_workspace_ignores: bool,
+    cache_context_fingerprint: u64,
+    source_contents: &'a HashMap<String, Vec<u8>>,
 }
 
 fn run_queued_mutation(
@@ -510,16 +794,14 @@ fn run_queued_mutation(
         shared.build_command_explicit,
         shared.env,
     );
-
-    let original_target = ResolvedMutation::new(shared.project_root, &mutation);
+    let cache_ctx = format!(
+        "{cache_ctx};context={:016x}",
+        shared.cache_context_fingerprint
+    );
 
     // Check cache before acquiring a workspace slot.
-    let file_content = original_target
-        .file_path
-        .as_ref()
-        .ok()
-        .and_then(|file_path| fs::read(file_path).ok());
-    let cache_key = file_content.as_ref().map(|content| {
+    let source_key = normalized_cache_path(shared.project_root, &mutation.file);
+    let cache_key = shared.source_contents.get(&source_key).map(|content| {
         CacheKey::new(
             content,
             &cache_identity(shared.project_root, &mutation),
@@ -538,6 +820,19 @@ fn run_queued_mutation(
     let outcome = {
         let workspace_slot = shared.workspace_pool.acquire();
         let workspace_root = workspace_slot.root().to_path_buf();
+        if let Err(e) = reset_workspace(
+            shared.project_root,
+            &workspace_root,
+            shared.respect_workspace_ignores,
+        ) {
+            eprintln!(
+                "warning: could not reset isolated mutation workspace {}: {e}",
+                workspace_root.display()
+            );
+            reservation.release();
+            record_progress(&shared, &mutation, MutationResult::BuildError, None, false);
+            return Some((index, mutation, MutationResult::BuildError));
+        }
         let workspace_target =
             ResolvedMutation::new_for_execution(shared.project_root, &workspace_root, &mutation);
         run_single_mutation(
@@ -715,6 +1010,7 @@ impl TestRunner {
             }
         };
 
+        let source_contents = source_content_cache(&self.project_root, &mutations);
         let project_root = Arc::new(self.project_root.clone());
         let build_command = Arc::new(self.commands.build_command.clone());
         let build_command_explicit = self.commands.build_command_explicit;
@@ -723,6 +1019,7 @@ impl TestRunner {
         ));
         let results = Arc::new(Mutex::new(Vec::new()));
         let worker_count = workspace_pool.len().min(total).max(1);
+        let cache_context_hash = cache_context_fingerprint(&self.project_root);
 
         thread::scope(|scope| {
             for _ in 0..worker_count {
@@ -738,6 +1035,7 @@ impl TestRunner {
                 let env = &self.env;
                 let max_tested = self.max_tested;
                 let show_output = self.show_output;
+                let source_contents = &source_contents;
 
                 scope.spawn(move || {
                     loop {
@@ -778,6 +1076,9 @@ impl TestRunner {
                                     show_output,
                                     counter: &counter,
                                     cancelled: &cancelled,
+                                    respect_workspace_ignores: self.respect_workspace_ignores,
+                                    cache_context_fingerprint: cache_context_hash,
+                                    source_contents,
                                 },
                             )
                         }));
@@ -999,6 +1300,7 @@ struct ResolvedMutation<'a> {
 }
 
 impl<'a> ResolvedMutation<'a> {
+    #[cfg(test)]
     fn new(project_root: &Path, mutation: &'a Mutation) -> Self {
         Self {
             mutation,
@@ -1700,6 +2002,124 @@ mod tests {
         std::fs::write(&file, b"hello world").unwrap();
         let mutation = make_test_mutation(Path::new("test.txt"));
         (dir, file, mutation)
+    }
+
+    #[test]
+    fn cache_context_fingerprint_changes_for_tests_and_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let initial = cache_context_fingerprint(dir.path());
+
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("src/lib.rs"),
+            b"pub fn value() -> i32 { 1 }",
+        )
+        .unwrap();
+        assert_eq!(
+            cache_context_fingerprint(dir.path()),
+            initial,
+            "regular source files are already covered by per-mutation content hashes"
+        );
+
+        std::fs::create_dir_all(dir.path().join("tests")).unwrap();
+        let test_file = dir.path().join("tests/calc_test.go");
+        std::fs::write(&test_file, b"package calc\nfunc TestValue() {}\n").unwrap();
+        let with_test = cache_context_fingerprint(dir.path());
+        assert_ne!(with_test, initial);
+
+        std::fs::write(&test_file, b"package calc\nfunc TestValueChanged() {}\n").unwrap();
+        let changed_test = cache_context_fingerprint(dir.path());
+        assert_ne!(changed_test, with_test);
+
+        std::fs::write(dir.path().join("togi.toml"), b"[test]\ntimeout = 10\n").unwrap();
+        assert_ne!(cache_context_fingerprint(dir.path()), changed_test);
+    }
+
+    #[test]
+    fn source_content_cache_reads_each_file_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("src.txt");
+        std::fs::write(&file, b"hello world").unwrap();
+
+        let mut first = make_test_mutation(&file);
+        first.id = 1;
+        let mut second = make_test_mutation(&file);
+        second.id = 2;
+        second.byte_range = 6..11;
+
+        let cache = source_content_cache(dir.path(), &[first, second]);
+
+        assert_eq!(cache.len(), 1);
+        assert_eq!(
+            cache
+                .get(&normalized_cache_path(dir.path(), &file))
+                .unwrap(),
+            b"hello world"
+        );
+    }
+
+    #[test]
+    fn git_cache_context_uses_index_when_context_is_clean() {
+        if !git_available() {
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        run_git(root, &["init"]);
+        run_git(root, &["config", "user.email", "test@example.com"]);
+        run_git(root, &["config", "user.name", "Test"]);
+
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("tests")).unwrap();
+        std::fs::write(root.join("Cargo.toml"), b"[package]\nname = \"fixture\"\n").unwrap();
+        std::fs::write(root.join("src/lib.rs"), b"pub fn value() -> i32 { 1 }\n").unwrap();
+        std::fs::write(
+            root.join("tests/value_test.rs"),
+            b"#[test]\nfn value() {}\n",
+        )
+        .unwrap();
+        run_git(root, &["add", "."]);
+        run_git(root, &["commit", "-m", "initial"]);
+
+        let clean = git_cache_context_fingerprint(root).expect("clean git fingerprint");
+        std::fs::write(root.join("src/lib.rs"), b"pub fn value() -> i32 { 2 }\n").unwrap();
+        assert_eq!(
+            git_cache_context_fingerprint(root).expect("dirty source should still use git"),
+            clean
+        );
+
+        std::fs::write(
+            root.join("tests/value_test.rs"),
+            b"#[test]\nfn changed() {}\n",
+        )
+        .unwrap();
+        assert!(
+            git_cache_context_fingerprint(root).is_none(),
+            "dirty test files should fall back to filesystem hashing"
+        );
+    }
+
+    fn git_available() -> bool {
+        std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+    }
+
+    fn run_git(root: &Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .unwrap_or_else(|e| panic!("failed to run git {args:?}: {e}"));
+        assert!(
+            output.status.success(),
+            "git {args:?} failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     fn test_command_config() -> CommandConfig {
@@ -2825,6 +3245,10 @@ rmdir "$lock"
                 commands.build_command_explicit,
                 &env,
             );
+            let cache_ctx = format!(
+                "{cache_ctx};context={:016x}",
+                cache_context_fingerprint(dir.path())
+            );
             let cached_content = std::fs::read(&cached_file).unwrap();
             let key = CacheKey::new(
                 &cached_content,
@@ -3243,6 +3667,55 @@ exit 1"#
         );
         assert_eq!(std::fs::read_to_string(&first).unwrap(), "hello world");
         assert_eq!(std::fs::read_to_string(&second).unwrap(), "hello world");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reused_workspace_is_reset_between_mutations() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first.txt");
+        let second = dir.path().join("second.txt");
+        std::fs::write(&first, b"hello world").unwrap();
+        std::fs::write(&second, b"hello world").unwrap();
+
+        let mut first_mutation = make_test_mutation(&first);
+        first_mutation.description = "first side-effect mutation".into();
+        let mut second_mutation = make_test_mutation(&second);
+        second_mutation.id = 2;
+        second_mutation.description = "second side-effect mutation".into();
+
+        let runner = TestRunner {
+            commands: CommandConfig {
+                command: vec![
+                    "sh".into(),
+                    "-c".into(),
+                    "test ! -f side_effect && touch side_effect".into(),
+                ],
+                force_default_command: false,
+                force_default_timeout: false,
+                project_commands: vec![],
+                language_commands: HashMap::new(),
+                build_command: vec![],
+                build_command_explicit: false,
+                timeout: Duration::from_secs(5),
+                language_timeouts: HashMap::new(),
+                test_selection: None,
+            },
+            parallelism: 1,
+            project_root: dir.path().to_path_buf(),
+            verbose: false,
+            show_output: false,
+            max_tested: None,
+            respect_workspace_ignores: true,
+            env: HashMap::new(),
+            cancelled: Arc::new(AtomicBool::new(false)),
+        };
+
+        let report = runner.run(vec![first_mutation, second_mutation]).report;
+
+        assert_eq!(report.total, 2);
+        assert_eq!(report.survived, 2);
+        assert_eq!(report.killed, 0);
     }
 
     #[test]
