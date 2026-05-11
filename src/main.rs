@@ -18,6 +18,7 @@ struct CheckConfig {
     output_format: togi::cli::OutputFormat,
     jobs: Option<usize>,
     timeout: Option<u64>,
+    max_per_run: Option<usize>,
     dry_run: bool,
     verbose: bool,
     show_output: bool,
@@ -70,6 +71,7 @@ fn main() {
             format,
             jobs,
             timeout,
+            max_per_run,
             dry_run,
             verbose,
             show_output,
@@ -94,6 +96,7 @@ fn main() {
                 output_format: format,
                 jobs,
                 timeout,
+                max_per_run,
                 dry_run,
                 verbose,
                 show_output,
@@ -421,6 +424,9 @@ fn resolve_config(
     }
     if let Some(t) = cfg.timeout {
         config.test.timeout = t;
+    }
+    if let Some(max) = cfg.max_per_run {
+        config.mutations.max_per_run = max;
     }
     if let Some(cmd) = cfg.test_cmd {
         config.test.command =
