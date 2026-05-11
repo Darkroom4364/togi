@@ -93,6 +93,9 @@ togi check --all
 # Adjust parallelism and timeout
 togi check --jobs 8 --timeout 60
 
+# Cap mutation count for a bounded exploratory run
+togi check --max-per-run 50  # --max-per-run 0 = unlimited
+
 # Scope to a directory
 togi check --all --path src/rules/
 
