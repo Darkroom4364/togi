@@ -271,7 +271,7 @@ pub fn plan(project_root: &Path, mutations: Vec<Mutation>) -> SchemaPlan {
         }
     }
 
-    let overlapping = overlapping_schema_indices(&selected);
+    let overlapping = overlapping_schema_indices(project_root, &selected);
     let mut final_selected = Vec::with_capacity(selected.len());
     for (idx, schema_mutation) in selected.into_iter().enumerate() {
         if overlapping.contains_key(&idx) {
@@ -318,11 +318,15 @@ fn validate_source_range(mutation: &Mutation, source: &[u8]) -> Result<(), Schem
     Ok(())
 }
 
-fn overlapping_schema_indices(selected: &[SchemaMutation]) -> BTreeMap<usize, ()> {
+fn overlapping_schema_indices(
+    project_root: &Path,
+    selected: &[SchemaMutation],
+) -> BTreeMap<usize, ()> {
     let mut by_file: BTreeMap<String, Vec<(usize, std::ops::Range<usize>)>> = BTreeMap::new();
     for (idx, schema_mutation) in selected.iter().enumerate() {
+        let path = source_path(project_root, &schema_mutation.mutation.file);
         by_file
-            .entry(normalized_path_key(&schema_mutation.mutation.file))
+            .entry(normalized_path_key(&path))
             .or_default()
             .push((idx, schema_mutation.mutation.byte_range.clone()));
     }
@@ -377,10 +381,10 @@ fn strip_rust_visibility(value: &str) -> &str {
     if rest.chars().next().is_some_and(char::is_whitespace) {
         return rest.trim_start();
     }
-    if let Some(rest) = rest.strip_prefix('(')
-        && let Some((_, after_visibility)) = rest.split_once(')')
-    {
-        return after_visibility.trim_start();
+    if let Some(rest) = rest.strip_prefix('(') {
+        if let Some((_, after_visibility)) = rest.split_once(')') {
+            return after_visibility.trim_start();
+        }
     }
     value
 }
@@ -450,9 +454,63 @@ mod tests {
         std::fs::write(path, content).unwrap();
     }
 
+    fn assert_parsed_node_kind(dir: &TempDir, file: &str, adapter: &dyn SchemaAdapter, kind: &str) {
+        let source = std::fs::read(dir.path().join(file)).unwrap();
+        let (tree, lang) = crate::parser::parse_file(Path::new(file), &source).unwrap();
+        assert_eq!(lang.name(), adapter.language());
+        assert!(
+            crate::test_helpers::find_node_by_kind(tree.root_node(), kind).is_some(),
+            "expected {file} to parse a {kind} node; tree: {}",
+            tree.root_node().to_sexp()
+        );
+    }
+
+    fn assert_parsed_node_text(
+        dir: &TempDir,
+        file: &str,
+        adapter: &dyn SchemaAdapter,
+        kind: &str,
+        text: &str,
+    ) {
+        let source = std::fs::read(dir.path().join(file)).unwrap();
+        let (tree, lang) = crate::parser::parse_file(Path::new(file), &source).unwrap();
+        assert_eq!(lang.name(), adapter.language());
+        assert!(
+            find_node_by_kind_and_text(tree.root_node(), &source, kind, text).is_some(),
+            "expected {file} to parse a {kind} node covering {text:?}; tree: {}",
+            tree.root_node().to_sexp()
+        );
+    }
+
+    fn find_node_by_kind_and_text<'tree>(
+        node: tree_sitter::Node<'tree>,
+        source: &[u8],
+        kind: &str,
+        text: &str,
+    ) -> Option<tree_sitter::Node<'tree>> {
+        if node.kind() == kind && &source[node.byte_range()] == text.as_bytes() {
+            return Some(node);
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if let Some(found) = find_node_by_kind_and_text(child, source, kind, text) {
+                return Some(found);
+            }
+        }
+        None
+    }
+
     #[test]
     fn adapters_wrap_expressions_with_language_syntax() {
+        let dir = TempDir::new().unwrap();
+
         let go = adapter_for_language("go").unwrap();
+        write_source(
+            &dir,
+            "calc.go",
+            "package calc\nfunc f(a, b int) bool { return a == b }\n",
+        );
+        assert_parsed_node_text(&dir, "calc.go", go, "binary_expression", "a == b");
         assert_eq!(
             go.wrap_expression(42, "a == b", "a != b"),
             "func() bool { if __togi_active(\"42\") { return a != b } return a == b }()"
@@ -460,18 +518,32 @@ mod tests {
         assert_eq!(go.required_imports(), &["os"]);
 
         let rust = adapter_for_language("rust").unwrap();
+        write_source(
+            &dir,
+            "src/lib.rs",
+            "fn f(a: i32, b: i32) -> bool { a == b }\n",
+        );
+        assert_parsed_node_text(&dir, "src/lib.rs", rust, "binary_expression", "a == b");
         assert_eq!(
             rust.wrap_expression(42, "a == b", "a != b"),
             "__togi_select(42, || { a == b }, || { a != b })"
         );
 
         let python = adapter_for_language("python").unwrap();
+        write_source(&dir, "app.py", "def f(a, b):\n    return a == b\n");
+        assert_parsed_node_text(&dir, "app.py", python, "comparison_operator", "a == b");
         assert_eq!(
             python.wrap_expression(42, "a == b", "a != b"),
             "__togi_select(42, lambda: (a == b), lambda: (a != b))"
         );
 
         let typescript = adapter_for_language("typescript").unwrap();
+        write_source(
+            &dir,
+            "app.ts",
+            "function f(a: number, b: number): boolean { return a === b; }\n",
+        );
+        assert_parsed_node_text(&dir, "app.ts", typescript, "binary_expression", "a === b");
         assert_eq!(
             typescript.wrap_expression(42, "a === b", "a !== b"),
             "__togi_select(42, () => (a === b), () => (a !== b))"
@@ -481,11 +553,13 @@ mod tests {
     #[test]
     fn plan_selects_expression_mutations_for_supported_languages() {
         let dir = TempDir::new().unwrap();
+        let adapter = adapter_for_language("go").unwrap();
         write_source(
             &dir,
             "calc.go",
             "package calc\nfunc f(a, b int) bool { return a == b }\n",
         );
+        assert_parsed_node_text(&dir, "calc.go", adapter, "binary_expression", "a == b");
         let start = "package calc\nfunc f(a, b int) bool { return ".len();
         let mutation = mutation(
             "go",
@@ -506,11 +580,13 @@ mod tests {
     #[test]
     fn plan_falls_back_for_go_non_boolean_expression_mutations() {
         let dir = TempDir::new().unwrap();
+        let adapter = adapter_for_language("go").unwrap();
         write_source(
             &dir,
             "calc.go",
             "package calc\nfunc f(a, b int) int { return a + b }\n",
         );
+        assert_parsed_node_text(&dir, "calc.go", adapter, "binary_expression", "a + b");
         let start = "package calc\nfunc f(a, b int) int { return ".len();
         let mutation = mutation(
             "go",
@@ -534,11 +610,14 @@ mod tests {
     #[test]
     fn plan_falls_back_for_go_const_block_context() {
         let dir = TempDir::new().unwrap();
+        let adapter = adapter_for_language("go").unwrap();
         write_source(
             &dir,
             "calc.go",
             "package calc\nconst (\n    Enabled = true\n)\n",
         );
+        assert_parsed_node_kind(&dir, "calc.go", adapter, "const_declaration");
+        assert_parsed_node_text(&dir, "calc.go", adapter, "true", "true");
         let start = "package calc\nconst (\n    Enabled = ".len();
         let mutation = mutation(
             "go",
@@ -564,6 +643,9 @@ mod tests {
         let dir = TempDir::new().unwrap();
         write_source(&dir, "src/app.rb", "value = true\n");
         write_source(&dir, "src/lib.rs", "fn f() { call(); }\n");
+        let rust = adapter_for_language("rust").unwrap();
+        assert_parsed_node_kind(&dir, "src/lib.rs", rust, "expression_statement");
+        assert_parsed_node_text(&dir, "src/lib.rs", rust, "call_expression", "call()");
         let unsupported_language = mutation(
             "ruby",
             "src/app.rb",
@@ -598,7 +680,10 @@ mod tests {
     #[test]
     fn plan_falls_back_for_rust_compile_time_context() {
         let dir = TempDir::new().unwrap();
+        let adapter = adapter_for_language("rust").unwrap();
         write_source(&dir, "src/lib.rs", "pub const VERSION: u16 = 2;\n");
+        assert_parsed_node_kind(&dir, "src/lib.rs", adapter, "const_item");
+        assert_parsed_node_text(&dir, "src/lib.rs", adapter, "integer_literal", "2");
         let start = "pub const VERSION: u16 = ".len();
         let mutation = mutation(
             "rust",
@@ -622,11 +707,13 @@ mod tests {
     #[test]
     fn plan_falls_back_for_overlapping_ranges_after_first_mutation() {
         let dir = TempDir::new().unwrap();
+        let adapter = adapter_for_language("rust").unwrap();
         write_source(
             &dir,
             "src/lib.rs",
             "fn f(a: i32, b: i32) -> bool { a == b }\n",
         );
+        assert_parsed_node_text(&dir, "src/lib.rs", adapter, "binary_expression", "a == b");
         let start = "fn f(a: i32, b: i32) -> bool { ".len();
         let first = mutation(
             "rust",
@@ -646,6 +733,41 @@ mod tests {
         );
 
         let plan = plan(dir.path(), vec![first, second]);
+
+        assert_eq!(plan.selected.len(), 1);
+        assert_eq!(plan.fallback.len(), 1);
+        assert_eq!(plan.fallback[0].reason, SchemaSkipReason::OverlappingRange);
+    }
+
+    #[test]
+    fn plan_detects_overlapping_ranges_with_absolute_and_relative_paths() {
+        let dir = TempDir::new().unwrap();
+        let adapter = adapter_for_language("rust").unwrap();
+        write_source(
+            &dir,
+            "src/lib.rs",
+            "fn f(a: i32, b: i32) -> bool { a == b }\n",
+        );
+        assert_parsed_node_text(&dir, "src/lib.rs", adapter, "binary_expression", "a == b");
+        let start = "fn f(a: i32, b: i32) -> bool { ".len();
+        let relative = mutation(
+            "rust",
+            "src/lib.rs",
+            "a == b",
+            "a != b",
+            start..start + 6,
+            "eq_to_neq",
+        );
+        let absolute = mutation(
+            "rust",
+            dir.path().join("src/lib.rs").to_str().unwrap(),
+            "a == b",
+            "a <= b",
+            start..start + 6,
+            "lt_to_lte",
+        );
+
+        let plan = plan(dir.path(), vec![relative, absolute]);
 
         assert_eq!(plan.selected.len(), 1);
         assert_eq!(plan.fallback.len(), 1);
