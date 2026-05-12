@@ -1093,32 +1093,38 @@ impl TestRunner {
             .map(|(index, mutation)| (mutation.id, index))
             .collect();
         let plan = crate::schemata::plan(&self.project_root, mutations);
-        let mut schema_mutations = Vec::new();
+        let mut schema_by_language = HashMap::<String, Vec<crate::schemata::SchemaMutation>>::new();
         let mut fallback_mutations = Vec::new();
 
         for schema_mutation in plan.selected {
-            if schema_mutation.mutation.language == "go" {
-                schema_mutations.push(schema_mutation);
-            } else {
-                fallback_mutations.push(schema_mutation.mutation);
+            match schema_mutation.mutation.language.as_str() {
+                "go" | "rust" => {
+                    schema_by_language
+                        .entry(schema_mutation.mutation.language.clone())
+                        .or_default()
+                        .push(schema_mutation);
+                }
+                _ => fallback_mutations.push(schema_mutation.mutation),
             }
         }
         fallback_mutations.extend(plan.fallback.into_iter().map(|fallback| fallback.mutation));
 
-        if schema_mutations.is_empty() {
+        if schema_by_language.is_empty() {
             return self.run_regular(fallback_mutations);
         }
 
         let mut all_results = Vec::new();
-        match self.run_go_schema_mutations(&schema_mutations) {
-            Ok(results) => all_results.extend(results),
-            Err(err) => {
-                eprintln!("warning: could not run Go schemata: {err} — falling back");
-                fallback_mutations.extend(
-                    schema_mutations
-                        .into_iter()
-                        .map(|schema_mutation| schema_mutation.mutation),
-                );
+        for (language, schema_mutations) in schema_by_language {
+            match self.run_schema_mutations(&language, &schema_mutations) {
+                Ok(results) => all_results.extend(results),
+                Err(err) => {
+                    eprintln!("warning: could not run {language} schemata: {err} — falling back");
+                    fallback_mutations.extend(
+                        schema_mutations
+                            .into_iter()
+                            .map(|schema_mutation| schema_mutation.mutation),
+                    );
+                }
             }
         }
 
@@ -1275,11 +1281,20 @@ impl TestRunner {
         self.outcome_from_results(all_results, start.elapsed())
     }
 
-    fn run_go_schema_mutations(
+    fn run_schema_mutations(
         &self,
+        language: &str,
         schema_mutations: &[crate::schemata::SchemaMutation],
     ) -> Result<Vec<(Mutation, MutationResult)>, crate::schemata::SchemaRewriteError> {
-        let rewrites = crate::schemata::rewrite_go_files(&self.project_root, schema_mutations)?;
+        let rewrites = match language {
+            "go" => crate::schemata::rewrite_go_files(&self.project_root, schema_mutations)?,
+            "rust" => crate::schemata::rewrite_rust_files(&self.project_root, schema_mutations)?,
+            _ => {
+                return Err(crate::schemata::SchemaRewriteError::new(format!(
+                    "{language} schemata execution is not available"
+                )));
+            }
+        };
         let workspace =
             copy_workspace_with_options(&self.project_root, self.respect_workspace_ignores)
                 .map_err(|e| {
@@ -1340,10 +1355,15 @@ impl TestRunner {
             }
             let mutation = &schema_mutation.mutation;
             let selected = select_test_command(&self.project_root, &self.commands, mutation);
+            let argv = if language == "go" {
+                force_go_no_test_cache(selected.argv)
+            } else {
+                selected.argv
+            };
             let mut env = self.env.clone();
             env.insert("TOGI_MUTANT".to_string(), mutation.id.to_string());
             let outcome = run_command(
-                &force_go_no_test_cache(selected.argv),
+                &argv,
                 workspace.root(),
                 selected.timeout,
                 self.show_output,
@@ -2326,6 +2346,12 @@ mod tests {
             replacement: "!=".into(),
             byte_range: offset..offset + 2,
         }
+    }
+
+    fn rust_operator_mutation(id: u32, file: &str, source: &str, nth: usize) -> Mutation {
+        let mut mutation = go_operator_mutation(id, file, source, nth);
+        mutation.language = "rust".into();
+        mutation
     }
 
     #[test]
@@ -3528,6 +3554,61 @@ esac
         assert_eq!(report.total, 2);
         assert_eq!(report.results[0].1, MutationResult::Killed);
         assert_eq!(report.results[1].1, MutationResult::Survived);
+    }
+
+    #[test]
+    fn run_with_schemata_executes_rust_mutation_with_active_env() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"schemata_fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .unwrap();
+        let source = "\
+pub fn same(a: i32, b: i32) -> bool { a == b }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn same_values_match() {
+        assert!(same(1, 1));
+        assert!(!same(1, 2));
+    }
+}
+";
+        std::fs::write(dir.path().join("src/lib.rs"), source).unwrap();
+        let mutation = rust_operator_mutation(0, "src/lib.rs", source, 0);
+
+        let runner = TestRunner {
+            commands: CommandConfig {
+                command: vec!["cargo".into(), "test".into(), "--quiet".into()],
+                force_default_command: false,
+                force_default_timeout: false,
+                project_commands: vec![],
+                language_commands: HashMap::new(),
+                build_command: vec![],
+                build_command_explicit: false,
+                timeout: Duration::from_secs(15),
+                language_timeouts: HashMap::new(),
+                test_selection: None,
+            },
+            parallelism: 1,
+            project_root: dir.path().to_path_buf(),
+            verbose: false,
+            show_output: false,
+            max_tested: None,
+            respect_workspace_ignores: true,
+            env: HashMap::new(),
+            cancelled: Arc::new(AtomicBool::new(false)),
+        };
+
+        let report = runner.run_with_schemata(vec![mutation]).report;
+
+        assert_eq!(report.total, 1);
+        assert_eq!(report.results[0].1, MutationResult::Killed);
     }
 
     #[test]
