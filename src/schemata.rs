@@ -7,7 +7,7 @@
 
 use crate::Mutation;
 use crate::operators;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -142,7 +142,7 @@ impl SchemaAdapter for GoSchema {
 
     fn wrap_expression(&self, mutant_id: u32, original: &str, replacement: &str) -> String {
         format!(
-            "func() bool {{ if __togi_active(\"{mutant_id}\") {{ return {replacement} }} return {original} }}()"
+            "func() bool {{ if __togi_active(\"{mutant_id}\") {{ return {replacement} }}; return {original} }}()"
         )
     }
 
@@ -351,23 +351,24 @@ pub fn rewrite_go_files(
     }
 
     let mut rewritten = BTreeMap::new();
-    let mut helper_file_by_dir = BTreeMap::<PathBuf, PathBuf>::new();
+    let mut helper_file_by_package = BTreeMap::<(PathBuf, String), PathBuf>::new();
     for (file, mutations) in by_file {
         let source = std::fs::read_to_string(&file).map_err(|e| {
             SchemaRewriteError::new(format!("could not read {}: {e}", file.display()))
         })?;
+        let package_name = go_package_name(&source)?;
         let rewritten_source = rewrite_go_file(&source, &mutations, adapter)?;
         let dir = file
             .parent()
             .map(Path::to_path_buf)
             .unwrap_or_else(|| project_root.to_path_buf());
-        helper_file_by_dir
-            .entry(dir)
+        helper_file_by_package
+            .entry((dir, package_name))
             .or_insert_with(|| file.clone());
         rewritten.insert(file, rewritten_source);
     }
 
-    for helper_file in helper_file_by_dir.values() {
+    for helper_file in helper_file_by_package.values() {
         if let Some(source) = rewritten.get_mut(helper_file) {
             *source = inject_go_runtime(source, adapter)?;
         }
@@ -569,10 +570,36 @@ enum GoImportDeclaration {
         end: usize,
     },
     Single {
-        import_start: usize,
         path_start: usize,
         end: usize,
     },
+}
+
+impl GoImportDeclaration {
+    fn end(self) -> usize {
+        match self {
+            Self::Block { end, .. } | Self::Single { end, .. } => end,
+        }
+    }
+
+    fn import_text(self, source: &str) -> &str {
+        match self {
+            Self::Block {
+                open_end,
+                close_start,
+                ..
+            } => &source[open_end..close_start],
+            Self::Single { path_start, end } => &source[path_start..end],
+        }
+    }
+}
+
+#[derive(Debug)]
+struct GoImportRegion {
+    declarations: Vec<GoImportDeclaration>,
+    imports: BTreeSet<String>,
+    new_import_block_offset: usize,
+    runtime_insert_offset: usize,
 }
 
 fn ensure_go_imports(mut source: String, imports: &[&str]) -> Result<String, SchemaRewriteError> {
@@ -585,98 +612,150 @@ fn ensure_go_imports(mut source: String, imports: &[&str]) -> Result<String, Sch
         return Ok(source);
     }
 
-    let package_end = go_package_decl_end(&source)?;
-    match go_import_declaration(&source, package_end) {
-        Some(GoImportDeclaration::Block {
-            import_start,
-            open_end,
-            close_start,
-            end,
-        }) => {
-            let body = &source[open_end..close_start];
-            if body.contains('\n') {
-                let insertion = missing
-                    .iter()
-                    .map(|import| format!("\n    \"{import}\""))
-                    .collect::<String>();
-                source.insert_str(open_end, &insertion);
-            } else {
-                let existing_imports = body.trim();
-                let mut replacement = String::from("import (\n");
-                for import in missing {
-                    replacement.push_str(&format!("    \"{import}\"\n"));
-                }
-                if !existing_imports.is_empty() {
-                    replacement.push_str("    ");
-                    replacement.push_str(existing_imports);
-                    replacement.push('\n');
-                }
-                replacement.push(')');
-                source.replace_range(import_start..end, &replacement);
-            }
-            return Ok(source);
-        }
-        Some(GoImportDeclaration::Single {
-            import_start,
-            path_start,
-            end,
-        }) => {
-            let existing_import = source[path_start..end].trim();
-            let mut replacement = String::from("import (\n");
-            for import in missing {
-                replacement.push_str(&format!("    \"{import}\"\n"));
-            }
-            replacement.push_str("    ");
-            replacement.push_str(existing_import);
-            replacement.push_str("\n)");
-            source.replace_range(import_start..end, &replacement);
-            return Ok(source);
-        }
-        None => {}
-    }
-
-    let import_block = missing
+    let region = go_import_region(&source)?;
+    if let Some(block) = region
+        .declarations
         .iter()
-        .map(|import| format!("    \"{import}\"\n"))
-        .collect::<String>();
-    source.insert_str(package_end, &format!("\nimport (\n{import_block})\n"));
+        .rev()
+        .copied()
+        .find(|declaration| matches!(declaration, GoImportDeclaration::Block { .. }))
+    {
+        insert_missing_go_imports_into_block(&mut source, block, &missing);
+    } else {
+        let import_block =
+            go_import_block_for_insert(&source, region.new_import_block_offset, &missing);
+        source.insert_str(region.new_import_block_offset, &import_block);
+    }
     Ok(source)
 }
 
 fn go_source_imports(source: &str, import: &str) -> bool {
-    let Ok(package_end) = go_package_decl_end(source) else {
-        return false;
-    };
-    let needle = format!("\"{import}\"");
-    match go_import_declaration(source, package_end) {
-        Some(GoImportDeclaration::Block {
-            open_end,
-            close_start,
-            ..
-        }) => source[open_end..close_start].contains(&needle),
-        Some(GoImportDeclaration::Single {
-            path_start, end, ..
-        }) => source[path_start..end].contains(&needle),
-        None => false,
+    match go_import_region(source) {
+        Ok(region) => region.imports.contains(import),
+        Err(_) => false,
     }
 }
 
 fn go_runtime_insert_offset(source: &str) -> Result<usize, SchemaRewriteError> {
-    let package_end = go_package_decl_end(source)?;
-    match go_import_declaration(source, package_end) {
-        Some(GoImportDeclaration::Block { end, .. } | GoImportDeclaration::Single { end, .. }) => {
-            let mut offset = end;
-            if source.as_bytes().get(offset) == Some(&b'\n') {
-                offset += 1;
-            }
-            Ok(offset)
+    Ok(go_import_region(source)?.runtime_insert_offset)
+}
+
+fn insert_missing_go_imports_into_block(
+    source: &mut String,
+    declaration: GoImportDeclaration,
+    missing: &[&str],
+) {
+    let GoImportDeclaration::Block {
+        import_start,
+        open_end,
+        close_start,
+        end,
+    } = declaration
+    else {
+        return;
+    };
+
+    let body = &source[open_end..close_start];
+    if body.contains('\n') {
+        let insertion_at = go_import_block_append_offset(source, close_start);
+        let mut insertion = String::new();
+        if insertion_at == open_end
+            || !source
+                .as_bytes()
+                .get(insertion_at.saturating_sub(1))
+                .is_some_and(|byte| *byte == b'\n' || *byte == b'\r')
+        {
+            insertion.push('\n');
         }
-        None => Ok(package_end),
+        for import in missing {
+            insertion.push_str(&format!("    \"{import}\"\n"));
+        }
+        source.insert_str(insertion_at, &insertion);
+    } else {
+        let existing_imports = body.trim();
+        let mut replacement = String::from("import (\n");
+        if !existing_imports.is_empty() {
+            replacement.push_str("    ");
+            replacement.push_str(existing_imports);
+            replacement.push('\n');
+        }
+        for import in missing {
+            replacement.push_str(&format!("    \"{import}\"\n"));
+        }
+        replacement.push(')');
+        source.replace_range(import_start..end, &replacement);
     }
 }
 
-fn go_import_declaration(source: &str, package_end: usize) -> Option<GoImportDeclaration> {
-    let import_start = skip_ascii_whitespace(source, package_end);
+fn go_import_block_append_offset(source: &str, close_start: usize) -> usize {
+    let mut offset = close_start;
+    while offset > 0
+        && source
+            .as_bytes()
+            .get(offset - 1)
+            .is_some_and(|byte| *byte == b' ' || *byte == b'\t')
+    {
+        offset -= 1;
+    }
+    offset
+}
+
+fn go_import_block_for_insert(source: &str, offset: usize, imports: &[&str]) -> String {
+    let mut block = String::new();
+    if offset > 0
+        && !source
+            .as_bytes()
+            .get(offset - 1)
+            .is_some_and(|byte| *byte == b'\n' || *byte == b'\r')
+    {
+        block.push('\n');
+    }
+    block.push_str("import (\n");
+    for import in imports {
+        block.push_str(&format!("    \"{import}\"\n"));
+    }
+    block.push_str(")\n");
+    block
+}
+
+fn go_import_region(source: &str) -> Result<GoImportRegion, SchemaRewriteError> {
+    let package_end = go_package_decl_end(source)?;
+    let mut declarations = Vec::new();
+    let mut imports = BTreeSet::new();
+    let mut offset = package_end;
+    let mut first_declaration_offset = None;
+    let mut runtime_insert_offset = package_end;
+
+    loop {
+        let next = skip_go_import_trivia(source, offset);
+        if first_declaration_offset.is_none() {
+            first_declaration_offset = Some(next);
+        }
+        let Some(declaration) = go_import_declaration(source, next) else {
+            break;
+        };
+
+        collect_go_imports(declaration.import_text(source), &mut imports);
+        runtime_insert_offset = go_import_declaration_end_with_line(source, declaration);
+        offset = runtime_insert_offset;
+        declarations.push(declaration);
+    }
+
+    let new_import_block_offset = if declarations.is_empty() {
+        first_declaration_offset.unwrap_or(package_end)
+    } else {
+        runtime_insert_offset
+    };
+
+    Ok(GoImportRegion {
+        declarations,
+        imports,
+        new_import_block_offset,
+        runtime_insert_offset,
+    })
+}
+
+fn go_import_declaration(source: &str, import_start: usize) -> Option<GoImportDeclaration> {
     let rest = source.get(import_start..)?;
     if !rest.starts_with("import") {
         return None;
@@ -706,10 +785,62 @@ fn go_import_declaration(source: &str, package_end: usize) -> Option<GoImportDec
         .map(|idx| spec_start + idx)
         .unwrap_or(source.len());
     Some(GoImportDeclaration::Single {
-        import_start,
         path_start: spec_start,
         end,
     })
+}
+
+fn go_import_declaration_end_with_line(source: &str, declaration: GoImportDeclaration) -> usize {
+    let mut offset = declaration.end();
+    if source.as_bytes().get(offset) == Some(&b'\r') {
+        offset += 1;
+    }
+    if source.as_bytes().get(offset) == Some(&b'\n') {
+        offset += 1;
+    }
+    offset
+}
+
+fn collect_go_imports(source: &str, imports: &mut BTreeSet<String>) {
+    let bytes = source.as_bytes();
+    let mut offset = 0usize;
+    while let Some(relative_start) = bytes[offset..]
+        .iter()
+        .position(|byte| *byte == b'"' || *byte == b'`')
+    {
+        let start = offset + relative_start;
+        let quote = bytes[start];
+        let Some(relative_end) = bytes[start + 1..].iter().position(|byte| *byte == quote) else {
+            break;
+        };
+        let end = start + 1 + relative_end;
+        imports.insert(source[start + 1..end].to_string());
+        offset = end + 1;
+    }
+}
+
+fn skip_go_import_trivia(source: &str, mut offset: usize) -> usize {
+    loop {
+        offset = skip_ascii_whitespace(source, offset);
+        let Some(rest) = source.get(offset..) else {
+            return offset;
+        };
+        if rest.starts_with("//") {
+            offset = rest
+                .find('\n')
+                .map(|idx| offset + idx + 1)
+                .unwrap_or(source.len());
+            continue;
+        }
+        if rest.starts_with("/*") {
+            offset = rest
+                .find("*/")
+                .map(|idx| offset + idx + 2)
+                .unwrap_or(source.len());
+            continue;
+        }
+        return offset;
+    }
 }
 
 fn go_package_decl_end(source: &str) -> Result<usize, SchemaRewriteError> {
@@ -722,6 +853,29 @@ fn go_package_decl_end(source: &str) -> Result<usize, SchemaRewriteError> {
     }
     if source.trim_start().starts_with("package ") {
         return Ok(source.len());
+    }
+    Err(SchemaRewriteError::new(
+        "could not find Go package declaration",
+    ))
+}
+
+fn go_package_name(source: &str) -> Result<String, SchemaRewriteError> {
+    for line in source.lines() {
+        let trimmed = line.trim_start();
+        let Some(rest) = trimmed.strip_prefix("package") else {
+            continue;
+        };
+        if !rest.as_bytes().first().is_some_and(u8::is_ascii_whitespace) {
+            continue;
+        }
+        let name = rest
+            .trim_start()
+            .split(|character: char| character != '_' && !character.is_ascii_alphanumeric())
+            .next()
+            .unwrap_or_default();
+        if !name.is_empty() {
+            return Ok(name.to_string());
+        }
     }
     Err(SchemaRewriteError::new(
         "could not find Go package declaration",
@@ -954,7 +1108,7 @@ mod tests {
         assert_parsed_node_text(&dir, "calc.go", go, "binary_expression", "a == b");
         assert_eq!(
             go.wrap_expression(42, "a == b", "a != b"),
-            "func() bool { if __togi_active(\"42\") { return a != b } return a == b }()"
+            "func() bool { if __togi_active(\"42\") { return a != b }; return a == b }()"
         );
         assert_eq!(go.required_imports(), &["os"]);
 
@@ -1243,19 +1397,21 @@ mod tests {
         let rewritten = String::from_utf8(rewrites[0].content.clone()).unwrap();
         assert!(rewritten.contains("import (\n    \"os\"\n)"));
         assert!(rewritten.contains("func __togi_active(id string) bool"));
-        assert!(
-            rewritten.contains(
-                "func() bool { if __togi_active(\"7\") { return a != b } return a == b }()"
-            )
-        );
+        assert!(rewritten.contains(
+            "func() bool { if __togi_active(\"7\") { return a != b }; return a == b }()"
+        ));
+        parse_go_source(&rewritten).unwrap();
     }
 
     #[test]
     fn go_import_handling_accepts_spacing_variants() {
         let adapter = adapter_for_language("go").unwrap();
         for (import_decl, expected_imports) in [
-            ("import(\"fmt\")", "import (\n    \"os\"\n    \"fmt\"\n)"),
-            ("import\t\"fmt\"", "import (\n    \"os\"\n    \"fmt\"\n)"),
+            ("import(\"fmt\")", "import (\n    \"fmt\"\n    \"os\"\n)"),
+            (
+                "import\t\"fmt\"",
+                "import\t\"fmt\"\nimport (\n    \"os\"\n)",
+            ),
         ] {
             let source = format!(
                 "package calc\n{import_decl}\nfunc packageName() string {{ return fmt.Sprintf(\"%s\", \"os\") }}\nfunc f(a, b int) bool {{ return a == b }}\n",
@@ -1278,6 +1434,26 @@ mod tests {
                     < rewritten.find("func packageName()").unwrap()
             );
         }
+    }
+
+    #[test]
+    fn go_import_handling_scans_comments_and_multiple_declarations() {
+        let adapter = adapter_for_language("go").unwrap();
+        let source = "package calc\n\n// generated imports\nimport \"fmt\"\n\n// grouped imports\nimport (\n    \"strings\"\n)\n\nfunc packageName() string { return fmt.Sprintf(\"%s\", strings.TrimSpace(\"os\")) }\n";
+        parse_go_source(source).unwrap();
+        assert!(go_source_imports(source, "fmt"));
+        assert!(go_source_imports(source, "strings"));
+        assert!(!go_source_imports(source, "os"));
+
+        let rewritten = inject_go_runtime(source, adapter).unwrap();
+
+        assert!(rewritten.contains("import \"fmt\""));
+        assert!(rewritten.contains("import (\n    \"strings\"\n    \"os\"\n)"));
+        let helper = rewritten.find("func __togi_active(").unwrap();
+        assert!(helper > rewritten.find("\"fmt\"").unwrap());
+        assert!(helper > rewritten.find("\"os\"").unwrap());
+        assert!(helper < rewritten.find("func packageName()").unwrap());
+        parse_go_source(&rewritten).unwrap();
     }
 
     #[test]
@@ -1329,5 +1505,54 @@ mod tests {
             })
             .count();
         assert_eq!(helper_count, 1);
+    }
+
+    #[test]
+    fn rewrite_go_files_injects_helpers_per_directory_and_package() {
+        let dir = TempDir::new().unwrap();
+        let first_source = "package calc\nfunc f(a, b int) bool { return a == b }\n";
+        let second_source = "package calc_test\nfunc g(c, d int) bool { return c == d }\n";
+        write_source(&dir, "calc.go", first_source);
+        write_source(&dir, "calc_test.go", second_source);
+        let first_operator = first_source.find("==").unwrap();
+        let second_operator = second_source.find("==").unwrap();
+        let first = mutation(
+            "go",
+            "calc.go",
+            "==",
+            "!=",
+            first_operator..first_operator + 2,
+            "eq_to_neq",
+        );
+        let second = mutation(
+            "go",
+            "calc_test.go",
+            "==",
+            "!=",
+            second_operator..second_operator + 2,
+            "eq_to_neq",
+        );
+
+        let rewrites = rewrite_go_files(
+            dir.path(),
+            &[
+                SchemaMutation {
+                    mutation: first,
+                    kind: SchemaKind::Expression,
+                },
+                SchemaMutation {
+                    mutation: second,
+                    kind: SchemaKind::Expression,
+                },
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(rewrites.len(), 2);
+        for rewrite in rewrites {
+            let rewritten = String::from_utf8(rewrite.content).unwrap();
+            assert!(rewritten.contains("func __togi_active("));
+            parse_go_source(&rewritten).unwrap();
+        }
     }
 }
