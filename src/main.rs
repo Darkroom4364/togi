@@ -19,6 +19,7 @@ struct CheckConfig {
     jobs: Option<usize>,
     timeout: Option<u64>,
     max_per_run: Option<usize>,
+    schemata: bool,
     dry_run: bool,
     verbose: bool,
     show_output: bool,
@@ -72,6 +73,7 @@ fn main() {
             jobs,
             timeout,
             max_per_run,
+            schemata,
             dry_run,
             verbose,
             show_output,
@@ -97,6 +99,7 @@ fn main() {
                 jobs,
                 timeout,
                 max_per_run,
+                schemata,
                 dry_run,
                 verbose,
                 show_output,
@@ -428,6 +431,9 @@ fn resolve_config(
     if let Some(max) = cfg.max_per_run {
         config.mutations.max_per_run = max;
     }
+    if cfg.schemata {
+        config.mutations.schemata = true;
+    }
     if let Some(cmd) = cfg.test_cmd {
         config.test.command =
             shell_words::split(&cmd).map_err(|e| anyhow::anyhow!("bad --test-cmd: {e}"))?;
@@ -664,6 +670,7 @@ fn execute(
         config.mutations.test_selection_file.as_deref(),
         &project_root,
     );
+    let use_schemata = config.mutations.schemata;
 
     let runner = togi::runner::TestRunner {
         commands: togi::runner::CommandConfig {
@@ -696,7 +703,11 @@ fn execute(
         cancelled: options.cancelled,
     };
 
-    runner.run(mutations)
+    if use_schemata {
+        runner.run_with_schemata(mutations)
+    } else {
+        runner.run(mutations)
+    }
 }
 
 fn load_test_selection(

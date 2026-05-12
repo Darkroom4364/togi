@@ -82,6 +82,8 @@ pub struct MutationConfig {
     pub respect_workspace_ignores: bool,
     #[serde(default)]
     pub operators: Vec<String>,
+    #[serde(default)]
+    pub schemata: bool,
 }
 
 fn default_true() -> bool {
@@ -277,6 +279,7 @@ impl Default for MutationConfig {
             skip_noisy_files: true,
             respect_workspace_ignores: true,
             operators: vec![],
+            schemata: false,
         }
     }
 }
@@ -431,6 +434,7 @@ impl Config {
              [mutations]\n\
              max_per_run = 20\n\
              # max_per_file = 20  # cap mutations per source file (0 = unlimited)\n\
+             # schemata = false  # opt in to supported mutant schemata execution\n\
              # respect_workspace_ignores = true  # honor .ignore/.gitignore in mutation workspaces\n",
         );
 
@@ -470,6 +474,7 @@ base = "origin/develop"
 
 [mutations]
 max_per_run = 50
+schemata = true
 "#;
         let config: Config = toml::from_str(toml_str).unwrap();
         assert_eq!(config.test.command, vec!["make", "test"]);
@@ -477,6 +482,7 @@ max_per_run = 50
         assert_eq!(config.test.jobs, 8);
         assert_eq!(config.diff.base, "origin/develop");
         assert_eq!(config.mutations.max_per_run, 50);
+        assert!(config.mutations.schemata);
     }
 
     #[test]
@@ -529,6 +535,7 @@ commnad = ["cargo", "test"]
         );
         assert!(config.mutations.skip_noisy_files);
         assert!(config.mutations.respect_workspace_ignores);
+        assert!(!config.mutations.schemata);
         let project = &config.projects["api"];
         assert_eq!(project.path, PathBuf::from("services/api"));
         assert_eq!(project.test.as_ref().unwrap().timeout, Some(60));
@@ -552,6 +559,7 @@ commnad = ["cargo", "test"]
         assert!(config.mutations.exclude_paths.is_empty());
         assert!(config.mutations.skip_noisy_files);
         assert!(config.mutations.respect_workspace_ignores);
+        assert!(!config.mutations.schemata);
         assert!(config.projects.is_empty());
     }
 

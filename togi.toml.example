@@ -60,6 +60,11 @@ max_per_run = 20
 # 0 means unlimited.
 max_per_file = 20
 
+# Opt in to supported mutant schemata execution.
+# Type: boolean
+# Default: false
+schemata = false
+
 # Optional LCOV file. When set, togi only keeps mutations on covered lines.
 # Type: string path
 # Default: unset

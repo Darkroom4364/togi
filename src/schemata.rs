@@ -8,6 +8,7 @@
 use crate::Mutation;
 use crate::operators;
 use std::collections::{BTreeMap, HashMap};
+use std::fmt;
 use std::path::{Path, PathBuf};
 
 /// A schema rewrite shape understood by the generic schemata engine.
@@ -39,6 +40,35 @@ pub struct SchemaPlan {
     pub selected: Vec<SchemaMutation>,
     pub fallback: Vec<SchemaFallback>,
 }
+
+/// Rewritten source for one schema-enabled file.
+#[derive(Debug, Clone)]
+pub struct SchemaFileRewrite {
+    pub file: PathBuf,
+    pub content: Vec<u8>,
+}
+
+/// Why schema source rewriting failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SchemaRewriteError {
+    message: String,
+}
+
+impl SchemaRewriteError {
+    pub(crate) fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl fmt::Display for SchemaRewriteError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for SchemaRewriteError {}
 
 /// Why a mutation is not safe for schema execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -290,12 +320,363 @@ pub fn plan(project_root: &Path, mutations: Vec<Mutation>) -> SchemaPlan {
     }
 }
 
+/// Rewrite Go files once so selected mutations can be activated by `TOGI_MUTANT`.
+pub fn rewrite_go_files(
+    project_root: &Path,
+    selected: &[SchemaMutation],
+) -> Result<Vec<SchemaFileRewrite>, SchemaRewriteError> {
+    let Some(adapter) = adapter_for_language("go") else {
+        return Err(SchemaRewriteError::new(
+            "go schema adapter is not available",
+        ));
+    };
+
+    let mut by_file: BTreeMap<PathBuf, Vec<&SchemaMutation>> = BTreeMap::new();
+    for mutation in selected {
+        if mutation.mutation.language != "go" {
+            return Err(SchemaRewriteError::new(format!(
+                "schema rewrite only supports go, got {}",
+                mutation.mutation.language
+            )));
+        }
+        if mutation.kind != SchemaKind::Expression {
+            return Err(SchemaRewriteError::new(
+                "go schema rewrite currently supports expression mutations only",
+            ));
+        }
+        by_file
+            .entry(source_path(project_root, &mutation.mutation.file))
+            .or_default()
+            .push(mutation);
+    }
+
+    let mut rewritten = BTreeMap::new();
+    let mut helper_file_by_dir = BTreeMap::<PathBuf, PathBuf>::new();
+    for (file, mutations) in by_file {
+        let source = std::fs::read_to_string(&file).map_err(|e| {
+            SchemaRewriteError::new(format!("could not read {}: {e}", file.display()))
+        })?;
+        let rewritten_source = rewrite_go_file(&source, &mutations, adapter)?;
+        let dir = file
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| project_root.to_path_buf());
+        helper_file_by_dir
+            .entry(dir)
+            .or_insert_with(|| file.clone());
+        rewritten.insert(file, rewritten_source);
+    }
+
+    for helper_file in helper_file_by_dir.values() {
+        if let Some(source) = rewritten.get_mut(helper_file) {
+            *source = inject_go_runtime(source, adapter)?;
+        }
+    }
+
+    Ok(rewritten
+        .into_iter()
+        .map(|(file, content)| SchemaFileRewrite {
+            file,
+            content: content.into_bytes(),
+        })
+        .collect())
+}
+
 fn source_path(project_root: &Path, mutation_file: &Path) -> PathBuf {
     if mutation_file.is_absolute() {
         mutation_file.to_path_buf()
     } else {
         project_root.join(mutation_file)
     }
+}
+
+fn rewrite_go_file(
+    source: &str,
+    selected: &[&SchemaMutation],
+    adapter: &dyn SchemaAdapter,
+) -> Result<String, SchemaRewriteError> {
+    let source_bytes = source.as_bytes();
+    let tree = parse_go_source(source)?;
+    let mut edits = Vec::with_capacity(selected.len());
+
+    for schema_mutation in selected {
+        let mutation = &schema_mutation.mutation;
+        validate_source_range(mutation, source_bytes).map_err(|reason| {
+            SchemaRewriteError::new(format!(
+                "mutation {} is not rewriteable: {reason:?}",
+                mutation.id
+            ))
+        })?;
+        let expression_range =
+            go_expression_range_for_mutation(tree.root_node(), source, mutation)?;
+        let original = source_slice(source, expression_range.clone())?;
+        let replacement = mutated_expression(source, expression_range.clone(), mutation)?;
+        let wrapped = adapter.wrap_expression(mutation.id, original, &replacement);
+        edits.push((expression_range, wrapped));
+    }
+
+    edits.sort_by_key(|(range, _)| (range.start, range.end));
+    let mut previous_end = 0usize;
+    for (position, (range, _)) in edits.iter().enumerate() {
+        if position > 0 && range.start < previous_end {
+            return Err(SchemaRewriteError::new(
+                "schema mutations overlap after expression expansion",
+            ));
+        }
+        previous_end = range.end;
+    }
+
+    let mut rewritten = source.as_bytes().to_vec();
+    for (range, replacement) in edits.into_iter().rev() {
+        rewritten.splice(range, replacement.bytes());
+    }
+
+    String::from_utf8(rewritten)
+        .map_err(|e| SchemaRewriteError::new(format!("rewritten Go source is not utf-8: {e}")))
+}
+
+fn mutated_expression(
+    source: &str,
+    expression_range: std::ops::Range<usize>,
+    mutation: &Mutation,
+) -> Result<String, SchemaRewriteError> {
+    if mutation.byte_range.start < expression_range.start
+        || mutation.byte_range.end > expression_range.end
+    {
+        return Err(SchemaRewriteError::new(format!(
+            "mutation {} is outside its containing expression",
+            mutation.id
+        )));
+    }
+
+    let mut expression = source.as_bytes()[expression_range.clone()].to_vec();
+    let start = mutation.byte_range.start - expression_range.start;
+    let end = mutation.byte_range.end - expression_range.start;
+    expression.splice(start..end, mutation.replacement.bytes());
+
+    String::from_utf8(expression)
+        .map_err(|e| SchemaRewriteError::new(format!("mutated expression is not utf-8: {e}")))
+}
+
+fn parse_go_source(source: &str) -> Result<tree_sitter::Tree, SchemaRewriteError> {
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&tree_sitter_go::LANGUAGE.into())
+        .map_err(|e| SchemaRewriteError::new(format!("could not load Go grammar: {e}")))?;
+    let tree = parser
+        .parse(source, None)
+        .ok_or_else(|| SchemaRewriteError::new("could not parse Go source"))?;
+    if tree.root_node().has_error() {
+        return Err(SchemaRewriteError::new("Go source contains parse errors"));
+    }
+    Ok(tree)
+}
+
+fn go_expression_range_for_mutation(
+    root: tree_sitter::Node<'_>,
+    source: &str,
+    mutation: &Mutation,
+) -> Result<std::ops::Range<usize>, SchemaRewriteError> {
+    match mutation.operator.as_str() {
+        "eq_to_neq" | "lt_to_lte" | "gt_to_gte" | "and_to_or" | "or_to_and" => {
+            smallest_go_node_range(root, mutation.byte_range.clone(), |node| {
+                node.kind() == "binary_expression"
+            })
+        }
+        "true_to_false" | "false_to_true" => exact_go_node_range(root, mutation.byte_range.clone()),
+        "remove_unary_not" => smallest_go_node_range(root, mutation.byte_range.clone(), |node| {
+            node.kind() == "unary_expression"
+        }),
+        "negate_condition" => {
+            source_slice(source, mutation.byte_range.clone())?;
+            Ok(mutation.byte_range.clone())
+        }
+        _ => Err(SchemaRewriteError::new(format!(
+            "unsupported Go schema operator {}",
+            mutation.operator
+        ))),
+    }
+}
+
+fn smallest_go_node_range(
+    node: tree_sitter::Node<'_>,
+    range: std::ops::Range<usize>,
+    predicate: impl Fn(tree_sitter::Node<'_>) -> bool + Copy,
+) -> Result<std::ops::Range<usize>, SchemaRewriteError> {
+    let mut best = None::<std::ops::Range<usize>>;
+    visit_go_nodes(node, &mut |candidate| {
+        let candidate_range = candidate.byte_range();
+        if candidate_range.start <= range.start
+            && range.end <= candidate_range.end
+            && predicate(candidate)
+            && best
+                .as_ref()
+                .is_none_or(|best| candidate_range.len() < best.len())
+        {
+            best = Some(candidate_range);
+        }
+    });
+    best.ok_or_else(|| SchemaRewriteError::new("could not find containing Go expression"))
+}
+
+fn exact_go_node_range(
+    node: tree_sitter::Node<'_>,
+    range: std::ops::Range<usize>,
+) -> Result<std::ops::Range<usize>, SchemaRewriteError> {
+    let mut found = None;
+    visit_go_nodes(node, &mut |candidate| {
+        if candidate.byte_range() == range {
+            found = Some(range.clone());
+        }
+    });
+    found.ok_or_else(|| SchemaRewriteError::new("could not find Go expression node"))
+}
+
+fn visit_go_nodes(node: tree_sitter::Node<'_>, visit: &mut impl FnMut(tree_sitter::Node<'_>)) {
+    visit(node);
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        visit_go_nodes(child, visit);
+    }
+}
+
+fn source_slice(source: &str, range: std::ops::Range<usize>) -> Result<&str, SchemaRewriteError> {
+    std::str::from_utf8(&source.as_bytes()[range])
+        .map_err(|e| SchemaRewriteError::new(format!("source slice is not utf-8: {e}")))
+}
+
+fn inject_go_runtime(
+    source: &str,
+    adapter: &dyn SchemaAdapter,
+) -> Result<String, SchemaRewriteError> {
+    if source.contains("func __togi_active(") {
+        return Ok(source.to_string());
+    }
+    let source = ensure_go_imports(source.to_string(), adapter.required_imports())?;
+    let insert_at = go_runtime_insert_offset(&source)?;
+    let helper = adapter.runtime_helper().trim();
+    let mut rewritten = source;
+    rewritten.insert_str(insert_at, &format!("\n{helper}\n"));
+    Ok(rewritten)
+}
+
+fn ensure_go_imports(mut source: String, imports: &[&str]) -> Result<String, SchemaRewriteError> {
+    let missing: Vec<&str> = imports
+        .iter()
+        .copied()
+        .filter(|import| !go_source_imports(&source, import))
+        .collect();
+    if missing.is_empty() {
+        return Ok(source);
+    }
+
+    let package_end = go_package_decl_end(&source)?;
+    let import_start = skip_ascii_whitespace(&source, package_end);
+    if source[import_start..].starts_with("import (") {
+        let open_end = import_start + "import (".len();
+        let insertion = missing
+            .iter()
+            .map(|import| format!("\n    \"{import}\""))
+            .collect::<String>();
+        source.insert_str(open_end, &insertion);
+        return Ok(source);
+    }
+
+    if source[import_start..].starts_with("import ") {
+        let line_end = source[import_start..]
+            .find('\n')
+            .map(|idx| import_start + idx)
+            .unwrap_or(source.len());
+        let existing_import = source[import_start + "import ".len()..line_end].trim();
+        let mut replacement = String::from("import (\n");
+        for import in missing {
+            replacement.push_str(&format!("    \"{import}\"\n"));
+        }
+        replacement.push_str("    ");
+        replacement.push_str(existing_import);
+        replacement.push_str("\n)");
+        source.replace_range(import_start..line_end, &replacement);
+        return Ok(source);
+    }
+
+    let import_block = missing
+        .iter()
+        .map(|import| format!("    \"{import}\"\n"))
+        .collect::<String>();
+    source.insert_str(package_end, &format!("\nimport (\n{import_block})\n"));
+    Ok(source)
+}
+
+fn go_source_imports(source: &str, import: &str) -> bool {
+    let Ok(package_end) = go_package_decl_end(source) else {
+        return false;
+    };
+    let import_start = skip_ascii_whitespace(source, package_end);
+    let needle = format!("\"{import}\"");
+    if source[import_start..].starts_with("import (") {
+        let rest = &source[import_start..];
+        return rest
+            .find("\n)")
+            .is_some_and(|close| rest[..close + 2].contains(&needle));
+    }
+    if source[import_start..].starts_with("import ") {
+        let line_end = source[import_start..]
+            .find('\n')
+            .map(|idx| import_start + idx)
+            .unwrap_or(source.len());
+        return source[import_start..line_end].contains(&needle);
+    }
+    false
+}
+
+fn go_runtime_insert_offset(source: &str) -> Result<usize, SchemaRewriteError> {
+    let package_end = go_package_decl_end(source)?;
+    let import_start = skip_ascii_whitespace(source, package_end);
+    if source[import_start..].starts_with("import (") {
+        let rest = &source[import_start..];
+        let close = rest
+            .find("\n)")
+            .ok_or_else(|| SchemaRewriteError::new("could not find end of Go import block"))?;
+        let mut offset = import_start + close + 2;
+        if source.as_bytes().get(offset) == Some(&b'\n') {
+            offset += 1;
+        }
+        return Ok(offset);
+    }
+    if source[import_start..].starts_with("import ") {
+        return Ok(source[import_start..]
+            .find('\n')
+            .map(|idx| import_start + idx + 1)
+            .unwrap_or(source.len()));
+    }
+    Ok(package_end)
+}
+
+fn go_package_decl_end(source: &str) -> Result<usize, SchemaRewriteError> {
+    let mut offset = 0usize;
+    for line in source.split_inclusive('\n') {
+        if line.trim_start().starts_with("package ") {
+            return Ok(offset + line.len());
+        }
+        offset += line.len();
+    }
+    if source.trim_start().starts_with("package ") {
+        return Ok(source.len());
+    }
+    Err(SchemaRewriteError::new(
+        "could not find Go package declaration",
+    ))
+}
+
+fn skip_ascii_whitespace(source: &str, mut offset: usize) -> usize {
+    while source
+        .as_bytes()
+        .get(offset)
+        .is_some_and(u8::is_ascii_whitespace)
+    {
+        offset += 1;
+    }
+    offset
 }
 
 fn schema_kind_for_operator(operator: &str) -> Option<SchemaKind> {
@@ -772,5 +1153,91 @@ mod tests {
         assert_eq!(plan.selected.len(), 1);
         assert_eq!(plan.fallback.len(), 1);
         assert_eq!(plan.fallback[0].reason, SchemaSkipReason::OverlappingRange);
+    }
+
+    #[test]
+    fn rewrite_go_files_expands_operator_mutation_to_expression_wrapper() {
+        let dir = TempDir::new().unwrap();
+        let source = "package calc\nfunc packageName() string { return \"os\" }\nfunc f(a, b int) bool { return a == b }\n";
+        write_source(&dir, "calc.go", source);
+        let operator = source.find("==").unwrap();
+        let mutation = mutation(
+            "go",
+            "calc.go",
+            "==",
+            "!=",
+            operator..operator + 2,
+            "eq_to_neq",
+        );
+
+        let rewrites = rewrite_go_files(
+            dir.path(),
+            &[SchemaMutation {
+                mutation,
+                kind: SchemaKind::Expression,
+            }],
+        )
+        .unwrap();
+
+        assert_eq!(rewrites.len(), 1);
+        let rewritten = String::from_utf8(rewrites[0].content.clone()).unwrap();
+        assert!(rewritten.contains("import (\n    \"os\"\n)"));
+        assert!(rewritten.contains("func __togi_active(id string) bool"));
+        assert!(
+            rewritten.contains(
+                "func() bool { if __togi_active(\"7\") { return a != b } return a == b }()"
+            )
+        );
+    }
+
+    #[test]
+    fn rewrite_go_files_injects_one_helper_per_package_directory() {
+        let dir = TempDir::new().unwrap();
+        let first_source = "package calc\nfunc f(a, b int) bool { return a == b }\n";
+        let second_source = "package calc\nfunc g(c, d int) bool { return c == d }\n";
+        write_source(&dir, "first.go", first_source);
+        write_source(&dir, "second.go", second_source);
+        let first_operator = first_source.find("==").unwrap();
+        let second_operator = second_source.find("==").unwrap();
+        let first = mutation(
+            "go",
+            "first.go",
+            "==",
+            "!=",
+            first_operator..first_operator + 2,
+            "eq_to_neq",
+        );
+        let second = mutation(
+            "go",
+            "second.go",
+            "==",
+            "!=",
+            second_operator..second_operator + 2,
+            "eq_to_neq",
+        );
+
+        let rewrites = rewrite_go_files(
+            dir.path(),
+            &[
+                SchemaMutation {
+                    mutation: first,
+                    kind: SchemaKind::Expression,
+                },
+                SchemaMutation {
+                    mutation: second,
+                    kind: SchemaKind::Expression,
+                },
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(rewrites.len(), 2);
+        let helper_count = rewrites
+            .iter()
+            .filter(|rewrite| {
+                String::from_utf8_lossy(&rewrite.content).contains("func __togi_active(")
+            })
+            .count();
+        assert_eq!(helper_count, 1);
     }
 }
