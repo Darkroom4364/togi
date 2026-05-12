@@ -124,6 +124,28 @@ struct RustSchema;
 struct PythonSchema;
 struct TypeScriptSchema;
 
+const RUST_OPERATOR_ALLOWLIST: &[&str] = &[
+    "eq_to_neq",
+    "lt_to_lte",
+    "gt_to_gte",
+    "and_to_or",
+    "or_to_and",
+    "mul_to_div",
+    "div_to_mul",
+    "mod_to_mul",
+    "plus_to_minus",
+    "minus_to_plus",
+    "true_to_false",
+    "false_to_true",
+    "zero_to_one",
+    "string_to_empty",
+    "increment_numeric",
+    "decrement_numeric",
+    "remove_unary_not",
+    "remove_unary_neg",
+    "negate_condition",
+];
+
 impl SchemaAdapter for GoSchema {
     fn language(&self) -> &str {
         "go"
@@ -200,13 +222,10 @@ where
         if rust_line_looks_compile_time(mutation, source) {
             return Err(SchemaSkipReason::CompileTimeContext);
         }
-        match mutation.operator.as_str() {
-            "eq_to_neq" | "lt_to_lte" | "gt_to_gte" | "and_to_or" | "or_to_and" | "mul_to_div"
-            | "div_to_mul" | "mod_to_mul" | "plus_to_minus" | "minus_to_plus" | "true_to_false"
-            | "false_to_true" | "zero_to_one" | "string_to_empty" | "increment_numeric"
-            | "decrement_numeric" | "remove_unary_not" | "remove_unary_neg"
-            | "negate_condition" => Ok(SchemaKind::Expression),
-            _ => Err(SchemaSkipReason::UnsupportedOperator),
+        if RUST_OPERATOR_ALLOWLIST.contains(&mutation.operator.as_str()) {
+            Ok(SchemaKind::Expression)
+        } else {
+            Err(SchemaSkipReason::UnsupportedOperator)
         }
     }
 
@@ -624,6 +643,13 @@ fn rust_expression_range_for_mutation(
     source: &str,
     mutation: &Mutation,
 ) -> Result<std::ops::Range<usize>, SchemaRewriteError> {
+    if !RUST_OPERATOR_ALLOWLIST.contains(&mutation.operator.as_str()) {
+        return Err(SchemaRewriteError::new(format!(
+            "unsupported Rust schema operator {}",
+            mutation.operator
+        )));
+    }
+
     match mutation.operator.as_str() {
         "eq_to_neq" | "lt_to_lte" | "gt_to_gte" | "and_to_or" | "or_to_and" | "mul_to_div"
         | "div_to_mul" | "mod_to_mul" | "plus_to_minus" | "minus_to_plus" => {
@@ -645,7 +671,7 @@ fn rust_expression_range_for_mutation(
             Ok(mutation.byte_range.clone())
         }
         _ => Err(SchemaRewriteError::new(format!(
-            "unsupported Rust schema operator {}",
+            "accepted Rust schema operator has no rewrite strategy: {}",
             mutation.operator
         ))),
     }
@@ -764,15 +790,35 @@ fn inject_rust_runtime(source: &str, adapter: &dyn SchemaAdapter) -> String {
 
 fn rust_runtime_insert_offset(source: &str) -> usize {
     let mut offset = 0usize;
-    for line in source.split_inclusive('\n') {
+    let mut lines = source.split_inclusive('\n');
+
+    while let Some(line) = lines.next() {
         let trimmed = line.trim_start();
-        if trimmed.is_empty() || trimmed.starts_with("//") || trimmed.starts_with("#![") {
+        if trimmed.is_empty() || trimmed.starts_with("//") {
             offset += line.len();
+        } else if trimmed.starts_with("#![") {
+            let mut balance = square_bracket_balance(line);
+            offset += line.len();
+            while balance > 0 {
+                let Some(line) = lines.next() else {
+                    break;
+                };
+                balance += square_bracket_balance(line);
+                offset += line.len();
+            }
         } else {
             break;
         }
     }
     offset
+}
+
+fn square_bracket_balance(line: &str) -> i32 {
+    line.chars().fold(0, |balance, character| match character {
+        '[' => balance + 1,
+        ']' => balance - 1,
+        _ => balance,
+    })
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1647,6 +1693,40 @@ mod tests {
         assert!(rewritten.contains("fn __togi_active(id: u32) -> bool"));
         assert!(
             rewritten.contains("__togi_select(7, || { a == b }, || { a != b })"),
+            "{rewritten}"
+        );
+        parse_rust_source(&rewritten).unwrap();
+    }
+
+    #[test]
+    fn rewrite_rust_files_inserts_helper_after_multiline_inner_attribute() {
+        let dir = TempDir::new().unwrap();
+        let source = "#![doc(\n    html_logo_url = \"https://example.com/logo.png\"\n)]\npub fn f(a: i32, b: i32) -> bool { a == b }\n";
+        write_source(&dir, "src/lib.rs", source);
+        let operator = source.find("==").unwrap();
+        let mutation = mutation(
+            "rust",
+            "src/lib.rs",
+            "==",
+            "!=",
+            operator..operator + 2,
+            "eq_to_neq",
+        );
+
+        let rewrites = rewrite_rust_files(
+            dir.path(),
+            &[SchemaMutation {
+                mutation,
+                kind: SchemaKind::Expression,
+            }],
+        )
+        .unwrap();
+
+        let rewritten = String::from_utf8(rewrites[0].content.clone()).unwrap();
+        assert!(
+            rewritten.starts_with(
+                "#![doc(\n    html_logo_url = \"https://example.com/logo.png\"\n)]\n#[allow(dead_code)]\n"
+            ),
             "{rewritten}"
         );
         parse_rust_source(&rewritten).unwrap();
