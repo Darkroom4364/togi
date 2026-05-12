@@ -560,6 +560,21 @@ fn inject_go_runtime(
     Ok(rewritten)
 }
 
+#[derive(Debug, Clone, Copy)]
+enum GoImportDeclaration {
+    Block {
+        import_start: usize,
+        open_end: usize,
+        close_start: usize,
+        end: usize,
+    },
+    Single {
+        import_start: usize,
+        path_start: usize,
+        end: usize,
+    },
+}
+
 fn ensure_go_imports(mut source: String, imports: &[&str]) -> Result<String, SchemaRewriteError> {
     let missing: Vec<&str> = imports
         .iter()
@@ -571,32 +586,53 @@ fn ensure_go_imports(mut source: String, imports: &[&str]) -> Result<String, Sch
     }
 
     let package_end = go_package_decl_end(&source)?;
-    let import_start = skip_ascii_whitespace(&source, package_end);
-    if source[import_start..].starts_with("import (") {
-        let open_end = import_start + "import (".len();
-        let insertion = missing
-            .iter()
-            .map(|import| format!("\n    \"{import}\""))
-            .collect::<String>();
-        source.insert_str(open_end, &insertion);
-        return Ok(source);
-    }
-
-    if source[import_start..].starts_with("import ") {
-        let line_end = source[import_start..]
-            .find('\n')
-            .map(|idx| import_start + idx)
-            .unwrap_or(source.len());
-        let existing_import = source[import_start + "import ".len()..line_end].trim();
-        let mut replacement = String::from("import (\n");
-        for import in missing {
-            replacement.push_str(&format!("    \"{import}\"\n"));
+    match go_import_declaration(&source, package_end) {
+        Some(GoImportDeclaration::Block {
+            import_start,
+            open_end,
+            close_start,
+            end,
+        }) => {
+            let body = &source[open_end..close_start];
+            if body.contains('\n') {
+                let insertion = missing
+                    .iter()
+                    .map(|import| format!("\n    \"{import}\""))
+                    .collect::<String>();
+                source.insert_str(open_end, &insertion);
+            } else {
+                let existing_imports = body.trim();
+                let mut replacement = String::from("import (\n");
+                for import in missing {
+                    replacement.push_str(&format!("    \"{import}\"\n"));
+                }
+                if !existing_imports.is_empty() {
+                    replacement.push_str("    ");
+                    replacement.push_str(existing_imports);
+                    replacement.push('\n');
+                }
+                replacement.push(')');
+                source.replace_range(import_start..end, &replacement);
+            }
+            return Ok(source);
         }
-        replacement.push_str("    ");
-        replacement.push_str(existing_import);
-        replacement.push_str("\n)");
-        source.replace_range(import_start..line_end, &replacement);
-        return Ok(source);
+        Some(GoImportDeclaration::Single {
+            import_start,
+            path_start,
+            end,
+        }) => {
+            let existing_import = source[path_start..end].trim();
+            let mut replacement = String::from("import (\n");
+            for import in missing {
+                replacement.push_str(&format!("    \"{import}\"\n"));
+            }
+            replacement.push_str("    ");
+            replacement.push_str(existing_import);
+            replacement.push_str("\n)");
+            source.replace_range(import_start..end, &replacement);
+            return Ok(source);
+        }
+        None => {}
     }
 
     let import_block = missing
@@ -611,45 +647,69 @@ fn go_source_imports(source: &str, import: &str) -> bool {
     let Ok(package_end) = go_package_decl_end(source) else {
         return false;
     };
-    let import_start = skip_ascii_whitespace(source, package_end);
     let needle = format!("\"{import}\"");
-    if source[import_start..].starts_with("import (") {
-        let rest = &source[import_start..];
-        return rest
-            .find("\n)")
-            .is_some_and(|close| rest[..close + 2].contains(&needle));
+    match go_import_declaration(source, package_end) {
+        Some(GoImportDeclaration::Block {
+            open_end,
+            close_start,
+            ..
+        }) => source[open_end..close_start].contains(&needle),
+        Some(GoImportDeclaration::Single {
+            path_start, end, ..
+        }) => source[path_start..end].contains(&needle),
+        None => false,
     }
-    if source[import_start..].starts_with("import ") {
-        let line_end = source[import_start..]
-            .find('\n')
-            .map(|idx| import_start + idx)
-            .unwrap_or(source.len());
-        return source[import_start..line_end].contains(&needle);
-    }
-    false
 }
 
 fn go_runtime_insert_offset(source: &str) -> Result<usize, SchemaRewriteError> {
     let package_end = go_package_decl_end(source)?;
-    let import_start = skip_ascii_whitespace(source, package_end);
-    if source[import_start..].starts_with("import (") {
-        let rest = &source[import_start..];
-        let close = rest
-            .find("\n)")
-            .ok_or_else(|| SchemaRewriteError::new("could not find end of Go import block"))?;
-        let mut offset = import_start + close + 2;
-        if source.as_bytes().get(offset) == Some(&b'\n') {
-            offset += 1;
+    match go_import_declaration(source, package_end) {
+        Some(GoImportDeclaration::Block { end, .. } | GoImportDeclaration::Single { end, .. }) => {
+            let mut offset = end;
+            if source.as_bytes().get(offset) == Some(&b'\n') {
+                offset += 1;
+            }
+            Ok(offset)
         }
-        return Ok(offset);
+        None => Ok(package_end),
     }
-    if source[import_start..].starts_with("import ") {
-        return Ok(source[import_start..]
-            .find('\n')
-            .map(|idx| import_start + idx + 1)
-            .unwrap_or(source.len()));
+}
+
+fn go_import_declaration(source: &str, package_end: usize) -> Option<GoImportDeclaration> {
+    let import_start = skip_ascii_whitespace(source, package_end);
+    let rest = source.get(import_start..)?;
+    if !rest.starts_with("import") {
+        return None;
     }
-    Ok(package_end)
+
+    let keyword_end = import_start + "import".len();
+    match source.as_bytes().get(keyword_end) {
+        Some(byte) if byte.is_ascii_whitespace() || *byte == b'(' => {}
+        _ => return None,
+    }
+
+    let spec_start = skip_ascii_whitespace(source, keyword_end);
+    if source.as_bytes().get(spec_start) == Some(&b'(') {
+        let open_end = spec_start + 1;
+        let close_start = source[open_end..].find(')')? + open_end;
+        return Some(GoImportDeclaration::Block {
+            import_start,
+            open_end,
+            close_start,
+            end: close_start + 1,
+        });
+    }
+
+    source.as_bytes().get(spec_start)?;
+    let end = source[spec_start..]
+        .find('\n')
+        .map(|idx| spec_start + idx)
+        .unwrap_or(source.len());
+    Some(GoImportDeclaration::Single {
+        import_start,
+        path_start: spec_start,
+        end,
+    })
 }
 
 fn go_package_decl_end(source: &str) -> Result<usize, SchemaRewriteError> {
@@ -1188,6 +1248,36 @@ mod tests {
                 "func() bool { if __togi_active(\"7\") { return a != b } return a == b }()"
             )
         );
+    }
+
+    #[test]
+    fn go_import_handling_accepts_spacing_variants() {
+        let adapter = adapter_for_language("go").unwrap();
+        for (import_decl, expected_imports) in [
+            ("import(\"fmt\")", "import (\n    \"os\"\n    \"fmt\"\n)"),
+            ("import\t\"fmt\"", "import (\n    \"os\"\n    \"fmt\"\n)"),
+        ] {
+            let source = format!(
+                "package calc\n{import_decl}\nfunc packageName() string {{ return fmt.Sprintf(\"%s\", \"os\") }}\nfunc f(a, b int) bool {{ return a == b }}\n",
+            );
+            parse_go_source(&source).unwrap();
+            assert!(go_source_imports(&source, "fmt"));
+            assert!(!go_source_imports(&source, "os"));
+
+            let rewritten = inject_go_runtime(&source, adapter).unwrap();
+
+            assert!(
+                rewritten.contains(expected_imports),
+                "rewritten source did not contain {expected_imports:?}:\n{rewritten}"
+            );
+            parse_go_source(&rewritten).unwrap_or_else(|error| {
+                panic!("rewritten source failed to parse: {error:?}\n{rewritten}")
+            });
+            assert!(
+                rewritten.find("func __togi_active(").unwrap()
+                    < rewritten.find("func packageName()").unwrap()
+            );
+        }
     }
 
     #[test]
