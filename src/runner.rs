@@ -586,21 +586,69 @@ fn update_cache_hash(hasher: &mut impl Hasher, bytes: &[u8]) {
     hasher.write(bytes);
 }
 
-fn source_content_cache(project_root: &Path, mutations: &[Mutation]) -> HashMap<String, Vec<u8>> {
-    let mut contents = HashMap::new();
-    for mutation in mutations {
-        let key = normalized_cache_path(project_root, &mutation.file);
-        if contents.contains_key(&key) {
-            continue;
-        }
-        let Ok(file_path) = validate_and_resolve_mutation_path(project_root, &mutation.file) else {
-            continue;
+#[derive(Default)]
+struct SourceContentCache {
+    contents: Mutex<HashMap<String, Option<Vec<u8>>>>,
+}
+
+impl SourceContentCache {
+    fn content_for(&self, project_root: &Path, mutation_file: &Path) -> Option<Vec<u8>> {
+        let key = normalized_cache_path(project_root, mutation_file);
+        let Ok(mut contents) = self.contents.lock() else {
+            eprintln!("warning: source content cache mutex poisoned");
+            return read_source_content(project_root, mutation_file);
         };
-        if let Ok(content) = fs::read(file_path) {
-            contents.insert(key, content);
+        if let Some(content) = contents.get(&key) {
+            return content.clone();
         }
+
+        let content = read_source_content(project_root, mutation_file);
+        contents.insert(key, content.clone());
+        content
     }
-    contents
+
+    #[cfg(test)]
+    fn cached_entry_count(&self) -> usize {
+        self.contents
+            .lock()
+            .expect("source content cache mutex poisoned")
+            .len()
+    }
+}
+
+fn read_source_content(project_root: &Path, mutation_file: &Path) -> Option<Vec<u8>> {
+    let Ok(file_path) = validate_and_resolve_mutation_path(project_root, mutation_file) else {
+        return None;
+    };
+    #[cfg(test)]
+    notify_source_content_read(&file_path);
+    fs::read(file_path).ok()
+}
+
+#[cfg(test)]
+type SourceContentReadHook = Arc<dyn Fn(&Path) + Send + Sync + 'static>;
+
+#[cfg(test)]
+static SOURCE_CONTENT_READ_HOOK: std::sync::OnceLock<Mutex<Option<SourceContentReadHook>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+fn set_source_content_read_hook(hook: Option<SourceContentReadHook>) {
+    let lock = SOURCE_CONTENT_READ_HOOK.get_or_init(|| Mutex::new(None));
+    *lock.lock().expect("source content read hook poisoned") = hook;
+}
+
+#[cfg(test)]
+fn notify_source_content_read(path: &Path) {
+    let Some(lock) = SOURCE_CONTENT_READ_HOOK.get() else {
+        return;
+    };
+    let Ok(hook) = lock.lock() else {
+        return;
+    };
+    if let Some(hook) = hook.as_ref() {
+        hook(path);
+    }
 }
 
 pub(crate) fn copy_workspace(project_root: &Path) -> std::io::Result<WorkspaceCopy> {
@@ -824,7 +872,7 @@ struct RunShared<'a> {
     cancelled: &'a AtomicBool,
     respect_workspace_ignores: bool,
     cache_context_fingerprint: u64,
-    source_contents: &'a HashMap<String, Vec<u8>>,
+    source_contents: &'a SourceContentCache,
 }
 
 fn run_queued_mutation(
@@ -851,15 +899,17 @@ fn run_queued_mutation(
     );
 
     // Check cache before acquiring a workspace slot.
-    let source_key = normalized_cache_path(shared.project_root, &mutation.file);
-    let cache_key = shared.source_contents.get(&source_key).map(|content| {
-        CacheKey::new(
-            content,
-            &cache_identity(shared.project_root, &mutation),
-            &mutation.description,
-            &cache_ctx,
-        )
-    });
+    let cache_key = shared
+        .source_contents
+        .content_for(shared.project_root, &mutation.file)
+        .map(|content| {
+            CacheKey::new(
+                &content,
+                &cache_identity(shared.project_root, &mutation),
+                &mutation.description,
+                &cache_ctx,
+            )
+        });
     if let Some(ref key) = cache_key {
         if let Some(result) = cache::lookup(shared.project_root, key) {
             reservation.release();
@@ -1117,7 +1167,7 @@ impl TestRunner {
             }
         };
 
-        let source_contents = source_content_cache(&self.project_root, &mutations);
+        let source_contents = SourceContentCache::default();
         let project_root = Arc::new(self.project_root.clone());
         let build_command = Arc::new(self.commands.build_command.clone());
         let build_command_explicit = self.commands.build_command_explicit;
@@ -2310,7 +2360,7 @@ mod tests {
     }
 
     #[test]
-    fn source_content_cache_reads_each_file_once() {
+    fn source_content_cache_reads_each_file_once_lazily() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("src.txt");
         std::fs::write(&file, b"hello world").unwrap();
@@ -2321,15 +2371,18 @@ mod tests {
         second.id = 2;
         second.byte_range = 6..11;
 
-        let cache = source_content_cache(dir.path(), &[first, second]);
+        let cache = SourceContentCache::default();
 
-        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.cached_entry_count(), 0);
         assert_eq!(
-            cache
-                .get(&normalized_cache_path(dir.path(), &file))
-                .unwrap(),
+            cache.content_for(dir.path(), &first.file).unwrap(),
             b"hello world"
         );
+        assert_eq!(
+            cache.content_for(dir.path(), &second.file).unwrap(),
+            b"hello world"
+        );
+        assert_eq!(cache.cached_entry_count(), 1);
     }
 
     #[test]
@@ -3582,6 +3635,73 @@ sleep 0.2
         assert_eq!(
             runs, 1,
             "max_tested should reserve before execution, not after commands finish"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn max_tested_does_not_read_sources_for_unscheduled_mutations() {
+        struct ReadHookGuard;
+
+        impl Drop for ReadHookGuard {
+            fn drop(&mut self) {
+                set_source_content_read_hook(None);
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let mutations: Vec<Mutation> = (0..25)
+            .map(|i| {
+                let file = dir.path().join(format!("mutation{i}.txt"));
+                std::fs::write(&file, b"hello world").unwrap();
+                let mut mutation = make_test_mutation(&file);
+                mutation.id = i;
+                mutation.description = format!("lazy setup {i}");
+                mutation
+            })
+            .collect();
+
+        let reads = Arc::new(AtomicUsize::new(0));
+        let root = dir.path().to_path_buf();
+        let reads_for_hook = reads.clone();
+        set_source_content_read_hook(Some(Arc::new(move |path: &Path| {
+            if path.starts_with(&root) {
+                reads_for_hook.fetch_add(1, Ordering::SeqCst);
+            }
+        })));
+        let _guard = ReadHookGuard;
+
+        let runner = TestRunner {
+            commands: CommandConfig {
+                command: vec!["true".into()],
+                force_default_command: false,
+                force_default_timeout: false,
+                project_commands: vec![],
+                language_commands: HashMap::new(),
+                build_command: vec![],
+                build_command_explicit: false,
+                timeout: Duration::from_secs(5),
+                language_timeouts: HashMap::new(),
+                test_selection: None,
+            },
+            parallelism: 8,
+            project_root: dir.path().to_path_buf(),
+            verbose: false,
+            show_output: false,
+            max_tested: Some(1),
+            respect_workspace_ignores: true,
+            env: HashMap::new(),
+            cancelled: Arc::new(AtomicBool::new(false)),
+        };
+
+        let report = runner.run(mutations).report;
+
+        assert_eq!(report.total, 1);
+        assert_eq!(report.survived, 1);
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            1,
+            "source content should be read only after a mutation reserves execution budget"
         );
     }
 
