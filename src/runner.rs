@@ -1028,6 +1028,63 @@ fn record_progress(
 impl TestRunner {
     #[allow(clippy::manual_is_multiple_of)]
     pub fn run(&self, mutations: Vec<Mutation>) -> RunOutcome {
+        self.run_regular(mutations)
+    }
+
+    pub fn run_with_schemata(&self, mutations: Vec<Mutation>) -> RunOutcome {
+        let start = Instant::now();
+        if mutations.is_empty() {
+            return self.outcome_from_results(Vec::new(), start.elapsed());
+        }
+
+        let index_by_id: HashMap<u32, usize> = mutations
+            .iter()
+            .enumerate()
+            .map(|(index, mutation)| (mutation.id, index))
+            .collect();
+        let plan = crate::schemata::plan(&self.project_root, mutations);
+        let mut schema_mutations = Vec::new();
+        let mut fallback_mutations = Vec::new();
+
+        for schema_mutation in plan.selected {
+            if schema_mutation.mutation.language == "go" {
+                schema_mutations.push(schema_mutation);
+            } else {
+                fallback_mutations.push(schema_mutation.mutation);
+            }
+        }
+        fallback_mutations.extend(plan.fallback.into_iter().map(|fallback| fallback.mutation));
+
+        if schema_mutations.is_empty() {
+            return self.run_regular(fallback_mutations);
+        }
+
+        let mut all_results = Vec::new();
+        match self.run_go_schema_mutations(&schema_mutations) {
+            Ok(results) => all_results.extend(results),
+            Err(err) => {
+                eprintln!("warning: could not run Go schemata: {err} — falling back");
+                fallback_mutations.extend(
+                    schema_mutations
+                        .into_iter()
+                        .map(|schema_mutation| schema_mutation.mutation),
+                );
+            }
+        }
+
+        if !self.cancelled.load(Ordering::Acquire) && !fallback_mutations.is_empty() {
+            let fallback = self.run_regular(fallback_mutations);
+            all_results.extend(fallback.report.results);
+        }
+
+        all_results.sort_by_key(|(mutation, _)| {
+            index_by_id.get(&mutation.id).copied().unwrap_or(usize::MAX)
+        });
+        self.outcome_from_results(all_results, start.elapsed())
+    }
+
+    #[allow(clippy::manual_is_multiple_of)]
+    fn run_regular(&self, mutations: Vec<Mutation>) -> RunOutcome {
         let start = Instant::now();
         let total = mutations.len();
         if total == 0 {
@@ -1168,6 +1225,119 @@ impl TestRunner {
         self.outcome_from_results(all_results, start.elapsed())
     }
 
+    fn run_go_schema_mutations(
+        &self,
+        schema_mutations: &[crate::schemata::SchemaMutation],
+    ) -> Result<Vec<(Mutation, MutationResult)>, crate::schemata::SchemaRewriteError> {
+        let rewrites = crate::schemata::rewrite_go_files(&self.project_root, schema_mutations)?;
+        let workspace =
+            copy_workspace_with_options(&self.project_root, self.respect_workspace_ignores)
+                .map_err(|e| {
+                    crate::schemata::SchemaRewriteError::new(format!(
+                        "could not create schema workspace: {e}"
+                    ))
+                })?;
+
+        for rewrite in rewrites {
+            let relative =
+                project_relative_path(&self.project_root, &rewrite.file).map_err(|_| {
+                    crate::schemata::SchemaRewriteError::new(format!(
+                        "could not resolve rewritten file {}",
+                        rewrite.file.display()
+                    ))
+                })?;
+            let target =
+                validate_and_resolve_mutation_path(workspace.root(), &relative).map_err(|_| {
+                    crate::schemata::SchemaRewriteError::new(format!(
+                        "rewritten file {} is not in schema workspace",
+                        rewrite.file.display()
+                    ))
+                })?;
+            write_workspace_file(&target, &rewrite.content).map_err(|e| {
+                crate::schemata::SchemaRewriteError::new(format!(
+                    "could not write schema file {}: {e}",
+                    target.display()
+                ))
+            })?;
+        }
+
+        if self.commands.build_command_explicit && !self.commands.build_command.is_empty() {
+            let build = run_command(
+                &self.commands.build_command,
+                workspace.root(),
+                self.commands.timeout,
+                false,
+                &self.env,
+                &self.cancelled,
+            );
+            if build.cancelled {
+                return Ok(Vec::new());
+            }
+            if build.result != MutationResult::Survived {
+                return Ok(schema_mutations
+                    .iter()
+                    .map(|schema_mutation| {
+                        (schema_mutation.mutation.clone(), MutationResult::BuildError)
+                    })
+                    .collect());
+            }
+        }
+
+        let mut results = Vec::with_capacity(schema_mutations.len());
+        for schema_mutation in schema_mutations {
+            if self.cancelled.load(Ordering::Acquire) {
+                break;
+            }
+            let mutation = &schema_mutation.mutation;
+            let selected = select_test_command(&self.project_root, &self.commands, mutation);
+            let mut env = self.env.clone();
+            env.insert("TOGI_MUTANT".to_string(), mutation.id.to_string());
+            let outcome = run_command(
+                &force_go_no_test_cache(selected.argv),
+                workspace.root(),
+                selected.timeout,
+                self.show_output,
+                &env,
+                &self.cancelled,
+            );
+            if outcome.cancelled {
+                break;
+            }
+            if self.verbose {
+                let symbol = match outcome.result {
+                    MutationResult::Killed => "✓ killed",
+                    MutationResult::Survived => "✗ survived",
+                    MutationResult::Timeout => "⧖ timeout",
+                    MutationResult::BuildError => "⚠ build error",
+                };
+                eprintln!(
+                    "  [schema] {}  {}:{} — {}",
+                    symbol,
+                    mutation.file.display(),
+                    mutation.line,
+                    mutation.operator
+                );
+            }
+            if self.show_output && outcome.result == MutationResult::Survived {
+                if let Some(output) = outcome.test_output.as_deref() {
+                    eprintln!(
+                        "  ┌─ test output for {}:{} ({})",
+                        mutation.file.display(),
+                        mutation.line,
+                        mutation.operator
+                    );
+                    for line in output.lines() {
+                        eprintln!("  │ {}", line);
+                    }
+                    eprintln!("  └─");
+                }
+            }
+            results.push((mutation.clone(), outcome.result));
+        }
+
+        Ok(results)
+    }
+
     fn outcome_from_results(
         &self,
         all_results: Vec<(Mutation, MutationResult)>,
@@ -1270,6 +1440,34 @@ fn mutation_file_path(project_root: &Path, mutation_file: &Path) -> PathBuf {
     } else {
         project_root.join(mutation_file)
     }
+}
+
+fn project_relative_path(project_root: &Path, file: &Path) -> Result<PathBuf, ()> {
+    if file.is_absolute() {
+        let canonical = file.canonicalize().map_err(|_| ())?;
+        let root = project_root.canonicalize().map_err(|_| ())?;
+        canonical
+            .strip_prefix(root)
+            .map(PathBuf::from)
+            .map_err(|_| ())
+    } else {
+        Ok(file.to_path_buf())
+    }
+}
+
+fn force_go_no_test_cache(mut argv: Vec<String>) -> Vec<String> {
+    if argv.len() < 2 || argv[0] != "go" || argv[1] != "test" {
+        return argv;
+    }
+    if argv
+        .iter()
+        .skip(2)
+        .any(|arg| arg == "-count" || arg.starts_with("-count="))
+    {
+        return argv;
+    }
+    argv.insert(2, "-count=1".to_string());
+    argv
 }
 
 fn cache_identity(project_root: &Path, mutation: &Mutation) -> String {
@@ -2054,6 +2252,32 @@ mod tests {
         (dir, file, mutation)
     }
 
+    fn go_operator_mutation(id: u32, file: &str, source: &str, nth: usize) -> Mutation {
+        let mut offset = 0usize;
+        for index in 0..=nth {
+            let next = source[offset..]
+                .find("==")
+                .expect("source should contain ==");
+            offset += next;
+            if index == nth {
+                break;
+            }
+            offset += 2;
+        }
+        Mutation {
+            id,
+            file: PathBuf::from(file),
+            language: "go".into(),
+            line: 1,
+            column: 1,
+            operator: "eq_to_neq".into(),
+            description: "Replace == with !=".into(),
+            original: "==".into(),
+            replacement: "!=".into(),
+            byte_range: offset..offset + 2,
+        }
+    }
+
     #[test]
     fn cache_context_fingerprint_changes_for_tests_and_config() {
         let dir = tempfile::tempdir().unwrap();
@@ -2467,6 +2691,27 @@ mod tests {
         assert_eq!(
             selected.argv,
             vec!["go", "test", "-count=1", "-run=^(TestAdd)$", "./..."]
+        );
+    }
+
+    #[test]
+    fn force_go_no_test_cache_inserts_count_once() {
+        assert_eq!(
+            force_go_no_test_cache(vec!["go".into(), "test".into(), "./...".into()]),
+            vec!["go", "test", "-count=1", "./..."]
+        );
+        assert_eq!(
+            force_go_no_test_cache(vec![
+                "go".into(),
+                "test".into(),
+                "-count=1".into(),
+                "./...".into()
+            ]),
+            vec!["go", "test", "-count=1", "./..."]
+        );
+        assert_eq!(
+            force_go_no_test_cache(vec!["cargo".into(), "test".into()]),
+            vec!["cargo", "test"]
         );
     }
 
@@ -3176,6 +3421,60 @@ mod tests {
             "runner should not wait for the command timeout after cancellation"
         );
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "hello world");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_with_schemata_executes_go_mutations_with_active_env() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = "\
+package calc
+func first(a, b int) bool { return a == b }
+func second(c, d int) bool { return c == d }
+";
+        std::fs::write(dir.path().join("calc.go"), source).unwrap();
+        let first = go_operator_mutation(0, "calc.go", source, 0);
+        let second = go_operator_mutation(1, "calc.go", source, 1);
+        let script = r#"
+case "$(cat calc.go)" in
+  *__togi_active*) ;;
+  *) exit 2 ;;
+esac
+case "$TOGI_MUTANT" in
+  0) exit 1 ;;
+  1) exit 0 ;;
+  *) exit 2 ;;
+esac
+"#;
+
+        let runner = TestRunner {
+            commands: CommandConfig {
+                command: vec!["sh".into(), "-c".into(), script.into()],
+                force_default_command: false,
+                force_default_timeout: false,
+                project_commands: vec![],
+                language_commands: HashMap::new(),
+                build_command: vec![],
+                build_command_explicit: false,
+                timeout: Duration::from_secs(5),
+                language_timeouts: HashMap::new(),
+                test_selection: None,
+            },
+            parallelism: 1,
+            project_root: dir.path().to_path_buf(),
+            verbose: false,
+            show_output: false,
+            max_tested: None,
+            respect_workspace_ignores: true,
+            env: HashMap::new(),
+            cancelled: Arc::new(AtomicBool::new(false)),
+        };
+
+        let report = runner.run_with_schemata(vec![first, second]).report;
+
+        assert_eq!(report.total, 2);
+        assert_eq!(report.results[0].1, MutationResult::Killed);
+        assert_eq!(report.results[1].1, MutationResult::Survived);
     }
 
     #[test]

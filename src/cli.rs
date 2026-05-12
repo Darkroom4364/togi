@@ -53,6 +53,10 @@ pub enum Commands {
         #[arg(long)]
         max_per_run: Option<usize>,
 
+        /// Use opt-in mutant schemata for supported languages
+        #[arg(long)]
+        schemata: bool,
+
         /// Show mutations without running tests
         #[arg(long)]
         dry_run: bool,
@@ -194,6 +198,17 @@ mod tests {
         match cli.command {
             Commands::Check { max_per_run, .. } => {
                 assert_eq!(max_per_run, Some(25));
+            }
+            _ => panic!("expected Check command"),
+        }
+    }
+
+    #[test]
+    fn schemata_argument_is_accepted() {
+        let cli = Cli::try_parse_from(["togi", "check", "--schemata"]).unwrap();
+        match cli.command {
+            Commands::Check { schemata, .. } => {
+                assert!(schemata);
             }
             _ => panic!("expected Check command"),
         }
