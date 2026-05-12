@@ -49,6 +49,10 @@ pub enum Commands {
         #[arg(short, long)]
         timeout: Option<u64>,
 
+        /// Maximum mutations to run (0 = unlimited)
+        #[arg(long)]
+        max_per_run: Option<usize>,
+
         /// Show mutations without running tests
         #[arg(long)]
         dry_run: bool,
@@ -181,6 +185,17 @@ mod tests {
                 assert_eq!(output, PathBuf::from("map.json"));
             }
             _ => panic!("expected TestMap command"),
+        }
+    }
+
+    #[test]
+    fn max_per_run_argument_is_accepted() {
+        let cli = Cli::try_parse_from(["togi", "check", "--max-per-run", "25"]).unwrap();
+        match cli.command {
+            Commands::Check { max_per_run, .. } => {
+                assert_eq!(max_per_run, Some(25));
+            }
+            _ => panic!("expected Check command"),
         }
     }
 

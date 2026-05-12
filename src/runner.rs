@@ -336,6 +336,13 @@ fn should_copy_workspace_entry(project_root: &Path, path: &Path) -> bool {
             .is_ok_and(|relative| !should_skip_workspace_entry(relative))
 }
 
+/// Workspace directories kept across resets.
+///
+/// Stashes are created in `workspace_root.parent()` as `.togi-preserved-{name}`
+/// so `fs::rename` stays on the same filesystem and remains metadata-only.
+/// Any stale stash from an interrupted prior reset is reclaimed before rename.
+const PRESERVED_WORKSPACE_DIRS: &[&str] = &["target"];
+
 fn cache_context_fingerprint(project_root: &Path) -> u64 {
     git_cache_context_fingerprint(project_root)
         .unwrap_or_else(|| filesystem_cache_context_fingerprint(project_root))
@@ -620,11 +627,53 @@ fn reset_workspace(
     workspace_root: &Path,
     respect_ignores: bool,
 ) -> std::io::Result<()> {
+    let preserved_dirs = preserve_workspace_dirs(workspace_root)?;
     if workspace_root.exists() {
         fs::remove_dir_all(workspace_root)?;
     }
     fs::create_dir(workspace_root)?;
+    restore_workspace_dirs(workspace_root, preserved_dirs)?;
     populate_workspace(project_root, workspace_root, respect_ignores)
+}
+
+/// Move preserved dirs to sibling stashes before deleting the workspace.
+///
+/// The sibling stash location keeps rename on the same filesystem; removing an
+/// existing stash is intentional recovery from an interrupted previous reset.
+fn preserve_workspace_dirs(workspace_root: &Path) -> std::io::Result<Vec<(PathBuf, PathBuf)>> {
+    let Some(parent) = workspace_root.parent() else {
+        return Ok(Vec::new());
+    };
+
+    let mut preserved = Vec::new();
+    for name in PRESERVED_WORKSPACE_DIRS {
+        let source = workspace_root.join(name);
+        if !source.exists() {
+            continue;
+        }
+
+        let stash = parent.join(format!(".togi-preserved-{name}"));
+        if stash.exists() {
+            fs::remove_dir_all(&stash)?;
+        }
+        fs::rename(&source, &stash)?;
+        preserved.push((PathBuf::from(name), stash));
+    }
+    Ok(preserved)
+}
+
+fn restore_workspace_dirs(
+    workspace_root: &Path,
+    preserved_dirs: Vec<(PathBuf, PathBuf)>,
+) -> std::io::Result<()> {
+    for (relative, stash) in preserved_dirs {
+        let destination = workspace_root.join(relative);
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::rename(stash, destination)?;
+    }
+    Ok(())
 }
 
 fn populate_workspace(
@@ -2585,6 +2634,45 @@ mod tests {
         );
         assert!(copy.root().join("src/lib.rs").exists());
         assert!(!copy.root().join("target").exists());
+    }
+
+    #[test]
+    fn reset_workspace_preserves_target_cache_and_removes_other_side_effects() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("source");
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), b"pub fn f() {}\n").unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(workspace.join("target/debug")).unwrap();
+        std::fs::write(workspace.join("target/debug/cache"), b"keep").unwrap();
+        std::fs::write(workspace.join("side-effect"), b"drop").unwrap();
+
+        reset_workspace(&root, &workspace, true).unwrap();
+
+        assert_eq!(
+            std::fs::read(workspace.join("target/debug/cache")).unwrap(),
+            b"keep"
+        );
+        assert!(workspace.join("src/lib.rs").exists());
+        assert!(!workspace.join("side-effect").exists());
+    }
+
+    #[test]
+    fn reset_workspace_handles_missing_workspace_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("source");
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), b"pub fn f() {}\n").unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join("side-effect"), b"drop").unwrap();
+
+        reset_workspace(&root, &workspace, true).unwrap();
+
+        assert!(workspace.join("src/lib.rs").exists());
+        assert!(!workspace.join("side-effect").exists());
+        assert!(!workspace.join("target/debug/cache").exists());
     }
 
     #[test]
