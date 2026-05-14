@@ -120,9 +120,32 @@ pub trait SchemaAdapter: Send + Sync {
 }
 
 struct GoSchema;
+struct JavaSchema;
 struct RustSchema;
 struct PythonSchema;
 struct TypeScriptSchema;
+
+const JAVA_OPERATOR_ALLOWLIST: &[&str] = &[
+    "eq_to_neq",
+    "lt_to_lte",
+    "gt_to_gte",
+    "and_to_or",
+    "or_to_and",
+    "mul_to_div",
+    "div_to_mul",
+    "mod_to_mul",
+    "plus_to_minus",
+    "minus_to_plus",
+    "true_to_false",
+    "false_to_true",
+    "zero_to_one",
+    "string_to_empty",
+    "increment_numeric",
+    "decrement_numeric",
+    "remove_unary_not",
+    "remove_unary_neg",
+    "negate_condition",
+];
 
 const RUST_OPERATOR_ALLOWLIST: &[&str] = &[
     "eq_to_neq",
@@ -184,6 +207,43 @@ impl SchemaAdapter for GoSchema {
             }
             _ => Err(SchemaSkipReason::UnsupportedOperator),
         }
+    }
+}
+
+impl SchemaAdapter for JavaSchema {
+    fn language(&self) -> &str {
+        "java"
+    }
+
+    fn runtime_helper(&self) -> &'static str {
+        r#"    private static boolean __togi_active(int id) {
+        return Integer.toString(id).equals(System.getenv("TOGI_MUTANT"));
+    }
+"#
+    }
+
+    fn wrap_expression(&self, mutant_id: u32, original: &str, replacement: &str) -> String {
+        format!("(__togi_active({mutant_id}) ? ({replacement}) : ({original}))")
+    }
+
+    fn wrap_statement(&self, mutant_id: u32, original: &str, replacement: &str) -> String {
+        format!("if (__togi_active({mutant_id})) {{ {replacement} }} else {{ {original} }}")
+    }
+
+    fn classify(&self, mutation: &Mutation, source: &[u8]) -> Result<SchemaKind, SchemaSkipReason> {
+        validate_source_range(mutation, source)?;
+        if java_line_looks_compile_time(mutation, source) {
+            return Err(SchemaSkipReason::CompileTimeContext);
+        }
+        if JAVA_OPERATOR_ALLOWLIST.contains(&mutation.operator.as_str()) {
+            Ok(SchemaKind::Expression)
+        } else {
+            Err(SchemaSkipReason::UnsupportedOperator)
+        }
+    }
+
+    fn is_compile_time_context(&self, mutation: &Mutation, source: &[u8]) -> bool {
+        java_line_looks_compile_time(mutation, source)
     }
 }
 
@@ -284,6 +344,7 @@ function __togi_select<T>(id: number, original: () => T, mutated: () => T): T {
 }
 
 static GO_SCHEMA: GoSchema = GoSchema;
+static JAVA_SCHEMA: JavaSchema = JavaSchema;
 static RUST_SCHEMA: RustSchema = RustSchema;
 static PYTHON_SCHEMA: PythonSchema = PythonSchema;
 static TYPESCRIPT_SCHEMA: TypeScriptSchema = TypeScriptSchema;
@@ -292,6 +353,7 @@ static TYPESCRIPT_SCHEMA: TypeScriptSchema = TypeScriptSchema;
 pub fn adapter_for_language(language: &str) -> Option<&'static dyn SchemaAdapter> {
     match language {
         "go" => Some(&GO_SCHEMA),
+        "java" => Some(&JAVA_SCHEMA),
         "rust" => Some(&RUST_SCHEMA),
         "python" => Some(&PYTHON_SCHEMA),
         "typescript" => Some(&TYPESCRIPT_SCHEMA),
@@ -417,6 +479,51 @@ pub fn rewrite_go_files(
         .collect())
 }
 
+/// Rewrite Java files once so selected mutations can be activated by `TOGI_MUTANT`.
+pub fn rewrite_java_files(
+    project_root: &Path,
+    selected: &[SchemaMutation],
+) -> Result<Vec<SchemaFileRewrite>, SchemaRewriteError> {
+    let Some(adapter) = adapter_for_language("java") else {
+        return Err(SchemaRewriteError::new(
+            "java schema adapter is not available",
+        ));
+    };
+
+    let mut by_file: BTreeMap<PathBuf, Vec<&SchemaMutation>> = BTreeMap::new();
+    for mutation in selected {
+        if mutation.mutation.language != "java" {
+            return Err(SchemaRewriteError::new(format!(
+                "schema rewrite only supports java, got {}",
+                mutation.mutation.language
+            )));
+        }
+        if mutation.kind != SchemaKind::Expression {
+            return Err(SchemaRewriteError::new(
+                "java schema rewrite currently supports expression mutations only",
+            ));
+        }
+        by_file
+            .entry(source_path(project_root, &mutation.mutation.file))
+            .or_default()
+            .push(mutation);
+    }
+
+    let mut rewritten = Vec::new();
+    for (file, mutations) in by_file {
+        let source = std::fs::read_to_string(&file).map_err(|e| {
+            SchemaRewriteError::new(format!("could not read {}: {e}", file.display()))
+        })?;
+        let rewritten_source = rewrite_java_file(&source, &mutations, adapter)?;
+        rewritten.push(SchemaFileRewrite {
+            file,
+            content: rewritten_source.into_bytes(),
+        });
+    }
+
+    Ok(rewritten)
+}
+
 /// Rewrite Rust files once so selected mutations can be activated by `TOGI_MUTANT`.
 pub fn rewrite_rust_files(
     project_root: &Path,
@@ -516,6 +623,69 @@ fn rewrite_go_file(
         .map_err(|e| SchemaRewriteError::new(format!("rewritten Go source is not utf-8: {e}")))
 }
 
+fn rewrite_java_file(
+    source: &str,
+    selected: &[&SchemaMutation],
+    adapter: &dyn SchemaAdapter,
+) -> Result<String, SchemaRewriteError> {
+    let source_bytes = source.as_bytes();
+    let tree = parse_java_source(source)?;
+    let root = tree.root_node();
+    let mut expression_edits = Vec::with_capacity(selected.len());
+    let mut helper_bodies = BTreeMap::<usize, tree_sitter::Node<'_>>::new();
+
+    for schema_mutation in selected {
+        let mutation = &schema_mutation.mutation;
+        validate_source_range(mutation, source_bytes).map_err(|reason| {
+            SchemaRewriteError::new(format!(
+                "mutation {} is not rewriteable: {reason:?}",
+                mutation.id
+            ))
+        })?;
+        let expression_range = java_expression_range_for_mutation(root, source, mutation)?;
+        let original = source_slice(source, expression_range.clone())?;
+        let replacement = mutated_expression(source, expression_range.clone(), mutation)?;
+        let wrapped = adapter.wrap_expression(mutation.id, original, &replacement);
+        let class_body = java_class_body_for_range(root, expression_range.clone())?;
+        helper_bodies
+            .entry(class_body.byte_range().start)
+            .or_insert(class_body);
+        expression_edits.push((expression_range, wrapped));
+    }
+
+    expression_edits.sort_by_key(|(range, _)| (range.start, range.end));
+    let mut previous_end = 0usize;
+    for (position, (range, _)) in expression_edits.iter().enumerate() {
+        if position > 0 && range.start < previous_end {
+            return Err(SchemaRewriteError::new(
+                "schema mutations overlap after expression expansion",
+            ));
+        }
+        previous_end = range.end;
+    }
+
+    let mut edits = expression_edits;
+    for class_body in helper_bodies.values() {
+        if java_class_body_declares_togi_active(*class_body, source_bytes) {
+            continue;
+        }
+        let insert_at = class_body.byte_range().start + 1;
+        edits.push((
+            insert_at..insert_at,
+            format!("\n{}\n", adapter.runtime_helper().trim_end()),
+        ));
+    }
+
+    let mut rewritten = source.as_bytes().to_vec();
+    edits.sort_by_key(|(range, _)| (range.start, range.end));
+    for (range, replacement) in edits.into_iter().rev() {
+        rewritten.splice(range, replacement.bytes());
+    }
+
+    String::from_utf8(rewritten)
+        .map_err(|e| SchemaRewriteError::new(format!("rewritten Java source is not utf-8: {e}")))
+}
+
 fn rewrite_rust_file(
     source: &str,
     selected: &[&SchemaMutation],
@@ -598,6 +768,20 @@ fn parse_go_source(source: &str) -> Result<tree_sitter::Tree, SchemaRewriteError
     Ok(tree)
 }
 
+fn parse_java_source(source: &str) -> Result<tree_sitter::Tree, SchemaRewriteError> {
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&tree_sitter_java::LANGUAGE.into())
+        .map_err(|e| SchemaRewriteError::new(format!("could not load Java grammar: {e}")))?;
+    let tree = parser
+        .parse(source, None)
+        .ok_or_else(|| SchemaRewriteError::new("could not parse Java source"))?;
+    if tree.root_node().has_error() {
+        return Err(SchemaRewriteError::new("Java source contains parse errors"));
+    }
+    Ok(tree)
+}
+
 fn parse_rust_source(source: &str) -> Result<tree_sitter::Tree, SchemaRewriteError> {
     let mut parser = tree_sitter::Parser::new();
     parser
@@ -633,6 +817,45 @@ fn go_expression_range_for_mutation(
         }
         _ => Err(SchemaRewriteError::new(format!(
             "unsupported Go schema operator {}",
+            mutation.operator
+        ))),
+    }
+}
+
+fn java_expression_range_for_mutation(
+    root: tree_sitter::Node<'_>,
+    source: &str,
+    mutation: &Mutation,
+) -> Result<std::ops::Range<usize>, SchemaRewriteError> {
+    if !JAVA_OPERATOR_ALLOWLIST.contains(&mutation.operator.as_str()) {
+        return Err(SchemaRewriteError::new(format!(
+            "unsupported Java schema operator {}",
+            mutation.operator
+        )));
+    }
+
+    match mutation.operator.as_str() {
+        "eq_to_neq" | "lt_to_lte" | "gt_to_gte" | "and_to_or" | "or_to_and" | "mul_to_div"
+        | "div_to_mul" | "mod_to_mul" | "plus_to_minus" | "minus_to_plus" => {
+            smallest_java_node_range(root, mutation.byte_range.clone(), |node| {
+                node.kind() == "binary_expression"
+            })
+        }
+        "true_to_false" | "false_to_true" | "zero_to_one" | "string_to_empty"
+        | "increment_numeric" | "decrement_numeric" => {
+            exact_java_node_range(root, mutation.byte_range.clone())
+        }
+        "remove_unary_not" | "remove_unary_neg" => {
+            smallest_java_node_range(root, mutation.byte_range.clone(), |node| {
+                node.kind() == "unary_expression"
+            })
+        }
+        "negate_condition" => {
+            source_slice(source, mutation.byte_range.clone())?;
+            Ok(mutation.byte_range.clone())
+        }
+        _ => Err(SchemaRewriteError::new(format!(
+            "accepted Java schema operator has no rewrite strategy: {}",
             mutation.operator
         ))),
     }
@@ -698,6 +921,27 @@ fn smallest_go_node_range(
     best.ok_or_else(|| SchemaRewriteError::new("could not find containing Go expression"))
 }
 
+fn smallest_java_node_range(
+    node: tree_sitter::Node<'_>,
+    range: std::ops::Range<usize>,
+    predicate: impl Fn(tree_sitter::Node<'_>) -> bool + Copy,
+) -> Result<std::ops::Range<usize>, SchemaRewriteError> {
+    let mut best = None::<std::ops::Range<usize>>;
+    visit_nodes(node, &mut |candidate| {
+        let candidate_range = candidate.byte_range();
+        if candidate_range.start <= range.start
+            && range.end <= candidate_range.end
+            && predicate(candidate)
+            && best
+                .as_ref()
+                .is_none_or(|best| candidate_range.len() < best.len())
+        {
+            best = Some(candidate_range);
+        }
+    });
+    best.ok_or_else(|| SchemaRewriteError::new("could not find containing Java expression"))
+}
+
 fn smallest_rust_node_range(
     node: tree_sitter::Node<'_>,
     range: std::ops::Range<usize>,
@@ -732,6 +976,19 @@ fn exact_go_node_range(
     found.ok_or_else(|| SchemaRewriteError::new("could not find Go expression node"))
 }
 
+fn exact_java_node_range(
+    node: tree_sitter::Node<'_>,
+    range: std::ops::Range<usize>,
+) -> Result<std::ops::Range<usize>, SchemaRewriteError> {
+    let mut found = None;
+    visit_nodes(node, &mut |candidate| {
+        if candidate.byte_range() == range {
+            found = Some(range.clone());
+        }
+    });
+    found.ok_or_else(|| SchemaRewriteError::new("could not find Java expression node"))
+}
+
 fn exact_rust_node_range(
     node: tree_sitter::Node<'_>,
     range: std::ops::Range<usize>,
@@ -745,11 +1002,73 @@ fn exact_rust_node_range(
     found.ok_or_else(|| SchemaRewriteError::new("could not find Rust expression node"))
 }
 
-fn visit_go_nodes(node: tree_sitter::Node<'_>, visit: &mut impl FnMut(tree_sitter::Node<'_>)) {
+fn java_class_body_for_range<'tree>(
+    node: tree_sitter::Node<'tree>,
+    range: std::ops::Range<usize>,
+) -> Result<tree_sitter::Node<'tree>, SchemaRewriteError> {
+    let mut best = None::<tree_sitter::Node<'tree>>;
+    visit_nodes(node, &mut |candidate| {
+        let candidate_range = candidate.byte_range();
+        let parent_kind = candidate.parent().map(|parent| parent.kind());
+        if candidate.kind() == "class_body"
+            && parent_kind == Some("class_declaration")
+            && candidate_range.start <= range.start
+            && range.end <= candidate_range.end
+            && best
+                .as_ref()
+                .is_none_or(|best| candidate_range.len() < best.byte_range().len())
+        {
+            best = Some(candidate);
+        }
+    });
+    best.ok_or_else(|| {
+        SchemaRewriteError::new("could not find containing Java class body for schema helper")
+    })
+}
+
+fn java_class_body_declares_togi_active(class_body: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    let mut cursor = class_body.walk();
+    class_body.children(&mut cursor).any(|child| {
+        child.kind() == "method_declaration"
+            && java_method_declaration_name_is(child, source, "__togi_active")
+    })
+}
+
+fn java_method_declaration_name_is(
+    method: tree_sitter::Node<'_>,
+    source: &[u8],
+    expected: &str,
+) -> bool {
+    if method
+        .child_by_field_name("name")
+        .is_some_and(|name| node_text_eq(name, source, expected))
+    {
+        return true;
+    }
+
+    let mut cursor = method.walk();
+    method
+        .children(&mut cursor)
+        .any(|child| child.kind() == "identifier" && node_text_eq(child, source, expected))
+}
+
+fn node_text_eq(node: tree_sitter::Node<'_>, source: &[u8], expected: &str) -> bool {
+    source
+        .get(node.byte_range())
+        .is_some_and(|bytes| bytes == expected.as_bytes())
+}
+
+fn visit_go_nodes<'tree>(
+    node: tree_sitter::Node<'tree>,
+    visit: &mut impl FnMut(tree_sitter::Node<'tree>),
+) {
     visit_nodes(node, visit);
 }
 
-fn visit_nodes(node: tree_sitter::Node<'_>, visit: &mut impl FnMut(tree_sitter::Node<'_>)) {
+fn visit_nodes<'tree>(
+    node: tree_sitter::Node<'tree>,
+    visit: &mut impl FnMut(tree_sitter::Node<'tree>),
+) {
     visit(node);
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
@@ -1211,6 +1530,61 @@ fn normalized_path_key(path: &Path) -> String {
         .join("/")
 }
 
+fn java_line_looks_compile_time(mutation: &Mutation, source: &[u8]) -> bool {
+    let line_start = source[..mutation.byte_range.start]
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map(|idx| idx + 1)
+        .unwrap_or(0);
+    let line_end = source[mutation.byte_range.end..]
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .map(|idx| mutation.byte_range.end + idx)
+        .unwrap_or(source.len());
+    let context_start = source[line_start..mutation.byte_range.start]
+        .iter()
+        .rposition(|byte| *byte == b'{')
+        .map(|idx| line_start + idx + 1)
+        .unwrap_or(line_start);
+    let Ok(line) = std::str::from_utf8(&source[context_start..line_end]) else {
+        return false;
+    };
+
+    let mut rest = line.trim_start();
+    let mut saw_static = false;
+    let mut saw_final = false;
+    while let Some((token, after_token)) = split_java_token(rest) {
+        match token {
+            "public" | "protected" | "private" | "abstract" | "synchronized" | "native"
+            | "strictfp" | "transient" | "volatile" => rest = after_token.trim_start(),
+            "static" => {
+                saw_static = true;
+                rest = after_token.trim_start();
+            }
+            "final" => {
+                saw_final = true;
+                rest = after_token.trim_start();
+            }
+            _ => break,
+        }
+    }
+    saw_static && saw_final
+}
+
+fn split_java_token(value: &str) -> Option<(&str, &str)> {
+    let value = value.trim_start();
+    if value.is_empty() {
+        return None;
+    }
+    let end = value
+        .char_indices()
+        .find_map(|(index, character)| {
+            (!character.is_ascii_alphanumeric() && character != '_').then_some(index)
+        })
+        .unwrap_or(value.len());
+    (end > 0).then(|| value.split_at(end))
+}
+
 fn rust_line_looks_compile_time(mutation: &Mutation, source: &[u8]) -> bool {
     let line_start = source[..mutation.byte_range.start]
         .iter()
@@ -1372,6 +1746,18 @@ mod tests {
         );
         assert_eq!(go.required_imports(), &["os"]);
 
+        let java = adapter_for_language("java").unwrap();
+        write_source(
+            &dir,
+            "Calc.java",
+            "class Calc { boolean f(int a, int b) { return a == b; } }\n",
+        );
+        assert_parsed_node_text(&dir, "Calc.java", java, "binary_expression", "a == b");
+        assert_eq!(
+            java.wrap_expression(42, "a == b", "a != b"),
+            "(__togi_active(42) ? (a != b) : (a == b))"
+        );
+
         let rust = adapter_for_language("rust").unwrap();
         write_source(
             &dir,
@@ -1481,6 +1867,34 @@ mod tests {
             "false",
             start..start + 4,
             "true_to_false",
+        );
+
+        let plan = plan(dir.path(), vec![mutation]);
+
+        assert!(plan.selected.is_empty());
+        assert_eq!(plan.fallback.len(), 1);
+        assert_eq!(
+            plan.fallback[0].reason,
+            SchemaSkipReason::CompileTimeContext
+        );
+    }
+
+    #[test]
+    fn plan_falls_back_for_java_static_final_context() {
+        let dir = TempDir::new().unwrap();
+        let adapter = adapter_for_language("java").unwrap();
+        let source = "class Calc { private static final int VERSION = 2; }\n";
+        write_source(&dir, "Calc.java", source);
+        assert_parsed_node_kind(&dir, "Calc.java", adapter, "field_declaration");
+        assert_parsed_node_text(&dir, "Calc.java", adapter, "decimal_integer_literal", "2");
+        let start = source.find('2').unwrap();
+        let mutation = mutation(
+            "java",
+            "Calc.java",
+            "2",
+            "3",
+            start..start + 1,
+            "increment_numeric",
         );
 
         let plan = plan(dir.path(), vec![mutation]);
@@ -1661,6 +2075,107 @@ mod tests {
             "func() bool { if __togi_active(\"7\") { return a != b }; return a == b }()"
         ));
         parse_go_source(&rewritten).unwrap();
+    }
+
+    #[test]
+    fn rewrite_java_files_expands_operator_mutation_to_expression_wrapper() {
+        let dir = TempDir::new().unwrap();
+        let source = "class Calc { static boolean f(int a, int b) { return a == b; } }\n";
+        write_source(&dir, "Calc.java", source);
+        let operator = source.find("==").unwrap();
+        let mutation = mutation(
+            "java",
+            "Calc.java",
+            "==",
+            "!=",
+            operator..operator + 2,
+            "eq_to_neq",
+        );
+
+        let rewrites = rewrite_java_files(
+            dir.path(),
+            &[SchemaMutation {
+                mutation,
+                kind: SchemaKind::Expression,
+            }],
+        )
+        .unwrap();
+
+        assert_eq!(rewrites.len(), 1);
+        let rewritten = String::from_utf8(rewrites[0].content.clone()).unwrap();
+        assert!(rewritten.contains("private static boolean __togi_active(int id)"));
+        assert!(rewritten.contains("return (__togi_active(7) ? (a != b) : (a == b));"));
+        parse_java_source(&rewritten).unwrap();
+    }
+
+    #[test]
+    fn rewrite_java_files_ignores_togi_active_mentions_in_text() {
+        let dir = TempDir::new().unwrap();
+        let source = "class Calc { static String marker() { return \"__togi_active(\"; } static boolean f(int a, int b) { return a == b; } }\n";
+        write_source(&dir, "Calc.java", source);
+        let operator = source.find("==").unwrap();
+        let mutation = mutation(
+            "java",
+            "Calc.java",
+            "==",
+            "!=",
+            operator..operator + 2,
+            "eq_to_neq",
+        );
+
+        let rewrites = rewrite_java_files(
+            dir.path(),
+            &[SchemaMutation {
+                mutation,
+                kind: SchemaKind::Expression,
+            }],
+        )
+        .unwrap();
+
+        let rewritten = String::from_utf8(rewrites[0].content.clone()).unwrap();
+        assert_eq!(
+            rewritten
+                .matches("private static boolean __togi_active")
+                .count(),
+            1,
+            "{rewritten}"
+        );
+        parse_java_source(&rewritten).unwrap();
+    }
+
+    #[test]
+    fn rewrite_java_files_reuses_existing_togi_active_method_with_spacing() {
+        let dir = TempDir::new().unwrap();
+        let source = "class Calc { private static boolean __togi_active (int id) { return false; } static boolean f(int a, int b) { return a == b; } }\n";
+        write_source(&dir, "Calc.java", source);
+        let operator = source.find("==").unwrap();
+        let mutation = mutation(
+            "java",
+            "Calc.java",
+            "==",
+            "!=",
+            operator..operator + 2,
+            "eq_to_neq",
+        );
+
+        let rewrites = rewrite_java_files(
+            dir.path(),
+            &[SchemaMutation {
+                mutation,
+                kind: SchemaKind::Expression,
+            }],
+        )
+        .unwrap();
+
+        let rewritten = String::from_utf8(rewrites[0].content.clone()).unwrap();
+        assert_eq!(
+            rewritten
+                .matches("private static boolean __togi_active")
+                .count(),
+            1,
+            "{rewritten}"
+        );
+        parse_java_source(&rewritten).unwrap();
     }
 
     #[test]
