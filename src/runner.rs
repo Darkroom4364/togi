@@ -1098,7 +1098,7 @@ impl TestRunner {
 
         for schema_mutation in plan.selected {
             match schema_mutation.mutation.language.as_str() {
-                "go" | "rust" => {
+                "go" | "java" | "rust" => {
                     schema_by_language
                         .entry(schema_mutation.mutation.language.clone())
                         .or_default()
@@ -1288,6 +1288,7 @@ impl TestRunner {
     ) -> Result<Vec<(Mutation, MutationResult)>, crate::schemata::SchemaRewriteError> {
         let rewrites = match language {
             "go" => crate::schemata::rewrite_go_files(&self.project_root, schema_mutations)?,
+            "java" => crate::schemata::rewrite_java_files(&self.project_root, schema_mutations)?,
             "rust" => crate::schemata::rewrite_rust_files(&self.project_root, schema_mutations)?,
             _ => {
                 return Err(crate::schemata::SchemaRewriteError::new(format!(
@@ -2403,6 +2404,12 @@ mod tests {
     fn rust_operator_mutation(id: u32, file: &str, source: &str, nth: usize) -> Mutation {
         let mut mutation = go_operator_mutation(id, file, source, nth);
         mutation.language = "rust".into();
+        mutation
+    }
+
+    fn java_operator_mutation(id: u32, file: &str, source: &str, nth: usize) -> Mutation {
+        let mut mutation = go_operator_mutation(id, file, source, nth);
+        mutation.language = "java".into();
         mutation
     }
 
@@ -3692,6 +3699,71 @@ esac
         assert_eq!(report.results[0].1, MutationResult::Survived);
         assert_eq!(report.results[1].1, MutationResult::Survived);
         assert_eq!(runs, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_with_schemata_executes_java_mutation_with_active_env() {
+        if std::process::Command::new("javac")
+            .arg("-version")
+            .output()
+            .is_err()
+            || std::process::Command::new("java")
+                .arg("-version")
+                .output()
+                .is_err()
+        {
+            eprintln!("skipping Java schemata runner test because javac/java is unavailable");
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let source = "\
+class Calc {
+    static boolean same(int a, int b) {
+        return a == b;
+    }
+
+    public static void main(String[] args) {
+        if (!same(1, 1)) {
+            throw new AssertionError(\"same values should match\");
+        }
+        if (same(1, 2)) {
+            throw new AssertionError(\"different values should not match\");
+        }
+    }
+}
+";
+        std::fs::write(dir.path().join("Calc.java"), source).unwrap();
+        let mutation = java_operator_mutation(0, "Calc.java", source, 0);
+
+        let runner = TestRunner {
+            commands: CommandConfig {
+                command: vec!["java".into(), "Calc".into()],
+                force_default_command: false,
+                force_default_timeout: false,
+                project_commands: vec![],
+                language_commands: HashMap::new(),
+                build_command: vec!["javac".into(), "Calc.java".into()],
+                build_command_explicit: true,
+                timeout: Duration::from_secs(30),
+                language_timeouts: HashMap::new(),
+                test_selection: None,
+            },
+            parallelism: 1,
+            project_root: dir.path().to_path_buf(),
+            verbose: false,
+            show_output: false,
+            max_tested: None,
+            respect_workspace_ignores: true,
+            env: HashMap::new(),
+            cancelled: Arc::new(AtomicBool::new(false)),
+        };
+
+        let report = runner.run_with_schemata(vec![mutation]).report;
+
+        assert_eq!(report.total, 1);
+        assert_eq!(report.results[0].1, MutationResult::Killed);
     }
 
     #[test]
