@@ -632,7 +632,7 @@ fn rewrite_java_file(
     let tree = parse_java_source(source)?;
     let root = tree.root_node();
     let mut expression_edits = Vec::with_capacity(selected.len());
-    let mut helper_bodies = BTreeMap::<usize, std::ops::Range<usize>>::new();
+    let mut helper_bodies = BTreeMap::<usize, tree_sitter::Node<'_>>::new();
 
     for schema_mutation in selected {
         let mutation = &schema_mutation.mutation;
@@ -647,7 +647,9 @@ fn rewrite_java_file(
         let replacement = mutated_expression(source, expression_range.clone(), mutation)?;
         let wrapped = adapter.wrap_expression(mutation.id, original, &replacement);
         let class_body = java_class_body_for_range(root, expression_range.clone())?;
-        helper_bodies.entry(class_body.start).or_insert(class_body);
+        helper_bodies
+            .entry(class_body.byte_range().start)
+            .or_insert(class_body);
         expression_edits.push((expression_range, wrapped));
     }
 
@@ -664,10 +666,10 @@ fn rewrite_java_file(
 
     let mut edits = expression_edits;
     for class_body in helper_bodies.values() {
-        if source_slice(source, class_body.clone())?.contains("__togi_active(") {
+        if java_class_body_declares_togi_active(*class_body, source_bytes) {
             continue;
         }
-        let insert_at = class_body.start + 1;
+        let insert_at = class_body.byte_range().start + 1;
         edits.push((
             insert_at..insert_at,
             format!("\n{}\n", adapter.runtime_helper().trim_end()),
@@ -1000,11 +1002,11 @@ fn exact_rust_node_range(
     found.ok_or_else(|| SchemaRewriteError::new("could not find Rust expression node"))
 }
 
-fn java_class_body_for_range(
-    node: tree_sitter::Node<'_>,
+fn java_class_body_for_range<'tree>(
+    node: tree_sitter::Node<'tree>,
     range: std::ops::Range<usize>,
-) -> Result<std::ops::Range<usize>, SchemaRewriteError> {
-    let mut best = None::<std::ops::Range<usize>>;
+) -> Result<tree_sitter::Node<'tree>, SchemaRewriteError> {
+    let mut best = None::<tree_sitter::Node<'tree>>;
     visit_nodes(node, &mut |candidate| {
         let candidate_range = candidate.byte_range();
         let parent_kind = candidate.parent().map(|parent| parent.kind());
@@ -1014,9 +1016,9 @@ fn java_class_body_for_range(
             && range.end <= candidate_range.end
             && best
                 .as_ref()
-                .is_none_or(|best| candidate_range.len() < best.len())
+                .is_none_or(|best| candidate_range.len() < best.byte_range().len())
         {
-            best = Some(candidate_range);
+            best = Some(candidate);
         }
     });
     best.ok_or_else(|| {
@@ -1024,11 +1026,49 @@ fn java_class_body_for_range(
     })
 }
 
-fn visit_go_nodes(node: tree_sitter::Node<'_>, visit: &mut impl FnMut(tree_sitter::Node<'_>)) {
+fn java_class_body_declares_togi_active(class_body: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    let mut cursor = class_body.walk();
+    class_body.children(&mut cursor).any(|child| {
+        child.kind() == "method_declaration"
+            && java_method_declaration_name_is(child, source, "__togi_active")
+    })
+}
+
+fn java_method_declaration_name_is(
+    method: tree_sitter::Node<'_>,
+    source: &[u8],
+    expected: &str,
+) -> bool {
+    if method
+        .child_by_field_name("name")
+        .is_some_and(|name| node_text_eq(name, source, expected))
+    {
+        return true;
+    }
+
+    let mut cursor = method.walk();
+    method
+        .children(&mut cursor)
+        .any(|child| child.kind() == "identifier" && node_text_eq(child, source, expected))
+}
+
+fn node_text_eq(node: tree_sitter::Node<'_>, source: &[u8], expected: &str) -> bool {
+    source
+        .get(node.byte_range())
+        .is_some_and(|bytes| bytes == expected.as_bytes())
+}
+
+fn visit_go_nodes<'tree>(
+    node: tree_sitter::Node<'tree>,
+    visit: &mut impl FnMut(tree_sitter::Node<'tree>),
+) {
     visit_nodes(node, visit);
 }
 
-fn visit_nodes(node: tree_sitter::Node<'_>, visit: &mut impl FnMut(tree_sitter::Node<'_>)) {
+fn visit_nodes<'tree>(
+    node: tree_sitter::Node<'tree>,
+    visit: &mut impl FnMut(tree_sitter::Node<'tree>),
+) {
     visit(node);
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
@@ -2065,6 +2105,76 @@ mod tests {
         let rewritten = String::from_utf8(rewrites[0].content.clone()).unwrap();
         assert!(rewritten.contains("private static boolean __togi_active(int id)"));
         assert!(rewritten.contains("return (__togi_active(7) ? (a != b) : (a == b));"));
+        parse_java_source(&rewritten).unwrap();
+    }
+
+    #[test]
+    fn rewrite_java_files_ignores_togi_active_mentions_in_text() {
+        let dir = TempDir::new().unwrap();
+        let source = "class Calc { static String marker() { return \"__togi_active(\"; } static boolean f(int a, int b) { return a == b; } }\n";
+        write_source(&dir, "Calc.java", source);
+        let operator = source.find("==").unwrap();
+        let mutation = mutation(
+            "java",
+            "Calc.java",
+            "==",
+            "!=",
+            operator..operator + 2,
+            "eq_to_neq",
+        );
+
+        let rewrites = rewrite_java_files(
+            dir.path(),
+            &[SchemaMutation {
+                mutation,
+                kind: SchemaKind::Expression,
+            }],
+        )
+        .unwrap();
+
+        let rewritten = String::from_utf8(rewrites[0].content.clone()).unwrap();
+        assert_eq!(
+            rewritten
+                .matches("private static boolean __togi_active")
+                .count(),
+            1,
+            "{rewritten}"
+        );
+        parse_java_source(&rewritten).unwrap();
+    }
+
+    #[test]
+    fn rewrite_java_files_reuses_existing_togi_active_method_with_spacing() {
+        let dir = TempDir::new().unwrap();
+        let source = "class Calc { private static boolean __togi_active (int id) { return false; } static boolean f(int a, int b) { return a == b; } }\n";
+        write_source(&dir, "Calc.java", source);
+        let operator = source.find("==").unwrap();
+        let mutation = mutation(
+            "java",
+            "Calc.java",
+            "==",
+            "!=",
+            operator..operator + 2,
+            "eq_to_neq",
+        );
+
+        let rewrites = rewrite_java_files(
+            dir.path(),
+            &[SchemaMutation {
+                mutation,
+                kind: SchemaKind::Expression,
+            }],
+        )
+        .unwrap();
+
+        let rewritten = String::from_utf8(rewrites[0].content.clone()).unwrap();
+        assert_eq!(
+            rewritten
+                .matches("private static boolean __togi_active")
+                .count(),
+            1,
+            "{rewritten}"
+        );
         parse_java_source(&rewritten).unwrap();
     }
 
