@@ -124,6 +124,28 @@ struct RustSchema;
 struct PythonSchema;
 struct TypeScriptSchema;
 
+const RUST_OPERATOR_ALLOWLIST: &[&str] = &[
+    "eq_to_neq",
+    "lt_to_lte",
+    "gt_to_gte",
+    "and_to_or",
+    "or_to_and",
+    "mul_to_div",
+    "div_to_mul",
+    "mod_to_mul",
+    "plus_to_minus",
+    "minus_to_plus",
+    "true_to_false",
+    "false_to_true",
+    "zero_to_one",
+    "string_to_empty",
+    "increment_numeric",
+    "decrement_numeric",
+    "remove_unary_not",
+    "remove_unary_neg",
+    "negate_condition",
+];
+
 impl SchemaAdapter for GoSchema {
     fn language(&self) -> &str {
         "go"
@@ -193,6 +215,18 @@ where
 
     fn wrap_statement(&self, mutant_id: u32, original: &str, replacement: &str) -> String {
         format!("if __togi_active({mutant_id}) {{ {replacement} }} else {{ {original} }}")
+    }
+
+    fn classify(&self, mutation: &Mutation, source: &[u8]) -> Result<SchemaKind, SchemaSkipReason> {
+        validate_source_range(mutation, source)?;
+        if rust_line_looks_compile_time(mutation, source) {
+            return Err(SchemaSkipReason::CompileTimeContext);
+        }
+        if RUST_OPERATOR_ALLOWLIST.contains(&mutation.operator.as_str()) {
+            Ok(SchemaKind::Expression)
+        } else {
+            Err(SchemaSkipReason::UnsupportedOperator)
+        }
     }
 
     fn is_compile_time_context(&self, mutation: &Mutation, source: &[u8]) -> bool {
@@ -383,6 +417,52 @@ pub fn rewrite_go_files(
         .collect())
 }
 
+/// Rewrite Rust files once so selected mutations can be activated by `TOGI_MUTANT`.
+pub fn rewrite_rust_files(
+    project_root: &Path,
+    selected: &[SchemaMutation],
+) -> Result<Vec<SchemaFileRewrite>, SchemaRewriteError> {
+    let Some(adapter) = adapter_for_language("rust") else {
+        return Err(SchemaRewriteError::new(
+            "rust schema adapter is not available",
+        ));
+    };
+
+    let mut by_file: BTreeMap<PathBuf, Vec<&SchemaMutation>> = BTreeMap::new();
+    for mutation in selected {
+        if mutation.mutation.language != "rust" {
+            return Err(SchemaRewriteError::new(format!(
+                "schema rewrite only supports rust, got {}",
+                mutation.mutation.language
+            )));
+        }
+        if mutation.kind != SchemaKind::Expression {
+            return Err(SchemaRewriteError::new(
+                "rust schema rewrite currently supports expression mutations only",
+            ));
+        }
+        by_file
+            .entry(source_path(project_root, &mutation.mutation.file))
+            .or_default()
+            .push(mutation);
+    }
+
+    let mut rewritten = Vec::new();
+    for (file, mutations) in by_file {
+        let source = std::fs::read_to_string(&file).map_err(|e| {
+            SchemaRewriteError::new(format!("could not read {}: {e}", file.display()))
+        })?;
+        let rewritten_source = rewrite_rust_file(&source, &mutations, adapter)?;
+        let rewritten_source = inject_rust_runtime(&rewritten_source, adapter);
+        rewritten.push(SchemaFileRewrite {
+            file,
+            content: rewritten_source.into_bytes(),
+        });
+    }
+
+    Ok(rewritten)
+}
+
 fn source_path(project_root: &Path, mutation_file: &Path) -> PathBuf {
     if mutation_file.is_absolute() {
         mutation_file.to_path_buf()
@@ -436,6 +516,51 @@ fn rewrite_go_file(
         .map_err(|e| SchemaRewriteError::new(format!("rewritten Go source is not utf-8: {e}")))
 }
 
+fn rewrite_rust_file(
+    source: &str,
+    selected: &[&SchemaMutation],
+    adapter: &dyn SchemaAdapter,
+) -> Result<String, SchemaRewriteError> {
+    let source_bytes = source.as_bytes();
+    let tree = parse_rust_source(source)?;
+    let mut edits = Vec::with_capacity(selected.len());
+
+    for schema_mutation in selected {
+        let mutation = &schema_mutation.mutation;
+        validate_source_range(mutation, source_bytes).map_err(|reason| {
+            SchemaRewriteError::new(format!(
+                "mutation {} is not rewriteable: {reason:?}",
+                mutation.id
+            ))
+        })?;
+        let expression_range =
+            rust_expression_range_for_mutation(tree.root_node(), source, mutation)?;
+        let original = source_slice(source, expression_range.clone())?;
+        let replacement = mutated_expression(source, expression_range.clone(), mutation)?;
+        let wrapped = adapter.wrap_expression(mutation.id, original, &replacement);
+        edits.push((expression_range, wrapped));
+    }
+
+    edits.sort_by_key(|(range, _)| (range.start, range.end));
+    let mut previous_end = 0usize;
+    for (position, (range, _)) in edits.iter().enumerate() {
+        if position > 0 && range.start < previous_end {
+            return Err(SchemaRewriteError::new(
+                "schema mutations overlap after expression expansion",
+            ));
+        }
+        previous_end = range.end;
+    }
+
+    let mut rewritten = source.as_bytes().to_vec();
+    for (range, replacement) in edits.into_iter().rev() {
+        rewritten.splice(range, replacement.bytes());
+    }
+
+    String::from_utf8(rewritten)
+        .map_err(|e| SchemaRewriteError::new(format!("rewritten Rust source is not utf-8: {e}")))
+}
+
 fn mutated_expression(
     source: &str,
     expression_range: std::ops::Range<usize>,
@@ -473,6 +598,20 @@ fn parse_go_source(source: &str) -> Result<tree_sitter::Tree, SchemaRewriteError
     Ok(tree)
 }
 
+fn parse_rust_source(source: &str) -> Result<tree_sitter::Tree, SchemaRewriteError> {
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&tree_sitter_rust::LANGUAGE.into())
+        .map_err(|e| SchemaRewriteError::new(format!("could not load Rust grammar: {e}")))?;
+    let tree = parser
+        .parse(source, None)
+        .ok_or_else(|| SchemaRewriteError::new("could not parse Rust source"))?;
+    if tree.root_node().has_error() {
+        return Err(SchemaRewriteError::new("Rust source contains parse errors"));
+    }
+    Ok(tree)
+}
+
 fn go_expression_range_for_mutation(
     root: tree_sitter::Node<'_>,
     source: &str,
@@ -499,6 +638,45 @@ fn go_expression_range_for_mutation(
     }
 }
 
+fn rust_expression_range_for_mutation(
+    root: tree_sitter::Node<'_>,
+    source: &str,
+    mutation: &Mutation,
+) -> Result<std::ops::Range<usize>, SchemaRewriteError> {
+    if !RUST_OPERATOR_ALLOWLIST.contains(&mutation.operator.as_str()) {
+        return Err(SchemaRewriteError::new(format!(
+            "unsupported Rust schema operator {}",
+            mutation.operator
+        )));
+    }
+
+    match mutation.operator.as_str() {
+        "eq_to_neq" | "lt_to_lte" | "gt_to_gte" | "and_to_or" | "or_to_and" | "mul_to_div"
+        | "div_to_mul" | "mod_to_mul" | "plus_to_minus" | "minus_to_plus" => {
+            smallest_rust_node_range(root, mutation.byte_range.clone(), |node| {
+                node.kind() == "binary_expression"
+            })
+        }
+        "true_to_false" | "false_to_true" | "zero_to_one" | "string_to_empty"
+        | "increment_numeric" | "decrement_numeric" => {
+            exact_rust_node_range(root, mutation.byte_range.clone())
+        }
+        "remove_unary_not" | "remove_unary_neg" => {
+            smallest_rust_node_range(root, mutation.byte_range.clone(), |node| {
+                node.kind() == "unary_expression"
+            })
+        }
+        "negate_condition" => {
+            source_slice(source, mutation.byte_range.clone())?;
+            Ok(mutation.byte_range.clone())
+        }
+        _ => Err(SchemaRewriteError::new(format!(
+            "accepted Rust schema operator has no rewrite strategy: {}",
+            mutation.operator
+        ))),
+    }
+}
+
 fn smallest_go_node_range(
     node: tree_sitter::Node<'_>,
     range: std::ops::Range<usize>,
@@ -520,6 +698,27 @@ fn smallest_go_node_range(
     best.ok_or_else(|| SchemaRewriteError::new("could not find containing Go expression"))
 }
 
+fn smallest_rust_node_range(
+    node: tree_sitter::Node<'_>,
+    range: std::ops::Range<usize>,
+    predicate: impl Fn(tree_sitter::Node<'_>) -> bool + Copy,
+) -> Result<std::ops::Range<usize>, SchemaRewriteError> {
+    let mut best = None::<std::ops::Range<usize>>;
+    visit_nodes(node, &mut |candidate| {
+        let candidate_range = candidate.byte_range();
+        if candidate_range.start <= range.start
+            && range.end <= candidate_range.end
+            && predicate(candidate)
+            && best
+                .as_ref()
+                .is_none_or(|best| candidate_range.len() < best.len())
+        {
+            best = Some(candidate_range);
+        }
+    });
+    best.ok_or_else(|| SchemaRewriteError::new("could not find containing Rust expression"))
+}
+
 fn exact_go_node_range(
     node: tree_sitter::Node<'_>,
     range: std::ops::Range<usize>,
@@ -533,11 +732,28 @@ fn exact_go_node_range(
     found.ok_or_else(|| SchemaRewriteError::new("could not find Go expression node"))
 }
 
+fn exact_rust_node_range(
+    node: tree_sitter::Node<'_>,
+    range: std::ops::Range<usize>,
+) -> Result<std::ops::Range<usize>, SchemaRewriteError> {
+    let mut found = None;
+    visit_nodes(node, &mut |candidate| {
+        if candidate.byte_range() == range {
+            found = Some(range.clone());
+        }
+    });
+    found.ok_or_else(|| SchemaRewriteError::new("could not find Rust expression node"))
+}
+
 fn visit_go_nodes(node: tree_sitter::Node<'_>, visit: &mut impl FnMut(tree_sitter::Node<'_>)) {
+    visit_nodes(node, visit);
+}
+
+fn visit_nodes(node: tree_sitter::Node<'_>, visit: &mut impl FnMut(tree_sitter::Node<'_>)) {
     visit(node);
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        visit_go_nodes(child, visit);
+        visit_nodes(child, visit);
     }
 }
 
@@ -559,6 +775,50 @@ fn inject_go_runtime(
     let mut rewritten = source;
     rewritten.insert_str(insert_at, &format!("\n{helper}\n"));
     Ok(rewritten)
+}
+
+fn inject_rust_runtime(source: &str, adapter: &dyn SchemaAdapter) -> String {
+    if source.contains("fn __togi_active(") {
+        return source.to_string();
+    }
+    let insert_at = rust_runtime_insert_offset(source);
+    let helper = adapter.runtime_helper().trim();
+    let mut rewritten = source.to_string();
+    rewritten.insert_str(insert_at, &format!("{helper}\n\n"));
+    rewritten
+}
+
+fn rust_runtime_insert_offset(source: &str) -> usize {
+    let mut offset = 0usize;
+    let mut lines = source.split_inclusive('\n');
+
+    while let Some(line) = lines.next() {
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() || trimmed.starts_with("//") {
+            offset += line.len();
+        } else if trimmed.starts_with("#![") {
+            let mut balance = square_bracket_balance(line);
+            offset += line.len();
+            while balance > 0 {
+                let Some(line) = lines.next() else {
+                    break;
+                };
+                balance += square_bracket_balance(line);
+                offset += line.len();
+            }
+        } else {
+            break;
+        }
+    }
+    offset
+}
+
+fn square_bracket_balance(line: &str) -> i32 {
+    line.chars().fold(0, |balance, character| match character {
+        '[' => balance + 1,
+        ']' => balance - 1,
+        _ => balance,
+    })
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1401,6 +1661,75 @@ mod tests {
             "func() bool { if __togi_active(\"7\") { return a != b }; return a == b }()"
         ));
         parse_go_source(&rewritten).unwrap();
+    }
+
+    #[test]
+    fn rewrite_rust_files_expands_operator_mutation_to_expression_wrapper() {
+        let dir = TempDir::new().unwrap();
+        let source = "#![allow(dead_code)]\npub fn f(a: i32, b: i32) -> bool { a == b }\n";
+        write_source(&dir, "src/lib.rs", source);
+        let operator = source.find("==").unwrap();
+        let mutation = mutation(
+            "rust",
+            "src/lib.rs",
+            "==",
+            "!=",
+            operator..operator + 2,
+            "eq_to_neq",
+        );
+
+        let rewrites = rewrite_rust_files(
+            dir.path(),
+            &[SchemaMutation {
+                mutation,
+                kind: SchemaKind::Expression,
+            }],
+        )
+        .unwrap();
+
+        assert_eq!(rewrites.len(), 1);
+        let rewritten = String::from_utf8(rewrites[0].content.clone()).unwrap();
+        assert!(rewritten.starts_with("#![allow(dead_code)]\n#[allow(dead_code)]\n"));
+        assert!(rewritten.contains("fn __togi_active(id: u32) -> bool"));
+        assert!(
+            rewritten.contains("__togi_select(7, || { a == b }, || { a != b })"),
+            "{rewritten}"
+        );
+        parse_rust_source(&rewritten).unwrap();
+    }
+
+    #[test]
+    fn rewrite_rust_files_inserts_helper_after_multiline_inner_attribute() {
+        let dir = TempDir::new().unwrap();
+        let source = "#![doc(\n    html_logo_url = \"https://example.com/logo.png\"\n)]\npub fn f(a: i32, b: i32) -> bool { a == b }\n";
+        write_source(&dir, "src/lib.rs", source);
+        let operator = source.find("==").unwrap();
+        let mutation = mutation(
+            "rust",
+            "src/lib.rs",
+            "==",
+            "!=",
+            operator..operator + 2,
+            "eq_to_neq",
+        );
+
+        let rewrites = rewrite_rust_files(
+            dir.path(),
+            &[SchemaMutation {
+                mutation,
+                kind: SchemaKind::Expression,
+            }],
+        )
+        .unwrap();
+
+        let rewritten = String::from_utf8(rewrites[0].content.clone()).unwrap();
+        assert!(
+            rewritten.starts_with(
+                "#![doc(\n    html_logo_url = \"https://example.com/logo.png\"\n)]\n#[allow(dead_code)]\n"
+            ),
+            "{rewritten}"
+        );
+        parse_rust_source(&rewritten).unwrap();
     }
 
     #[test]
