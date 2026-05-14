@@ -119,11 +119,34 @@ pub trait SchemaAdapter: Send + Sync {
     }
 }
 
+struct CSchema;
 struct GoSchema;
 struct JavaSchema;
 struct RustSchema;
 struct PythonSchema;
 struct TypeScriptSchema;
+
+const C_OPERATOR_ALLOWLIST: &[&str] = &[
+    "eq_to_neq",
+    "lt_to_lte",
+    "gt_to_gte",
+    "and_to_or",
+    "or_to_and",
+    "mul_to_div",
+    "div_to_mul",
+    "mod_to_mul",
+    "plus_to_minus",
+    "minus_to_plus",
+    "true_to_false",
+    "false_to_true",
+    "zero_to_one",
+    "string_to_empty",
+    "increment_numeric",
+    "decrement_numeric",
+    "remove_unary_not",
+    "remove_unary_neg",
+    "negate_condition",
+];
 
 const JAVA_OPERATOR_ALLOWLIST: &[&str] = &[
     "eq_to_neq",
@@ -168,6 +191,52 @@ const RUST_OPERATOR_ALLOWLIST: &[&str] = &[
     "remove_unary_neg",
     "negate_condition",
 ];
+
+impl SchemaAdapter for CSchema {
+    fn language(&self) -> &str {
+        "c"
+    }
+
+    fn runtime_helper(&self) -> &'static str {
+        r#"static int __togi_active(unsigned int id) {
+    extern char *getenv(const char *);
+    const char *value = getenv("TOGI_MUTANT");
+    unsigned int parsed = 0u;
+    if (value == 0 || *value == '\0') {
+        return 0;
+    }
+    while (*value >= '0' && *value <= '9') {
+        parsed = parsed * 10u + (unsigned int)(*value - '0');
+        value++;
+    }
+    return *value == '\0' && parsed == id;
+}
+"#
+    }
+
+    fn wrap_expression(&self, mutant_id: u32, original: &str, replacement: &str) -> String {
+        format!("(__togi_active({mutant_id}u) ? ({replacement}) : ({original}))")
+    }
+
+    fn wrap_statement(&self, mutant_id: u32, original: &str, replacement: &str) -> String {
+        format!("if (__togi_active({mutant_id}u)) {{ {replacement} }} else {{ {original} }}")
+    }
+
+    fn classify(&self, mutation: &Mutation, source: &[u8]) -> Result<SchemaKind, SchemaSkipReason> {
+        validate_source_range(mutation, source)?;
+        if !C_OPERATOR_ALLOWLIST.contains(&mutation.operator.as_str()) {
+            return Err(SchemaSkipReason::UnsupportedOperator);
+        }
+        if !c_range_is_runtime_context(source, mutation.byte_range.clone()) {
+            return Err(SchemaSkipReason::CompileTimeContext);
+        }
+        Ok(SchemaKind::Expression)
+    }
+
+    fn is_compile_time_context(&self, mutation: &Mutation, source: &[u8]) -> bool {
+        !c_range_is_runtime_context(source, mutation.byte_range.clone())
+    }
+}
 
 impl SchemaAdapter for GoSchema {
     fn language(&self) -> &str {
@@ -343,6 +412,7 @@ function __togi_select<T>(id: number, original: () => T, mutated: () => T): T {
     }
 }
 
+static C_SCHEMA: CSchema = CSchema;
 static GO_SCHEMA: GoSchema = GoSchema;
 static JAVA_SCHEMA: JavaSchema = JavaSchema;
 static RUST_SCHEMA: RustSchema = RustSchema;
@@ -352,6 +422,7 @@ static TYPESCRIPT_SCHEMA: TypeScriptSchema = TypeScriptSchema;
 /// Return the schema adapter for a language, if implemented.
 pub fn adapter_for_language(language: &str) -> Option<&'static dyn SchemaAdapter> {
     match language {
+        "c" => Some(&C_SCHEMA),
         "go" => Some(&GO_SCHEMA),
         "java" => Some(&JAVA_SCHEMA),
         "rust" => Some(&RUST_SCHEMA),
@@ -414,6 +485,49 @@ pub fn plan(project_root: &Path, mutations: Vec<Mutation>) -> SchemaPlan {
         selected: final_selected,
         fallback,
     }
+}
+
+/// Rewrite C files once so selected mutations can be activated by `TOGI_MUTANT`.
+pub fn rewrite_c_files(
+    project_root: &Path,
+    selected: &[SchemaMutation],
+) -> Result<Vec<SchemaFileRewrite>, SchemaRewriteError> {
+    let Some(adapter) = adapter_for_language("c") else {
+        return Err(SchemaRewriteError::new("c schema adapter is not available"));
+    };
+
+    let mut by_file: BTreeMap<PathBuf, Vec<&SchemaMutation>> = BTreeMap::new();
+    for mutation in selected {
+        if mutation.mutation.language != "c" {
+            return Err(SchemaRewriteError::new(format!(
+                "schema rewrite only supports c, got {}",
+                mutation.mutation.language
+            )));
+        }
+        if mutation.kind != SchemaKind::Expression {
+            return Err(SchemaRewriteError::new(
+                "c schema rewrite currently supports expression mutations only",
+            ));
+        }
+        by_file
+            .entry(source_path(project_root, &mutation.mutation.file))
+            .or_default()
+            .push(mutation);
+    }
+
+    let mut rewritten = Vec::new();
+    for (file, mutations) in by_file {
+        let source = std::fs::read_to_string(&file).map_err(|e| {
+            SchemaRewriteError::new(format!("could not read {}: {e}", file.display()))
+        })?;
+        let rewritten_source = rewrite_c_file(&source, &mutations, adapter)?;
+        rewritten.push(SchemaFileRewrite {
+            file,
+            content: rewritten_source.into_bytes(),
+        });
+    }
+
+    Ok(rewritten)
 }
 
 /// Rewrite Go files once so selected mutations can be activated by `TOGI_MUTANT`.
@@ -576,6 +690,51 @@ fn source_path(project_root: &Path, mutation_file: &Path) -> PathBuf {
     } else {
         project_root.join(mutation_file)
     }
+}
+
+fn rewrite_c_file(
+    source: &str,
+    selected: &[&SchemaMutation],
+    adapter: &dyn SchemaAdapter,
+) -> Result<String, SchemaRewriteError> {
+    let source_bytes = source.as_bytes();
+    let tree = parse_c_source(source)?;
+    let mut edits = Vec::with_capacity(selected.len());
+
+    for schema_mutation in selected {
+        let mutation = &schema_mutation.mutation;
+        validate_source_range(mutation, source_bytes).map_err(|reason| {
+            SchemaRewriteError::new(format!(
+                "mutation {} is not rewriteable: {reason:?}",
+                mutation.id
+            ))
+        })?;
+        let expression_range = c_expression_range_for_mutation(tree.root_node(), source, mutation)?;
+        let original = source_slice(source, expression_range.clone())?;
+        let replacement = mutated_expression(source, expression_range.clone(), mutation)?;
+        let wrapped = adapter.wrap_expression(mutation.id, original, &replacement);
+        edits.push((expression_range, wrapped));
+    }
+
+    edits.sort_by_key(|(range, _)| (range.start, range.end));
+    let mut previous_end = 0usize;
+    for (position, (range, _)) in edits.iter().enumerate() {
+        if position > 0 && range.start < previous_end {
+            return Err(SchemaRewriteError::new(
+                "schema mutations overlap after expression expansion",
+            ));
+        }
+        previous_end = range.end;
+    }
+
+    let mut rewritten = source.as_bytes().to_vec();
+    for (range, replacement) in edits.into_iter().rev() {
+        rewritten.splice(range, replacement.bytes());
+    }
+
+    let rewritten = String::from_utf8(rewritten)
+        .map_err(|e| SchemaRewriteError::new(format!("rewritten C source is not utf-8: {e}")))?;
+    inject_c_runtime(&rewritten, adapter)
 }
 
 fn rewrite_go_file(
@@ -754,6 +913,20 @@ fn mutated_expression(
         .map_err(|e| SchemaRewriteError::new(format!("mutated expression is not utf-8: {e}")))
 }
 
+fn parse_c_source(source: &str) -> Result<tree_sitter::Tree, SchemaRewriteError> {
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&tree_sitter_c::LANGUAGE.into())
+        .map_err(|e| SchemaRewriteError::new(format!("could not load C grammar: {e}")))?;
+    let tree = parser
+        .parse(source, None)
+        .ok_or_else(|| SchemaRewriteError::new("could not parse C source"))?;
+    if tree.root_node().has_error() {
+        return Err(SchemaRewriteError::new("C source contains parse errors"));
+    }
+    Ok(tree)
+}
+
 fn parse_go_source(source: &str) -> Result<tree_sitter::Tree, SchemaRewriteError> {
     let mut parser = tree_sitter::Parser::new();
     parser
@@ -794,6 +967,45 @@ fn parse_rust_source(source: &str) -> Result<tree_sitter::Tree, SchemaRewriteErr
         return Err(SchemaRewriteError::new("Rust source contains parse errors"));
     }
     Ok(tree)
+}
+
+fn c_expression_range_for_mutation(
+    root: tree_sitter::Node<'_>,
+    source: &str,
+    mutation: &Mutation,
+) -> Result<std::ops::Range<usize>, SchemaRewriteError> {
+    if !C_OPERATOR_ALLOWLIST.contains(&mutation.operator.as_str()) {
+        return Err(SchemaRewriteError::new(format!(
+            "unsupported C schema operator {}",
+            mutation.operator
+        )));
+    }
+
+    match mutation.operator.as_str() {
+        "eq_to_neq" | "lt_to_lte" | "gt_to_gte" | "and_to_or" | "or_to_and" | "mul_to_div"
+        | "div_to_mul" | "mod_to_mul" | "plus_to_minus" | "minus_to_plus" => {
+            smallest_c_node_range(root, mutation.byte_range.clone(), |node| {
+                node.kind() == "binary_expression"
+            })
+        }
+        "true_to_false" | "false_to_true" | "zero_to_one" | "string_to_empty"
+        | "increment_numeric" | "decrement_numeric" => {
+            exact_c_node_range(root, mutation.byte_range.clone())
+        }
+        "remove_unary_not" | "remove_unary_neg" => {
+            smallest_c_node_range(root, mutation.byte_range.clone(), |node| {
+                node.kind() == "unary_expression"
+            })
+        }
+        "negate_condition" => {
+            source_slice(source, mutation.byte_range.clone())?;
+            Ok(mutation.byte_range.clone())
+        }
+        _ => Err(SchemaRewriteError::new(format!(
+            "accepted C schema operator has no rewrite strategy: {}",
+            mutation.operator
+        ))),
+    }
 }
 
 fn go_expression_range_for_mutation(
@@ -900,6 +1112,27 @@ fn rust_expression_range_for_mutation(
     }
 }
 
+fn smallest_c_node_range(
+    node: tree_sitter::Node<'_>,
+    range: std::ops::Range<usize>,
+    predicate: impl Fn(tree_sitter::Node<'_>) -> bool + Copy,
+) -> Result<std::ops::Range<usize>, SchemaRewriteError> {
+    let mut best = None::<std::ops::Range<usize>>;
+    visit_nodes(node, &mut |candidate| {
+        let candidate_range = candidate.byte_range();
+        if candidate_range.start <= range.start
+            && range.end <= candidate_range.end
+            && predicate(candidate)
+            && best
+                .as_ref()
+                .is_none_or(|best| candidate_range.len() < best.len())
+        {
+            best = Some(candidate_range);
+        }
+    });
+    best.ok_or_else(|| SchemaRewriteError::new("could not find containing C expression"))
+}
+
 fn smallest_go_node_range(
     node: tree_sitter::Node<'_>,
     range: std::ops::Range<usize>,
@@ -974,6 +1207,19 @@ fn exact_go_node_range(
         }
     });
     found.ok_or_else(|| SchemaRewriteError::new("could not find Go expression node"))
+}
+
+fn exact_c_node_range(
+    node: tree_sitter::Node<'_>,
+    range: std::ops::Range<usize>,
+) -> Result<std::ops::Range<usize>, SchemaRewriteError> {
+    let mut found = None;
+    visit_nodes(node, &mut |candidate| {
+        if candidate.byte_range() == range {
+            found = Some(range.clone());
+        }
+    });
+    found.ok_or_else(|| SchemaRewriteError::new("could not find C expression node"))
 }
 
 fn exact_java_node_range(
@@ -1058,6 +1304,69 @@ fn node_text_eq(node: tree_sitter::Node<'_>, source: &[u8], expected: &str) -> b
         .is_some_and(|bytes| bytes == expected.as_bytes())
 }
 
+fn c_range_is_runtime_context(source: &[u8], range: std::ops::Range<usize>) -> bool {
+    let Ok(source_text) = std::str::from_utf8(source) else {
+        return false;
+    };
+    let Ok(tree) = parse_c_source(source_text) else {
+        return false;
+    };
+    let Some(mut current) = smallest_containing_node(tree.root_node(), range) else {
+        return false;
+    };
+
+    let mut inside_function_body = false;
+    loop {
+        let kind = current.kind();
+        if kind.starts_with("preproc") || kind == "case_statement" || kind == "enumerator" {
+            return false;
+        }
+        if kind == "declaration" && c_declaration_has_static_storage(current, source) {
+            return false;
+        }
+        if kind == "compound_statement"
+            && current
+                .parent()
+                .is_some_and(|parent| parent.kind() == "function_definition")
+        {
+            inside_function_body = true;
+        }
+
+        let Some(parent) = current.parent() else {
+            break;
+        };
+        current = parent;
+    }
+
+    inside_function_body
+}
+
+fn smallest_containing_node<'tree>(
+    node: tree_sitter::Node<'tree>,
+    range: std::ops::Range<usize>,
+) -> Option<tree_sitter::Node<'tree>> {
+    let mut best = None::<tree_sitter::Node<'tree>>;
+    visit_nodes(node, &mut |candidate| {
+        let candidate_range = candidate.byte_range();
+        if candidate_range.start <= range.start
+            && range.end <= candidate_range.end
+            && best
+                .as_ref()
+                .is_none_or(|best| candidate_range.len() < best.byte_range().len())
+        {
+            best = Some(candidate);
+        }
+    });
+    best
+}
+
+fn c_declaration_has_static_storage(declaration: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    source
+        .get(declaration.byte_range())
+        .and_then(|bytes| std::str::from_utf8(bytes).ok())
+        .is_some_and(|text| text.trim_start().starts_with("static "))
+}
+
 fn visit_go_nodes<'tree>(
     node: tree_sitter::Node<'tree>,
     visit: &mut impl FnMut(tree_sitter::Node<'tree>),
@@ -1079,6 +1388,73 @@ fn visit_nodes<'tree>(
 fn source_slice(source: &str, range: std::ops::Range<usize>) -> Result<&str, SchemaRewriteError> {
     std::str::from_utf8(&source.as_bytes()[range])
         .map_err(|e| SchemaRewriteError::new(format!("source slice is not utf-8: {e}")))
+}
+
+fn inject_c_runtime(
+    source: &str,
+    adapter: &dyn SchemaAdapter,
+) -> Result<String, SchemaRewriteError> {
+    let tree = parse_c_source(source)?;
+    let root = tree.root_node();
+    if c_source_declares_togi_active(root, source.as_bytes()) {
+        return Ok(source.to_string());
+    }
+    let insert_at = c_runtime_insert_offset(root)?;
+    let helper = adapter.runtime_helper().trim_end();
+    let mut insertion = String::new();
+    if insert_at > 0 && !source[..insert_at].ends_with('\n') {
+        insertion.push('\n');
+    }
+    insertion.push_str(helper);
+    insertion.push_str("\n\n");
+
+    let mut rewritten = source.to_string();
+    rewritten.insert_str(insert_at, &insertion);
+    Ok(rewritten)
+}
+
+fn c_runtime_insert_offset(root: tree_sitter::Node<'_>) -> Result<usize, SchemaRewriteError> {
+    let mut cursor = root.walk();
+    root.children(&mut cursor)
+        .find(|child| child.kind() == "function_definition")
+        .map(|child| child.byte_range().start)
+        .ok_or_else(|| SchemaRewriteError::new("could not find C function for schema helper"))
+}
+
+fn c_source_declares_togi_active(root: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    let mut found = false;
+    visit_nodes(root, &mut |candidate| {
+        if candidate.kind() == "function_definition"
+            && c_function_definition_name_is(candidate, source, "__togi_active")
+        {
+            found = true;
+        }
+    });
+    found
+}
+
+fn c_function_definition_name_is(
+    function: tree_sitter::Node<'_>,
+    source: &[u8],
+    expected: &str,
+) -> bool {
+    function
+        .child_by_field_name("declarator")
+        .is_some_and(|declarator| c_declarator_name_is(declarator, source, expected))
+}
+
+fn c_declarator_name_is(declarator: tree_sitter::Node<'_>, source: &[u8], expected: &str) -> bool {
+    if declarator.kind() == "identifier" {
+        return node_text_eq(declarator, source, expected);
+    }
+    if let Some(child) = declarator.child_by_field_name("declarator") {
+        return c_declarator_name_is(child, source, expected);
+    }
+
+    let mut cursor = declarator.walk();
+    declarator.children(&mut cursor).any(|child| {
+        child.kind() != "parameter_list" && c_declarator_name_is(child, source, expected)
+    })
 }
 
 fn inject_go_runtime(
@@ -1733,6 +2109,14 @@ mod tests {
     fn adapters_wrap_expressions_with_language_syntax() {
         let dir = TempDir::new().unwrap();
 
+        let c = adapter_for_language("c").unwrap();
+        write_source(&dir, "calc.c", "int f(int a, int b) { return a == b; }\n");
+        assert_parsed_node_text(&dir, "calc.c", c, "binary_expression", "a == b");
+        assert_eq!(
+            c.wrap_expression(42, "a == b", "a != b"),
+            "(__togi_active(42u) ? (a != b) : (a == b))"
+        );
+
         let go = adapter_for_language("go").unwrap();
         write_source(
             &dir,
@@ -1819,6 +2203,29 @@ mod tests {
     }
 
     #[test]
+    fn plan_selects_c_expression_mutations_inside_function_body() {
+        let dir = TempDir::new().unwrap();
+        let adapter = adapter_for_language("c").unwrap();
+        write_source(&dir, "calc.c", "int f(int a, int b) { return a == b; }\n");
+        assert_parsed_node_text(&dir, "calc.c", adapter, "binary_expression", "a == b");
+        let start = "int f(int a, int b) { return ".len();
+        let mutation = mutation(
+            "c",
+            "calc.c",
+            "a == b",
+            "a != b",
+            start..start + 6,
+            "eq_to_neq",
+        );
+
+        let plan = plan(dir.path(), vec![mutation]);
+
+        assert_eq!(plan.selected.len(), 1);
+        assert_eq!(plan.selected[0].kind, SchemaKind::Expression);
+        assert!(plan.fallback.is_empty());
+    }
+
+    #[test]
     fn plan_falls_back_for_go_non_boolean_expression_mutations() {
         let dir = TempDir::new().unwrap();
         let adapter = adapter_for_language("go").unwrap();
@@ -1867,6 +2274,34 @@ mod tests {
             "false",
             start..start + 4,
             "true_to_false",
+        );
+
+        let plan = plan(dir.path(), vec![mutation]);
+
+        assert!(plan.selected.is_empty());
+        assert_eq!(plan.fallback.len(), 1);
+        assert_eq!(
+            plan.fallback[0].reason,
+            SchemaSkipReason::CompileTimeContext
+        );
+    }
+
+    #[test]
+    fn plan_falls_back_for_c_global_context() {
+        let dir = TempDir::new().unwrap();
+        let adapter = adapter_for_language("c").unwrap();
+        let source = "static const int VERSION = 2;\nint f(void) { return VERSION; }\n";
+        write_source(&dir, "calc.c", source);
+        assert_parsed_node_kind(&dir, "calc.c", adapter, "declaration");
+        assert_parsed_node_text(&dir, "calc.c", adapter, "number_literal", "2");
+        let start = source.find('2').unwrap();
+        let mutation = mutation(
+            "c",
+            "calc.c",
+            "2",
+            "3",
+            start..start + 1,
+            "increment_numeric",
         );
 
         let plan = plan(dir.path(), vec![mutation]);
@@ -2041,6 +2476,109 @@ mod tests {
         assert_eq!(plan.selected.len(), 1);
         assert_eq!(plan.fallback.len(), 1);
         assert_eq!(plan.fallback[0].reason, SchemaSkipReason::OverlappingRange);
+    }
+
+    #[test]
+    fn rewrite_c_files_expands_operator_mutation_to_expression_wrapper() {
+        let dir = TempDir::new().unwrap();
+        let source = "#include <stdio.h>\nint f(int a, int b) { return a == b; }\n";
+        write_source(&dir, "calc.c", source);
+        let operator = source.find("==").unwrap();
+        let mutation = mutation(
+            "c",
+            "calc.c",
+            "==",
+            "!=",
+            operator..operator + 2,
+            "eq_to_neq",
+        );
+
+        let rewrites = rewrite_c_files(
+            dir.path(),
+            &[SchemaMutation {
+                mutation,
+                kind: SchemaKind::Expression,
+            }],
+        )
+        .unwrap();
+
+        assert_eq!(rewrites.len(), 1);
+        let rewritten = String::from_utf8(rewrites[0].content.clone()).unwrap();
+        assert!(rewritten.contains("static int __togi_active(unsigned int id)"));
+        assert!(rewritten.contains("return (__togi_active(7u) ? (a != b) : (a == b));"));
+        assert!(
+            rewritten.find("static int __togi_active").unwrap() < rewritten.find("int f").unwrap(),
+            "{rewritten}"
+        );
+        parse_c_source(&rewritten).unwrap();
+    }
+
+    #[test]
+    fn rewrite_c_files_ignores_togi_active_mentions_in_text() {
+        let dir = TempDir::new().unwrap();
+        let source = "const char *marker(void) { return \"__togi_active(\"; }\nint f(int a, int b) { return a == b; }\n";
+        write_source(&dir, "calc.c", source);
+        let operator = source.find("==").unwrap();
+        let mutation = mutation(
+            "c",
+            "calc.c",
+            "==",
+            "!=",
+            operator..operator + 2,
+            "eq_to_neq",
+        );
+
+        let rewrites = rewrite_c_files(
+            dir.path(),
+            &[SchemaMutation {
+                mutation,
+                kind: SchemaKind::Expression,
+            }],
+        )
+        .unwrap();
+
+        let rewritten = String::from_utf8(rewrites[0].content.clone()).unwrap();
+        assert_eq!(
+            rewritten
+                .matches("static int __togi_active(unsigned int id)")
+                .count(),
+            1,
+            "{rewritten}"
+        );
+        parse_c_source(&rewritten).unwrap();
+    }
+
+    #[test]
+    fn rewrite_c_files_reuses_existing_togi_active_function_with_spacing() {
+        let dir = TempDir::new().unwrap();
+        let source = "static int __togi_active (unsigned int id) { return 0; }\nint f(int a, int b) { return a == b; }\n";
+        write_source(&dir, "calc.c", source);
+        let operator = source.find("==").unwrap();
+        let mutation = mutation(
+            "c",
+            "calc.c",
+            "==",
+            "!=",
+            operator..operator + 2,
+            "eq_to_neq",
+        );
+
+        let rewrites = rewrite_c_files(
+            dir.path(),
+            &[SchemaMutation {
+                mutation,
+                kind: SchemaKind::Expression,
+            }],
+        )
+        .unwrap();
+
+        let rewritten = String::from_utf8(rewrites[0].content.clone()).unwrap();
+        assert_eq!(
+            rewritten.matches("static int __togi_active").count(),
+            1,
+            "{rewritten}"
+        );
+        parse_c_source(&rewritten).unwrap();
     }
 
     #[test]
