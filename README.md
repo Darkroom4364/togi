@@ -96,7 +96,7 @@ togi check --jobs 8 --timeout 60
 # Cap mutation count for a bounded exploratory run
 togi check --max-per-run 50  # --max-per-run 0 = unlimited
 
-# Opt in to Go mutant schemata for compatible mutations
+# Opt in to compiled-language schemata for compatible mutations
 togi check --schemata
 
 # Scope to a directory
@@ -236,6 +236,10 @@ togi check --check-baseline
 ```
 
 Baselines let existing weak spots stay visible without blocking every PR. New regressions still fail the run.
+
+### Mutant schemata
+
+`--schemata` batches compatible mutations into one build and switches mutants at runtime with `TOGI_MUTANT`. It currently supports expression-safe mutations in runtime contexts for Go, Rust, Java, C, and C++; unsupported operators or compile-time contexts automatically fall back to the regular one-mutant-at-a-time runner.
 
 ## Coverage and test selection
 
