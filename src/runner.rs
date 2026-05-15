@@ -1098,7 +1098,7 @@ impl TestRunner {
 
         for schema_mutation in plan.selected {
             match schema_mutation.mutation.language.as_str() {
-                "c" | "go" | "java" | "rust" => {
+                "c" | "cpp" | "go" | "java" | "rust" => {
                     schema_by_language
                         .entry(schema_mutation.mutation.language.clone())
                         .or_default()
@@ -1288,6 +1288,7 @@ impl TestRunner {
     ) -> Result<Vec<(Mutation, MutationResult)>, crate::schemata::SchemaRewriteError> {
         let rewrites = match language {
             "c" => crate::schemata::rewrite_c_files(&self.project_root, schema_mutations)?,
+            "cpp" => crate::schemata::rewrite_cpp_files(&self.project_root, schema_mutations)?,
             "go" => crate::schemata::rewrite_go_files(&self.project_root, schema_mutations)?,
             "java" => crate::schemata::rewrite_java_files(&self.project_root, schema_mutations)?,
             "rust" => crate::schemata::rewrite_rust_files(&self.project_root, schema_mutations)?,
@@ -2405,6 +2406,12 @@ mod tests {
     fn c_operator_mutation(id: u32, file: &str, source: &str, nth: usize) -> Mutation {
         let mut mutation = go_operator_mutation(id, file, source, nth);
         mutation.language = "c".into();
+        mutation
+    }
+
+    fn cpp_operator_mutation(id: u32, file: &str, source: &str, nth: usize) -> Mutation {
+        let mut mutation = go_operator_mutation(id, file, source, nth);
+        mutation.language = "cpp".into();
         mutation
     }
 
@@ -3607,6 +3614,72 @@ int main(void) {
                 project_commands: vec![],
                 language_commands: HashMap::new(),
                 build_command: vec!["cc".into(), "calc.c".into(), "-o".into(), "calc".into()],
+                build_command_explicit: true,
+                timeout: Duration::from_secs(30),
+                language_timeouts: HashMap::new(),
+                test_selection: None,
+            },
+            parallelism: 1,
+            project_root: dir.path().to_path_buf(),
+            verbose: false,
+            show_output: false,
+            max_tested: None,
+            respect_workspace_ignores: true,
+            env: HashMap::new(),
+            cancelled: Arc::new(AtomicBool::new(false)),
+        };
+
+        let report = runner.run_with_schemata(vec![mutation]).report;
+
+        assert_eq!(report.total, 1);
+        assert_eq!(report.results[0].1, MutationResult::Killed);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_with_schemata_executes_cpp_mutation_with_active_env() {
+        if std::process::Command::new("c++")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("skipping C++ schemata runner test because c++ is unavailable");
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let source = "\
+bool same(int a, int b) {
+    return a == b;
+}
+
+int main() {
+    if (!same(1, 1)) {
+        return 1;
+    }
+    if (same(1, 2)) {
+        return 2;
+    }
+    return 0;
+}
+";
+        std::fs::write(dir.path().join("calc.cpp"), source).unwrap();
+        let mutation = cpp_operator_mutation(0, "calc.cpp", source, 0);
+
+        let runner = TestRunner {
+            commands: CommandConfig {
+                command: vec!["./calc".into()],
+                force_default_command: false,
+                force_default_timeout: false,
+                project_commands: vec![],
+                language_commands: HashMap::new(),
+                build_command: vec![
+                    "c++".into(),
+                    "calc.cpp".into(),
+                    "-std=c++11".into(),
+                    "-o".into(),
+                    "calc".into(),
+                ],
                 build_command_explicit: true,
                 timeout: Duration::from_secs(30),
                 language_timeouts: HashMap::new(),
