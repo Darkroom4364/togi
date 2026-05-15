@@ -1610,7 +1610,13 @@ fn cpp_range_is_runtime_context(source: &[u8], range: std::ops::Range<usize>) ->
         if kind.starts_with("preproc") || kind == "case_statement" || kind == "enumerator" {
             return false;
         }
+        if kind.contains("static_assert") {
+            return false;
+        }
         if kind == "declaration" && c_declaration_has_static_storage(current, source) {
+            return false;
+        }
+        if kind == "function_definition" && cpp_function_is_constant_evaluated(current, source) {
             return false;
         }
         if kind == "compound_statement"
@@ -1819,7 +1825,7 @@ fn cpp_function_is_member_definition(function: tree_sitter::Node<'_>) -> bool {
     while let Some(parent) = current.parent() {
         if matches!(
             parent.kind(),
-            "class_specifier" | "struct_specifier" | "union_specifier"
+            "class_specifier" | "struct_specifier" | "union_specifier" | "namespace_definition"
         ) {
             return true;
         }
@@ -1838,6 +1844,33 @@ fn cpp_declarator_is_qualified(declarator: tree_sitter::Node<'_>) -> bool {
     declarator
         .children(&mut cursor)
         .any(cpp_declarator_is_qualified)
+}
+
+fn cpp_function_is_constant_evaluated(function: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    let prefix_end = function
+        .child_by_field_name("declarator")
+        .map(|declarator| declarator.byte_range().start)
+        .unwrap_or_else(|| function.byte_range().end);
+    source
+        .get(function.byte_range().start..prefix_end)
+        .and_then(|bytes| std::str::from_utf8(bytes).ok())
+        .is_some_and(|prefix| {
+            contains_ascii_keyword(prefix, "constexpr")
+                || contains_ascii_keyword(prefix, "consteval")
+        })
+}
+
+fn contains_ascii_keyword(text: &str, keyword: &str) -> bool {
+    text.match_indices(keyword).any(|(start, _)| {
+        let before = text[..start].chars().next_back();
+        let after = text[start + keyword.len()..].chars().next();
+        before.is_none_or(|character| !is_ascii_identifier_character(character))
+            && after.is_none_or(|character| !is_ascii_identifier_character(character))
+    })
+}
+
+fn is_ascii_identifier_character(character: char) -> bool {
+    character == '_' || character.is_ascii_alphanumeric()
 }
 
 fn c_runtime_insert_offset(root: tree_sitter::Node<'_>) -> Result<usize, SchemaRewriteError> {
@@ -2810,6 +2843,54 @@ mod tests {
     }
 
     #[test]
+    fn plan_falls_back_for_cpp_constant_evaluated_contexts() {
+        let dir = TempDir::new().unwrap();
+        let adapter = adapter_for_language("cpp").unwrap();
+        for (file, source, original, replacement) in [
+            (
+                "constexpr.cpp",
+                "constexpr bool f(int a, int b) { return a == b; }\n",
+                "a == b",
+                "a != b",
+            ),
+            (
+                "consteval.cpp",
+                "consteval bool f(int a, int b) { return a == b; }\n",
+                "a == b",
+                "a != b",
+            ),
+            (
+                "static_assert.cpp",
+                "bool f() { static_assert(1 == 1, \"ok\"); return true; }\n",
+                "1 == 1",
+                "1 != 1",
+            ),
+        ] {
+            write_source(&dir, file, source);
+            assert_parsed_node_text(&dir, file, adapter, "binary_expression", original);
+            let start = source.find(original).unwrap();
+            let mutation = mutation(
+                "cpp",
+                file,
+                original,
+                replacement,
+                start..start + original.len(),
+                "eq_to_neq",
+            );
+
+            let plan = plan(dir.path(), vec![mutation]);
+
+            assert!(plan.selected.is_empty(), "{file}");
+            assert_eq!(plan.fallback.len(), 1, "{file}");
+            assert_eq!(
+                plan.fallback[0].reason,
+                SchemaSkipReason::CompileTimeContext,
+                "{file}"
+            );
+        }
+    }
+
+    #[test]
     fn plan_falls_back_for_java_static_final_context() {
         let dir = TempDir::new().unwrap();
         let adapter = adapter_for_language("java").unwrap();
@@ -3150,6 +3231,44 @@ mod tests {
         );
         assert!(
             rewritten.contains("return (::__togi_active(7u) ? (a != b) : (a == b));"),
+            "{rewritten}"
+        );
+        parse_cpp_source(&rewritten).unwrap();
+    }
+
+    #[test]
+    fn rewrite_cpp_files_does_not_reuse_namespace_togi_active_function() {
+        let dir = TempDir::new().unwrap();
+        let source = "namespace hidden { static bool __togi_active (unsigned int id) { return false; } }\nbool f(int a, int b) { return a == b; }\n";
+        write_source(&dir, "calc.cpp", source);
+        let operator = source.find("==").unwrap();
+        let mutation = mutation(
+            "cpp",
+            "calc.cpp",
+            "==",
+            "!=",
+            operator..operator + 2,
+            "eq_to_neq",
+        );
+
+        let rewrites = rewrite_cpp_files(
+            dir.path(),
+            &[SchemaMutation {
+                mutation,
+                kind: SchemaKind::Expression,
+            }],
+        )
+        .unwrap();
+
+        let rewritten = String::from_utf8(rewrites[0].content.clone()).unwrap();
+        assert!(rewritten.contains("#include <cstdlib>"), "{rewritten}");
+        assert!(
+            rewritten.contains("static bool __togi_active(unsigned int id)"),
+            "{rewritten}"
+        );
+        assert_eq!(
+            rewritten.matches("static bool __togi_active").count(),
+            2,
             "{rewritten}"
         );
         parse_cpp_source(&rewritten).unwrap();
