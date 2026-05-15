@@ -1,6 +1,7 @@
 use crate::{MutationReport, MutationResult};
 use anyhow::Result;
 use serde::Serialize;
+use std::collections::BTreeMap;
 
 #[derive(Serialize)]
 struct JsonReport {
@@ -14,7 +15,36 @@ struct JsonReport {
     duration_ms: u128,
     test_command: Option<Vec<String>>,
     build_command: Vec<String>,
+    build_error_groups: Vec<JsonBuildErrorGroup>,
     mutations: Vec<JsonMutation>,
+}
+
+#[derive(Serialize)]
+struct JsonBuildErrorGroup {
+    count: usize,
+    language: String,
+    operator: String,
+    runner: String,
+    phase: String,
+    fingerprint: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    command: Vec<String>,
+    message: String,
+    files: Vec<JsonBuildErrorFileCount>,
+    examples: Vec<JsonBuildErrorExample>,
+}
+
+#[derive(Serialize)]
+struct JsonBuildErrorFileCount {
+    file: String,
+    count: usize,
+}
+
+#[derive(Serialize)]
+struct JsonBuildErrorExample {
+    mutation_id: u32,
+    file: String,
+    line: usize,
 }
 
 #[derive(Serialize)]
@@ -33,6 +63,8 @@ struct JsonMutation {
     replacement: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     diff: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    build_error_fingerprint: Option<String>,
 }
 
 pub fn print_report(report: &MutationReport) -> Result<()> {
@@ -43,6 +75,11 @@ pub fn print_report(report: &MutationReport) -> Result<()> {
 
 /// Serialize report to a JSON string (for testing and programmatic use).
 pub fn to_json_string(report: &MutationReport) -> Result<String> {
+    let diagnostic_by_id: BTreeMap<_, _> = report
+        .build_error_diagnostics
+        .iter()
+        .map(|diagnostic| (diagnostic.mutation_id, diagnostic))
+        .collect();
     let mutations: Vec<JsonMutation> = report
         .results
         .iter()
@@ -62,6 +99,39 @@ pub fn to_json_string(report: &MutationReport) -> Result<String> {
             original: Some(m.original.clone()),
             replacement: Some(m.replacement.clone()),
             diff: super::mutation_diff(m),
+            build_error_fingerprint: diagnostic_by_id
+                .get(&m.id)
+                .map(|diagnostic| diagnostic.fingerprint.clone()),
+        })
+        .collect();
+    let build_error_groups = super::build_error_groups(report)
+        .into_iter()
+        .map(|group| JsonBuildErrorGroup {
+            count: group.count,
+            language: group.language,
+            operator: group.operator,
+            runner: group.runner,
+            phase: group.phase,
+            fingerprint: group.fingerprint,
+            command: group.command,
+            message: group.message,
+            files: group
+                .files
+                .into_iter()
+                .map(|file| JsonBuildErrorFileCount {
+                    file: file.file,
+                    count: file.count,
+                })
+                .collect(),
+            examples: group
+                .examples
+                .into_iter()
+                .map(|example| JsonBuildErrorExample {
+                    mutation_id: example.mutation_id,
+                    file: example.file,
+                    line: example.line,
+                })
+                .collect(),
         })
         .collect();
 
@@ -77,6 +147,7 @@ pub fn to_json_string(report: &MutationReport) -> Result<String> {
         duration_ms: report.duration.as_millis(),
         test_command: report.test_command.clone(),
         build_command: report.build_command.clone(),
+        build_error_groups,
         mutations,
     };
 
@@ -86,8 +157,8 @@ pub fn to_json_string(report: &MutationReport) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Mutation;
     use crate::test_helpers::sample_report;
+    use crate::{BuildErrorDiagnostic, Mutation};
     use serde_json::Value;
     use std::path::PathBuf;
     use std::time::Duration;
@@ -124,6 +195,7 @@ mod tests {
         assert_eq!(value["duration_ms"], 1234);
         assert_eq!(value["test_command"], serde_json::json!(["cargo", "test"]));
         assert_eq!(value["build_command"], serde_json::json!([]));
+        assert_eq!(value["build_error_groups"], serde_json::json!([]));
 
         let mutations = value["mutations"].as_array().unwrap();
         assert_eq!(mutations.len(), 2);
@@ -154,6 +226,7 @@ mod tests {
                 "duration_ms",
                 "test_command",
                 "build_command",
+                "build_error_groups",
                 "mutations",
             ],
         );
@@ -207,6 +280,7 @@ mod tests {
                 },
                 MutationResult::BuildError,
             )],
+            build_error_diagnostics: vec![],
             duration: Duration::from_millis(100),
             test_command: None,
             build_command: vec![],
@@ -223,9 +297,64 @@ mod tests {
     }
 
     #[test]
+    fn json_output_includes_build_error_groups() {
+        let diagnostic = BuildErrorDiagnostic::new(
+            1,
+            "regular",
+            "build_command",
+            vec!["cargo".into(), "check".into()],
+            "error[E0308]: mismatched types",
+        );
+        let fingerprint = diagnostic.fingerprint.clone();
+        let report = MutationReport {
+            results: vec![(
+                Mutation {
+                    id: 1,
+                    file: PathBuf::from("src/a.rs"),
+                    language: "rust".to_string(),
+                    line: 1,
+                    column: 1,
+                    operator: "eq_to_neq".to_string(),
+                    description: "d".to_string(),
+                    original: "==".to_string(),
+                    replacement: "!=".to_string(),
+                    byte_range: 0..2,
+                },
+                MutationResult::BuildError,
+            )],
+            build_error_diagnostics: vec![diagnostic],
+            duration: Duration::from_millis(100),
+            test_command: None,
+            build_command: vec![],
+            total: 1,
+            killed: 0,
+            survived: 0,
+            timeout: 0,
+            build_errors: 1,
+        };
+
+        let json_str = to_json_string(&report).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(value["build_error_groups"][0]["count"], 1);
+        assert_eq!(value["build_error_groups"][0]["language"], "rust");
+        assert_eq!(value["build_error_groups"][0]["operator"], "eq_to_neq");
+        assert_eq!(value["build_error_groups"][0]["runner"], "regular");
+        assert_eq!(value["build_error_groups"][0]["phase"], "build_command");
+        assert_eq!(
+            value["build_error_groups"][0]["command"],
+            serde_json::json!(["cargo", "check"])
+        );
+        assert_eq!(
+            value["mutations"][0]["build_error_fingerprint"],
+            serde_json::json!(fingerprint)
+        );
+    }
+
+    #[test]
     fn json_score_100_when_empty_report() {
         let report = MutationReport {
             results: vec![],
+            build_error_diagnostics: vec![],
             duration: Duration::from_millis(0),
             test_command: None,
             build_command: vec![],

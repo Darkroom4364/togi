@@ -104,11 +104,68 @@ fn format_report(report: &MutationReport, color: bool) -> String {
     writeln!(out, "Duration: {:.2}s", report.duration.as_secs_f64()).unwrap();
     writeln!(out, "{separator}").unwrap();
 
+    let build_error_summary = format_build_error_groups(report);
+    if !build_error_summary.is_empty() {
+        writeln!(out).unwrap();
+        write!(out, "{build_error_summary}").unwrap();
+    }
+
     if let Some(guidance) = all_build_error_guidance(report) {
         writeln!(out).unwrap();
         write!(out, "{guidance}").unwrap();
     }
 
+    out
+}
+
+fn format_build_error_groups(report: &MutationReport) -> String {
+    let groups = super::build_error_groups(report);
+    if groups.is_empty() {
+        return String::new();
+    }
+
+    let mut out = String::new();
+    writeln!(out, "Build error diagnostics:").unwrap();
+    for group in groups.iter().take(5) {
+        writeln!(
+            out,
+            "  {} build error{} — {} / {} / {} / {} [{}]",
+            group.count,
+            if group.count == 1 { "" } else { "s" },
+            group.language,
+            group.operator,
+            group.runner,
+            group.phase,
+            group.fingerprint
+        )
+        .unwrap();
+        if !group.command.is_empty() {
+            writeln!(out, "      command: {}", group.command.join(" ")).unwrap();
+        }
+        if !group.files.is_empty() {
+            let files = group
+                .files
+                .iter()
+                .take(3)
+                .map(|file| format!("{} ({})", file.file, file.count))
+                .collect::<Vec<_>>()
+                .join(", ");
+            writeln!(out, "      files: {files}").unwrap();
+        }
+        let first_line = group.message.lines().next().unwrap_or("").trim();
+        if !first_line.is_empty() {
+            writeln!(out, "      {first_line}").unwrap();
+        }
+    }
+    if groups.len() > 5 {
+        writeln!(
+            out,
+            "  ... {} more build-error group{}",
+            groups.len() - 5,
+            if groups.len() - 5 == 1 { "" } else { "s" }
+        )
+        .unwrap();
+    }
     out
 }
 
@@ -170,7 +227,7 @@ fn all_build_error_guidance(report: &MutationReport) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Mutation;
+    use crate::{BuildErrorDiagnostic, Mutation};
     use std::path::PathBuf;
     use std::time::Duration;
 
@@ -210,6 +267,7 @@ mod tests {
 
         MutationReport {
             results,
+            build_error_diagnostics: vec![],
             duration: Duration::from_millis(500),
             test_command: None,
             build_command: vec![],
@@ -254,14 +312,27 @@ mod tests {
 
     #[test]
     fn terminal_output_summary_with_timeout_and_build_errors() {
-        let report = report(vec![
+        let mut report = report(vec![
             (mutation(1, "src/a.rs", 1), MutationResult::Killed),
             (mutation(2, "src/b.rs", 2), MutationResult::Timeout),
             (mutation(3, "src/c.rs", 3), MutationResult::BuildError),
         ]);
+        report
+            .build_error_diagnostics
+            .push(BuildErrorDiagnostic::new(
+                3,
+                "regular",
+                "build_command",
+                vec!["cargo".into(), "check".into()],
+                "error[E0308]: mismatched types",
+            ));
         let output = format_report_plain(&report);
         assert!(output.contains("Results: 1 killed, 0 survived, 1 timeout, 1 build errors"));
         assert!(output.contains("Mutation score (test kills only): 50.0%"));
+        assert!(output.contains("Build error diagnostics:"));
+        assert!(output.contains("unknown / op / regular / build_command"));
+        assert!(output.contains("command: cargo check"));
+        assert!(output.contains("error[E0308]: mismatched types"));
     }
 
     #[test]

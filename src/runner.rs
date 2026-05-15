@@ -1,7 +1,7 @@
 // Parallel test execution with timeouts
 
 use crate::cache::{self, CacheKey};
-use crate::{Mutation, MutationReport, MutationResult};
+use crate::{BuildErrorDiagnostic, Mutation, MutationReport, MutationResult};
 use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::hash::Hasher;
@@ -857,6 +857,27 @@ struct QueuedMutation {
     mutation: Mutation,
 }
 
+#[derive(Debug)]
+struct MutationRunRecord {
+    mutation: Mutation,
+    result: MutationResult,
+    build_error_diagnostic: Option<BuildErrorDiagnostic>,
+}
+
+impl MutationRunRecord {
+    fn new(
+        mutation: Mutation,
+        result: MutationResult,
+        build_error_diagnostic: Option<BuildErrorDiagnostic>,
+    ) -> Self {
+        Self {
+            mutation,
+            result,
+            build_error_diagnostic,
+        }
+    }
+}
+
 struct RunShared<'a> {
     workspace_pool: &'a WorkspacePool,
     project_root: &'a Path,
@@ -879,7 +900,7 @@ fn run_queued_mutation(
     queued: QueuedMutation,
     reservation: TestSlotReservation,
     shared: RunShared<'_>,
-) -> Option<(usize, Mutation, MutationResult)> {
+) -> Option<(usize, MutationRunRecord)> {
     let QueuedMutation { index, mutation } = queued;
 
     // Stop if cancelled (Ctrl+C).
@@ -914,7 +935,8 @@ fn run_queued_mutation(
         if let Some(result) = cache::lookup(shared.project_root, key) {
             reservation.release();
             record_progress(&shared, &mutation, result, None, true);
-            return Some((index, mutation, result));
+            let diagnostic = cached_build_error_diagnostic(&mutation, "regular", result);
+            return Some((index, MutationRunRecord::new(mutation, result, diagnostic)));
         }
     }
 
@@ -932,7 +954,20 @@ fn run_queued_mutation(
             );
             reservation.release();
             record_progress(&shared, &mutation, MutationResult::BuildError, None, false);
-            return Some((index, mutation, MutationResult::BuildError));
+            let diagnostic = BuildErrorDiagnostic::new(
+                mutation.id,
+                "regular",
+                "workspace_reset",
+                vec![],
+                format!(
+                    "could not reset isolated mutation workspace {}: {e}",
+                    workspace_root.display()
+                ),
+            );
+            return Some((
+                index,
+                MutationRunRecord::new(mutation, MutationResult::BuildError, Some(diagnostic)),
+            ));
         }
         let workspace_target =
             ResolvedMutation::new_for_execution(shared.project_root, &workspace_root, &mutation);
@@ -972,7 +1007,8 @@ fn run_queued_mutation(
         outcome.test_output.as_deref(),
         false,
     );
-    Some((index, mutation, result))
+    let diagnostic = build_error_diagnostic_from_outcome(&mutation, "regular", &outcome);
+    Some((index, MutationRunRecord::new(mutation, result, diagnostic)))
 }
 
 struct TestSlotReservation {
@@ -1084,7 +1120,7 @@ impl TestRunner {
     pub fn run_with_schemata(&self, mutations: Vec<Mutation>) -> RunOutcome {
         let start = Instant::now();
         if mutations.is_empty() {
-            return self.outcome_from_results(Vec::new(), start.elapsed());
+            return self.outcome_from_records(Vec::new(), start.elapsed());
         }
 
         let index_by_id: HashMap<u32, usize> = mutations
@@ -1113,10 +1149,10 @@ impl TestRunner {
             return self.run_regular(fallback_mutations);
         }
 
-        let mut all_results = Vec::new();
+        let mut all_records = Vec::new();
         for (language, schema_mutations) in schema_by_language {
             match self.run_schema_mutations(&language, &schema_mutations) {
-                Ok(results) => all_results.extend(results),
+                Ok(records) => all_records.extend(records),
                 Err(err) => {
                     eprintln!("warning: could not run {language} schemata: {err} — falling back");
                     fallback_mutations.extend(
@@ -1130,13 +1166,16 @@ impl TestRunner {
 
         if !self.cancelled.load(Ordering::Acquire) && !fallback_mutations.is_empty() {
             let fallback = self.run_regular(fallback_mutations);
-            all_results.extend(fallback.report.results);
+            all_records.extend(records_from_report(fallback.report));
         }
 
-        all_results.sort_by_key(|(mutation, _)| {
-            index_by_id.get(&mutation.id).copied().unwrap_or(usize::MAX)
+        all_records.sort_by_key(|record| {
+            index_by_id
+                .get(&record.mutation.id)
+                .copied()
+                .unwrap_or(usize::MAX)
         });
-        self.outcome_from_results(all_results, start.elapsed())
+        self.outcome_from_records(all_records, start.elapsed())
     }
 
     #[allow(clippy::manual_is_multiple_of)]
@@ -1144,10 +1183,10 @@ impl TestRunner {
         let start = Instant::now();
         let total = mutations.len();
         if total == 0 {
-            return self.outcome_from_results(Vec::new(), start.elapsed());
+            return self.outcome_from_records(Vec::new(), start.elapsed());
         }
         if self.cancelled.load(Ordering::Acquire) {
-            return self.outcome_from_results(Vec::new(), start.elapsed());
+            return self.outcome_from_records(Vec::new(), start.elapsed());
         }
 
         let counter = Arc::new(AtomicUsize::new(0));
@@ -1167,9 +1206,22 @@ impl TestRunner {
                 eprintln!("warning: could not create isolated mutation workspaces: {e}");
                 let results = mutations
                     .into_iter()
-                    .map(|mutation| (mutation, MutationResult::BuildError))
+                    .map(|mutation| {
+                        let diagnostic = BuildErrorDiagnostic::new(
+                            mutation.id,
+                            "regular",
+                            "workspace_pool",
+                            vec![],
+                            format!("could not create isolated mutation workspaces: {e}"),
+                        );
+                        MutationRunRecord::new(
+                            mutation,
+                            MutationResult::BuildError,
+                            Some(diagnostic),
+                        )
+                    })
                     .collect();
-                return self.outcome_from_results(results, start.elapsed());
+                return self.outcome_from_records(results, start.elapsed());
             }
         };
 
@@ -1266,10 +1318,10 @@ impl TestRunner {
             .expect("all result handles should be dropped")
             .into_inner()
             .expect("mutation results mutex poisoned");
-        indexed_results.sort_by_key(|(index, _, _)| *index);
-        let all_results = indexed_results
+        indexed_results.sort_by_key(|(index, _)| *index);
+        let all_records = indexed_results
             .into_iter()
-            .map(|(_, mutation, result)| (mutation, result))
+            .map(|(_, record)| record)
             .collect();
 
         // Clear progress line on TTY
@@ -1278,14 +1330,14 @@ impl TestRunner {
             let _ = std::io::stderr().flush();
         }
 
-        self.outcome_from_results(all_results, start.elapsed())
+        self.outcome_from_records(all_records, start.elapsed())
     }
 
     fn run_schema_mutations(
         &self,
         language: &str,
         schema_mutations: &[crate::schemata::SchemaMutation],
-    ) -> Result<Vec<(Mutation, MutationResult)>, crate::schemata::SchemaRewriteError> {
+    ) -> Result<Vec<MutationRunRecord>, crate::schemata::SchemaRewriteError> {
         let rewrites = match language {
             "c" => crate::schemata::rewrite_c_files(&self.project_root, schema_mutations)?,
             "cpp" => crate::schemata::rewrite_cpp_files(&self.project_root, schema_mutations)?,
@@ -1334,7 +1386,7 @@ impl TestRunner {
                 &self.commands.build_command,
                 workspace.root(),
                 self.commands.timeout,
-                false,
+                true,
                 &self.env,
                 &self.cancelled,
             );
@@ -1345,7 +1397,23 @@ impl TestRunner {
                 return Ok(schema_mutations
                     .iter()
                     .map(|schema_mutation| {
-                        (schema_mutation.mutation.clone(), MutationResult::BuildError)
+                        let diagnostic = BuildErrorDiagnostic::new(
+                            schema_mutation.mutation.id,
+                            "schemata",
+                            "schema_build",
+                            self.commands.build_command.clone(),
+                            build_error_message_from_outcome(
+                                "schema build command",
+                                &self.commands.build_command,
+                                workspace.root(),
+                                &build,
+                            ),
+                        );
+                        MutationRunRecord::new(
+                            schema_mutation.mutation.clone(),
+                            MutationResult::BuildError,
+                            Some(diagnostic),
+                        )
                     })
                     .collect());
             }
@@ -1404,7 +1472,8 @@ impl TestRunner {
                             mutation.operator
                         );
                     }
-                    results.push((mutation.clone(), result));
+                    let diagnostic = cached_build_error_diagnostic(mutation, "schemata", result);
+                    results.push(MutationRunRecord::new(mutation.clone(), result, diagnostic));
                     continue;
                 }
             }
@@ -1457,48 +1526,58 @@ impl TestRunner {
                     eprintln!("  └─");
                 }
             }
-            results.push((mutation.clone(), outcome.result));
+            let diagnostic = build_error_diagnostic_from_outcome(mutation, "schemata", &outcome);
+            results.push(MutationRunRecord::new(
+                mutation.clone(),
+                outcome.result,
+                diagnostic,
+            ));
         }
 
         Ok(results)
     }
 
-    fn outcome_from_results(
+    fn outcome_from_records(
         &self,
-        all_results: Vec<(Mutation, MutationResult)>,
+        all_records: Vec<MutationRunRecord>,
         duration: Duration,
     ) -> RunOutcome {
         RunOutcome {
-            report: self.report_from_results(all_results, duration),
+            report: self.report_from_records(all_records, duration),
             cancelled: self.cancelled.load(Ordering::Acquire),
         }
     }
 
-    fn report_from_results(
+    fn report_from_records(
         &self,
-        all_results: Vec<(Mutation, MutationResult)>,
+        all_records: Vec<MutationRunRecord>,
         duration: Duration,
     ) -> MutationReport {
-        let total = all_results.len();
-        let killed = all_results
-            .iter()
-            .filter(|(_, r)| *r == MutationResult::Killed)
-            .count();
-        let survived = all_results
-            .iter()
-            .filter(|(_, r)| *r == MutationResult::Survived)
-            .count();
-        let timeout_count = all_results
-            .iter()
-            .filter(|(_, r)| *r == MutationResult::Timeout)
-            .count();
-        let build_errors = all_results
-            .iter()
-            .filter(|(_, r)| *r == MutationResult::BuildError)
-            .count();
+        let mut results = Vec::with_capacity(all_records.len());
+        let mut build_error_diagnostics = Vec::new();
+        let mut total = 0;
+        let mut killed = 0;
+        let mut survived = 0;
+        let mut timeout_count = 0;
+        let mut build_errors = 0;
+
+        for record in all_records {
+            total += 1;
+            match record.result {
+                MutationResult::Killed => killed += 1,
+                MutationResult::Survived => survived += 1,
+                MutationResult::Timeout => timeout_count += 1,
+                MutationResult::BuildError => build_errors += 1,
+            }
+            if let Some(diagnostic) = record.build_error_diagnostic {
+                build_error_diagnostics.push(diagnostic);
+            }
+            results.push((record.mutation, record.result));
+        }
 
         MutationReport {
-            results: all_results,
+            results,
+            build_error_diagnostics,
             duration,
             test_command: if self.commands.language_commands.is_empty()
                 && self.commands.project_commands.is_empty()
@@ -1521,6 +1600,22 @@ impl TestRunner {
     }
 }
 
+fn records_from_report(report: MutationReport) -> Vec<MutationRunRecord> {
+    let mut diagnostics: HashMap<u32, BuildErrorDiagnostic> = report
+        .build_error_diagnostics
+        .into_iter()
+        .map(|diagnostic| (diagnostic.mutation_id, diagnostic))
+        .collect();
+    report
+        .results
+        .into_iter()
+        .map(|(mutation, result)| {
+            let diagnostic = diagnostics.remove(&mutation.id);
+            MutationRunRecord::new(mutation, result, diagnostic)
+        })
+        .collect()
+}
+
 fn workspace_pool_slot_count(parallelism: usize, total: usize) -> usize {
     debug_assert!(total > 0);
     parallelism.max(1).min(total)
@@ -1529,7 +1624,24 @@ fn workspace_pool_slot_count(parallelism: usize, total: usize) -> usize {
 struct MutationOutcome {
     result: MutationResult,
     test_output: Option<String>,
+    build_error_detail: Option<BuildErrorDetail>,
     cancelled: bool,
+}
+
+struct BuildErrorDetail {
+    phase: String,
+    command: Vec<String>,
+    message: String,
+}
+
+impl BuildErrorDetail {
+    fn new(phase: impl Into<String>, command: Vec<String>, message: impl Into<String>) -> Self {
+        Self {
+            phase: phase.into(),
+            command,
+            message: message.into(),
+        }
+    }
 }
 
 impl MutationOutcome {
@@ -1537,18 +1649,29 @@ impl MutationOutcome {
         Self {
             result,
             test_output,
+            build_error_detail: None,
             cancelled: false,
         }
     }
 
-    fn build_error() -> Self {
-        Self::new(MutationResult::BuildError, None)
+    fn build_error_with(
+        phase: impl Into<String>,
+        command: Vec<String>,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            result: MutationResult::BuildError,
+            test_output: None,
+            build_error_detail: Some(BuildErrorDetail::new(phase, command, message)),
+            cancelled: false,
+        }
     }
 
     fn cancelled() -> Self {
         Self {
             result: MutationResult::BuildError,
             test_output: None,
+            build_error_detail: None,
             cancelled: true,
         }
     }
@@ -1557,6 +1680,80 @@ impl MutationOutcome {
 struct BuildCommand<'a> {
     argv: &'a [String],
     explicit: bool,
+}
+
+/// Cache entries currently persist only [`MutationResult`], so
+/// `cached_build_error_diagnostic` intentionally groups cached build errors
+/// under one synthetic [`BuildErrorDiagnostic::new`] bucket. Persist the
+/// original phase/fingerprint with cached results to restore full fidelity.
+fn cached_build_error_diagnostic(
+    mutation: &Mutation,
+    runner: &str,
+    result: MutationResult,
+) -> Option<BuildErrorDiagnostic> {
+    (result == MutationResult::BuildError).then(|| {
+        BuildErrorDiagnostic::new(
+            mutation.id,
+            runner,
+            "cache",
+            vec![],
+            "build error result restored from cache; diagnostic output unavailable",
+        )
+    })
+}
+
+fn build_error_diagnostic_from_outcome(
+    mutation: &Mutation,
+    runner: &str,
+    outcome: &MutationOutcome,
+) -> Option<BuildErrorDiagnostic> {
+    if outcome.result != MutationResult::BuildError {
+        return None;
+    }
+    let Some(detail) = outcome.build_error_detail.as_ref() else {
+        return Some(BuildErrorDiagnostic::new(
+            mutation.id,
+            runner,
+            "unknown",
+            vec![],
+            "build error diagnostic unavailable",
+        ));
+    };
+    Some(BuildErrorDiagnostic::new(
+        mutation.id,
+        runner,
+        detail.phase.clone(),
+        detail.command.clone(),
+        detail.message.clone(),
+    ))
+}
+
+fn build_error_message_from_outcome(
+    context: &str,
+    command: &[String],
+    cwd: &Path,
+    outcome: &MutationOutcome,
+) -> String {
+    if let Some(output) = outcome.test_output.as_deref() {
+        if !output.trim().is_empty() {
+            return output.to_string();
+        }
+    }
+    if let Some(detail) = outcome.build_error_detail.as_ref() {
+        if !detail.message.trim().is_empty() {
+            return detail.message.clone();
+        }
+    }
+    let command = if command.is_empty() {
+        "<empty>".to_string()
+    } else {
+        command.join(" ")
+    };
+    format!(
+        "{context} returned {}; command: {command}; cwd: {}",
+        outcome.result,
+        cwd.display()
+    )
 }
 
 fn mutation_file_path(project_root: &Path, mutation_file: &Path) -> PathBuf {
@@ -1731,7 +1928,15 @@ fn run_single_mutation(
     let file_path = match target.file_path {
         Ok(path) => path,
         Err(()) => {
-            return MutationOutcome::build_error();
+            return MutationOutcome::build_error_with(
+                "resolve_mutation_path",
+                vec![],
+                format!(
+                    "could not resolve mutation path {} in workspace {}",
+                    mutation.file.display(),
+                    project_root.display()
+                ),
+            );
         }
     };
 
@@ -1740,7 +1945,11 @@ fn run_single_mutation(
         Ok(content) => content,
         Err(e) => {
             eprintln!("warning: could not read {}: {e}", file_path.display());
-            return MutationOutcome::build_error();
+            return MutationOutcome::build_error_with(
+                "read_source",
+                vec![],
+                format!("could not read {}: {e}", file_path.display()),
+            );
         }
     };
 
@@ -1754,13 +1963,27 @@ fn run_single_mutation(
     let mut mutated = original.clone();
     let range = mutation.byte_range.clone();
     if range.start > range.end || range.end > mutated.len() {
-        return MutationOutcome::build_error();
+        return MutationOutcome::build_error_with(
+            "apply_mutation",
+            vec![],
+            format!(
+                "mutation byte range {}..{} is outside {} bytes in {}",
+                range.start,
+                range.end,
+                mutated.len(),
+                file_path.display()
+            ),
+        );
     }
     mutated.splice(range, mutation.replacement.as_bytes().iter().copied());
 
     if let Err(e) = write_workspace_file(&file_path, &mutated) {
         eprintln!("warning: could not write {}: {e}", file_path.display());
-        return MutationOutcome::build_error();
+        return MutationOutcome::build_error_with(
+            "write_source",
+            vec![],
+            format!("could not write {}: {e}", file_path.display()),
+        );
     }
 
     // Explicit build check: skip expensive test if mutation doesn't compile.
@@ -1769,7 +1992,7 @@ fn run_single_mutation(
             build_command.argv,
             project_root,
             timeout,
-            false,
+            true,
             env,
             cancelled,
         );
@@ -1777,7 +2000,16 @@ fn run_single_mutation(
             return build_outcome;
         }
         if build_outcome.result != MutationResult::Survived {
-            return MutationOutcome::build_error();
+            return MutationOutcome::build_error_with(
+                "build_command",
+                build_command.argv.to_vec(),
+                build_error_message_from_outcome(
+                    "build command",
+                    build_command.argv,
+                    project_root,
+                    &build_outcome,
+                ),
+            );
         }
     }
 
@@ -1809,7 +2041,7 @@ fn run_command(
     }
 
     if command.is_empty() {
-        return MutationOutcome::build_error();
+        return MutationOutcome::build_error_with("command", vec![], "command is empty");
     }
 
     let mut cmd = std::process::Command::new(&command[0]);
@@ -1823,14 +2055,22 @@ fn run_command(
             Ok(capture) => Some(capture),
             Err(e) => {
                 eprintln!("warning: could not create stdout capture file: {e}");
-                return MutationOutcome::build_error();
+                return MutationOutcome::build_error_with(
+                    "command",
+                    command.to_vec(),
+                    format!("could not create stdout capture file: {e}"),
+                );
             }
         };
         stderr_capture = match OutputCapture::new("stderr") {
             Ok(capture) => Some(capture),
             Err(e) => {
                 eprintln!("warning: could not create stderr capture file: {e}");
-                return MutationOutcome::build_error();
+                return MutationOutcome::build_error_with(
+                    "command",
+                    command.to_vec(),
+                    format!("could not create stderr capture file: {e}"),
+                );
             }
         };
         cmd.stdout(std::process::Stdio::piped());
@@ -1848,7 +2088,11 @@ fn run_command(
         Ok(c) => c,
         Err(e) => {
             eprintln!("warning: could not spawn command {:?}: {e}", &command[0]);
-            return MutationOutcome::build_error();
+            return MutationOutcome::build_error_with(
+                "command",
+                command.to_vec(),
+                format!("could not spawn command {:?}: {e}", &command[0]),
+            );
         }
     };
     let mut process_tree = ProcessTreeGuard::attach(&child);
@@ -1856,27 +2100,43 @@ fn run_command(
     if capture_output {
         let Some(stdout) = child.stdout.take() else {
             terminate_and_wait(&mut child, &mut process_tree);
-            return MutationOutcome::build_error();
+            return MutationOutcome::build_error_with(
+                "command",
+                command.to_vec(),
+                "could not capture command stdout",
+            );
         };
         if let Some(capture) = stdout_capture.as_mut() {
             if let Err(e) = capture.start(stdout) {
                 eprintln!("warning: could not open stdout capture file: {e}");
                 terminate_and_wait(&mut child, &mut process_tree);
-                return MutationOutcome::build_error();
+                return MutationOutcome::build_error_with(
+                    "command",
+                    command.to_vec(),
+                    format!("could not open stdout capture file: {e}"),
+                );
             }
         }
 
         let Some(stderr) = child.stderr.take() else {
             terminate_and_wait(&mut child, &mut process_tree);
             finish_capture_threads(&mut stdout_capture, &mut stderr_capture);
-            return MutationOutcome::build_error();
+            return MutationOutcome::build_error_with(
+                "command",
+                command.to_vec(),
+                "could not capture command stderr",
+            );
         };
         if let Some(capture) = stderr_capture.as_mut() {
             if let Err(e) = capture.start(stderr) {
                 eprintln!("warning: could not open stderr capture file: {e}");
                 terminate_and_wait(&mut child, &mut process_tree);
                 finish_capture_threads(&mut stdout_capture, &mut stderr_capture);
-                return MutationOutcome::build_error();
+                return MutationOutcome::build_error_with(
+                    "command",
+                    command.to_vec(),
+                    format!("could not open stderr capture file: {e}"),
+                );
             }
         }
     }
@@ -1899,10 +2159,14 @@ fn run_command(
                 let remaining = timeout_dur.saturating_sub(started.elapsed());
                 thread::sleep(remaining.min(Duration::from_millis(10)));
             }
-            Err(_) => {
+            Err(e) => {
                 terminate_and_wait(&mut child, &mut process_tree);
                 finish_capture_threads(&mut stdout_capture, &mut stderr_capture);
-                return MutationOutcome::build_error();
+                return MutationOutcome::build_error_with(
+                    "command",
+                    command.to_vec(),
+                    format!("could not wait for command: {e}"),
+                );
             }
         }
     };
@@ -3243,6 +3507,21 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "hello world");
     }
 
+    #[test]
+    fn empty_build_error_output_falls_back_to_command_context() {
+        let outcome = MutationOutcome::new(MutationResult::Killed, Some(String::new()));
+        let message = build_error_message_from_outcome(
+            "build command",
+            &["cargo".to_string(), "check".to_string()],
+            Path::new("/tmp/workspace"),
+            &outcome,
+        );
+
+        assert!(message.contains("build command returned killed"));
+        assert!(message.contains("command: cargo check"));
+        assert!(message.contains("cwd: /tmp/workspace"));
+    }
+
     #[cfg(unix)]
     #[test]
     fn build_check_failure_skips_test() {
@@ -3257,7 +3536,11 @@ mod tests {
                 format!("touch {}", marker.display()),
             ],
             BuildCommand {
-                argv: &["false".to_string()], // build fails
+                argv: &[
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    "echo compile nope >&2; exit 1".to_string(),
+                ],
                 explicit: true,
             },
             Duration::from_secs(5),
@@ -3269,6 +3552,12 @@ mod tests {
         );
 
         assert_eq!(outcome.result, MutationResult::BuildError);
+        let detail = outcome
+            .build_error_detail
+            .as_ref()
+            .expect("build failure should carry diagnostics");
+        assert_eq!(detail.phase, "build_command");
+        assert!(detail.message.contains("compile nope"));
         assert!(!marker.exists(), "test command should not have run");
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "hello world");
     }

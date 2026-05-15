@@ -94,10 +94,53 @@ impl fmt::Display for MutationResult {
     }
 }
 
+/// Diagnostic details captured when a mutation is classified as a build error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuildErrorDiagnostic {
+    pub mutation_id: u32,
+    pub runner: String,
+    pub phase: String,
+    pub command: Vec<String>,
+    pub message: String,
+    pub fingerprint: String,
+}
+
+impl BuildErrorDiagnostic {
+    pub fn new(
+        mutation_id: u32,
+        runner: impl Into<String>,
+        phase: impl Into<String>,
+        command: Vec<String>,
+        message: impl Into<String>,
+    ) -> Self {
+        let message = build_error_message_snippet(&message.into());
+        let fingerprint = Self::fingerprint_for(&message);
+        Self {
+            mutation_id,
+            runner: runner.into(),
+            phase: phase.into(),
+            command,
+            message,
+            fingerprint,
+        }
+    }
+
+    pub fn fingerprint_for(message: &str) -> String {
+        let normalized = normalize_build_error_message(message);
+        let mut hash = 0xcbf29ce484222325u64;
+        for byte in normalized.as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        format!("{hash:016x}")
+    }
+}
+
 /// Aggregated results from a mutation testing run
 #[derive(Debug)]
 pub struct MutationReport {
     pub results: Vec<(Mutation, MutationResult)>,
+    pub build_error_diagnostics: Vec<BuildErrorDiagnostic>,
     pub duration: Duration,
     pub test_command: Option<Vec<String>>,
     pub build_command: Vec<String>,
@@ -106,6 +149,198 @@ pub struct MutationReport {
     pub survived: usize,
     pub timeout: usize,
     pub build_errors: usize,
+}
+
+fn build_error_message_snippet(message: &str) -> String {
+    const LIMIT: usize = 1_200;
+    let trimmed = message.trim();
+    if trimmed.is_empty() {
+        return "build error diagnostic unavailable".to_string();
+    }
+
+    let mut snippet = String::new();
+    for ch in trimmed.chars().take(LIMIT) {
+        snippet.push(ch);
+    }
+    if trimmed.chars().count() > LIMIT {
+        snippet.push_str("\n[diagnostic truncated]");
+    }
+    snippet
+}
+
+fn normalize_build_error_message(message: &str) -> String {
+    let stripped = strip_ansi(message);
+    let tokens = tokenize_for_fingerprint(&stripped);
+    let mut normalized = String::new();
+    let mut pending_space = false;
+
+    for (index, token) in tokens.iter().enumerate() {
+        match token.kind {
+            FingerprintTokenKind::Word => {
+                if pending_space && !normalized.is_empty() {
+                    normalized.push(' ');
+                }
+                pending_space = false;
+                if should_collapse_numeric_token(&tokens, index) {
+                    normalized.push('#');
+                } else {
+                    normalized.push_str(&token.text);
+                }
+            }
+            FingerprintTokenKind::Other => {
+                for ch in token.text.chars() {
+                    if ch.is_whitespace() {
+                        pending_space = true;
+                        continue;
+                    }
+                    if pending_space && !normalized.is_empty() {
+                        normalized.push(' ');
+                    }
+                    pending_space = false;
+                    normalized.push(ch);
+                }
+            }
+        }
+    }
+
+    normalized
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FingerprintTokenKind {
+    Word,
+    Other,
+}
+
+#[derive(Debug)]
+struct FingerprintToken {
+    kind: FingerprintTokenKind,
+    text: String,
+}
+
+fn tokenize_for_fingerprint(value: &str) -> Vec<FingerprintToken> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut current_kind = None;
+
+    for ch in value.chars() {
+        let kind = if ch.is_alphanumeric() || ch == '_' {
+            FingerprintTokenKind::Word
+        } else {
+            FingerprintTokenKind::Other
+        };
+        if current_kind == Some(kind) {
+            current.push(ch);
+            continue;
+        }
+        if let Some(previous_kind) = current_kind {
+            tokens.push(FingerprintToken {
+                kind: previous_kind,
+                text: std::mem::take(&mut current),
+            });
+        }
+        current_kind = Some(kind);
+        current.push(ch);
+    }
+
+    if let Some(kind) = current_kind {
+        tokens.push(FingerprintToken {
+            kind,
+            text: current,
+        });
+    }
+
+    tokens
+}
+
+fn should_collapse_numeric_token(tokens: &[FingerprintToken], index: usize) -> bool {
+    let token = &tokens[index];
+    if token.kind != FingerprintTokenKind::Word || !token.text.chars().all(|ch| ch.is_ascii_digit())
+    {
+        return false;
+    }
+
+    previous_non_whitespace_char(tokens, index).is_some_and(|ch| ch == ':')
+        || previous_word(tokens, index).is_some_and(|word| {
+            matches!(
+                word.to_ascii_lowercase().as_str(),
+                "line" | "lines" | "column" | "columns" | "col" | "row"
+            )
+        })
+        || (previous_non_whitespace_char(tokens, index).is_some_and(|ch| ch == '[')
+            && previous_word(tokens, index).is_some_and(|word| word.eq_ignore_ascii_case("error")))
+        || is_standalone_numeric_token(tokens, index)
+}
+
+fn is_standalone_numeric_token(tokens: &[FingerprintToken], index: usize) -> bool {
+    let previous_is_word = index
+        .checked_sub(1)
+        .and_then(|previous| tokens.get(previous))
+        .is_some_and(|token| token.kind == FingerprintTokenKind::Word);
+    let next_is_word = tokens
+        .get(index + 1)
+        .is_some_and(|token| token.kind == FingerprintTokenKind::Word);
+    !previous_is_word && !next_is_word
+}
+
+fn previous_word(tokens: &[FingerprintToken], index: usize) -> Option<&str> {
+    tokens[..index]
+        .iter()
+        .rev()
+        .find(|token| token.kind == FingerprintTokenKind::Word)
+        .map(|token| token.text.as_str())
+}
+
+fn previous_non_whitespace_char(tokens: &[FingerprintToken], index: usize) -> Option<char> {
+    tokens[..index]
+        .iter()
+        .rev()
+        .flat_map(|token| token.text.chars().rev())
+        .find(|ch| !ch.is_whitespace())
+}
+
+fn strip_ansi(message: &str) -> String {
+    let mut stripped = String::new();
+    let mut chars = message.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\x1b' => match chars.next() {
+                Some('[') => consume_csi(&mut chars),
+                Some(']') => consume_osc(&mut chars),
+                Some(_) | None => {}
+            },
+            '\u{009b}' => consume_csi(&mut chars),
+            _ => stripped.push(ch),
+        }
+    }
+    stripped
+}
+
+fn consume_csi<I>(chars: &mut std::iter::Peekable<I>)
+where
+    I: Iterator<Item = char>,
+{
+    for ch in chars.by_ref() {
+        if ('@'..='~').contains(&ch) {
+            break;
+        }
+    }
+}
+
+fn consume_osc<I>(chars: &mut std::iter::Peekable<I>)
+where
+    I: Iterator<Item = char>,
+{
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\x07' => break,
+            '\x1b' if chars.peek() == Some(&'\\') => {
+                chars.next();
+                break;
+            }
+            _ => {}
+        }
+    }
 }
 
 #[cfg(test)]
@@ -125,6 +360,39 @@ mod tests {
         assert_eq!(MutationResult::Survived.to_string(), "survived");
         assert_eq!(MutationResult::Timeout.to_string(), "timeout");
         assert_eq!(MutationResult::BuildError.to_string(), "build error");
+    }
+
+    #[test]
+    fn build_error_fingerprint_normalizes_unstable_text() {
+        let first = BuildErrorDiagnostic::fingerprint_for(
+            "\x1b[31merror[E0308]\x1b[0m: mismatched types at line 12",
+        );
+        let second =
+            BuildErrorDiagnostic::fingerprint_for("error[E0308]:   mismatched types at line 99");
+        assert_eq!(first, second);
+
+        let distinct_code =
+            BuildErrorDiagnostic::fingerprint_for("error[E0277]: mismatched types at line 99");
+        assert_ne!(first, distinct_code);
+    }
+
+    #[test]
+    fn build_error_normalization_preserves_identifier_digits() {
+        let normalized = normalize_build_error_message(
+            "error[E0308]: i32 func2 src/lib.rs:12:34 line 99 column 8",
+        );
+        assert_eq!(
+            normalized,
+            "error[E0308]: i32 func2 src/lib.rs:#:# line # column #"
+        );
+    }
+
+    #[test]
+    fn strip_ansi_handles_csi_osc_and_single_character_escapes() {
+        let stripped = strip_ansi(
+            "a\x1b[31mred\x1b[0m b\x1b]0;title\x07c\x1bc d\u{009b}31me\x1b]1;title\x1b\\f",
+        );
+        assert_eq!(stripped, "ared bc def");
     }
 
     #[test]

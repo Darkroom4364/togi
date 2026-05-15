@@ -39,6 +39,7 @@ pub fn sample_report() -> MutationReport {
                 MutationResult::Survived,
             ),
         ],
+        build_error_diagnostics: vec![],
         duration: Duration::from_millis(1234),
         test_command: Some(vec!["cargo".into(), "test".into()]),
         build_command: vec![],

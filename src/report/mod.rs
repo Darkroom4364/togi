@@ -3,7 +3,8 @@ pub mod html;
 pub mod json;
 pub mod terminal;
 
-use crate::{Mutation, MutationReport};
+use crate::{BuildErrorDiagnostic, Mutation, MutationReport, MutationResult};
+use std::collections::BTreeMap;
 use std::fmt::Write;
 use std::fs;
 
@@ -16,6 +17,148 @@ pub fn mutation_score(report: &MutationReport) -> f64 {
         100.0
     } else {
         0.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuildErrorGroup {
+    pub count: usize,
+    pub language: String,
+    pub operator: String,
+    pub runner: String,
+    pub phase: String,
+    pub fingerprint: String,
+    pub command: Vec<String>,
+    pub message: String,
+    pub files: Vec<BuildErrorFileCount>,
+    pub examples: Vec<BuildErrorExample>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuildErrorFileCount {
+    pub file: String,
+    pub count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuildErrorExample {
+    pub mutation_id: u32,
+    pub file: String,
+    pub line: usize,
+}
+
+struct BuildErrorGroupAccumulator {
+    count: usize,
+    command: Vec<String>,
+    message: String,
+    files: BTreeMap<String, usize>,
+    examples: Vec<BuildErrorExample>,
+}
+
+/// Group build errors into actionable buckets for report output.
+pub fn build_error_groups(report: &MutationReport) -> Vec<BuildErrorGroup> {
+    let diagnostics: BTreeMap<u32, &BuildErrorDiagnostic> = report
+        .build_error_diagnostics
+        .iter()
+        .map(|diagnostic| (diagnostic.mutation_id, diagnostic))
+        .collect();
+    let mut groups =
+        BTreeMap::<(String, String, String, String, String), BuildErrorGroupAccumulator>::new();
+
+    for (mutation, result) in &report.results {
+        if *result != MutationResult::BuildError {
+            continue;
+        }
+
+        let diagnostic = diagnostics.get(&mutation.id).copied();
+        let language = label_or_unknown(&mutation.language);
+        let operator = label_or_unknown(&mutation.operator);
+        let runner = diagnostic
+            .map(|diagnostic| diagnostic.runner.clone())
+            .unwrap_or_else(|| "unknown".to_string());
+        let phase = diagnostic
+            .map(|diagnostic| diagnostic.phase.clone())
+            .unwrap_or_else(|| "unknown".to_string());
+        let message = diagnostic
+            .map(|diagnostic| diagnostic.message.clone())
+            .unwrap_or_else(|| "build error diagnostic unavailable".to_string());
+        let fingerprint = diagnostic
+            .map(|diagnostic| diagnostic.fingerprint.clone())
+            .unwrap_or_else(|| BuildErrorDiagnostic::fingerprint_for(&message));
+        let command = diagnostic
+            .map(|diagnostic| diagnostic.command.clone())
+            .unwrap_or_default();
+        let key = (
+            language.clone(),
+            operator.clone(),
+            runner.clone(),
+            phase.clone(),
+            fingerprint.clone(),
+        );
+        let accumulator = groups
+            .entry(key)
+            .or_insert_with(|| BuildErrorGroupAccumulator {
+                count: 0,
+                command,
+                message,
+                files: BTreeMap::new(),
+                examples: Vec::new(),
+            });
+
+        accumulator.count += 1;
+        *accumulator
+            .files
+            .entry(mutation.file.display().to_string())
+            .or_default() += 1;
+        if accumulator.examples.len() < 3 {
+            accumulator.examples.push(BuildErrorExample {
+                mutation_id: mutation.id + 1,
+                file: mutation.file.display().to_string(),
+                line: mutation.line,
+            });
+        }
+    }
+
+    let mut groups: Vec<_> = groups
+        .into_iter()
+        .map(
+            |((language, operator, runner, phase, fingerprint), accumulator)| BuildErrorGroup {
+                count: accumulator.count,
+                language,
+                operator,
+                runner,
+                phase,
+                fingerprint,
+                command: accumulator.command,
+                message: accumulator.message,
+                files: accumulator
+                    .files
+                    .into_iter()
+                    .map(|(file, count)| BuildErrorFileCount { file, count })
+                    .collect(),
+                examples: accumulator.examples,
+            },
+        )
+        .collect();
+    groups.sort_by(|left, right| {
+        right
+            .count
+            .cmp(&left.count)
+            .then_with(|| left.language.cmp(&right.language))
+            .then_with(|| left.operator.cmp(&right.operator))
+            .then_with(|| left.runner.cmp(&right.runner))
+            .then_with(|| left.phase.cmp(&right.phase))
+            .then_with(|| left.fingerprint.cmp(&right.fingerprint))
+    });
+    groups
+}
+
+fn label_or_unknown(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        "unknown".to_string()
+    } else {
+        trimmed.to_string()
     }
 }
 
@@ -217,6 +360,69 @@ mod tests {
         }
     }
 
+    fn report_mutation(id: u32, file: &str, result: MutationResult) -> (Mutation, MutationResult) {
+        (
+            Mutation {
+                id,
+                file: std::path::PathBuf::from(file),
+                language: "rust".into(),
+                line: usize::try_from(id + 1).unwrap(),
+                column: 1,
+                operator: "eq_to_neq".into(),
+                description: "Replace == with !=".into(),
+                original: "==".into(),
+                replacement: "!=".into(),
+                byte_range: 0..2,
+            },
+            result,
+        )
+    }
+
+    #[test]
+    fn build_error_groups_deduplicate_by_diagnostic_fingerprint() {
+        let report = MutationReport {
+            results: vec![
+                report_mutation(0, "src/a.rs", MutationResult::BuildError),
+                report_mutation(1, "src/b.rs", MutationResult::BuildError),
+                report_mutation(2, "src/c.rs", MutationResult::Killed),
+            ],
+            build_error_diagnostics: vec![
+                BuildErrorDiagnostic::new(
+                    0,
+                    "regular",
+                    "build_command",
+                    vec!["cargo".into(), "check".into()],
+                    "error[E0308]: mismatched types at line 10",
+                ),
+                BuildErrorDiagnostic::new(
+                    1,
+                    "regular",
+                    "build_command",
+                    vec!["cargo".into(), "check".into()],
+                    "error[E0308]: mismatched types at line 20",
+                ),
+            ],
+            duration: std::time::Duration::from_millis(10),
+            test_command: None,
+            build_command: vec![],
+            total: 3,
+            killed: 1,
+            survived: 0,
+            timeout: 0,
+            build_errors: 2,
+        };
+
+        let groups = build_error_groups(&report);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].count, 2);
+        assert_eq!(groups[0].language, "rust");
+        assert_eq!(groups[0].operator, "eq_to_neq");
+        assert_eq!(groups[0].runner, "regular");
+        assert_eq!(groups[0].phase, "build_command");
+        assert_eq!(groups[0].files.len(), 2);
+        assert_eq!(groups[0].examples.len(), 2);
+    }
+
     #[test]
     fn mutation_diff_basic() {
         let tmp = TempDir::new().unwrap();
@@ -349,6 +555,7 @@ mod tests {
                 },
                 MutationResult::Killed,
             )],
+            build_error_diagnostics: vec![],
             duration: Duration::from_secs(1),
             test_command: None,
             build_command: vec![],
@@ -383,6 +590,7 @@ mod tests {
                 },
                 MutationResult::Timeout,
             )],
+            build_error_diagnostics: vec![],
             duration: Duration::from_secs(1),
             test_command: None,
             build_command: vec![],
