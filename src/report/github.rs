@@ -99,6 +99,7 @@ mod tests {
             test_command: None,
             build_command: vec![],
             results,
+            build_error_diagnostics: vec![],
         }
     }
 

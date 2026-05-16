@@ -125,6 +125,51 @@ pub fn generate_report(report: &MutationReport) -> Result<String> {
 
     write!(html, "</ul></nav><main>")?;
 
+    let build_error_groups = super::build_error_groups(report);
+    if !build_error_groups.is_empty() {
+        write!(
+            html,
+            "<section class=\"build-error-diagnostics\"><h3>Build error diagnostics</h3>\
+             <table><thead><tr>\
+             <th>Count</th><th>Language</th><th>Operator</th><th>Runner</th>\
+             <th>Phase</th><th>Files</th><th>Fingerprint</th><th>Message</th>\
+             </tr></thead><tbody>"
+        )?;
+        for group in build_error_groups.iter().take(10) {
+            let files = group
+                .files
+                .iter()
+                .take(3)
+                .map(|file| format!("{} ({})", file.file, file.count))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let message = group.message.lines().next().unwrap_or("").trim();
+            write!(
+                html,
+                "<tr><td>{}</td><td>{}</td><td><code>{}</code></td><td>{}</td>\
+                 <td>{}</td><td>{}</td><td><code>{}</code></td><td>{}</td></tr>",
+                group.count,
+                html_escape(&group.language),
+                html_escape(&group.operator),
+                html_escape(&group.runner),
+                html_escape(&group.phase),
+                html_escape(&files),
+                html_escape(&group.fingerprint),
+                html_escape(message)
+            )?;
+        }
+        if build_error_groups.len() > 10 {
+            let remaining = build_error_groups.len() - 10;
+            write!(
+                html,
+                "<tr><td colspan=\"8\">... {} more group{}</td></tr>",
+                remaining,
+                if remaining == 1 { "" } else { "s" }
+            )?;
+        }
+        write!(html, "</tbody></table></section>")?;
+    }
+
     // Per-file sections
     for (path, stats) in &files {
         write!(
@@ -233,6 +278,7 @@ code{font-family:'SF Mono',Menlo,monospace;font-size:.82rem}
 .result-survived{background:rgba(233,69,96,.08)}
 .result-timeout{background:rgba(255,200,50,.06)}
 .result-build-error{background:rgba(255,200,50,.06)}
+.build-error-diagnostics{background:rgba(255,200,50,.05);padding:1rem;border:1px solid rgba(255,200,50,.18)}
 .score-good,.score-good .badge{color:#53d769}
 .score-ok,.score-ok .badge{color:#f5a623}
 .score-bad,.score-bad .badge{color:#e94560}
@@ -242,8 +288,8 @@ a.score-good,a.score-ok,a.score-bad{color:inherit}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Mutation;
     use crate::test_helpers::sample_report;
+    use crate::{BuildErrorDiagnostic, Mutation};
     use std::path::PathBuf;
     use std::time::Duration;
 
@@ -277,6 +323,94 @@ mod tests {
     }
 
     #[test]
+    fn html_contains_build_error_diagnostics() {
+        let report = MutationReport {
+            results: vec![(
+                Mutation {
+                    id: 1,
+                    file: PathBuf::from("src/test.rs"),
+                    language: "rust".to_string(),
+                    line: 1,
+                    column: 1,
+                    operator: "eq_to_neq".to_string(),
+                    description: "d".to_string(),
+                    original: "==".to_string(),
+                    replacement: "!=".to_string(),
+                    byte_range: 0..2,
+                },
+                MutationResult::BuildError,
+            )],
+            build_error_diagnostics: vec![BuildErrorDiagnostic::new(
+                1,
+                "regular",
+                "build_command",
+                vec!["cargo".into(), "check".into()],
+                "error[E0308]: mismatched types",
+            )],
+            duration: Duration::from_millis(100),
+            test_command: None,
+            build_command: vec![],
+            total: 1,
+            killed: 0,
+            survived: 0,
+            timeout: 0,
+            build_errors: 1,
+        };
+
+        let html = generate_report(&report).unwrap();
+        assert!(html.contains("Build error diagnostics"));
+        assert!(html.contains("eq_to_neq"));
+        assert!(html.contains("build_command"));
+        assert!(html.contains("error[E0308]: mismatched types"));
+    }
+
+    #[test]
+    fn html_build_error_diagnostics_show_truncation_notice() {
+        let mut results = Vec::new();
+        let mut build_error_diagnostics = Vec::new();
+        for id in 0..11 {
+            let operator = format!("op{id}");
+            results.push((
+                Mutation {
+                    id,
+                    file: PathBuf::from(format!("src/test{id}.rs")),
+                    language: "rust".to_string(),
+                    line: 1,
+                    column: 1,
+                    operator,
+                    description: "d".to_string(),
+                    original: "==".to_string(),
+                    replacement: "!=".to_string(),
+                    byte_range: 0..2,
+                },
+                MutationResult::BuildError,
+            ));
+            build_error_diagnostics.push(BuildErrorDiagnostic::new(
+                id,
+                "regular",
+                "build_command",
+                vec!["cargo".into(), "check".into()],
+                format!("error {id}"),
+            ));
+        }
+        let report = MutationReport {
+            results,
+            build_error_diagnostics,
+            duration: Duration::from_millis(100),
+            test_command: None,
+            build_command: vec![],
+            total: 11,
+            killed: 0,
+            survived: 0,
+            timeout: 0,
+            build_errors: 11,
+        };
+
+        let html = generate_report(&report).unwrap();
+        assert!(html.contains("... 1 more group"));
+    }
+
+    #[test]
     fn html_escapes_special_chars() {
         let report = MutationReport {
             results: vec![(
@@ -294,6 +428,7 @@ mod tests {
                 },
                 MutationResult::Killed,
             )],
+            build_error_diagnostics: vec![],
             duration: Duration::from_millis(100),
             test_command: None,
             build_command: vec![],
