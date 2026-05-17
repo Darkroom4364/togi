@@ -190,7 +190,7 @@ pub fn format_pr_comment(report: &MutationReport, baseline_score: Option<f64>) -
 
     let score = mutation_score(report);
     let tested = report.total.saturating_sub(report.build_errors);
-    let emoji = if report.survived == 0 && report.timeout == 0 {
+    let emoji = if report.survived == 0 && report.timeout == 0 && report.build_errors == 0 {
         "✓"
     } else if score >= 80.0 {
         "⚠"
@@ -604,6 +604,102 @@ mod tests {
         assert!(!md.contains("✓"), "should not show checkmark with timeouts");
         assert!(md.contains("1 timeout"));
         assert!(!md.contains("<details>"));
+    }
+
+    #[test]
+    fn pr_comment_no_checkmark_when_all_build_errors() {
+        use crate::{MutationReport, MutationResult};
+        use std::time::Duration;
+        let report = MutationReport {
+            results: vec![(
+                Mutation {
+                    id: 0,
+                    file: std::path::PathBuf::from("test.rs"),
+                    language: "rust".into(),
+                    line: 1,
+                    column: 1,
+                    operator: "op".into(),
+                    description: "d".into(),
+                    original: "x".into(),
+                    replacement: "y".into(),
+                    byte_range: 0..1,
+                },
+                MutationResult::BuildError,
+            )],
+            build_error_diagnostics: vec![],
+            duration: Duration::from_secs(1),
+            test_command: None,
+            build_command: vec![],
+            total: 1,
+            killed: 0,
+            survived: 0,
+            timeout: 0,
+            build_errors: 1,
+        };
+        let md = format_pr_comment(&report, None);
+        assert!(
+            !md.contains("✓"),
+            "should not show checkmark when every mutation is a build error"
+        );
+        assert!(md.contains("## ✗ togi mutation report"));
+        assert!(md.contains("1 build errors"));
+    }
+
+    #[test]
+    fn pr_comment_no_checkmark_when_mixed_build_errors() {
+        use crate::{MutationReport, MutationResult};
+        use std::time::Duration;
+        let report = MutationReport {
+            results: vec![
+                (
+                    Mutation {
+                        id: 0,
+                        file: std::path::PathBuf::from("test.rs"),
+                        language: "rust".into(),
+                        line: 1,
+                        column: 1,
+                        operator: "op".into(),
+                        description: "d".into(),
+                        original: "x".into(),
+                        replacement: "y".into(),
+                        byte_range: 0..1,
+                    },
+                    MutationResult::Killed,
+                ),
+                (
+                    Mutation {
+                        id: 1,
+                        file: std::path::PathBuf::from("test.rs"),
+                        language: "rust".into(),
+                        line: 2,
+                        column: 1,
+                        operator: "op".into(),
+                        description: "d".into(),
+                        original: "x".into(),
+                        replacement: "y".into(),
+                        byte_range: 0..1,
+                    },
+                    MutationResult::BuildError,
+                ),
+            ],
+            build_error_diagnostics: vec![],
+            duration: Duration::from_secs(1),
+            test_command: None,
+            build_command: vec![],
+            total: 2,
+            killed: 1,
+            survived: 0,
+            timeout: 0,
+            build_errors: 1,
+        };
+        let md = format_pr_comment(&report, None);
+        assert!(
+            !md.contains("✓"),
+            "should not show checkmark when build errors remain"
+        );
+        assert!(md.contains("## ⚠ togi mutation report"));
+        assert!(md.contains("100.0%"));
+        assert!(md.contains("1 build errors"));
     }
 
     #[test]

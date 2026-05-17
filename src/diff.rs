@@ -264,6 +264,7 @@ pub fn parse_diff(input: &str) -> Vec<ChangedFile> {
     let mut files: Vec<ChangedFile> = Vec::new();
     let mut current_path: Option<PathBuf> = None;
     let mut current_hunks: Vec<LineRange> = Vec::new();
+    let mut saw_old_file_header = false;
 
     // Per-hunk state
     let mut in_hunk = false;
@@ -272,33 +273,59 @@ pub fn parse_diff(input: &str) -> Vec<ChangedFile> {
     let mut range_end: usize = 0;
 
     for line in input.lines() {
-        if let Some(path_str) = line.strip_prefix("+++ ") {
-            // Flush previous hunk range
+        if line.starts_with("diff --git ") {
             flush_range(&mut current_hunks, &mut range_start, range_end);
             in_hunk = false;
+            saw_old_file_header = false;
+            continue;
+        }
 
-            // Flush previous file
-            if let Some(path) = current_path.take() {
-                if !current_hunks.is_empty() {
-                    files.push(ChangedFile {
-                        path,
-                        hunks: current_hunks,
-                    });
+        // File headers are the out-of-hunk `---`/`+++` pair. Added source
+        // lines beginning with `++` are encoded as `+++ ...` inside hunks.
+        if !in_hunk {
+            if line.starts_with("--- ") {
+                saw_old_file_header = true;
+                continue;
+            }
+
+            if saw_old_file_header {
+                if let Some(path_str) = line.strip_prefix("+++ ") {
+                    saw_old_file_header = false;
+
+                    // Flush previous hunk range
+                    flush_range(&mut current_hunks, &mut range_start, range_end);
+                    in_hunk = false;
+
+                    // Flush previous file
+                    if let Some(path) = current_path.take() {
+                        if !current_hunks.is_empty() {
+                            files.push(ChangedFile {
+                                path,
+                                hunks: current_hunks,
+                            });
+                        }
+                    }
+                    current_hunks = Vec::new();
+
+                    // Extract path, stripping the `b/` prefix
+                    let path = if let Some(stripped) = path_str.strip_prefix("b/") {
+                        PathBuf::from(stripped)
+                    } else {
+                        PathBuf::from(path_str)
+                    };
+                    current_path = Some(path);
+                    continue;
                 }
             }
-            current_hunks = Vec::new();
 
-            // Extract path, stripping the `b/` prefix
-            let path = if let Some(stripped) = path_str.strip_prefix("b/") {
-                PathBuf::from(stripped)
-            } else {
-                PathBuf::from(path_str)
-            };
-            current_path = Some(path);
-        } else if line.starts_with("@@ ") {
+            saw_old_file_header = false;
+        }
+
+        if line.starts_with("@@ ") {
             // Flush any open range from a previous hunk
             flush_range(&mut current_hunks, &mut range_start, range_end);
             in_hunk = true;
+            saw_old_file_header = false;
 
             // Parse `@@ -old_start,old_count +new_start,new_count @@`
             if let Some(new_spec) = parse_hunk_header(line) {
@@ -489,6 +516,43 @@ diff --git a/src/main.rs b/src/main.rs
 "#;
         let files = parse_diff(diff);
         assert_eq!(files[0].path, PathBuf::from("path/to/file.rs"));
+    }
+
+    #[test]
+    fn treats_added_double_plus_source_line_as_hunk_content() {
+        let diff = r#"diff --git a/src/counter.rs b/src/counter.rs
+index 1111111..2222222 100644
+--- a/src/counter.rs
++++ b/src/counter.rs
+@@ -1,4 +1,6 @@
+ fn tick() {
+     let mut counter = 0;
++++ counter
+     counter += 1;
++    println!("{}", counter);
+ }
+diff --git a/src/next.rs b/src/next.rs
+index 3333333..4444444 100644
+--- a/src/next.rs
++++ b/src/next.rs
+@@ -10,2 +10,3 @@
+ fn next() {
++    next();
+ }
+"#;
+        let files = parse_diff(diff);
+
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].path, PathBuf::from("src/counter.rs"));
+        assert_eq!(
+            files[0].hunks,
+            vec![
+                LineRange { start: 3, end: 3 },
+                LineRange { start: 5, end: 5 }
+            ]
+        );
+        assert_eq!(files[1].path, PathBuf::from("src/next.rs"));
+        assert_eq!(files[1].hunks, vec![LineRange { start: 11, end: 11 }]);
     }
 
     #[test]

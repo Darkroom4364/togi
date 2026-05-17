@@ -1,10 +1,55 @@
 // Parse LCOV coverage data into a map of file -> covered lines.
 
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 /// Map from file path (relative to project root) to set of covered line numbers.
 pub type CoverageMap = HashMap<PathBuf, HashSet<usize>>;
+
+fn normalize_path_components(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    let mut rooted = false;
+
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => {
+                normalized.push(component.as_os_str());
+                rooted = true;
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                let can_pop = normalized
+                    .components()
+                    .next_back()
+                    .is_some_and(|last| matches!(last, Component::Normal(_)));
+
+                if can_pop {
+                    normalized.pop();
+                } else if !rooted {
+                    normalized.push(component.as_os_str());
+                }
+            }
+            Component::Normal(part) => normalized.push(part),
+        }
+    }
+
+    normalized
+}
+
+fn normalize_repo_relative_path(path: &Path, project_root: &Path) -> PathBuf {
+    let normalized_path = normalize_path_components(path);
+    let normalized_root = normalize_path_components(project_root);
+
+    if normalized_root.as_os_str().is_empty() {
+        return normalized_path;
+    }
+
+    normalized_path
+        .strip_prefix(&normalized_root)
+        .map(normalize_path_components)
+        .unwrap_or(normalized_path)
+}
 
 /// Parse an LCOV file and return a coverage map with paths relative to `project_root`.
 ///
@@ -17,12 +62,10 @@ pub fn parse_lcov(content: &str, project_root: &Path) -> CoverageMap {
     for (line_num, line) in content.lines().enumerate() {
         let line = line.trim();
         if let Some(path_str) = line.strip_prefix("SF:") {
-            let abs = PathBuf::from(path_str);
-            let rel = abs
-                .strip_prefix(project_root)
-                .map(|p| p.to_path_buf())
-                .unwrap_or(abs);
-            current_file = Some(rel);
+            current_file = Some(normalize_repo_relative_path(
+                Path::new(path_str),
+                project_root,
+            ));
         } else if let Some(da) = line.strip_prefix("DA:") {
             if let Some(ref file) = current_file {
                 let mut parts = da.split(',');
@@ -99,11 +142,7 @@ pub fn filter_by_coverage(
     mutations
         .into_iter()
         .filter(|m| {
-            let rel = m
-                .file
-                .strip_prefix(project_root)
-                .map(|p| p.to_path_buf())
-                .unwrap_or_else(|_| m.file.clone());
+            let rel = normalize_repo_relative_path(&m.file, project_root);
             match coverage.get(&rel) {
                 Some(lines) => lines.contains(&m.line),
                 None => {
@@ -160,6 +199,31 @@ end_of_record
         let lcov = "SF:src/lib.rs\nDA:5,1\nend_of_record\n";
         let map = parse_lcov(lcov, Path::new("/project"));
         assert!(map.contains_key(Path::new("src/lib.rs")));
+    }
+
+    #[test]
+    fn filter_matches_dot_relative_lcov_paths() {
+        let root = Path::new("/project");
+        let lcov = "SF:./src/lib.rs\nDA:42,1\nend_of_record\n";
+        let coverage = parse_lcov(lcov, root);
+        assert!(coverage.contains_key(Path::new("src/lib.rs")));
+
+        let mutations = vec![crate::Mutation {
+            id: 0,
+            file: root.join("src/lib.rs"),
+            language: "rust".into(),
+            line: 42,
+            column: 1,
+            operator: "eq_to_ne".into(),
+            description: "== to !=".into(),
+            original: "==".into(),
+            replacement: "!=".into(),
+            byte_range: 0..2,
+        }];
+
+        let filtered = filter_by_coverage(mutations, &coverage, root);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].line, 42);
     }
 
     #[test]

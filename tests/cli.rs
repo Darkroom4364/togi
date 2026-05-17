@@ -186,6 +186,102 @@ fn check_format_json_outputs_valid_json() {
     assert!(value.get("mutations").is_some());
 }
 
+#[cfg(unix)]
+#[test]
+fn check_format_json_includes_build_error_diagnostics() {
+    let dir = setup_git_repo();
+    let build_cmd = format!(
+        "{} not-a-togi-command",
+        shell_quote(&assert_cmd::cargo::cargo_bin("togi"))
+    );
+
+    let output = togi()
+        .args([
+            "check",
+            "--base",
+            "HEAD",
+            "--format",
+            "json",
+            "--test-cmd",
+            "true",
+            "--build-cmd",
+            &build_cmd,
+            "--operators",
+            "gt_to_gte",
+            "--max-per-run",
+            "1",
+            "--jobs",
+            "1",
+        ])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "check failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|e| {
+        panic!(
+            "invalid JSON output: {e}\nstdout: {}",
+            String::from_utf8_lossy(&output.stdout)
+        )
+    });
+
+    assert_eq!(value["build_errors"], 1);
+    assert_eq!(value["mutations"][0]["result"], "build_error");
+    assert!(value["mutations"][0]["build_error_fingerprint"].is_string());
+    assert_eq!(value["build_error_groups"][0]["phase"], "build_command");
+    assert_eq!(value["build_error_groups"][0]["runner"], "regular");
+    assert!(
+        value["build_error_groups"][0]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("not-a-togi-command"))
+    );
+    assert!(
+        value["build_error_groups"][0]["command"]
+            .as_array()
+            .is_some_and(|command| command
+                .iter()
+                .any(|arg| arg.as_str() == Some("not-a-togi-command")))
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn check_terminal_includes_build_error_diagnostics() {
+    let dir = setup_git_repo();
+    let build_cmd = format!(
+        "{} not-a-togi-command",
+        shell_quote(&assert_cmd::cargo::cargo_bin("togi"))
+    );
+
+    togi()
+        .args([
+            "check",
+            "--base",
+            "HEAD",
+            "--test-cmd",
+            "true",
+            "--build-cmd",
+            &build_cmd,
+            "--operators",
+            "gt_to_gte",
+            "--max-per-run",
+            "1",
+            "--jobs",
+            "1",
+        ])
+        .current_dir(dir.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Build error diagnostics:"))
+        .stdout(predicate::str::contains("build_command"))
+        .stdout(predicate::str::contains("not-a-togi-command"));
+}
+
 fn write_baseline(dir: &Path, killed: usize, total: usize) {
     fs::write(
         dir.join(".togi-baseline"),

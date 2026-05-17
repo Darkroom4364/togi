@@ -109,13 +109,14 @@ pub fn generate_report(report: &MutationReport) -> Result<String> {
     write!(html, "<div class=\"container\"><nav class=\"file-tree\">")?;
     write!(html, "<h2>Files</h2><ul>")?;
 
-    for (path, stats) in &files {
+    for (file_index, (path, stats)) in files.iter().enumerate() {
+        let anchor = file_anchor(path, file_index);
         let class = score_class(stats.score_pct());
         write!(
             html,
             "<li><a href=\"#{}\" class=\"{}\"><code>{}</code> \
              <span class=\"badge\">{}/{}</span></a></li>",
-            slug(path),
+            anchor,
             class,
             html_escape(path),
             stats.killed,
@@ -171,12 +172,13 @@ pub fn generate_report(report: &MutationReport) -> Result<String> {
     }
 
     // Per-file sections
-    for (path, stats) in &files {
+    for (file_index, (path, stats)) in files.iter().enumerate() {
+        let anchor = file_anchor(path, file_index);
         write!(
             html,
             "<section id=\"{}\"><h3><code>{}</code> \
              <span class=\"score-inline {}\">({:.0}%)</span></h3>",
-            slug(path),
+            anchor,
             html_escape(path),
             score_class(stats.score_pct()),
             stats.score_pct()
@@ -247,6 +249,10 @@ fn slug(path: &str) -> String {
     path.chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect()
+}
+
+fn file_anchor(path: &str, index: usize) -> String {
+    format!("file-{}-{}", index, slug(path))
 }
 
 const CSS: &str = r#"
@@ -440,5 +446,47 @@ mod tests {
         };
         let html = generate_report(&report).unwrap();
         assert!(html.contains("a &lt; b &amp; c &gt; d"));
+    }
+
+    #[test]
+    fn html_generates_unique_file_anchors_for_colliding_slugs() {
+        let mut results = Vec::new();
+        for (id, path) in ["a-b.rs", "a_b.rs", "a/b.rs"].iter().enumerate() {
+            results.push((
+                Mutation {
+                    id: id as u32,
+                    file: PathBuf::from(path),
+                    language: "rust".to_string(),
+                    line: 1,
+                    column: 1,
+                    operator: "eq_to_neq".to_string(),
+                    description: "d".to_string(),
+                    original: "==".to_string(),
+                    replacement: "!=".to_string(),
+                    byte_range: 0..2,
+                },
+                MutationResult::Killed,
+            ));
+        }
+
+        let report = MutationReport {
+            results,
+            build_error_diagnostics: vec![],
+            duration: Duration::from_millis(100),
+            test_command: None,
+            build_command: vec![],
+            total: 3,
+            killed: 3,
+            survived: 0,
+            timeout: 0,
+            build_errors: 0,
+        };
+
+        let html = generate_report(&report).unwrap();
+
+        for anchor in ["file-0-a-b-rs", "file-1-a-b-rs", "file-2-a-b-rs"] {
+            assert!(html.contains(&format!("href=\"#{}\"", anchor)));
+            assert!(html.contains(&format!("section id=\"{}\"", anchor)));
+        }
     }
 }

@@ -3,6 +3,7 @@ crate::languages::define_language!(
     name: "c",
     extensions: ["c", "h"],
     ts_language: tree_sitter_c::LANGUAGE,
+    bool_false: ["0", "false", "False", "FALSE"],
     filter_candidate: should_filter_candidate,
 );
 
@@ -24,6 +25,25 @@ fn should_filter_candidate(
 mod tests {
     use super::*;
     use crate::languages::LanguageSupport;
+    use crate::operators::MutationOperator;
+
+    fn find_node_by_kind<'a>(
+        node: tree_sitter::Node<'a>,
+        kind: &str,
+    ) -> Option<tree_sitter::Node<'a>> {
+        if node.kind() == kind {
+            return Some(node);
+        }
+
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if let Some(found) = find_node_by_kind(child, kind) {
+                return Some(found);
+            }
+        }
+
+        None
+    }
 
     #[test]
     fn test_c_extension_detection() {
@@ -54,5 +74,23 @@ mod tests {
         let tree = parser.parse(code, None).unwrap();
         let src = tree.root_node().to_sexp();
         assert!(src.contains("binary_expression"));
+    }
+
+    #[test]
+    fn return_empty_comparison_uses_zero_without_stdbool() {
+        let lang = C;
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&lang.tree_sitter_language()).unwrap();
+        let code = "int f(int a, int b) { return a > b; }";
+        let tree = parser.parse(code, None).unwrap();
+        let return_node = find_node_by_kind(tree.root_node(), "return_statement").unwrap();
+
+        let mut candidates =
+            crate::operators::ReturnEmpty.apply(&return_node, code.as_bytes(), &lang);
+        assert_eq!(candidates.len(), 1);
+        lang.fixup_replacement(&mut candidates[0]);
+
+        assert_eq!(&code[candidates[0].byte_range.clone()], "a > b");
+        assert_eq!(candidates[0].replacement, "0");
     }
 }

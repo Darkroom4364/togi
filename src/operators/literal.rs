@@ -111,6 +111,61 @@ impl MutationOperator for StringToEmpty {
 
 pub struct IncrementNumeric;
 
+fn integer_literal_value_and_range(
+    node: &tree_sitter::Node,
+    source: &[u8],
+    lang: &dyn crate::languages::LanguageSupport,
+) -> Option<(i64, std::ops::Range<usize>)> {
+    if !lang.is_integer_literal_node(node.kind()) {
+        return None;
+    }
+
+    if let Some(range) = unary_minus_literal_range(node, source, lang) {
+        return parse_integer_range(source, range.clone()).map(|n| (n, range));
+    }
+
+    let range = node.byte_range();
+    parse_integer_range(source, range.clone()).map(|n| (n, range))
+}
+
+fn unary_minus_literal_range(
+    node: &tree_sitter::Node,
+    source: &[u8],
+    lang: &dyn crate::languages::LanguageSupport,
+) -> Option<std::ops::Range<usize>> {
+    let parent = node.parent()?;
+    let parent_kind = parent.kind();
+    if !lang.is_unary_expression_node(parent_kind)
+        && !matches!(parent_kind, "negative_literal" | "unary_operator")
+    {
+        return None;
+    }
+
+    let parent_range = parent.byte_range();
+    let node_range = node.byte_range();
+    if parent_range.end != node_range.end || parent_range.start >= node_range.start {
+        return None;
+    }
+
+    let prefix = std::str::from_utf8(source.get(parent_range.start..node_range.start)?).ok()?;
+    if prefix.trim() == "-" {
+        Some(parent_range)
+    } else {
+        None
+    }
+}
+
+fn parse_integer_range(source: &[u8], range: std::ops::Range<usize>) -> Option<i64> {
+    let text = std::str::from_utf8(source.get(range)?).ok()?;
+    text.parse::<i64>().ok().or_else(|| {
+        if !text.chars().any(char::is_whitespace) {
+            return None;
+        }
+        let compact: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+        compact.parse::<i64>().ok()
+    })
+}
+
 impl MutationOperator for IncrementNumeric {
     fn id(&self) -> &str {
         "increment_numeric"
@@ -124,13 +179,9 @@ impl MutationOperator for IncrementNumeric {
         source: &[u8],
         lang: &dyn crate::languages::LanguageSupport,
     ) -> Vec<MutationCandidate> {
-        if !lang.is_integer_literal_node(node.kind()) {
-            return vec![];
-        }
-        let text = std::str::from_utf8(&source[node.byte_range()]).unwrap_or("");
-        if let Ok(n) = text.parse::<i64>() {
+        if let Some((n, range)) = integer_literal_value_and_range(node, source, lang) {
             n.checked_add(1)
-                .map(|n| mutation_candidate(self, node.byte_range(), n.to_string()))
+                .map(|n| mutation_candidate(self, range, n.to_string()))
                 .into_iter()
                 .collect()
         } else {
@@ -154,13 +205,9 @@ impl MutationOperator for DecrementNumeric {
         source: &[u8],
         lang: &dyn crate::languages::LanguageSupport,
     ) -> Vec<MutationCandidate> {
-        if !lang.is_integer_literal_node(node.kind()) {
-            return vec![];
-        }
-        let text = std::str::from_utf8(&source[node.byte_range()]).unwrap_or("");
-        if let Ok(n) = text.parse::<i64>() {
+        if let Some((n, range)) = integer_literal_value_and_range(node, source, lang) {
             n.checked_sub(1)
-                .map(|n| mutation_candidate(self, node.byte_range(), n.to_string()))
+                .map(|n| mutation_candidate(self, range, n.to_string()))
                 .into_iter()
                 .collect()
         } else {
@@ -173,7 +220,7 @@ impl MutationOperator for DecrementNumeric {
 mod tests {
     use super::*;
 
-    use crate::test_helpers::{find_node_by_kind, parse_go};
+    use crate::test_helpers::{find_node_by_kind, parse_go, parse_python, parse_rust};
 
     fn assert_single_candidate(
         candidates: &[MutationCandidate],
@@ -342,5 +389,51 @@ func f() string { return "" }"#;
                 .apply(&node, src.as_bytes(), &crate::languages::go::Go)
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn go_negative_numeric_mutators_replace_signed_literal() {
+        let src = "package main\nfunc f() int { return -1 }";
+        let tree = parse_go(src);
+        let node = find_node_by_kind(tree.root_node(), "int_literal")
+            .expect("should find int_literal node");
+
+        let candidates = IncrementNumeric.apply(&node, src.as_bytes(), &crate::languages::go::Go);
+        assert_single_candidate(&candidates, src, "0", "-1");
+
+        let candidates = DecrementNumeric.apply(&node, src.as_bytes(), &crate::languages::go::Go);
+        assert_single_candidate(&candidates, src, "-2", "-1");
+    }
+
+    #[test]
+    fn rust_negative_numeric_mutators_replace_signed_literal() {
+        let src = "fn f() -> i32 { -1 }";
+        let tree = parse_rust(src);
+        let node = find_node_by_kind(tree.root_node(), "integer_literal")
+            .expect("should find integer_literal node");
+
+        let candidates =
+            IncrementNumeric.apply(&node, src.as_bytes(), &crate::languages::rust_lang::Rust);
+        assert_single_candidate(&candidates, src, "0", "-1");
+
+        let candidates =
+            DecrementNumeric.apply(&node, src.as_bytes(), &crate::languages::rust_lang::Rust);
+        assert_single_candidate(&candidates, src, "-2", "-1");
+    }
+
+    #[test]
+    fn python_negative_numeric_mutators_replace_signed_literal() {
+        let src = "def f():\n    return -1\n";
+        let tree = parse_python(src);
+        let node =
+            find_node_by_kind(tree.root_node(), "integer").expect("should find integer node");
+
+        let candidates =
+            IncrementNumeric.apply(&node, src.as_bytes(), &crate::languages::python::Python);
+        assert_single_candidate(&candidates, src, "0", "-1");
+
+        let candidates =
+            DecrementNumeric.apply(&node, src.as_bytes(), &crate::languages::python::Python);
+        assert_single_candidate(&candidates, src, "-2", "-1");
     }
 }

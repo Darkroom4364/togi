@@ -131,19 +131,19 @@ impl MutationOperator for ReturnEmpty {
         let first = &children[0];
         let last = &children[children.len() - 1];
         let value_range = first.start_byte()..last.end_byte();
-        let text = std::str::from_utf8(&source[value_range.clone()]).unwrap_or("");
-        let replacement_kind = if matches!(first.kind(), "expression_list" | "argument_list") {
+        let replacement_node = if matches!(first.kind(), "expression_list" | "argument_list") {
             let mut cursor = first.walk();
             let mut values = first.named_children(&mut cursor);
             match (values.next(), values.next()) {
-                (Some(value), None) => value.kind(),
-                _ => first.kind(),
+                (Some(value), None) => value,
+                _ => *first,
             }
         } else {
-            first.kind()
+            *first
         };
 
-        let Some(replacement) = lang.return_empty_replacement(replacement_kind, text) else {
+        let Some(replacement) = lang.return_empty_replacement_for_node(&replacement_node, source)
+        else {
             return vec![];
         };
 
@@ -312,7 +312,8 @@ mod tests {
     use super::*;
     use crate::languages::LanguageSupport;
     use crate::test_helpers::{
-        find_node_by_kind, parse_go, parse_python, parse_ruby, parse_rust, parse_typescript,
+        find_node_by_kind, parse_go, parse_java, parse_python, parse_ruby, parse_rust,
+        parse_typescript,
     };
 
     fn apply_to_first_node(
@@ -440,6 +441,37 @@ func f() string { return "hello" }"#;
         let candidates = ReturnEmpty.apply(&ret_node, src.as_bytes(), &crate::languages::go::Go);
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].replacement, "false");
+    }
+
+    #[test]
+    fn return_empty_does_not_treat_string_concat_text_as_boolean() {
+        for (src, parse, lang) in [
+            (
+                r#"package main
+func f(prefix string) string { return prefix + "</>" }"#,
+                parse_go as fn(&str) -> tree_sitter::Tree,
+                Box::new(crate::languages::go::Go) as Box<dyn LanguageSupport>,
+            ),
+            (
+                r#"class T { String f(String prefix) { return prefix + "</>"; } }"#,
+                parse_java as fn(&str) -> tree_sitter::Tree,
+                Box::new(crate::languages::java::Java),
+            ),
+            (
+                r#"function f(prefix: string): string { return prefix + "</>"; }"#,
+                parse_typescript as fn(&str) -> tree_sitter::Tree,
+                Box::new(crate::languages::typescript::TypeScript),
+            ),
+        ] {
+            let candidates =
+                apply_to_first_node(src, parse, "return_statement", &ReturnEmpty, lang.as_ref());
+            assert!(
+                candidates
+                    .iter()
+                    .all(|candidate| candidate.replacement != "false"),
+                "{src}: string return expression must not be replaced with false: {candidates:?}"
+            );
+        }
     }
 
     #[test]
