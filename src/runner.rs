@@ -14,6 +14,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const CAPTURED_OUTPUT_LIMIT: usize = 1024 * 1024;
+const CAPTURE_CLEANUP_TIMEOUT: Duration = Duration::from_millis(100);
 
 /// Write mutation workspace content. Workspaces are disposable temp copies, so
 /// durable temp-file + fsync writes would only add hot-loop I/O overhead.
@@ -1358,67 +1359,6 @@ impl TestRunner {
                     ))
                 })?;
 
-        for rewrite in rewrites {
-            let relative =
-                project_relative_path(&self.project_root, &rewrite.file).map_err(|_| {
-                    crate::schemata::SchemaRewriteError::new(format!(
-                        "could not resolve rewritten file {}",
-                        rewrite.file.display()
-                    ))
-                })?;
-            let target =
-                validate_and_resolve_mutation_path(workspace.root(), &relative).map_err(|_| {
-                    crate::schemata::SchemaRewriteError::new(format!(
-                        "rewritten file {} is not in schema workspace",
-                        rewrite.file.display()
-                    ))
-                })?;
-            write_workspace_file(&target, &rewrite.content).map_err(|e| {
-                crate::schemata::SchemaRewriteError::new(format!(
-                    "could not write schema file {}: {e}",
-                    target.display()
-                ))
-            })?;
-        }
-
-        if self.commands.build_command_explicit && !self.commands.build_command.is_empty() {
-            let build = run_command(
-                &self.commands.build_command,
-                workspace.root(),
-                self.commands.timeout,
-                true,
-                &self.env,
-                &self.cancelled,
-            );
-            if build.cancelled {
-                return Ok(Vec::new());
-            }
-            if build.result != MutationResult::Survived {
-                return Ok(schema_mutations
-                    .iter()
-                    .map(|schema_mutation| {
-                        let diagnostic = BuildErrorDiagnostic::new(
-                            schema_mutation.mutation.id,
-                            "schemata",
-                            "schema_build",
-                            self.commands.build_command.clone(),
-                            build_error_message_from_outcome(
-                                "schema build command",
-                                &self.commands.build_command,
-                                workspace.root(),
-                                &build,
-                            ),
-                        );
-                        MutationRunRecord::new(
-                            schema_mutation.mutation.clone(),
-                            MutationResult::BuildError,
-                            Some(diagnostic),
-                        )
-                    })
-                    .collect());
-            }
-        }
-
         let mut results = Vec::with_capacity(schema_mutations.len());
         let tested_counter = Arc::new(AtomicUsize::new(0));
         let source_contents = SourceContentCache::default();
@@ -1478,14 +1418,75 @@ impl TestRunner {
                 }
             }
 
-            let outcome = run_command(
-                &argv,
+            let mut cacheable = true;
+            let outcome = if let Err(e) = reset_workspace(
+                &self.project_root,
                 workspace.root(),
-                selected.timeout,
-                self.show_output,
-                &env,
-                &self.cancelled,
-            );
+                self.respect_workspace_ignores,
+            ) {
+                cacheable = false;
+                MutationOutcome::build_error_with(
+                    "schema_workspace_reset",
+                    vec![],
+                    format!(
+                        "could not reset schema workspace {}: {e}",
+                        workspace.root().display()
+                    ),
+                )
+            } else if let Err(e) =
+                apply_schema_rewrites_to_workspace(&self.project_root, workspace.root(), &rewrites)
+            {
+                cacheable = false;
+                MutationOutcome::build_error_with(
+                    "schema_rewrite",
+                    vec![],
+                    format!("could not apply schema rewrites: {e}"),
+                )
+            } else if self.commands.build_command_explicit
+                && !self.commands.build_command.is_empty()
+            {
+                let build = run_command(
+                    &self.commands.build_command,
+                    workspace.root(),
+                    self.commands.timeout,
+                    true,
+                    &self.env,
+                    &self.cancelled,
+                );
+                if build.cancelled {
+                    break;
+                }
+                if build.result != MutationResult::Survived {
+                    MutationOutcome::build_error_with(
+                        "schema_build",
+                        self.commands.build_command.clone(),
+                        build_error_message_from_outcome(
+                            "schema build command",
+                            &self.commands.build_command,
+                            workspace.root(),
+                            &build,
+                        ),
+                    )
+                } else {
+                    run_command(
+                        &argv,
+                        workspace.root(),
+                        selected.timeout,
+                        self.show_output,
+                        &env,
+                        &self.cancelled,
+                    )
+                }
+            } else {
+                run_command(
+                    &argv,
+                    workspace.root(),
+                    selected.timeout,
+                    self.show_output,
+                    &env,
+                    &self.cancelled,
+                )
+            };
             if outcome.cancelled {
                 break;
             }
@@ -1494,8 +1495,10 @@ impl TestRunner {
             } else {
                 reservation.commit();
             }
-            if let Some(ref key) = cache_key {
-                cache::store(&self.project_root, key, outcome.result);
+            if cacheable {
+                if let Some(ref key) = cache_key {
+                    cache::store(&self.project_root, key, outcome.result);
+                }
             }
             if self.verbose {
                 let symbol = match outcome.result {
@@ -1598,6 +1601,36 @@ impl TestRunner {
             build_errors,
         }
     }
+}
+
+fn apply_schema_rewrites_to_workspace(
+    project_root: &Path,
+    workspace_root: &Path,
+    rewrites: &[crate::schemata::SchemaFileRewrite],
+) -> Result<(), crate::schemata::SchemaRewriteError> {
+    for rewrite in rewrites {
+        let relative = project_relative_path(project_root, &rewrite.file).map_err(|_| {
+            crate::schemata::SchemaRewriteError::new(format!(
+                "could not resolve rewritten file {}",
+                rewrite.file.display()
+            ))
+        })?;
+        let target =
+            validate_and_resolve_mutation_path(workspace_root, &relative).map_err(|_| {
+                crate::schemata::SchemaRewriteError::new(format!(
+                    "rewritten file {} is not in schema workspace",
+                    rewrite.file.display()
+                ))
+            })?;
+        write_workspace_file(&target, &rewrite.content).map_err(|e| {
+            crate::schemata::SchemaRewriteError::new(format!(
+                "could not write schema file {}: {e}",
+                target.display()
+            ))
+        })?;
+    }
+
+    Ok(())
 }
 
 fn records_from_report(report: MutationReport) -> Vec<MutationRunRecord> {
@@ -2120,7 +2153,11 @@ fn run_command(
 
         let Some(stderr) = child.stderr.take() else {
             terminate_and_wait(&mut child, &mut process_tree);
-            finish_capture_threads(&mut stdout_capture, &mut stderr_capture);
+            finish_capture_threads(
+                &mut stdout_capture,
+                &mut stderr_capture,
+                capture_cleanup_deadline(),
+            );
             return MutationOutcome::build_error_with(
                 "command",
                 command.to_vec(),
@@ -2131,7 +2168,11 @@ fn run_command(
             if let Err(e) = capture.start(stderr) {
                 eprintln!("warning: could not open stderr capture file: {e}");
                 terminate_and_wait(&mut child, &mut process_tree);
-                finish_capture_threads(&mut stdout_capture, &mut stderr_capture);
+                finish_capture_threads(
+                    &mut stdout_capture,
+                    &mut stderr_capture,
+                    capture_cleanup_deadline(),
+                );
                 return MutationOutcome::build_error_with(
                     "command",
                     command.to_vec(),
@@ -2148,12 +2189,20 @@ fn run_command(
             Ok(None) => {
                 if cancelled.load(Ordering::Acquire) {
                     terminate_and_wait(&mut child, &mut process_tree);
-                    finish_capture_threads(&mut stdout_capture, &mut stderr_capture);
+                    finish_capture_threads(
+                        &mut stdout_capture,
+                        &mut stderr_capture,
+                        capture_cleanup_deadline(),
+                    );
                     return MutationOutcome::cancelled();
                 }
                 if started.elapsed() >= timeout_dur {
                     terminate_and_wait(&mut child, &mut process_tree);
-                    finish_capture_threads(&mut stdout_capture, &mut stderr_capture);
+                    finish_capture_threads(
+                        &mut stdout_capture,
+                        &mut stderr_capture,
+                        capture_cleanup_deadline(),
+                    );
                     return MutationOutcome::new(MutationResult::Timeout, None);
                 }
                 let remaining = timeout_dur.saturating_sub(started.elapsed());
@@ -2161,7 +2210,11 @@ fn run_command(
             }
             Err(e) => {
                 terminate_and_wait(&mut child, &mut process_tree);
-                finish_capture_threads(&mut stdout_capture, &mut stderr_capture);
+                finish_capture_threads(
+                    &mut stdout_capture,
+                    &mut stderr_capture,
+                    capture_cleanup_deadline(),
+                );
                 return MutationOutcome::build_error_with(
                     "command",
                     command.to_vec(),
@@ -2179,14 +2232,15 @@ fn run_command(
         MutationResult::Killed
     };
     let test_output = if capture_output {
+        let capture_deadline = capture_cleanup_deadline();
         let stdout = stdout_capture
             .as_mut()
             .expect("stdout capture file should exist")
-            .finish();
+            .finish(capture_deadline);
         let stderr = stderr_capture
             .as_mut()
             .expect("stderr capture file should exist")
-            .finish();
+            .finish(capture_deadline);
         let mut combined = String::from_utf8_lossy(&stdout.bytes).into_owned();
         append_truncation_notice(&mut combined, stdout.truncated, "stdout");
 
@@ -2445,30 +2499,55 @@ impl OutputCapture {
         Ok(())
     }
 
-    fn finish(&mut self) -> CapturedOutput {
-        let truncated = match self.reader.take() {
-            Some(reader) => match reader.join() {
+    fn finish(&mut self, deadline: Instant) -> CapturedOutput {
+        let truncated = self
+            .reader
+            .take()
+            .is_some_and(|reader| finish_capture_reader(reader, deadline, self.stream));
+        read_captured_output(self.file.path(), self.stream, truncated)
+    }
+}
+
+fn capture_cleanup_deadline() -> Instant {
+    Instant::now() + CAPTURE_CLEANUP_TIMEOUT
+}
+
+fn finish_capture_reader(
+    reader: thread::JoinHandle<bool>,
+    deadline: Instant,
+    stream: &'static str,
+) -> bool {
+    loop {
+        if reader.is_finished() {
+            return match reader.join() {
                 Ok(truncated) => truncated,
                 Err(_) => {
-                    eprintln!("warning: {} capture thread panicked", self.stream);
+                    eprintln!("warning: {stream} capture thread panicked");
                     true
                 }
-            },
-            None => false,
-        };
-        read_captured_output(self.file.path(), self.stream, truncated)
+            };
+        }
+
+        let now = Instant::now();
+        if now >= deadline {
+            eprintln!("warning: {stream} capture thread did not finish before cleanup deadline");
+            return false;
+        }
+
+        thread::sleep((deadline - now).min(Duration::from_millis(5)));
     }
 }
 
 fn finish_capture_threads(
     stdout_capture: &mut Option<OutputCapture>,
     stderr_capture: &mut Option<OutputCapture>,
+    deadline: Instant,
 ) {
     if let Some(capture) = stdout_capture.as_mut() {
-        let _ = capture.finish();
+        let _ = capture.finish(deadline);
     }
     if let Some(capture) = stderr_capture.as_mut() {
-        let _ = capture.finish();
+        let _ = capture.finish(deadline);
     }
 }
 
@@ -3789,6 +3868,64 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn capture_output_timeout_returns_promptly_when_setsid_descendant_holds_stdout() {
+        let setsid_available = match std::process::Command::new("setsid").arg("true").status() {
+            Ok(status) => status.success(),
+            Err(_) => false,
+        };
+        if !setsid_available {
+            eprintln!("skipping setsid capture cleanup test because setsid is unavailable");
+            return;
+        }
+
+        struct EscapedProcessGuard(PathBuf);
+
+        impl Drop for EscapedProcessGuard {
+            fn drop(&mut self) {
+                let Ok(pid) = std::fs::read_to_string(&self.0) else {
+                    return;
+                };
+                let Ok(pid) = pid.trim().parse::<libc::pid_t>() else {
+                    return;
+                };
+                unsafe {
+                    let _ = libc::kill(pid, libc::SIGKILL);
+                }
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("escaped.pid");
+        let _guard = EscapedProcessGuard(pid_file.clone());
+        let mut env = HashMap::new();
+        env.insert("ESCAPED_PID".to_string(), pid_file.display().to_string());
+
+        let started = Instant::now();
+        let outcome = run_command(
+            &[
+                "sh".to_string(),
+                "-c".to_string(),
+                r#"setsid sh -c 'printf "%s\n" "$$" > "$ESCAPED_PID"; while :; do sleep 1; done' &
+while [ ! -s "$ESCAPED_PID" ]; do sleep 0.01; done
+sleep 10"#
+                    .to_string(),
+            ],
+            dir.path(),
+            Duration::from_millis(200),
+            true,
+            &env,
+            &AtomicBool::new(false),
+        );
+
+        assert_eq!(outcome.result, MutationResult::Timeout);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "timeout cleanup should not wait for a setsid descendant-held stdout"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn no_capture_normal_completion_terminates_background_descendants() {
         let dir = tempfile::tempdir().unwrap();
         let marker = dir.path().join("descendant.marker");
@@ -4042,6 +4179,57 @@ esac
         assert_eq!(report.total, 2);
         assert_eq!(report.results[0].1, MutationResult::Killed);
         assert_eq!(report.results[1].1, MutationResult::Survived);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_with_schemata_resets_workspace_between_schema_mutants() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = "\
+package calc
+func first(a, b int) bool { return a == b }
+func second(c, d int) bool { return c == d }
+";
+        std::fs::write(dir.path().join("calc.go"), source).unwrap();
+        let first = go_operator_mutation(0, "calc.go", source, 0);
+        let second = go_operator_mutation(1, "calc.go", source, 1);
+        let script = r#"
+case "$(cat calc.go)" in
+  *__togi_active*) ;;
+  *) exit 2 ;;
+esac
+test ! -f side_effect || exit 1
+touch side_effect
+"#;
+
+        let runner = TestRunner {
+            commands: CommandConfig {
+                command: vec!["sh".into(), "-c".into(), script.into()],
+                force_default_command: false,
+                force_default_timeout: false,
+                project_commands: vec![],
+                language_commands: HashMap::new(),
+                build_command: vec![],
+                build_command_explicit: false,
+                timeout: Duration::from_secs(5),
+                language_timeouts: HashMap::new(),
+                test_selection: None,
+            },
+            parallelism: 1,
+            project_root: dir.path().to_path_buf(),
+            verbose: false,
+            show_output: false,
+            max_tested: None,
+            respect_workspace_ignores: true,
+            env: HashMap::new(),
+            cancelled: Arc::new(AtomicBool::new(false)),
+        };
+
+        let report = runner.run_with_schemata(vec![first, second]).report;
+
+        assert_eq!(report.total, 2);
+        assert_eq!(report.survived, 2);
+        assert_eq!(report.killed, 0);
     }
 
     #[cfg(unix)]

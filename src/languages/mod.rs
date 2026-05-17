@@ -265,7 +265,10 @@ pub(crate) fn fixup_language_replacement<L: LanguageSupport + ?Sized>(
     }
 }
 
-fn looks_like_boolean_expression(kind: &str, text: &str, binary_expression_kind: &str) -> bool {
+const BOOLEAN_OPERATOR_TOKENS: &[&str] =
+    &["==", "!=", "<", "<=", ">", ">=", "&&", "||", "and", "or"];
+
+fn is_boolean_expression_kind(kind: &str, binary_expression_kind: &str) -> bool {
     if kind != binary_expression_kind
         && !matches!(
             kind,
@@ -279,17 +282,32 @@ fn looks_like_boolean_expression(kind: &str, text: &str, binary_expression_kind:
         return false;
     }
 
-    let spaced = format!(" {text} ");
-    text.contains("==")
-        || text.contains("!=")
-        || text.contains("<=")
-        || text.contains(">=")
-        || (text.contains('<') && !text.contains("<<"))
-        || (text.contains('>') && !text.contains(">>"))
-        || text.contains("&&")
-        || text.contains("||")
-        || spaced.contains(" and ")
-        || spaced.contains(" or ")
+    true
+}
+
+fn child_text<'a>(child: tree_sitter::Node<'a>, source: &'a [u8]) -> Option<&'a str> {
+    std::str::from_utf8(&source[child.byte_range()]).ok()
+}
+
+fn is_boolean_operator_token(token: &str) -> bool {
+    BOOLEAN_OPERATOR_TOKENS.contains(&token)
+}
+
+fn has_boolean_operator_child(
+    node: &tree_sitter::Node,
+    source: &[u8],
+    operator_field: &str,
+) -> bool {
+    if let Some(op_node) = node.child_by_field_name(operator_field) {
+        if child_text(op_node, source).is_some_and(is_boolean_operator_token) {
+            return true;
+        }
+    }
+
+    let mut cursor = node.walk();
+    node.children(&mut cursor).any(|child| {
+        !child.is_named() && child_text(child, source).is_some_and(is_boolean_operator_token)
+    })
 }
 
 /// Describes how to parse and mutate one supported language.
@@ -391,11 +409,29 @@ pub trait LanguageSupport: Send + Sync {
             Some("0".to_string())
         } else if text.starts_with('"') || text.starts_with('\'') || text.starts_with('`') {
             Some("\"\"".to_string())
-        } else if looks_like_boolean_expression(kind, text, self.binary_expression_node()) {
-            Some("false".to_string())
         } else {
             None
         }
+    }
+
+    /// Return the replacement for a return value node, using AST operators when needed.
+    fn return_empty_replacement_for_node(
+        &self,
+        node: &tree_sitter::Node,
+        source: &[u8],
+    ) -> Option<String> {
+        if self.is_boolean_expression_node(node, source) {
+            return self.return_empty_replacement("boolean", "false");
+        }
+
+        let text = std::str::from_utf8(&source[node.byte_range()]).unwrap_or("");
+        self.return_empty_replacement(node.kind(), text)
+    }
+
+    /// Return true when a node is an expression whose AST operator yields a boolean.
+    fn is_boolean_expression_node(&self, node: &tree_sitter::Node, source: &[u8]) -> bool {
+        is_boolean_expression_kind(node.kind(), self.binary_expression_node())
+            && has_boolean_operator_child(node, source, self.operator_field())
     }
 
     /// Return true when `kind` is a mutation-relevant AST node kind for this language.
