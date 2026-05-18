@@ -509,7 +509,7 @@ pub fn adapter_for_language(language: &str) -> Option<&'static dyn SchemaAdapter
 /// Partition mutations into generic schema-compatible and fallback sets.
 ///
 /// This validates source ranges, rejects unsupported languages/operators, and
-/// ensures at most one schema mutation touches any byte in a file.
+/// ensures at most one schema mutation touches any conflicting range in a file.
 pub fn plan(project_root: &Path, mutations: Vec<Mutation>) -> SchemaPlan {
     let mut source_cache: HashMap<PathBuf, Option<Vec<u8>>> = HashMap::new();
     let mut selected = Vec::new();
@@ -542,10 +542,16 @@ pub fn plan(project_root: &Path, mutations: Vec<Mutation>) -> SchemaPlan {
         }
     }
 
-    let overlapping = overlapping_schema_indices(project_root, &selected);
+    let (overlapping, conflict_failures) =
+        schema_conflict_analysis_with_sources(project_root, &selected, &source_cache);
     let mut final_selected = Vec::with_capacity(selected.len());
     for (idx, schema_mutation) in selected.into_iter().enumerate() {
-        if overlapping.contains_key(&idx) {
+        if let Some(reason) = conflict_failures.get(&idx) {
+            fallback.push(SchemaFallback {
+                mutation: schema_mutation.mutation,
+                reason: *reason,
+            });
+        } else if overlapping.contains_key(&idx) {
             fallback.push(SchemaFallback {
                 mutation: schema_mutation.mutation,
                 reason: SchemaSkipReason::OverlappingRange,
@@ -2328,21 +2334,65 @@ fn validate_source_range(mutation: &Mutation, source: &[u8]) -> Result<(), Schem
     Ok(())
 }
 
-fn overlapping_schema_indices(
+fn schema_conflict_analysis_with_sources(
     project_root: &Path,
     selected: &[SchemaMutation],
-) -> BTreeMap<usize, ()> {
-    let mut by_file: BTreeMap<String, Vec<(usize, std::ops::Range<usize>)>> = BTreeMap::new();
+    source_cache: &HashMap<PathBuf, Option<Vec<u8>>>,
+) -> (BTreeMap<usize, ()>, BTreeMap<usize, SchemaSkipReason>) {
+    let mut by_file: BTreeMap<String, (PathBuf, Vec<usize>)> = BTreeMap::new();
     for (idx, schema_mutation) in selected.iter().enumerate() {
         let path = source_path(project_root, &schema_mutation.mutation.file);
         by_file
             .entry(normalized_path_key(&path))
-            .or_default()
-            .push((idx, schema_mutation.mutation.byte_range.clone()));
+            .or_insert_with(|| (path, Vec::new()))
+            .1
+            .push(idx);
     }
 
     let mut overlapping = BTreeMap::new();
-    for ranges in by_file.values_mut() {
+    let mut failures = BTreeMap::new();
+    for (_, (path, indices)) in by_file {
+        let source_bytes = source_cache
+            .get(&path)
+            .and_then(|cached_source| cached_source.as_deref());
+        let source_problem = match source_bytes {
+            Some(bytes) if std::str::from_utf8(bytes).is_err() => {
+                Some(SchemaSkipReason::InvalidRange)
+            }
+            Some(_) => None,
+            None => Some(SchemaSkipReason::MissingSource),
+        };
+        let source_text = source_bytes.and_then(|bytes| std::str::from_utf8(bytes).ok());
+        let needs_rust_tree = indices
+            .iter()
+            .any(|idx| schema_conflict_range_uses_rust_expression(&selected[*idx]));
+        let (rust_tree, rust_problem) = if needs_rust_tree {
+            match source_text {
+                Some(source) => match parse_rust_source(source) {
+                    Ok(tree) => (Some(tree), None),
+                    Err(_) => (None, Some(SchemaSkipReason::InvalidRange)),
+                },
+                None => (None, source_problem),
+            }
+        } else {
+            (None, None)
+        };
+
+        let mut ranges = Vec::new();
+        for idx in indices {
+            match schema_conflict_range(
+                &selected[idx],
+                source_text,
+                rust_tree.as_ref(),
+                rust_problem,
+            ) {
+                Ok(range) => ranges.push((idx, range)),
+                Err(reason) => {
+                    failures.insert(idx, reason);
+                }
+            }
+        }
+
         ranges.sort_by_key(|(_, range)| (range.start, range.end));
         let mut previous_end = 0usize;
         for (position, (idx, range)) in ranges.iter().enumerate() {
@@ -2353,7 +2403,34 @@ fn overlapping_schema_indices(
             }
         }
     }
-    overlapping
+    (overlapping, failures)
+}
+
+fn schema_conflict_range(
+    schema_mutation: &SchemaMutation,
+    source: Option<&str>,
+    rust_tree: Option<&tree_sitter::Tree>,
+    rust_problem: Option<SchemaSkipReason>,
+) -> Result<std::ops::Range<usize>, SchemaSkipReason> {
+    if schema_conflict_range_uses_rust_expression(schema_mutation) {
+        if let Some(reason) = rust_problem {
+            return Err(reason);
+        }
+        let source = source.ok_or(SchemaSkipReason::MissingSource)?;
+        let tree = rust_tree.ok_or(SchemaSkipReason::InvalidRange)?;
+        return rust_expression_range_for_mutation(
+            tree.root_node(),
+            source,
+            &schema_mutation.mutation,
+        )
+        .map_err(|_| SchemaSkipReason::InvalidRange);
+    }
+
+    Ok(schema_mutation.mutation.byte_range.clone())
+}
+
+fn schema_conflict_range_uses_rust_expression(schema_mutation: &SchemaMutation) -> bool {
+    schema_mutation.mutation.language == "rust" && schema_mutation.kind == SchemaKind::Expression
 }
 
 fn normalized_path_key(path: &Path) -> String {
@@ -3051,6 +3128,113 @@ mod tests {
 
         assert_eq!(plan.selected.len(), 1);
         assert_eq!(plan.fallback.len(), 1);
+        assert_eq!(plan.fallback[0].reason, SchemaSkipReason::OverlappingRange);
+    }
+
+    #[test]
+    fn plan_detects_rust_overlaps_after_expression_expansion() {
+        let dir = TempDir::new().unwrap();
+        let adapter = adapter_for_language("rust").unwrap();
+        let source = "fn f(a: i32, b: i32, c: i32, d: i32) -> bool { a == b && c == d }\n";
+        write_source(&dir, "src/lib.rs", source);
+        assert_parsed_node_text(&dir, "src/lib.rs", adapter, "binary_expression", "a == b");
+        assert_parsed_node_text(
+            &dir,
+            "src/lib.rs",
+            adapter,
+            "binary_expression",
+            "a == b && c == d",
+        );
+        let equality = source.find("==").unwrap();
+        let conjunction = source.find("&&").unwrap();
+        let mut first = mutation(
+            "rust",
+            "src/lib.rs",
+            "==",
+            "!=",
+            equality..equality + 2,
+            "eq_to_neq",
+        );
+        first.id = 1;
+        let mut second = mutation(
+            "rust",
+            "src/lib.rs",
+            "&&",
+            "||",
+            conjunction..conjunction + 2,
+            "and_to_or",
+        );
+        second.id = 2;
+        assert!(first.byte_range.end <= second.byte_range.start);
+
+        let plan = plan(dir.path(), vec![first, second]);
+
+        assert_eq!(plan.selected.len(), 1);
+        assert_eq!(plan.selected[0].mutation.id, 1);
+        assert_eq!(plan.fallback.len(), 1);
+        assert_eq!(plan.fallback[0].mutation.id, 2);
+        assert_eq!(plan.fallback[0].reason, SchemaSkipReason::OverlappingRange);
+        let rewrites = rewrite_rust_files(dir.path(), &plan.selected).unwrap();
+        let rewritten = String::from_utf8(rewrites[0].content.clone()).unwrap();
+        assert!(rewritten.contains("__togi_select(1,"));
+        parse_rust_source(&rewritten).unwrap();
+    }
+
+    #[test]
+    fn plan_keeps_independent_rust_mutations_when_expanded_neighbor_overlaps() {
+        let dir = TempDir::new().unwrap();
+        let adapter = adapter_for_language("rust").unwrap();
+        let source = "fn f(a: i32, b: i32, c: i32, d: i32, e: i32, f: i32) -> bool { (a == b && c == d) || e == f }\n";
+        write_source(&dir, "src/lib.rs", source);
+        assert_parsed_node_text(
+            &dir,
+            "src/lib.rs",
+            adapter,
+            "binary_expression",
+            "a == b && c == d",
+        );
+        assert_parsed_node_text(&dir, "src/lib.rs", adapter, "binary_expression", "e == f");
+        let first_equality = source.find("==").unwrap();
+        let conjunction = source.find("&&").unwrap();
+        let independent_equality = source.rfind("==").unwrap();
+        let mut first = mutation(
+            "rust",
+            "src/lib.rs",
+            "==",
+            "!=",
+            first_equality..first_equality + 2,
+            "eq_to_neq",
+        );
+        first.id = 1;
+        let mut overlapping = mutation(
+            "rust",
+            "src/lib.rs",
+            "&&",
+            "||",
+            conjunction..conjunction + 2,
+            "and_to_or",
+        );
+        overlapping.id = 2;
+        let mut independent = mutation(
+            "rust",
+            "src/lib.rs",
+            "==",
+            "!=",
+            independent_equality..independent_equality + 2,
+            "eq_to_neq",
+        );
+        independent.id = 3;
+
+        let plan = plan(dir.path(), vec![first, overlapping, independent]);
+        let selected_ids = plan
+            .selected
+            .iter()
+            .map(|schema_mutation| schema_mutation.mutation.id)
+            .collect::<Vec<_>>();
+
+        assert_eq!(selected_ids, vec![1, 3]);
+        assert_eq!(plan.fallback.len(), 1);
+        assert_eq!(plan.fallback[0].mutation.id, 2);
         assert_eq!(plan.fallback[0].reason, SchemaSkipReason::OverlappingRange);
     }
 
