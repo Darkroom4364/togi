@@ -126,6 +126,7 @@ fn end_to_end_go_fixture_reports_expected_outcomes_with_fresh_tests() {
         verbose: false,
         show_output: false,
         max_tested: None,
+        early_stop: Default::default(),
         respect_workspace_ignores: true,
         env: go_env,
         cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),

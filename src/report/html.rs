@@ -95,7 +95,7 @@ pub fn generate_report(report: &MutationReport) -> Result<String> {
         html,
         "<div class=\"summary\"><span class=\"score\">{:.1}%</span> mutation score \
          &mdash; {}/{} killed, {} survived, {} timeout, {} build errors \
-         &mdash; {:.2}s</div></header>",
+         &mdash; {:.2}s</div>",
         score_pct,
         report.killed,
         tested,
@@ -104,6 +104,21 @@ pub fn generate_report(report: &MutationReport) -> Result<String> {
         report.build_errors,
         report.duration.as_secs_f64()
     )?;
+    if report.total < report.planned_total {
+        write!(
+            html,
+            "<div class=\"partial\">Partial report: stopped after {}/{} scheduled mutations.</div>",
+            report.total, report.planned_total
+        )?;
+    }
+    if let Some(reason) = &report.early_stop_reason {
+        write!(
+            html,
+            "<div class=\"partial\">Early stop: {}</div>",
+            html_escape(reason)
+        )?;
+    }
+    write!(html, "</header>")?;
 
     // Layout
     write!(html, "<div class=\"container\"><nav class=\"file-tree\">")?;
@@ -262,6 +277,7 @@ header{background:#16213e;padding:1.5rem 2rem;border-bottom:2px solid #0f3460}
 h1{font-size:1.4rem;color:#e94560}
 .summary{margin-top:.5rem;font-size:.95rem;color:#a0a0b0}
 .summary .score{font-size:1.3rem;font-weight:700;color:#e94560}
+.partial{margin-top:.35rem;font-size:.85rem;color:#f0b35a}
 .container{display:flex;min-height:calc(100vh - 100px)}
 .file-tree{width:280px;background:#16213e;padding:1rem;overflow-y:auto;border-right:1px solid #0f3460;flex-shrink:0}
 .file-tree h2{font-size:.9rem;text-transform:uppercase;letter-spacing:.1em;color:#888;margin-bottom:.5rem}
@@ -357,6 +373,8 @@ mod tests {
             duration: Duration::from_millis(100),
             test_command: None,
             build_command: vec![],
+            planned_total: 1,
+            early_stop_reason: None,
             total: 1,
             killed: 0,
             survived: 0,
@@ -407,6 +425,8 @@ mod tests {
             duration: Duration::from_millis(100),
             test_command: None,
             build_command: vec![],
+            planned_total: 11,
+            early_stop_reason: None,
             total: 11,
             killed: 0,
             survived: 0,
@@ -441,6 +461,8 @@ mod tests {
             duration: Duration::from_millis(100),
             test_command: None,
             build_command: vec![],
+            planned_total: 1,
+            early_stop_reason: None,
             total: 1,
             killed: 1,
             survived: 0,
@@ -479,6 +501,8 @@ mod tests {
             duration: Duration::from_millis(100),
             test_command: None,
             build_command: vec![],
+            planned_total: 3,
+            early_stop_reason: None,
             total: 3,
             killed: 3,
             survived: 0,

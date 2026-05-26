@@ -49,6 +49,15 @@ pub fn print_report(report: &MutationReport) {
         "Mutation score: {:.1}% ({} killed, {} survived, {} timeout, {} build errors)",
         score, report.killed, report.survived, report.timeout, report.build_errors
     );
+    if report.total < report.planned_total {
+        eprintln!(
+            "Partial results: stopped after {}/{} scheduled mutations",
+            report.total, report.planned_total
+        );
+    }
+    if let Some(reason) = &report.early_stop_reason {
+        eprintln!("Early stop: {reason}");
+    }
 
     if report.survived > 0 && tested > 0 {
         let message = format!(
@@ -90,6 +99,8 @@ mod tests {
             .filter(|(_, r)| *r == MutationResult::Survived)
             .count();
         MutationReport {
+            planned_total: results.len(),
+            early_stop_reason: None,
             total: results.len(),
             killed,
             survived,

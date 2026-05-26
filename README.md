@@ -99,6 +99,10 @@ togi check --jobs 1 --fail-fast
 # Cap mutation count for a bounded exploratory run
 togi check --max-per-run 50  # --max-per-run 0 = unlimited
 
+# Stop once a PR gate has enough signal
+togi check --first-survivor
+togi check --max-survivors 3
+
 # Disable schemata if you need one-mutant-at-a-time execution
 togi check --no-schemata
 
@@ -125,7 +129,7 @@ togi test-map --path . --output coverage/test-selection.json
 togi check --test-selection-file coverage/test-selection.json
 
 # Fail below a mutation score threshold
-togi check --fail-under 80
+togi check --fail-under 80  # stops early once 80% is impossible
 
 # Split mutation work across parallel CI jobs
 togi check --shard 1/4
@@ -234,8 +238,15 @@ Use togi as a PR gate, a non-blocking annotation job, or a scheduled deeper scan
 ### Fast PR gate
 
 ```bash
-togi check --base origin/main --fail-under 80
+togi check --base origin/main --fail-under 80 --first-survivor
 ```
+
+`--first-survivor` is shorthand for `--max-survivors 1`: it stops scheduling
+new mutants after the first survived result. `--max-survivors N` keeps collecting
+up to `N` survivors for triage. `--fail-under` also stops early once even killing
+every remaining scheduled mutation could not reach the threshold. Early-stop
+runs report how many scheduled mutations completed, so use full runs for
+baselines and detailed trend reports.
 
 ### GitHub annotations
 
