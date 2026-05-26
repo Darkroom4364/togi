@@ -137,7 +137,7 @@ mod tests {
         LOCK_TEST_MUTEX
             .get_or_init(|| Mutex::new(()))
             .lock()
-            .unwrap()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     #[test]
@@ -146,10 +146,10 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let lock_path = dir.path().join(LOCK_FILE);
 
-        {
-            let _guard = acquire(dir.path()).unwrap();
-            assert!(lock_path.exists());
-        }
+        let guard = acquire(dir.path()).unwrap();
+        assert!(lock_path.exists());
+        drop(guard);
+
         // The file stays behind; the advisory lock is released when the guard drops.
         assert!(lock_path.exists());
         let _guard = acquire(dir.path()).unwrap();

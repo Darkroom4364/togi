@@ -304,11 +304,58 @@ impl Drop for FileGuard {
 pub(crate) struct WorkspaceCopy {
     _tempdir: tempfile::TempDir,
     root: PathBuf,
+    reset_strategy: WorkspaceResetStrategy,
+}
+
+enum WorkspaceResetStrategy {
+    Copy,
+    GitWorktree { project_root: PathBuf },
 }
 
 impl WorkspaceCopy {
     pub(crate) fn root(&self) -> &Path {
         &self.root
+    }
+
+    fn reset(&self, project_root: &Path, respect_ignores: bool) -> std::io::Result<()> {
+        match &self.reset_strategy {
+            WorkspaceResetStrategy::Copy => {
+                reset_copied_workspace(project_root, &self.root, respect_ignores)
+            }
+            WorkspaceResetStrategy::GitWorktree { .. } => reset_git_worktree(&self.root),
+        }
+    }
+}
+
+impl Drop for WorkspaceCopy {
+    fn drop(&mut self) {
+        let WorkspaceResetStrategy::GitWorktree { project_root } = &self.reset_strategy else {
+            return;
+        };
+        if !self.root.exists() {
+            return;
+        }
+        let output = std::process::Command::new("git")
+            .args(["worktree", "remove", "--force"])
+            .arg(&self.root)
+            .current_dir(project_root)
+            .output();
+        match output {
+            Ok(output) if output.status.success() => {}
+            Ok(output) => {
+                eprintln!(
+                    "warning: could not remove git worktree {}\nstderr:\n{}",
+                    self.root.display(),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            Err(e) => {
+                eprintln!(
+                    "warning: could not remove git worktree {}: {e}",
+                    self.root.display()
+                );
+            }
+        }
     }
 }
 
@@ -665,16 +712,99 @@ fn copy_workspace_with_options(
 ) -> std::io::Result<WorkspaceCopy> {
     let tempdir = tempfile::tempdir()?;
     let root = tempdir.path().join("workspace");
+
+    if respect_ignores {
+        match create_git_worktree_workspace(project_root, &root) {
+            Ok(true) => {
+                return Ok(WorkspaceCopy {
+                    _tempdir: tempdir,
+                    root,
+                    reset_strategy: WorkspaceResetStrategy::GitWorktree {
+                        project_root: project_root.to_path_buf(),
+                    },
+                });
+            }
+            Ok(false) => {}
+            Err(e) => {
+                eprintln!(
+                    "warning: could not create git worktree workspace: {e}; falling back to copy"
+                );
+            }
+        }
+    }
+
     fs::create_dir(&root)?;
     populate_workspace(project_root, &root, respect_ignores)?;
 
     Ok(WorkspaceCopy {
         _tempdir: tempdir,
         root,
+        reset_strategy: WorkspaceResetStrategy::Copy,
     })
 }
 
-fn reset_workspace(
+fn create_git_worktree_workspace(project_root: &Path, root: &Path) -> std::io::Result<bool> {
+    if !git_worktree_workspace_is_safe(project_root) {
+        return Ok(false);
+    }
+
+    let output = std::process::Command::new("git")
+        .args(["worktree", "add", "--detach", "--quiet"])
+        .arg(root)
+        .arg("HEAD")
+        .current_dir(project_root)
+        .output()?;
+    if output.status.success() {
+        return Ok(true);
+    }
+
+    if root.exists() {
+        let _ = fs::remove_dir_all(root);
+    }
+    Ok(false)
+}
+
+fn git_worktree_workspace_is_safe(project_root: &Path) -> bool {
+    let Some(top_level) = git_top_level(project_root) else {
+        return false;
+    };
+    let Ok(project_root) = project_root.canonicalize() else {
+        return false;
+    };
+    if top_level != project_root {
+        return false;
+    }
+
+    let output = std::process::Command::new("git")
+        .args([
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--",
+        ])
+        .current_dir(&project_root)
+        .output();
+    let Ok(output) = output else {
+        return false;
+    };
+    output.status.success() && output.stdout.is_empty()
+}
+
+fn git_top_level(project_root: &Path) -> Option<PathBuf> {
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(project_root)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let top_level = String::from_utf8(output.stdout).ok()?;
+    PathBuf::from(top_level.trim()).canonicalize().ok()
+}
+
+fn reset_copied_workspace(
     project_root: &Path,
     workspace_root: &Path,
     respect_ignores: bool,
@@ -686,6 +816,35 @@ fn reset_workspace(
     fs::create_dir(workspace_root)?;
     restore_workspace_dirs(workspace_root, preserved_dirs)?;
     populate_workspace(project_root, workspace_root, respect_ignores)
+}
+
+fn reset_git_worktree(workspace_root: &Path) -> std::io::Result<()> {
+    run_git_workspace_command(workspace_root, &["reset", "--hard", "--quiet", "HEAD"])?;
+
+    let mut clean_args = vec!["clean", "-ffdx", "--quiet"];
+    for preserved in PRESERVED_WORKSPACE_DIRS {
+        clean_args.push("-e");
+        clean_args.push(preserved);
+    }
+    run_git_workspace_command(workspace_root, &clean_args)
+}
+
+fn run_git_workspace_command(workspace_root: &Path, args: &[&str]) -> std::io::Result<()> {
+    let output = std::process::Command::new("git")
+        .args(args)
+        .current_dir(workspace_root)
+        .output()?;
+    if output.status.success() {
+        return Ok(());
+    }
+
+    Err(std::io::Error::other(format!(
+        "git {} failed in {}\nstdout:\n{}\nstderr:\n{}",
+        args.join(" "),
+        workspace_root.display(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )))
 }
 
 /// Move preserved dirs to sibling stashes before deleting the workspace.
@@ -863,6 +1022,10 @@ impl WorkspaceSlot {
     fn needs_reset(&self) -> bool {
         self.needs_reset
     }
+
+    fn reset(&self, project_root: &Path, respect_ignores: bool) -> std::io::Result<()> {
+        self.slots[self.index].reset(project_root, respect_ignores)
+    }
 }
 
 impl Drop for WorkspaceSlot {
@@ -997,11 +1160,9 @@ fn run_queued_mutation(
         let workspace_slot = shared.workspace_pool.acquire();
         let workspace_root = workspace_slot.root().to_path_buf();
         if workspace_slot.needs_reset() {
-            if let Err(e) = reset_workspace(
-                shared.project_root,
-                &workspace_root,
-                shared.respect_workspace_ignores,
-            ) {
+            if let Err(e) =
+                workspace_slot.reset(shared.project_root, shared.respect_workspace_ignores)
+            {
                 eprintln!(
                     "warning: could not reset isolated mutation workspace {}: {e}",
                     workspace_root.display()
@@ -1491,11 +1652,8 @@ impl TestRunner {
 
             let mut cacheable = true;
             let outcome = if workspace_needs_reset {
-                if let Err(e) = reset_workspace(
-                    &self.project_root,
-                    workspace.root(),
-                    self.respect_workspace_ignores,
-                ) {
+                if let Err(e) = workspace.reset(&self.project_root, self.respect_workspace_ignores)
+                {
                     cacheable = false;
                     MutationOutcome::build_error_with(
                         "schema_workspace_reset",
@@ -2990,6 +3148,17 @@ mod tests {
         );
     }
 
+    fn init_clean_git_fixture(root: &Path) {
+        run_git(root, &["init"]);
+        run_git(root, &["config", "user.email", "test@example.com"]);
+        run_git(root, &["config", "user.name", "Test"]);
+        run_git(root, &["config", "core.autocrlf", "false"]);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), b"pub fn f() {}\n").unwrap();
+        run_git(root, &["add", "."]);
+        run_git(root, &["commit", "-m", "initial"]);
+    }
+
     fn test_command_config() -> CommandConfig {
         CommandConfig {
             command: vec!["cargo".into(), "test".into()],
@@ -3487,7 +3656,7 @@ mod tests {
         std::fs::write(workspace.join("target/debug/cache"), b"keep").unwrap();
         std::fs::write(workspace.join("side-effect"), b"drop").unwrap();
 
-        reset_workspace(&root, &workspace, true).unwrap();
+        reset_copied_workspace(&root, &workspace, true).unwrap();
 
         assert_eq!(
             std::fs::read(workspace.join("target/debug/cache")).unwrap(),
@@ -3507,11 +3676,67 @@ mod tests {
         std::fs::create_dir_all(&workspace).unwrap();
         std::fs::write(workspace.join("side-effect"), b"drop").unwrap();
 
-        reset_workspace(&root, &workspace, true).unwrap();
+        reset_copied_workspace(&root, &workspace, true).unwrap();
 
         assert!(workspace.join("src/lib.rs").exists());
         assert!(!workspace.join("side-effect").exists());
         assert!(!workspace.join("target/debug/cache").exists());
+    }
+
+    #[test]
+    fn copy_workspace_uses_git_worktree_for_clean_repo_root() {
+        if !git_available() {
+            return;
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        init_clean_git_fixture(root);
+
+        let copy = copy_workspace(root).unwrap();
+
+        assert!(copy.root().join(".git").exists());
+        assert_eq!(
+            std::fs::read(copy.root().join("src/lib.rs")).unwrap(),
+            b"pub fn f() {}\n"
+        );
+
+        std::fs::write(copy.root().join("src/lib.rs"), b"pub fn f() -> i32 { 2 }\n").unwrap();
+        std::fs::write(copy.root().join("side-effect"), b"drop").unwrap();
+        std::fs::create_dir_all(copy.root().join("target/debug")).unwrap();
+        std::fs::write(copy.root().join("target/debug/cache"), b"keep").unwrap();
+
+        copy.reset(root, true).unwrap();
+
+        assert_eq!(
+            std::fs::read(copy.root().join("src/lib.rs")).unwrap(),
+            b"pub fn f() {}\n"
+        );
+        assert!(!copy.root().join("side-effect").exists());
+        assert_eq!(
+            std::fs::read(copy.root().join("target/debug/cache")).unwrap(),
+            b"keep"
+        );
+    }
+
+    #[test]
+    fn copy_workspace_falls_back_to_copy_when_git_repo_is_dirty() {
+        if !git_available() {
+            return;
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        init_clean_git_fixture(root);
+        std::fs::write(root.join("local.txt"), b"copy me").unwrap();
+
+        let copy = copy_workspace(root).unwrap();
+
+        assert!(!copy.root().join(".git").exists());
+        assert_eq!(
+            std::fs::read(copy.root().join("local.txt")).unwrap(),
+            b"copy me"
+        );
     }
 
     #[test]
