@@ -100,6 +100,7 @@ mod tests {
             build_command: vec![],
             results,
             build_error_diagnostics: vec![],
+            schemata: None,
         }
     }
 

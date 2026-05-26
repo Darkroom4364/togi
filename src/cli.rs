@@ -53,9 +53,13 @@ pub enum Commands {
         #[arg(long)]
         max_per_run: Option<usize>,
 
-        /// Use opt-in mutant schemata for supported languages
+        /// Use mutant schemata for supported languages
         #[arg(long)]
         schemata: bool,
+
+        /// Disable mutant schemata and run every mutation individually
+        #[arg(long, conflicts_with = "schemata")]
+        no_schemata: bool,
 
         /// Show mutations without running tests
         #[arg(long)]
@@ -212,6 +216,12 @@ mod tests {
             }
             _ => panic!("expected Check command"),
         }
+    }
+
+    #[test]
+    fn no_schemata_conflicts_with_schemata() {
+        let res = Cli::try_parse_from(["togi", "check", "--schemata", "--no-schemata"]);
+        assert!(res.is_err(), "--schemata and --no-schemata should conflict");
     }
 
     #[test]

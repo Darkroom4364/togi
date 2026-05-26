@@ -99,8 +99,8 @@ togi check --jobs 1 --fail-fast
 # Cap mutation count for a bounded exploratory run
 togi check --max-per-run 50  # --max-per-run 0 = unlimited
 
-# Opt in to compiled-language schemata for compatible mutations
-togi check --schemata
+# Disable schemata if you need one-mutant-at-a-time execution
+togi check --no-schemata
 
 # Scope to a directory
 togi check --all --path src/rules/
@@ -186,6 +186,7 @@ base = "origin/main"
 [mutations]
 max_per_run = 20
 max_per_file = 20
+schemata = true
 coverage_file = "coverage/lcov.info"
 test_selection_file = "coverage/test-selection.json"
 operators = ["-string_to_empty"]
@@ -268,7 +269,7 @@ Baselines let existing weak spots stay visible without blocking every PR. New re
 
 ### Mutant schemata
 
-`--schemata` batches compatible mutations into one build and switches mutants at runtime with `TOGI_MUTANT`. It currently supports expression-safe mutations in runtime contexts for Go, Rust, Java, C, and C++; unsupported operators or compile-time contexts automatically fall back to the regular one-mutant-at-a-time runner.
+Schemata are enabled by default. They batch compatible mutations into one build and switch mutants at runtime with `TOGI_MUTANT`. The runner currently supports expression-safe mutations in runtime contexts for Go, Rust, Java, C, and C++; unsupported languages, unsupported operators, and compile-time contexts automatically fall back to the regular one-mutant-at-a-time runner. Use `--no-schemata` or `schemata = false` to force regular execution.
 
 ## Coverage and test selection
 

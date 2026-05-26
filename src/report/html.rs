@@ -353,6 +353,7 @@ mod tests {
                 vec!["cargo".into(), "check".into()],
                 "error[E0308]: mismatched types",
             )],
+            schemata: None,
             duration: Duration::from_millis(100),
             test_command: None,
             build_command: vec![],
@@ -402,6 +403,7 @@ mod tests {
         let report = MutationReport {
             results,
             build_error_diagnostics,
+            schemata: None,
             duration: Duration::from_millis(100),
             test_command: None,
             build_command: vec![],
@@ -435,6 +437,7 @@ mod tests {
                 MutationResult::Killed,
             )],
             build_error_diagnostics: vec![],
+            schemata: None,
             duration: Duration::from_millis(100),
             test_command: None,
             build_command: vec![],
@@ -472,6 +475,7 @@ mod tests {
         let report = MutationReport {
             results,
             build_error_diagnostics: vec![],
+            schemata: None,
             duration: Duration::from_millis(100),
             test_command: None,
             build_command: vec![],

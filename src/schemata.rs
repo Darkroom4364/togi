@@ -82,6 +82,20 @@ pub enum SchemaSkipReason {
     OverlappingRange,
 }
 
+impl SchemaSkipReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SchemaSkipReason::UnsupportedLanguage => "unsupported_language",
+            SchemaSkipReason::UnsupportedOperator => "unsupported_operator",
+            SchemaSkipReason::MissingSource => "missing_source",
+            SchemaSkipReason::InvalidRange => "invalid_range",
+            SchemaSkipReason::OriginalMismatch => "original_mismatch",
+            SchemaSkipReason::CompileTimeContext => "compile_time_context",
+            SchemaSkipReason::OverlappingRange => "overlapping_range",
+        }
+    }
+}
+
 /// Language-specific syntax hooks for a generic schema execution engine.
 pub trait SchemaAdapter: Send + Sync {
     /// Stable language name matching [`Mutation::language`].

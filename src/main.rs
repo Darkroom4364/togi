@@ -20,6 +20,7 @@ struct CheckConfig {
     timeout: Option<u64>,
     max_per_run: Option<usize>,
     schemata: bool,
+    no_schemata: bool,
     dry_run: bool,
     verbose: bool,
     show_output: bool,
@@ -74,6 +75,7 @@ fn main() {
             timeout,
             max_per_run,
             schemata,
+            no_schemata,
             dry_run,
             verbose,
             show_output,
@@ -100,6 +102,7 @@ fn main() {
                 timeout,
                 max_per_run,
                 schemata,
+                no_schemata,
                 dry_run,
                 verbose,
                 show_output,
@@ -433,6 +436,9 @@ fn resolve_config(
     }
     if cfg.schemata {
         config.mutations.schemata = true;
+    }
+    if cfg.no_schemata {
+        config.mutations.schemata = false;
     }
     if let Some(cmd) = cfg.test_cmd {
         config.test.command =
