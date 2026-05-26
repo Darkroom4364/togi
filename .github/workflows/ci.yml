@@ -9,7 +9,28 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+permissions:
+  contents: read
+
 jobs:
+  foxguard:
+    name: Foxguard Security Scan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@v6
+      - name: Run Foxguard
+        uses: 0sec-labs/foxguard/action@v0.8.1
+        with:
+          path: .
+          severity: medium
+          version: v0.8.1
+          fail-on-findings: "false"
+          upload-sarif: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+
   check:
     name: Build & Test
     runs-on: ${{ matrix.os }}
