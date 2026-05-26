@@ -11,8 +11,28 @@ permissions:
   id-token: write
 
 jobs:
+  foxguard:
+    name: Foxguard Security Scan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - name: Run Foxguard
+        uses: 0sec-labs/foxguard/action@e13233eb0b83a495ff7ad8fe30d62128cb625c14
+        with:
+          path: .
+          severity: medium
+          version: v0.8.1
+          fail-on-findings: "false"
+          upload-sarif: "true"
+
   build:
     name: Build ${{ matrix.target }}
+    needs: foxguard
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
