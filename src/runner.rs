@@ -777,6 +777,7 @@ fn populate_workspace(
 pub(crate) struct WorkspacePool {
     slots: Arc<Vec<WorkspaceCopy>>,
     free_slots: Arc<(Mutex<VecDeque<usize>>, Condvar)>,
+    dirty_slots: Arc<Mutex<Vec<bool>>>,
 }
 
 impl WorkspacePool {
@@ -801,10 +802,12 @@ impl WorkspacePool {
         }
 
         let free_slots = (0..slots).collect();
+        let dirty_slots = vec![false; slots];
 
         Ok(Self {
             slots: Arc::new(copies),
             free_slots: Arc::new((Mutex::new(free_slots), Condvar::new())),
+            dirty_slots: Arc::new(Mutex::new(dirty_slots)),
         })
     }
 
@@ -823,10 +826,21 @@ impl WorkspacePool {
                 .wait(free_slots)
                 .expect("workspace free-list mutex poisoned");
         };
+        let needs_reset = {
+            let mut dirty_slots = self
+                .dirty_slots
+                .lock()
+                .expect("workspace dirty-list mutex poisoned");
+            let needs_reset = dirty_slots[index];
+            dirty_slots[index] = true;
+            needs_reset
+        };
+
         WorkspaceSlot {
             slots: self.slots.clone(),
             free_slots: self.free_slots.clone(),
             index,
+            needs_reset,
         }
     }
 }
@@ -835,11 +849,16 @@ pub(crate) struct WorkspaceSlot {
     slots: Arc<Vec<WorkspaceCopy>>,
     free_slots: Arc<(Mutex<VecDeque<usize>>, Condvar)>,
     index: usize,
+    needs_reset: bool,
 }
 
 impl WorkspaceSlot {
     pub(crate) fn root(&self) -> &Path {
         self.slots[self.index].root()
+    }
+
+    fn needs_reset(&self) -> bool {
+        self.needs_reset
     }
 }
 
@@ -944,31 +963,33 @@ fn run_queued_mutation(
     let outcome = {
         let workspace_slot = shared.workspace_pool.acquire();
         let workspace_root = workspace_slot.root().to_path_buf();
-        if let Err(e) = reset_workspace(
-            shared.project_root,
-            &workspace_root,
-            shared.respect_workspace_ignores,
-        ) {
-            eprintln!(
-                "warning: could not reset isolated mutation workspace {}: {e}",
-                workspace_root.display()
-            );
-            reservation.release();
-            record_progress(&shared, &mutation, MutationResult::BuildError, None, false);
-            let diagnostic = BuildErrorDiagnostic::new(
-                mutation.id,
-                "regular",
-                "workspace_reset",
-                vec![],
-                format!(
-                    "could not reset isolated mutation workspace {}: {e}",
+        if workspace_slot.needs_reset() {
+            if let Err(e) = reset_workspace(
+                shared.project_root,
+                &workspace_root,
+                shared.respect_workspace_ignores,
+            ) {
+                eprintln!(
+                    "warning: could not reset isolated mutation workspace {}: {e}",
                     workspace_root.display()
-                ),
-            );
-            return Some((
-                index,
-                MutationRunRecord::new(mutation, MutationResult::BuildError, Some(diagnostic)),
-            ));
+                );
+                reservation.release();
+                record_progress(&shared, &mutation, MutationResult::BuildError, None, false);
+                let diagnostic = BuildErrorDiagnostic::new(
+                    mutation.id,
+                    "regular",
+                    "workspace_reset",
+                    vec![],
+                    format!(
+                        "could not reset isolated mutation workspace {}: {e}",
+                        workspace_root.display()
+                    ),
+                );
+                return Some((
+                    index,
+                    MutationRunRecord::new(mutation, MutationResult::BuildError, Some(diagnostic)),
+                ));
+            }
         }
         let workspace_target =
             ResolvedMutation::new_for_execution(shared.project_root, &workspace_root, &mutation);
@@ -1363,6 +1384,7 @@ impl TestRunner {
         let tested_counter = Arc::new(AtomicUsize::new(0));
         let source_contents = SourceContentCache::default();
         let cache_context_hash = cache_context_fingerprint(&self.project_root);
+        let mut workspace_needs_reset = false;
         for schema_mutation in schema_mutations {
             if self.cancelled.load(Ordering::Acquire) {
                 break;
@@ -1419,72 +1441,43 @@ impl TestRunner {
             }
 
             let mut cacheable = true;
-            let outcome = if let Err(e) = reset_workspace(
-                &self.project_root,
-                workspace.root(),
-                self.respect_workspace_ignores,
-            ) {
-                cacheable = false;
-                MutationOutcome::build_error_with(
-                    "schema_workspace_reset",
-                    vec![],
-                    format!(
-                        "could not reset schema workspace {}: {e}",
-                        workspace.root().display()
-                    ),
-                )
-            } else if let Err(e) =
-                apply_schema_rewrites_to_workspace(&self.project_root, workspace.root(), &rewrites)
-            {
-                cacheable = false;
-                MutationOutcome::build_error_with(
-                    "schema_rewrite",
-                    vec![],
-                    format!("could not apply schema rewrites: {e}"),
-                )
-            } else if self.commands.build_command_explicit
-                && !self.commands.build_command.is_empty()
-            {
-                let build = run_command(
-                    &self.commands.build_command,
+            let outcome = if workspace_needs_reset {
+                if let Err(e) = reset_workspace(
+                    &self.project_root,
                     workspace.root(),
-                    self.commands.timeout,
-                    true,
-                    &self.env,
-                    &self.cancelled,
-                );
-                if build.cancelled {
-                    break;
-                }
-                if build.result != MutationResult::Survived {
+                    self.respect_workspace_ignores,
+                ) {
+                    cacheable = false;
                     MutationOutcome::build_error_with(
-                        "schema_build",
-                        self.commands.build_command.clone(),
-                        build_error_message_from_outcome(
-                            "schema build command",
-                            &self.commands.build_command,
-                            workspace.root(),
-                            &build,
+                        "schema_workspace_reset",
+                        vec![],
+                        format!(
+                            "could not reset schema workspace {}: {e}",
+                            workspace.root().display()
                         ),
                     )
                 } else {
-                    run_command(
-                        &argv,
+                    workspace_needs_reset = true;
+                    run_schema_workspace_mutation(
+                        self,
                         workspace.root(),
+                        &rewrites,
+                        &argv,
                         selected.timeout,
-                        self.show_output,
                         &env,
-                        &self.cancelled,
+                        &mut cacheable,
                     )
                 }
             } else {
-                run_command(
-                    &argv,
+                workspace_needs_reset = true;
+                run_schema_workspace_mutation(
+                    self,
                     workspace.root(),
+                    &rewrites,
+                    &argv,
                     selected.timeout,
-                    self.show_output,
                     &env,
-                    &self.cancelled,
+                    &mut cacheable,
                 )
             };
             if outcome.cancelled {
@@ -1631,6 +1624,62 @@ fn apply_schema_rewrites_to_workspace(
     }
 
     Ok(())
+}
+
+fn run_schema_workspace_mutation(
+    runner: &TestRunner,
+    workspace_root: &Path,
+    rewrites: &[crate::schemata::SchemaFileRewrite],
+    argv: &[String],
+    timeout: Duration,
+    env: &HashMap<String, String>,
+    cacheable: &mut bool,
+) -> MutationOutcome {
+    if let Err(e) =
+        apply_schema_rewrites_to_workspace(&runner.project_root, workspace_root, rewrites)
+    {
+        *cacheable = false;
+        return MutationOutcome::build_error_with(
+            "schema_rewrite",
+            vec![],
+            format!("could not apply schema rewrites: {e}"),
+        );
+    }
+
+    if runner.commands.build_command_explicit && !runner.commands.build_command.is_empty() {
+        let build = run_command(
+            &runner.commands.build_command,
+            workspace_root,
+            runner.commands.timeout,
+            true,
+            &runner.env,
+            &runner.cancelled,
+        );
+        if build.cancelled {
+            return build;
+        }
+        if build.result != MutationResult::Survived {
+            return MutationOutcome::build_error_with(
+                "schema_build",
+                runner.commands.build_command.clone(),
+                build_error_message_from_outcome(
+                    "schema build command",
+                    &runner.commands.build_command,
+                    workspace_root,
+                    &build,
+                ),
+            );
+        }
+    }
+
+    run_command(
+        argv,
+        workspace_root,
+        timeout,
+        runner.show_output,
+        env,
+        &runner.cancelled,
+    )
 }
 
 fn records_from_report(report: MutationReport) -> Vec<MutationRunRecord> {
@@ -3427,6 +3476,8 @@ mod tests {
 
         let first = pool.acquire();
         let second = pool.acquire();
+        assert!(!first.needs_reset());
+        assert!(!second.needs_reset());
         assert_ne!(first.root(), second.root());
         assert!(first.root().join("src/lib.rs").exists());
         assert!(second.root().join("src/lib.rs").exists());
@@ -3436,6 +3487,7 @@ mod tests {
         drop(second);
 
         let third = pool.acquire();
+        assert!(third.needs_reset());
         assert_eq!(third.root(), second_root.as_path());
         assert_ne!(third.root(), first_root.as_path());
     }

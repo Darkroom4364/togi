@@ -23,11 +23,11 @@ command = ["go", "test", "./..."]
 timeout = 30
 
 # Maximum number of mutation jobs.
-# The shared working tree is protected so only one mutation is active at a time;
-# this still bounds task scheduling and future isolated execution.
+# Each job can launch a full test runner, so higher values can multiply CPU
+# load quickly. Keep this low for laptops and raise it explicitly in CI.
 # Type: integer
-# Default: number of available CPUs
-jobs = 4
+# Default: 1 on 1-2 CPU machines, otherwise 2
+jobs = 2
 
 [test.languages.python]
 # Override the test command for mutations in one language.
