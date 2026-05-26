@@ -91,7 +91,10 @@ togi check --format html
 togi check --all
 
 # Adjust parallelism and timeout
-togi check --jobs 8 --timeout 60
+togi check --jobs 2 --timeout 60
+
+# Keep laptop CPU/temperature lower
+togi check --jobs 1 --fail-fast
 
 # Cap mutation count for a bounded exploratory run
 togi check --max-per-run 50  # --max-per-run 0 = unlimited
@@ -163,7 +166,7 @@ Create a `togi.toml` for customization:
 [test]
 command = ["go", "test", "./..."]
 timeout = 30
-jobs = 4
+jobs = 2
 build_command = ["go", "build", "./..."]
 
 [test.languages.python]
@@ -196,6 +199,32 @@ Test command precedence is: CLI `--test-cmd` / `--timeout`, matching
 then the global `[test]` command.
 When `--test-cmd` is set, `--fail-fast` does not modify the custom command;
 include runner-specific fail-fast flags in `--test-cmd` instead.
+
+## Resource tuning
+
+The default worker count is conservative for local machines: `1` on 1-2 CPU
+systems, otherwise `2`. Increase `--jobs` or `[test] jobs` in CI when throughput
+matters more than fan noise, temperature, or foreground responsiveness.
+
+Each togi worker runs the configured test command, and that test command may
+parallelize too. For cooler local runs, cap both layers:
+
+```bash
+# Togi only runs one mutation test process at a time
+togi check --jobs 1 --fail-fast
+
+# Rust: cap Cargo build jobs and libtest threads
+togi check --jobs 1 --test-cmd "cargo test -j 2 -- --test-threads=2"
+
+# Go: cap package and test-level parallelism
+togi check --jobs 1 --test-cmd "go test -p 2 -parallel 2 ./..."
+
+# Jest: avoid worker fan-out
+togi check --jobs 1 --test-cmd "npm test -- --runInBand"
+
+# pytest: avoid xdist workers unless you explicitly want them
+togi check --jobs 1 --test-cmd "pytest"
+```
 
 ## CI workflows
 

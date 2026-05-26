@@ -222,8 +222,12 @@ fn default_timeout() -> u64 {
 
 fn default_jobs() -> usize {
     std::thread::available_parallelism()
-        .map(|n| n.get())
+        .map(|n| default_jobs_for_available_parallelism(n.get()))
         .unwrap_or(1)
+}
+
+fn default_jobs_for_available_parallelism(available: usize) -> usize {
+    if available <= 2 { 1 } else { 2 }
 }
 
 fn default_base() -> String {
@@ -368,11 +372,12 @@ impl Config {
             ));
         }
 
-        template.push_str(
+        template.push_str(&format!(
             "timeout = 30\n\
-             # jobs = 4  # defaults to number of CPUs\n\
+             # jobs = {}  # conservative local default; raise in CI for throughput\n\
              \n",
-        );
+            default_jobs()
+        ));
 
         // Detect additional languages for polyglot repos
         let has_python = project_root.join("pyproject.toml").exists()
@@ -522,7 +527,7 @@ commnad = ["cargo", "test"]
         assert_eq!(config.test.command, vec!["go", "test", "./..."]);
         assert!(config.test.build_command.is_empty());
         assert_eq!(config.test.timeout, 30);
-        assert_eq!(config.test.jobs, 4);
+        assert_eq!(config.test.jobs, 2);
         assert_eq!(config.test.languages["python"].command, vec!["pytest"]);
         assert_eq!(config.diff.base, "origin/main");
         assert_eq!(
@@ -561,6 +566,15 @@ commnad = ["cargo", "test"]
         assert!(config.mutations.respect_workspace_ignores);
         assert!(!config.mutations.schemata);
         assert!(config.projects.is_empty());
+    }
+
+    #[test]
+    fn default_jobs_are_conservative_for_local_runs() {
+        assert_eq!(default_jobs_for_available_parallelism(0), 1);
+        assert_eq!(default_jobs_for_available_parallelism(1), 1);
+        assert_eq!(default_jobs_for_available_parallelism(2), 1);
+        assert_eq!(default_jobs_for_available_parallelism(3), 2);
+        assert_eq!(default_jobs_for_available_parallelism(16), 2);
     }
 
     #[test]

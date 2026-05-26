@@ -41,7 +41,7 @@ pub enum Commands {
         #[arg(short, long, default_value = "terminal")]
         format: OutputFormat,
 
-        /// Number of parallel jobs
+        /// Number of parallel mutation workers
         #[arg(short, long)]
         jobs: Option<usize>,
 
