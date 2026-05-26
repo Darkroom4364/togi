@@ -140,6 +140,7 @@ impl BuildErrorDiagnostic {
 pub struct MutationReport {
     pub results: Vec<(Mutation, MutationResult)>,
     pub build_error_diagnostics: Vec<BuildErrorDiagnostic>,
+    pub schemata: Option<SchemataReport>,
     pub duration: Duration,
     pub test_command: Option<Vec<String>>,
     pub build_command: Vec<String>,
@@ -148,6 +149,20 @@ pub struct MutationReport {
     pub survived: usize,
     pub timeout: usize,
     pub build_errors: usize,
+}
+
+/// How schemata execution was used for a mutation run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SchemataReport {
+    pub fast_path: usize,
+    pub fallback: usize,
+    pub fallback_reasons: Vec<SchemataFallbackReasonCount>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SchemataFallbackReasonCount {
+    pub reason: String,
+    pub count: usize,
 }
 
 fn build_error_message_snippet(message: &str) -> String {

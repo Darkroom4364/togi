@@ -283,7 +283,7 @@ impl Default for MutationConfig {
             skip_noisy_files: true,
             respect_workspace_ignores: true,
             operators: vec![],
-            schemata: false,
+            schemata: true,
         }
     }
 }
@@ -439,7 +439,7 @@ impl Config {
              [mutations]\n\
              max_per_run = 20\n\
              # max_per_file = 20  # cap mutations per source file (0 = unlimited)\n\
-             # schemata = false  # opt in to supported mutant schemata execution\n\
+             # schemata = true  # use supported mutant schemata as the fast path\n\
              # respect_workspace_ignores = true  # honor .ignore/.gitignore in mutation workspaces\n",
         );
 
@@ -540,7 +540,7 @@ commnad = ["cargo", "test"]
         );
         assert!(config.mutations.skip_noisy_files);
         assert!(config.mutations.respect_workspace_ignores);
-        assert!(!config.mutations.schemata);
+        assert!(config.mutations.schemata);
         let project = &config.projects["api"];
         assert_eq!(project.path, PathBuf::from("services/api"));
         assert_eq!(project.test.as_ref().unwrap().timeout, Some(60));
@@ -564,7 +564,7 @@ commnad = ["cargo", "test"]
         assert!(config.mutations.exclude_paths.is_empty());
         assert!(config.mutations.skip_noisy_files);
         assert!(config.mutations.respect_workspace_ignores);
-        assert!(!config.mutations.schemata);
+        assert!(config.mutations.schemata);
         assert!(config.projects.is_empty());
     }
 

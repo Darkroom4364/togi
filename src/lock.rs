@@ -129,10 +129,20 @@ pub fn acquire(project_root: &Path) -> Result<LockGuard> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
     use tempfile::TempDir;
+
+    fn lock_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK_TEST_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK_TEST_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap()
+    }
 
     #[test]
     fn acquire_and_release() {
+        let _serial = lock_test_guard();
         let dir = TempDir::new().unwrap();
         let lock_path = dir.path().join(LOCK_FILE);
 
@@ -147,6 +157,7 @@ mod tests {
 
     #[test]
     fn rejects_concurrent_lock() {
+        let _serial = lock_test_guard();
         let dir = TempDir::new().unwrap();
 
         let _guard = acquire(dir.path()).unwrap();
@@ -156,6 +167,7 @@ mod tests {
 
     #[test]
     fn acquires_lock_on_orphaned_file() {
+        let _serial = lock_test_guard();
         let dir = TempDir::new().unwrap();
         let lock_path = dir.path().join(LOCK_FILE);
 

@@ -102,6 +102,23 @@ fn format_report(report: &MutationReport, color: bool) -> String {
     )
     .unwrap();
     writeln!(out, "Duration: {:.2}s", report.duration.as_secs_f64()).unwrap();
+    if let Some(schemata) = &report.schemata {
+        writeln!(
+            out,
+            "Schemata: {} fast-path, {} fallback",
+            schemata.fast_path, schemata.fallback
+        )
+        .unwrap();
+        if !schemata.fallback_reasons.is_empty() {
+            let reasons = schemata
+                .fallback_reasons
+                .iter()
+                .map(|reason| format!("{} ({})", reason.reason, reason.count))
+                .collect::<Vec<_>>()
+                .join(", ");
+            writeln!(out, "Fallback reasons: {reasons}").unwrap();
+        }
+    }
     writeln!(out, "{separator}").unwrap();
 
     let build_error_summary = format_build_error_groups(report);
@@ -268,6 +285,7 @@ mod tests {
         MutationReport {
             results,
             build_error_diagnostics: vec![],
+            schemata: None,
             duration: Duration::from_millis(500),
             test_command: None,
             build_command: vec![],
@@ -344,6 +362,24 @@ mod tests {
         let output = format_report_plain(&report);
         assert!(output.contains("Results: 1 killed, 1 survived, 0 timeout, 0 build errors"));
         assert!(output.contains("Mutation score (test kills only): 50.0%"));
+    }
+
+    #[test]
+    fn terminal_output_contains_schemata_summary_when_present() {
+        let mut report = report(vec![(mutation(1, "src/a.rs", 1), MutationResult::Killed)]);
+        report.schemata = Some(crate::SchemataReport {
+            fast_path: 1,
+            fallback: 2,
+            fallback_reasons: vec![crate::SchemataFallbackReasonCount {
+                reason: "unsupported_operator".into(),
+                count: 2,
+            }],
+        });
+
+        let output = format_report_plain(&report);
+
+        assert!(output.contains("Schemata: 1 fast-path, 2 fallback"));
+        assert!(output.contains("Fallback reasons: unsupported_operator (2)"));
     }
 
     #[test]

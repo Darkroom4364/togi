@@ -15,8 +15,23 @@ struct JsonReport {
     duration_ms: u128,
     test_command: Option<Vec<String>>,
     build_command: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    schemata: Option<JsonSchemata>,
     build_error_groups: Vec<JsonBuildErrorGroup>,
     mutations: Vec<JsonMutation>,
+}
+
+#[derive(Serialize)]
+struct JsonSchemata {
+    fast_path: usize,
+    fallback: usize,
+    fallback_reasons: Vec<JsonSchemataFallbackReason>,
+}
+
+#[derive(Serialize)]
+struct JsonSchemataFallbackReason {
+    reason: String,
+    count: usize,
 }
 
 #[derive(Serialize)]
@@ -147,6 +162,18 @@ pub fn to_json_string(report: &MutationReport) -> Result<String> {
         duration_ms: report.duration.as_millis(),
         test_command: report.test_command.clone(),
         build_command: report.build_command.clone(),
+        schemata: report.schemata.as_ref().map(|schemata| JsonSchemata {
+            fast_path: schemata.fast_path,
+            fallback: schemata.fallback,
+            fallback_reasons: schemata
+                .fallback_reasons
+                .iter()
+                .map(|reason| JsonSchemataFallbackReason {
+                    reason: reason.reason.clone(),
+                    count: reason.count,
+                })
+                .collect(),
+        }),
         build_error_groups,
         mutations,
     };
@@ -158,7 +185,7 @@ pub fn to_json_string(report: &MutationReport) -> Result<String> {
 mod tests {
     use super::*;
     use crate::test_helpers::sample_report;
-    use crate::{BuildErrorDiagnostic, Mutation};
+    use crate::{BuildErrorDiagnostic, Mutation, SchemataFallbackReasonCount, SchemataReport};
     use serde_json::Value;
     use std::path::PathBuf;
     use std::time::Duration;
@@ -281,6 +308,7 @@ mod tests {
                 MutationResult::BuildError,
             )],
             build_error_diagnostics: vec![],
+            schemata: None,
             duration: Duration::from_millis(100),
             test_command: None,
             build_command: vec![],
@@ -323,6 +351,7 @@ mod tests {
                 MutationResult::BuildError,
             )],
             build_error_diagnostics: vec![diagnostic],
+            schemata: None,
             duration: Duration::from_millis(100),
             test_command: None,
             build_command: vec![],
@@ -355,6 +384,7 @@ mod tests {
         let report = MutationReport {
             results: vec![],
             build_error_diagnostics: vec![],
+            schemata: None,
             duration: Duration::from_millis(0),
             test_command: None,
             build_command: vec![],
@@ -368,6 +398,30 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&json_str).unwrap();
         assert_eq!(value["mutation_score"], 100.0);
         assert_eq!(value["total"], 0);
+    }
+
+    #[test]
+    fn json_output_includes_schemata_stats_when_present() {
+        let mut report = sample_report();
+        report.schemata = Some(SchemataReport {
+            fast_path: 3,
+            fallback: 2,
+            fallback_reasons: vec![SchemataFallbackReasonCount {
+                reason: "unsupported_operator".into(),
+                count: 2,
+            }],
+        });
+
+        let json_str = to_json_string(&report).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+
+        assert_eq!(value["schemata"]["fast_path"], 3);
+        assert_eq!(value["schemata"]["fallback"], 2);
+        assert_eq!(
+            value["schemata"]["fallback_reasons"][0]["reason"],
+            "unsupported_operator"
+        );
+        assert_eq!(value["schemata"]["fallback_reasons"][0]["count"], 2);
     }
 
     #[test]

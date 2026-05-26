@@ -1,8 +1,11 @@
 // Parallel test execution with timeouts
 
 use crate::cache::{self, CacheKey};
-use crate::{BuildErrorDiagnostic, Mutation, MutationReport, MutationResult};
-use std::collections::{HashMap, VecDeque};
+use crate::{
+    BuildErrorDiagnostic, Mutation, MutationReport, MutationResult, SchemataFallbackReasonCount,
+    SchemataReport,
+};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs;
 use std::hash::Hasher;
 use std::io::{IsTerminal, Read, Write};
@@ -898,6 +901,36 @@ impl MutationRunRecord {
     }
 }
 
+#[derive(Default)]
+struct SchemataRunSummary {
+    fast_path: usize,
+    fallback: usize,
+    fallback_reasons: BTreeMap<String, usize>,
+}
+
+impl SchemataRunSummary {
+    fn record_fallback(&mut self, reason: &str) {
+        self.record_fallbacks(reason, 1);
+    }
+
+    fn record_fallbacks(&mut self, reason: &str, count: usize) {
+        self.fallback += count;
+        *self.fallback_reasons.entry(reason.to_string()).or_default() += count;
+    }
+
+    fn into_report(self) -> SchemataReport {
+        SchemataReport {
+            fast_path: self.fast_path,
+            fallback: self.fallback,
+            fallback_reasons: self
+                .fallback_reasons
+                .into_iter()
+                .map(|(reason, count)| SchemataFallbackReasonCount { reason, count })
+                .collect(),
+        }
+    }
+}
+
 struct RunShared<'a> {
     workspace_pool: &'a WorkspacePool,
     project_root: &'a Path,
@@ -1153,6 +1186,7 @@ impl TestRunner {
         let plan = crate::schemata::plan(&self.project_root, mutations);
         let mut schema_by_language = HashMap::<String, Vec<crate::schemata::SchemaMutation>>::new();
         let mut fallback_mutations = Vec::new();
+        let mut schemata_summary = SchemataRunSummary::default();
 
         for schema_mutation in plan.selected {
             match schema_mutation.mutation.language.as_str() {
@@ -1162,21 +1196,34 @@ impl TestRunner {
                         .or_default()
                         .push(schema_mutation);
                 }
-                _ => fallback_mutations.push(schema_mutation.mutation),
+                _ => {
+                    schemata_summary.record_fallback("unsupported_runner");
+                    fallback_mutations.push(schema_mutation.mutation);
+                }
             }
         }
-        fallback_mutations.extend(plan.fallback.into_iter().map(|fallback| fallback.mutation));
+        for fallback in plan.fallback {
+            schemata_summary.record_fallback(fallback.reason.as_str());
+            fallback_mutations.push(fallback.mutation);
+        }
 
         if schema_by_language.is_empty() {
-            return self.run_regular(fallback_mutations);
+            let mut outcome = self.run_regular(fallback_mutations);
+            outcome.report.schemata = Some(schemata_summary.into_report());
+            return outcome;
         }
 
         let mut all_records = Vec::new();
         for (language, schema_mutations) in schema_by_language {
+            let mutation_count = schema_mutations.len();
             match self.run_schema_mutations(&language, &schema_mutations) {
-                Ok(records) => all_records.extend(records),
+                Ok(records) => {
+                    schemata_summary.fast_path += records.len();
+                    all_records.extend(records);
+                }
                 Err(err) => {
                     eprintln!("warning: could not run {language} schemata: {err} — falling back");
+                    schemata_summary.record_fallbacks("rewrite_error", mutation_count);
                     fallback_mutations.extend(
                         schema_mutations
                             .into_iter()
@@ -1197,7 +1244,9 @@ impl TestRunner {
                 .copied()
                 .unwrap_or(usize::MAX)
         });
-        self.outcome_from_records(all_records, start.elapsed())
+        let mut outcome = self.outcome_from_records(all_records, start.elapsed());
+        outcome.report.schemata = Some(schemata_summary.into_report());
+        outcome
     }
 
     #[allow(clippy::manual_is_multiple_of)]
@@ -1574,6 +1623,7 @@ impl TestRunner {
         MutationReport {
             results,
             build_error_diagnostics,
+            schemata: None,
             duration,
             test_command: if self.commands.language_commands.is_empty()
                 && self.commands.project_commands.is_empty()
@@ -4051,6 +4101,61 @@ sleep 10"#
             "runner should not wait for the command timeout after cancellation"
         );
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "hello world");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_with_schemata_reports_unsupported_runner_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = "def same(a, b):\n    return a == b\n";
+        std::fs::write(dir.path().join("app.py"), source).unwrap();
+        let start = source.find("a == b").unwrap();
+        let mutation = Mutation {
+            id: 0,
+            file: PathBuf::from("app.py"),
+            language: "python".into(),
+            line: 2,
+            column: 12,
+            operator: "eq_to_neq".into(),
+            description: "Replace == with !=".into(),
+            original: "a == b".into(),
+            replacement: "a != b".into(),
+            byte_range: start..start + "a == b".len(),
+        };
+
+        let runner = TestRunner {
+            commands: CommandConfig {
+                command: vec!["true".into()],
+                force_default_command: false,
+                force_default_timeout: false,
+                project_commands: vec![],
+                language_commands: HashMap::new(),
+                build_command: vec![],
+                build_command_explicit: false,
+                timeout: Duration::from_secs(5),
+                language_timeouts: HashMap::new(),
+                test_selection: None,
+            },
+            parallelism: 1,
+            project_root: dir.path().to_path_buf(),
+            verbose: false,
+            show_output: false,
+            max_tested: None,
+            respect_workspace_ignores: true,
+            env: HashMap::new(),
+            cancelled: Arc::new(AtomicBool::new(false)),
+        };
+
+        let report = runner.run_with_schemata(vec![mutation]).report;
+        let schemata = report.schemata.expect("schemata run should report stats");
+
+        assert_eq!(report.total, 1);
+        assert_eq!(report.survived, 1);
+        assert_eq!(schemata.fast_path, 0);
+        assert_eq!(schemata.fallback, 1);
+        assert_eq!(schemata.fallback_reasons.len(), 1);
+        assert_eq!(schemata.fallback_reasons[0].reason, "unsupported_runner");
+        assert_eq!(schemata.fallback_reasons[0].count, 1);
     }
 
     #[cfg(unix)]
