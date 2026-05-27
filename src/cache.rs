@@ -6,15 +6,20 @@
 //! stored as JSON files in `.togi-cache/`.
 
 use crate::MutationResult;
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::hash::Hasher;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 /// Directory where cache entries are stored.
 const CACHE_DIR: &str = ".togi-cache";
 
 /// Bump when mutation/operator/cache semantics change without a package version bump.
 const CACHE_SCHEMA_VERSION: &str = "2";
+
+const HISTORY_FILE: &str = "history.json";
+const HISTORY_SCHEMA_VERSION: u32 = 1;
 
 const TOGI_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -94,9 +99,155 @@ pub fn clear(project_root: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IncrementalHistoryQuery {
+    pub mutation_identity: String,
+    pub mutation_description: String,
+    pub source_hash: u64,
+    pub command_hash: u64,
+    pub relevant_test_hash: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IncrementalHistoryEntry {
+    pub mutation_identity: String,
+    pub mutation_description: String,
+    pub result: MutationResult,
+    pub source_hash: u64,
+    pub command_hash: u64,
+    pub relevant_test_hash: u64,
+    #[serde(default)]
+    pub covering_tests: Vec<String>,
+    #[serde(default)]
+    pub killer_test: Option<String>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct IncrementalHistoryFile {
+    schema_version: u32,
+    entries: Vec<IncrementalHistoryEntry>,
+}
+
+pub struct IncrementalHistoryStore {
+    project_root: PathBuf,
+    state: Mutex<IncrementalHistoryFile>,
+}
+
+impl IncrementalHistoryStore {
+    pub fn load(project_root: &Path) -> Self {
+        Self {
+            project_root: project_root.to_path_buf(),
+            state: Mutex::new(load_history_file(project_root)),
+        }
+    }
+
+    pub fn lookup(&self, query: &IncrementalHistoryQuery) -> Option<MutationResult> {
+        let history = self.state.lock().ok()?;
+        history
+            .entries
+            .iter()
+            .rev()
+            .find(|entry| history_entry_matches(entry, query))
+            .and_then(|entry| reusable_history_result(entry.result))
+    }
+
+    pub fn preferred_killer_test(
+        &self,
+        mutation_identity: &str,
+        mutation_description: &str,
+        tests: &[String],
+    ) -> Option<String> {
+        let history = self.state.lock().ok()?;
+        history
+            .entries
+            .iter()
+            .rev()
+            .filter(|entry| {
+                entry.mutation_identity == mutation_identity
+                    && entry.mutation_description == mutation_description
+            })
+            .filter_map(|entry| entry.killer_test.as_ref())
+            .find(|killer| tests.iter().any(|test| test == *killer))
+            .cloned()
+    }
+
+    pub fn record(&self, entry: IncrementalHistoryEntry) {
+        let Ok(mut history) = self.state.lock() else {
+            eprintln!("warning: incremental history mutex poisoned");
+            return;
+        };
+        history.schema_version = HISTORY_SCHEMA_VERSION;
+        if let Some(existing) = history.entries.iter_mut().find(|existing| {
+            existing.mutation_identity == entry.mutation_identity
+                && existing.mutation_description == entry.mutation_description
+        }) {
+            *existing = entry;
+        } else {
+            history.entries.push(entry);
+        }
+        save_history_file(&self.project_root, &history);
+    }
+}
+
+fn history_entry_matches(entry: &IncrementalHistoryEntry, query: &IncrementalHistoryQuery) -> bool {
+    entry.mutation_identity == query.mutation_identity
+        && entry.mutation_description == query.mutation_description
+        && entry.source_hash == query.source_hash
+        && entry.command_hash == query.command_hash
+        && entry.relevant_test_hash == query.relevant_test_hash
+}
+
+fn reusable_history_result(result: MutationResult) -> Option<MutationResult> {
+    matches!(result, MutationResult::Killed | MutationResult::Survived).then_some(result)
+}
+
+fn load_history_file(project_root: &Path) -> IncrementalHistoryFile {
+    let path = history_path(project_root);
+    let Ok(data) = fs::read_to_string(path) else {
+        return IncrementalHistoryFile {
+            schema_version: HISTORY_SCHEMA_VERSION,
+            entries: Vec::new(),
+        };
+    };
+    let Ok(history) = serde_json::from_str::<IncrementalHistoryFile>(&data) else {
+        return IncrementalHistoryFile {
+            schema_version: HISTORY_SCHEMA_VERSION,
+            entries: Vec::new(),
+        };
+    };
+    if history.schema_version == HISTORY_SCHEMA_VERSION {
+        history
+    } else {
+        IncrementalHistoryFile {
+            schema_version: HISTORY_SCHEMA_VERSION,
+            entries: Vec::new(),
+        }
+    }
+}
+
+fn save_history_file(project_root: &Path, history: &IncrementalHistoryFile) {
+    let path = history_path(project_root);
+    if let Some(parent) = path.parent() {
+        if fs::create_dir_all(parent).is_err() {
+            return;
+        }
+    }
+    let Ok(data) = serde_json::to_vec(history) else {
+        return;
+    };
+    let tmp = path.with_extension("json.tmp");
+    if fs::write(&tmp, data).is_ok() {
+        let _ = fs::rename(tmp, path);
+    }
+}
+
 /// Return the cache directory path under the given project root.
 fn cache_dir(project_root: &Path) -> PathBuf {
     project_root.join(CACHE_DIR)
+}
+
+fn history_path(project_root: &Path) -> PathBuf {
+    cache_dir(project_root).join(HISTORY_FILE)
 }
 
 /// Return the file path for a given cache key.
@@ -130,13 +281,13 @@ impl Hasher for Fnv64Hasher {
     }
 }
 
-fn hash_bytes(data: &[u8]) -> u64 {
+pub(crate) fn hash_bytes(data: &[u8]) -> u64 {
     let mut hasher = Fnv64Hasher::default();
     hasher.write(data);
     hasher.finish()
 }
 
-fn hash_str(s: &str) -> u64 {
+pub(crate) fn hash_str(s: &str) -> u64 {
     hash_bytes(s.as_bytes())
 }
 
@@ -263,5 +414,113 @@ mod tests {
             store(tmp.path(), &key, *result);
             assert_eq!(lookup(tmp.path(), &key), Some(*result));
         }
+    }
+
+    #[test]
+    fn incremental_history_reuses_killed_result_when_inputs_match() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let store = IncrementalHistoryStore::load(tmp.path());
+        let query = IncrementalHistoryQuery {
+            mutation_identity: "src/lib.rs:0..1:op".into(),
+            mutation_description: "desc".into(),
+            source_hash: hash_bytes(b"source"),
+            command_hash: hash_str("cargo test"),
+            relevant_test_hash: hash_str("tests"),
+        };
+        store.record(IncrementalHistoryEntry {
+            mutation_identity: query.mutation_identity.clone(),
+            mutation_description: query.mutation_description.clone(),
+            result: MutationResult::Killed,
+            source_hash: query.source_hash,
+            command_hash: query.command_hash,
+            relevant_test_hash: query.relevant_test_hash,
+            covering_tests: vec!["test_add".into()],
+            killer_test: Some("test_add".into()),
+        });
+
+        let reloaded = IncrementalHistoryStore::load(tmp.path());
+
+        assert_eq!(reloaded.lookup(&query), Some(MutationResult::Killed));
+        Ok(())
+    }
+
+    #[test]
+    fn incremental_history_rejects_changed_relevant_tests() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let store = IncrementalHistoryStore::load(tmp.path());
+        store.record(IncrementalHistoryEntry {
+            mutation_identity: "src/lib.rs:0..1:op".into(),
+            mutation_description: "desc".into(),
+            result: MutationResult::Survived,
+            source_hash: 1,
+            command_hash: 2,
+            relevant_test_hash: 3,
+            covering_tests: vec!["test_add".into()],
+            killer_test: None,
+        });
+        let changed_tests = IncrementalHistoryQuery {
+            mutation_identity: "src/lib.rs:0..1:op".into(),
+            mutation_description: "desc".into(),
+            source_hash: 1,
+            command_hash: 2,
+            relevant_test_hash: 4,
+        };
+
+        assert_eq!(store.lookup(&changed_tests), None);
+        Ok(())
+    }
+
+    #[test]
+    fn incremental_history_does_not_reuse_timeout_or_build_error() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let store = IncrementalHistoryStore::load(tmp.path());
+        let query = IncrementalHistoryQuery {
+            mutation_identity: "src/lib.rs:0..1:op".into(),
+            mutation_description: "desc".into(),
+            source_hash: 1,
+            command_hash: 2,
+            relevant_test_hash: 3,
+        };
+        for result in [MutationResult::Timeout, MutationResult::BuildError] {
+            store.record(IncrementalHistoryEntry {
+                mutation_identity: query.mutation_identity.clone(),
+                mutation_description: query.mutation_description.clone(),
+                result,
+                source_hash: query.source_hash,
+                command_hash: query.command_hash,
+                relevant_test_hash: query.relevant_test_hash,
+                covering_tests: vec![],
+                killer_test: None,
+            });
+
+            assert_eq!(store.lookup(&query), None);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn incremental_history_prefers_recorded_killer_test() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let store = IncrementalHistoryStore::load(tmp.path());
+        store.record(IncrementalHistoryEntry {
+            mutation_identity: "src/lib.rs:0..1:op".into(),
+            mutation_description: "desc".into(),
+            result: MutationResult::Killed,
+            source_hash: 1,
+            command_hash: 2,
+            relevant_test_hash: 3,
+            covering_tests: vec!["test_add".into(), "test_max".into()],
+            killer_test: Some("test_max".into()),
+        });
+
+        assert_eq!(
+            store.preferred_killer_test(
+                "src/lib.rs:0..1:op",
+                "desc",
+                &["test_add".into(), "test_max".into()]
+            ),
+            Some("test_max".into())
+        );
+        Ok(())
     }
 }

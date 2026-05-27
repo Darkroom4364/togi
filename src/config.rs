@@ -153,6 +153,8 @@ pub struct MutationConfig {
     pub skip_noisy_files: bool,
     #[serde(default = "default_true")]
     pub respect_workspace_ignores: bool,
+    #[serde(default = "default_true")]
+    pub incremental_history: bool,
     #[serde(default)]
     pub operators: Vec<String>,
     #[serde(default)]
@@ -364,6 +366,7 @@ impl Default for MutationConfig {
             exclude_paths: vec![],
             skip_noisy_files: true,
             respect_workspace_ignores: true,
+            incremental_history: true,
             operators: vec![],
             schemata: true,
         }
@@ -526,6 +529,7 @@ impl Config {
              max_per_run = 20\n\
              # max_per_file = 20  # cap mutations per source file (0 = unlimited)\n\
              # schemata = true  # use supported mutant schemata as the fast path\n\
+             # incremental_history = true  # reuse safe results from previous runs\n\
              # respect_workspace_ignores = true  # honor .ignore/.gitignore in mutation workspaces\n",
         );
 
@@ -635,6 +639,7 @@ commnad = ["cargo", "test"]
         );
         assert!(config.mutations.skip_noisy_files);
         assert!(config.mutations.respect_workspace_ignores);
+        assert!(config.mutations.incremental_history);
         assert!(config.mutations.schemata);
         let project = &config.projects["api"];
         assert_eq!(project.path, PathBuf::from("services/api"));
@@ -664,6 +669,7 @@ commnad = ["cargo", "test"]
         assert!(config.mutations.exclude_paths.is_empty());
         assert!(config.mutations.skip_noisy_files);
         assert!(config.mutations.respect_workspace_ignores);
+        assert!(config.mutations.incremental_history);
         assert!(config.mutations.schemata);
         assert!(config.projects.is_empty());
     }
@@ -1061,6 +1067,7 @@ language = "go"
 exclude_paths = ["vendor/**", "*.generated.ts"]
 skip_noisy_files = false
 respect_workspace_ignores = false
+incremental_history = false
 "#;
         let config: Config = toml::from_str(toml_str).unwrap();
         assert_eq!(
@@ -1069,6 +1076,7 @@ respect_workspace_ignores = false
         );
         assert!(!config.mutations.skip_noisy_files);
         assert!(!config.mutations.respect_workspace_ignores);
+        assert!(!config.mutations.incremental_history);
     }
 
     #[test]

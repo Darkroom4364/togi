@@ -153,13 +153,21 @@ togi list-operators
 # Clear mutation cache
 togi clean
 
+# Re-run even if cache/history has a matching result
+togi check --force-rerun
+
+# Disable structured incremental history for one run
+togi check --no-incremental-history
+
 # Generate a config file
 togi init
 ```
 
 Mutation cache entries include the Togi package version and an internal cache
 schema version, so upgrades and operator behavior changes automatically stop
-matching older `.togi-cache` entries.
+matching older `.togi-cache` entries. Structured incremental history is stored
+under `.togi-cache/history.json`; it can reuse killed/survived results when the
+mutant source, command context, and relevant covering tests are unchanged.
 
 ## Configuration
 
@@ -201,6 +209,7 @@ max_per_file = 20
 schemata = true
 coverage_file = "coverage/lcov.info"
 test_selection_file = "coverage/test-selection.json"
+incremental_history = true
 operators = ["-string_to_empty"]
 exclude_paths = ["vendor/**"]
 skip_noisy_files = true

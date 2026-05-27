@@ -34,6 +34,8 @@ struct CheckConfig {
     test_cmd: Option<String>,
     coverage_file: Option<PathBuf>,
     test_selection_file: Option<PathBuf>,
+    no_incremental_history: bool,
+    force_rerun: bool,
     build_cmd: Option<String>,
     fail_fast: bool,
     no_skip_defaults: bool,
@@ -53,6 +55,7 @@ struct ExecuteOptions {
     force_default_timeout: bool,
     early_stop: togi::runner::EarlyStopConfig,
     env: HashMap<String, String>,
+    force_rerun: bool,
     cancelled: Arc<AtomicBool>,
 }
 
@@ -107,6 +110,8 @@ fn main() {
             test_cmd,
             coverage_file,
             test_selection_file,
+            no_incremental_history,
+            force_rerun,
             build_cmd,
             fail_fast,
             no_skip_defaults,
@@ -141,6 +146,8 @@ fn main() {
                 test_cmd,
                 coverage_file,
                 test_selection_file,
+                no_incremental_history,
+                force_rerun,
                 build_cmd,
                 fail_fast,
                 no_skip_defaults,
@@ -326,6 +333,7 @@ fn run_check(cfg: CheckConfig, cancelled: Arc<AtomicBool>) -> anyhow::Result<()>
     let save_baseline = cfg.save_baseline;
     let check_baseline = cfg.check_baseline;
     let pr_comment = cfg.pr_comment.clone();
+    let force_rerun = cfg.force_rerun;
 
     let resolved = resolve_config(cfg)?;
     let ResolvedCheckConfig {
@@ -443,6 +451,7 @@ fn run_check(cfg: CheckConfig, cancelled: Arc<AtomicBool>) -> anyhow::Result<()>
             force_default_timeout: has_cli_timeout,
             early_stop,
             env: profile_env,
+            force_rerun,
             cancelled,
         },
     );
@@ -571,6 +580,9 @@ fn resolve_config(cfg: CheckConfig) -> anyhow::Result<ResolvedCheckConfig> {
     }
     if let Some(path) = cfg.test_selection_file {
         config.mutations.test_selection_file = Some(path);
+    }
+    if cfg.no_incremental_history {
+        config.mutations.incremental_history = false;
     }
     if let Some(cmd) = cfg.build_cmd {
         config.test.build_command =
@@ -941,6 +953,8 @@ fn execute(
         early_stop: options.early_stop,
         respect_workspace_ignores: config.mutations.respect_workspace_ignores,
         env: options.env,
+        incremental_history: config.mutations.incremental_history,
+        force_rerun: options.force_rerun,
         cancelled: options.cancelled,
     };
 
@@ -1352,6 +1366,8 @@ mod tests {
             test_cmd: None,
             coverage_file: None,
             test_selection_file: None,
+            no_incremental_history: false,
+            force_rerun: false,
             build_cmd: None,
             fail_fast: false,
             no_skip_defaults: false,
