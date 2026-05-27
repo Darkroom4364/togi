@@ -1197,6 +1197,8 @@ mod tests {
             jobs: None,
             timeout: None,
             max_per_run: None,
+            first_survivor: false,
+            max_survivors: None,
             schemata: false,
             no_schemata: false,
             dry_run: false,
@@ -1219,14 +1221,14 @@ mod tests {
 
     #[test]
     fn resolve_config_applies_profile_jobs_when_implicit() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("tempdir should be created");
         let config_path = dir.path().join("togi.toml");
-        std::fs::write(&config_path, "").unwrap();
+        std::fs::write(&config_path, "").expect("empty config should be written");
         let mut cfg = check_config();
         cfg.config_path = Some(config_path);
         cfg.profile = Some(togi::config::ResourceProfile::Cool);
 
-        let resolved = resolve_config(cfg).unwrap();
+        let resolved = resolve_config(cfg).expect("config should resolve");
 
         assert_eq!(resolved.config.test.jobs, 1);
         assert!(resolved.fail_fast);
@@ -1234,7 +1236,7 @@ mod tests {
 
     #[test]
     fn resolve_config_keeps_explicit_jobs_over_profile() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("tempdir should be created");
         let config_path = dir.path().join("togi.toml");
         std::fs::write(
             &config_path,
@@ -1244,11 +1246,11 @@ profile = "cool"
 jobs = 4
 "#,
         )
-        .unwrap();
+        .expect("config should be written");
         let mut cfg = check_config();
         cfg.config_path = Some(config_path);
 
-        let resolved = resolve_config(cfg).unwrap();
+        let resolved = resolve_config(cfg).expect("config should resolve");
 
         assert_eq!(resolved.profile, Some(togi::config::ResourceProfile::Cool));
         assert_eq!(resolved.config.test.jobs, 4);
@@ -1257,15 +1259,15 @@ jobs = 4
 
     #[test]
     fn resolve_config_cli_jobs_override_profile() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("tempdir should be created");
         let config_path = dir.path().join("togi.toml");
-        std::fs::write(&config_path, "").unwrap();
+        std::fs::write(&config_path, "").expect("empty config should be written");
         let mut cfg = check_config();
         cfg.config_path = Some(config_path);
         cfg.profile = Some(togi::config::ResourceProfile::Ci);
         cfg.jobs = Some(3);
 
-        let resolved = resolve_config(cfg).unwrap();
+        let resolved = resolve_config(cfg).expect("config should resolve");
 
         assert_eq!(resolved.config.test.jobs, 3);
     }

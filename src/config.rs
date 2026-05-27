@@ -667,7 +667,7 @@ commnad = ["cargo", "test"]
 [test]
 profile = "cool"
 "#;
-        let config: Config = toml::from_str(toml_str).unwrap();
+        let config: Config = toml::from_str(toml_str).expect("profile config should parse");
         assert_eq!(config.test.profile, Some(ResourceProfile::Cool));
         assert!(!config.test.jobs_was_explicit());
     }
