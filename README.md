@@ -93,6 +93,9 @@ togi check --all
 # Adjust parallelism and timeout
 togi check --jobs 2 --timeout 60
 
+# Derive timeout from one unmutated baseline test run
+togi check --calibrate-timeout --timeout-multiplier 4 --timeout-slack 2
+
 # Keep laptop CPU/temperature lower
 togi check --profile cool
 
@@ -172,6 +175,9 @@ Create a `togi.toml` for customization:
 profile = "balanced"
 command = ["go", "test", "./..."]
 timeout = 30
+calibrate_timeout = false
+timeout_multiplier = 4.0
+timeout_slack = 2
 jobs = 2
 build_command = ["go", "build", "./..."]
 
@@ -208,6 +214,14 @@ When `--test-cmd` is set, `--fail-fast` does not modify the custom command;
 include runner-specific fail-fast flags in `--test-cmd` instead.
 Resource profiles provide defaults only: explicit CLI flags and `togi.toml`
 settings such as `jobs` keep taking precedence.
+
+`--calibrate-timeout` (or `[test] calibrate_timeout = true`) runs the
+unmutated build/test command once in a disposable workspace, then sets the
+default mutation timeout to `max(build_time, test_time) * timeout_multiplier +
+timeout_slack`. When `build_command` is not set, only `test_time` is used.
+Explicit `--timeout` wins. Use `--skip-baseline-timing` in CI jobs that already
+provide a tuned timeout or should avoid repeating the baseline run across
+shards.
 
 ## Resource tuning
 

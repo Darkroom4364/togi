@@ -29,6 +29,17 @@ command = ["go", "test", "./..."]
 # Default: 30
 timeout = 30
 
+# Optional adaptive timeout calibration. When enabled, togi runs the unmutated
+# build/test command once in a disposable workspace and derives the mutation
+# timeout from max(build_time, test_time) * timeout_multiplier + timeout_slack.
+# Defaults: false / 4.0 / 2
+# calibrate_timeout: boolean
+# timeout_multiplier: float
+# timeout_slack: integer seconds
+# calibrate_timeout = false
+# timeout_multiplier = 4.0
+# timeout_slack = 2
+
 # Maximum number of mutation jobs.
 # Each job can launch a full test runner, so higher values can multiply CPU
 # load quickly. Keep this low for laptops and raise it explicitly in CI.

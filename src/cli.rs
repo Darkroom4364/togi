@@ -53,6 +53,22 @@ pub enum Commands {
         #[arg(short, long)]
         timeout: Option<u64>,
 
+        /// Measure the unmutated test runtime and derive the mutation timeout
+        #[arg(long, conflicts_with = "skip_baseline_timing")]
+        calibrate_timeout: bool,
+
+        /// Disable configured baseline timing calibration for this run
+        #[arg(long)]
+        skip_baseline_timing: bool,
+
+        /// Multiplier applied to baseline runtime when calibrating timeout
+        #[arg(long)]
+        timeout_multiplier: Option<f64>,
+
+        /// Constant seconds added when calibrating timeout
+        #[arg(long)]
+        timeout_slack: Option<u64>,
+
         /// Maximum mutations to run (0 = unlimited)
         #[arg(long)]
         max_per_run: Option<usize>,
@@ -229,6 +245,47 @@ mod tests {
             }
             _ => panic!("expected Check command"),
         }
+    }
+
+    #[test]
+    fn timeout_calibration_arguments_are_accepted() -> Result<(), clap::Error> {
+        let cli = Cli::try_parse_from([
+            "togi",
+            "check",
+            "--calibrate-timeout",
+            "--timeout-multiplier",
+            "3.5",
+            "--timeout-slack",
+            "4",
+        ])?;
+        match cli.command {
+            Commands::Check {
+                calibrate_timeout,
+                timeout_multiplier,
+                timeout_slack,
+                ..
+            } => {
+                assert!(calibrate_timeout);
+                assert_eq!(timeout_multiplier, Some(3.5));
+                assert_eq!(timeout_slack, Some(4));
+            }
+            _ => panic!("expected Check command"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn calibrate_timeout_conflicts_with_skip_baseline_timing() {
+        let res = Cli::try_parse_from([
+            "togi",
+            "check",
+            "--calibrate-timeout",
+            "--skip-baseline-timing",
+        ]);
+        assert!(
+            res.is_err(),
+            "--calibrate-timeout and --skip-baseline-timing should conflict"
+        );
     }
 
     #[test]

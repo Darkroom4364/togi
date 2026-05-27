@@ -20,9 +20,21 @@ struct JsonReport {
     test_command: Option<Vec<String>>,
     build_command: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    baseline_timing: Option<JsonBaselineTiming>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     schemata: Option<JsonSchemata>,
     build_error_groups: Vec<JsonBuildErrorGroup>,
     mutations: Vec<JsonMutation>,
+}
+
+#[derive(Serialize)]
+struct JsonBaselineTiming {
+    build_command: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    build_duration_ms: Option<u128>,
+    test_command: Vec<String>,
+    test_duration_ms: u128,
+    calibrated_timeout_ms: u128,
 }
 
 #[derive(Serialize)]
@@ -169,6 +181,16 @@ pub fn to_json_string(report: &MutationReport) -> Result<String> {
         duration_ms: report.duration.as_millis(),
         test_command: report.test_command.clone(),
         build_command: report.build_command.clone(),
+        baseline_timing: report
+            .baseline_timing
+            .as_ref()
+            .map(|timing| JsonBaselineTiming {
+                build_command: timing.build_command.clone(),
+                build_duration_ms: timing.build_duration.map(|duration| duration.as_millis()),
+                test_command: timing.test_command.clone(),
+                test_duration_ms: timing.test_duration.as_millis(),
+                calibrated_timeout_ms: timing.calibrated_timeout.as_millis(),
+            }),
         schemata: report.schemata.as_ref().map(|schemata| JsonSchemata {
             fast_path: schemata.fast_path,
             fallback: schemata.fallback,
@@ -192,7 +214,9 @@ pub fn to_json_string(report: &MutationReport) -> Result<String> {
 mod tests {
     use super::*;
     use crate::test_helpers::sample_report;
-    use crate::{BuildErrorDiagnostic, Mutation, SchemataFallbackReasonCount, SchemataReport};
+    use crate::{
+        BaselineTiming, BuildErrorDiagnostic, Mutation, SchemataFallbackReasonCount, SchemataReport,
+    };
     use serde_json::Value;
     use std::path::PathBuf;
     use std::time::Duration;
@@ -316,6 +340,34 @@ mod tests {
     }
 
     #[test]
+    fn json_output_includes_baseline_timing_when_present() -> anyhow::Result<()> {
+        let mut report = sample_report();
+        report.baseline_timing = Some(BaselineTiming {
+            build_command: vec!["cargo".into(), "check".into()],
+            build_duration: Some(Duration::from_millis(250)),
+            test_command: vec!["cargo".into(), "test".into()],
+            test_duration: Duration::from_millis(750),
+            calibrated_timeout: Duration::from_secs(5),
+        });
+
+        let json_str = to_json_string(&report)?;
+        let value: Value = serde_json::from_str(&json_str)?;
+
+        assert_eq!(
+            value["baseline_timing"]["build_command"],
+            serde_json::json!(["cargo", "check"])
+        );
+        assert_eq!(value["baseline_timing"]["build_duration_ms"], 250);
+        assert_eq!(
+            value["baseline_timing"]["test_command"],
+            serde_json::json!(["cargo", "test"])
+        );
+        assert_eq!(value["baseline_timing"]["test_duration_ms"], 750);
+        assert_eq!(value["baseline_timing"]["calibrated_timeout_ms"], 5000);
+        Ok(())
+    }
+
+    #[test]
     fn json_score_zero_when_all_build_errors() {
         let report = MutationReport {
             results: vec![(
@@ -335,6 +387,7 @@ mod tests {
             )],
             build_error_diagnostics: vec![],
             schemata: None,
+            baseline_timing: None,
             duration: Duration::from_millis(100),
             test_command: None,
             build_command: vec![],
@@ -380,6 +433,7 @@ mod tests {
             )],
             build_error_diagnostics: vec![diagnostic],
             schemata: None,
+            baseline_timing: None,
             duration: Duration::from_millis(100),
             test_command: None,
             build_command: vec![],
@@ -415,6 +469,7 @@ mod tests {
             results: vec![],
             build_error_diagnostics: vec![],
             schemata: None,
+            baseline_timing: None,
             duration: Duration::from_millis(0),
             test_command: None,
             build_command: vec![],

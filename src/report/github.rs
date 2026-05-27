@@ -112,6 +112,7 @@ mod tests {
             results,
             build_error_diagnostics: vec![],
             schemata: None,
+            baseline_timing: None,
         }
     }
 
