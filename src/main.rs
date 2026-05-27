@@ -19,6 +19,8 @@ struct CheckConfig {
     jobs: Option<usize>,
     timeout: Option<u64>,
     max_per_run: Option<usize>,
+    first_survivor: bool,
+    max_survivors: Option<usize>,
     schemata: bool,
     no_schemata: bool,
     dry_run: bool,
@@ -44,6 +46,7 @@ struct ExecuteOptions {
     build_command_explicit: bool,
     force_default_command: bool,
     force_default_timeout: bool,
+    early_stop: togi::runner::EarlyStopConfig,
     cancelled: Arc<AtomicBool>,
 }
 
@@ -74,6 +77,8 @@ fn main() {
             jobs,
             timeout,
             max_per_run,
+            first_survivor,
+            max_survivors,
             schemata,
             no_schemata,
             dry_run,
@@ -101,6 +106,8 @@ fn main() {
                 jobs,
                 timeout,
                 max_per_run,
+                first_survivor,
+                max_survivors,
                 schemata,
                 no_schemata,
                 dry_run,
@@ -281,6 +288,15 @@ fn run_check(cfg: CheckConfig, cancelled: Arc<AtomicBool>) -> anyhow::Result<()>
     let show_output = cfg.show_output;
     let output_format = cfg.output_format;
     let fail_under = cfg.fail_under;
+    let max_survivors = match (cfg.first_survivor, cfg.max_survivors) {
+        (true, _) => Some(1),
+        (false, Some(0)) => anyhow::bail!("--max-survivors must be greater than 0"),
+        (false, value) => value,
+    };
+    let early_stop = togi::runner::EarlyStopConfig {
+        max_survivors,
+        fail_under,
+    };
     let shard = cfg.shard.as_deref().map(parse_shard).transpose()?;
     let save_baseline = cfg.save_baseline;
     let check_baseline = cfg.check_baseline;
@@ -347,6 +363,7 @@ fn run_check(cfg: CheckConfig, cancelled: Arc<AtomicBool>) -> anyhow::Result<()>
             build_command_explicit: has_explicit_build_cmd,
             force_default_command: has_custom_test_cmd,
             force_default_timeout: has_cli_timeout,
+            early_stop,
             cancelled,
         },
     );
@@ -362,14 +379,18 @@ fn run_check(cfg: CheckConfig, cancelled: Arc<AtomicBool>) -> anyhow::Result<()>
     let current = togi::baseline::from_report(&report, &project_root_ref);
     let mut should_fail = false;
 
-    if save_baseline {
+    let partial_report = report.total < report.planned_total;
+
+    if partial_report && (save_baseline || check_baseline) {
+        eprintln!("Partial early-stop report; skipping baseline save/check.");
+    } else if save_baseline {
         togi::baseline::save_baseline(&current, &project_root_ref)?;
         eprintln!("Baseline saved to .togi-baseline");
     }
 
     let mut baseline_score: Option<f64> = None;
     let mut loaded_baseline = false;
-    if check_baseline {
+    if check_baseline && !partial_report {
         if let Some(baseline) = togi::baseline::load_baseline(&project_root_ref)? {
             loaded_baseline = true;
             baseline_score = Some(baseline.killed as f64 / baseline.total.max(1) as f64 * 100.0);
@@ -704,6 +725,7 @@ fn execute(
         } else {
             Some(config.mutations.max_per_run)
         },
+        early_stop: options.early_stop,
         respect_workspace_ignores: config.mutations.respect_workspace_ignores,
         env: std::collections::HashMap::new(),
         cancelled: options.cancelled,

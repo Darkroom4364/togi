@@ -144,6 +144,8 @@ pub struct MutationReport {
     pub duration: Duration,
     pub test_command: Option<Vec<String>>,
     pub build_command: Vec<String>,
+    pub planned_total: usize,
+    pub early_stop_reason: Option<String>,
     pub total: usize,
     pub killed: usize,
     pub survived: usize,

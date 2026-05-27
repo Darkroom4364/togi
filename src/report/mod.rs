@@ -214,6 +214,17 @@ pub fn format_pr_comment(report: &MutationReport, baseline_score: Option<f64>) -
         "**{score:.1}%** mutation score{delta_str} — {}/{tested} killed, {} survived, {} timeout, {} build errors — {:.2}s",
         report.killed, report.survived, report.timeout, report.build_errors, report.duration.as_secs_f64()
     ).unwrap();
+    if report.total < report.planned_total {
+        writeln!(
+            md,
+            "\nPartial report: stopped after {}/{} scheduled mutations.",
+            report.total, report.planned_total
+        )
+        .expect("writing to String should not fail");
+    }
+    if let Some(reason) = &report.early_stop_reason {
+        writeln!(md, "\nEarly stop: {reason}").expect("writing to String should not fail");
+    }
     writeln!(md).unwrap();
 
     let survived: Vec<_> = report
@@ -406,6 +417,8 @@ mod tests {
             duration: std::time::Duration::from_millis(10),
             test_command: None,
             build_command: vec![],
+            planned_total: 3,
+            early_stop_reason: None,
             total: 3,
             killed: 1,
             survived: 0,
@@ -561,6 +574,8 @@ mod tests {
             duration: Duration::from_secs(1),
             test_command: None,
             build_command: vec![],
+            planned_total: 1,
+            early_stop_reason: None,
             total: 1,
             killed: 1,
             survived: 0,
@@ -597,6 +612,8 @@ mod tests {
             duration: Duration::from_secs(1),
             test_command: None,
             build_command: vec![],
+            planned_total: 1,
+            early_stop_reason: None,
             total: 1,
             killed: 0,
             survived: 0,
@@ -634,6 +651,8 @@ mod tests {
             duration: Duration::from_secs(1),
             test_command: None,
             build_command: vec![],
+            planned_total: 1,
+            early_stop_reason: None,
             total: 1,
             killed: 0,
             survived: 0,
@@ -691,6 +710,8 @@ mod tests {
             duration: Duration::from_secs(1),
             test_command: None,
             build_command: vec![],
+            planned_total: 2,
+            early_stop_reason: None,
             total: 2,
             killed: 1,
             survived: 0,

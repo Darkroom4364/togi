@@ -96,6 +96,22 @@ impl TestSelectionConfig {
     }
 }
 
+/// Optional conditions that stop scheduling new mutations once enough signal
+/// has been observed for a PR gate.
+#[derive(Debug, Clone, Default)]
+pub struct EarlyStopConfig {
+    /// Stop after at least this many survived mutants have completed.
+    pub max_survivors: Option<usize>,
+    /// Stop when even killing every remaining mutation could not satisfy this score.
+    pub fail_under: Option<f64>,
+}
+
+impl EarlyStopConfig {
+    fn is_enabled(&self) -> bool {
+        self.max_survivors.is_some() || self.fail_under.is_some()
+    }
+}
+
 /// Applies mutations, runs checks, restores files, and aggregates results.
 ///
 /// The runner evaluates mutations in isolated workspace copies so whole-project
@@ -115,6 +131,8 @@ pub struct TestRunner {
     pub show_output: bool,
     /// Optional cap on how many non-build-error mutations are tested.
     pub max_tested: Option<usize>,
+    /// Optional stop conditions for gate-style partial runs.
+    pub early_stop: EarlyStopConfig,
     /// Whether workspace copies should honor `.ignore`/`.gitignore` rules.
     pub respect_workspace_ignores: bool,
     /// Extra environment variables passed to every spawned command.
@@ -1094,6 +1112,114 @@ impl SchemataRunSummary {
     }
 }
 
+#[derive(Default)]
+struct EarlyStopCounts {
+    completed: usize,
+    killed: usize,
+    survived: usize,
+    build_errors: usize,
+}
+
+struct EarlyStopState {
+    config: EarlyStopConfig,
+    planned_total: usize,
+    stopped: AtomicBool,
+    reason: Mutex<Option<String>>,
+    counts: Mutex<EarlyStopCounts>,
+}
+
+impl EarlyStopState {
+    fn new(config: EarlyStopConfig, planned_total: usize) -> Self {
+        Self {
+            config,
+            planned_total,
+            stopped: AtomicBool::new(false),
+            reason: Mutex::new(None),
+            counts: Mutex::new(EarlyStopCounts::default()),
+        }
+    }
+
+    fn for_config(config: EarlyStopConfig, planned_total: usize) -> Option<Arc<Self>> {
+        config
+            .is_enabled()
+            .then(|| Arc::new(Self::new(config, planned_total)))
+    }
+
+    fn should_stop(&self) -> bool {
+        self.stopped.load(Ordering::Acquire)
+    }
+
+    fn reason(&self) -> Option<String> {
+        self.reason
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    fn record(&self, result: MutationResult) {
+        if self.should_stop() {
+            return;
+        }
+
+        let mut counts = self
+            .counts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        counts.completed += 1;
+        match result {
+            MutationResult::Killed => counts.killed += 1,
+            MutationResult::Survived => counts.survived += 1,
+            MutationResult::Timeout => {}
+            MutationResult::BuildError => counts.build_errors += 1,
+        }
+
+        let remaining = self.planned_total.saturating_sub(counts.completed);
+        if remaining == 0 {
+            return;
+        }
+
+        if let Some(max_survivors) = self.config.max_survivors {
+            if counts.survived >= max_survivors {
+                self.stop(format!(
+                    "--max-survivors {max_survivors} reached after {} completed mutation{}",
+                    counts.completed,
+                    if counts.completed == 1 { "" } else { "s" }
+                ));
+                return;
+            }
+        }
+
+        if let Some(threshold) = self.config.fail_under {
+            let tested = counts.completed.saturating_sub(counts.build_errors);
+            let best_tested = tested + remaining;
+            let best_killed = counts.killed + remaining;
+            let best_score = if best_tested > 0 {
+                (best_killed as f64 / best_tested as f64) * 100.0
+            } else if self.planned_total == 0 {
+                100.0
+            } else {
+                0.0
+            };
+            if best_score < threshold {
+                self.stop(format!(
+                    "--fail-under {threshold:.1} cannot be reached; best possible score is {best_score:.1}%"
+                ));
+            }
+        }
+    }
+
+    fn stop(&self, reason: String) {
+        let mut current = self
+            .reason
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if current.is_none() {
+            *current = Some(reason);
+            self.stopped.store(true, Ordering::Release);
+        }
+    }
+}
+
 struct RunShared<'a> {
     workspace_pool: &'a WorkspacePool,
     project_root: &'a Path,
@@ -1107,9 +1233,20 @@ struct RunShared<'a> {
     show_output: bool,
     counter: &'a AtomicUsize,
     cancelled: &'a AtomicBool,
+    early_stop: Option<&'a Arc<EarlyStopState>>,
     respect_workspace_ignores: bool,
     cache_context_fingerprint: u64,
     source_contents: &'a SourceContentCache,
+}
+
+fn should_stop_early(early_stop: &Option<Arc<EarlyStopState>>) -> bool {
+    early_stop.as_ref().is_some_and(|state| state.should_stop())
+}
+
+fn record_early_stop(shared: &RunShared<'_>, result: MutationResult) {
+    if let Some(early_stop) = shared.early_stop {
+        early_stop.record(result);
+    }
 }
 
 fn run_queued_mutation(
@@ -1151,6 +1288,7 @@ fn run_queued_mutation(
         if let Some(result) = cache::lookup(shared.project_root, key) {
             reservation.release();
             record_progress(&shared, &mutation, result, None, true);
+            record_early_stop(&shared, result);
             let diagnostic = cached_build_error_diagnostic(&mutation, "regular", result);
             return Some((index, MutationRunRecord::new(mutation, result, diagnostic)));
         }
@@ -1169,6 +1307,7 @@ fn run_queued_mutation(
                 );
                 reservation.release();
                 record_progress(&shared, &mutation, MutationResult::BuildError, None, false);
+                record_early_stop(&shared, MutationResult::BuildError);
                 let diagnostic = BuildErrorDiagnostic::new(
                     mutation.id,
                     "regular",
@@ -1223,6 +1362,7 @@ fn run_queued_mutation(
         outcome.test_output.as_deref(),
         false,
     );
+    record_early_stop(&shared, result);
     let diagnostic = build_error_diagnostic_from_outcome(&mutation, "regular", &outcome);
     Some((index, MutationRunRecord::new(mutation, result, diagnostic)))
 }
@@ -1330,7 +1470,9 @@ fn record_progress(
 impl TestRunner {
     #[allow(clippy::manual_is_multiple_of)]
     pub fn run(&self, mutations: Vec<Mutation>) -> RunOutcome {
-        self.run_regular(mutations)
+        let planned_total = mutations.len();
+        let early_stop = EarlyStopState::for_config(self.early_stop.clone(), planned_total);
+        self.run_regular_with_state(mutations, early_stop, planned_total)
     }
 
     pub fn run_with_schemata(&self, mutations: Vec<Mutation>) -> RunOutcome {
@@ -1338,6 +1480,8 @@ impl TestRunner {
         if mutations.is_empty() {
             return self.outcome_from_records(Vec::new(), start.elapsed());
         }
+        let planned_total = mutations.len();
+        let early_stop = EarlyStopState::for_config(self.early_stop.clone(), planned_total);
 
         let index_by_id: HashMap<u32, usize> = mutations
             .iter()
@@ -1369,15 +1513,19 @@ impl TestRunner {
         }
 
         if schema_by_language.is_empty() {
-            let mut outcome = self.run_regular(fallback_mutations);
+            let mut outcome =
+                self.run_regular_with_state(fallback_mutations, early_stop, planned_total);
             outcome.report.schemata = Some(schemata_summary.into_report());
             return outcome;
         }
 
         let mut all_records = Vec::new();
         for (language, schema_mutations) in schema_by_language {
+            if should_stop_early(&early_stop) {
+                break;
+            }
             let mutation_count = schema_mutations.len();
-            match self.run_schema_mutations(&language, &schema_mutations) {
+            match self.run_schema_mutations(&language, &schema_mutations, early_stop.clone()) {
                 Ok(records) => {
                     schemata_summary.fast_path += records.len();
                     all_records.extend(records);
@@ -1394,8 +1542,12 @@ impl TestRunner {
             }
         }
 
-        if !self.cancelled.load(Ordering::Acquire) && !fallback_mutations.is_empty() {
-            let fallback = self.run_regular(fallback_mutations);
+        if !self.cancelled.load(Ordering::Acquire)
+            && !fallback_mutations.is_empty()
+            && !should_stop_early(&early_stop)
+        {
+            let fallback =
+                self.run_regular_with_state(fallback_mutations, early_stop.clone(), planned_total);
             all_records.extend(records_from_report(fallback.report));
         }
 
@@ -1405,20 +1557,40 @@ impl TestRunner {
                 .copied()
                 .unwrap_or(usize::MAX)
         });
-        let mut outcome = self.outcome_from_records(all_records, start.elapsed());
+        let mut outcome = self.outcome_from_records_with_status(
+            all_records,
+            start.elapsed(),
+            planned_total,
+            early_stop.as_ref().and_then(|state| state.reason()),
+        );
         outcome.report.schemata = Some(schemata_summary.into_report());
         outcome
     }
 
     #[allow(clippy::manual_is_multiple_of)]
-    fn run_regular(&self, mutations: Vec<Mutation>) -> RunOutcome {
+    fn run_regular_with_state(
+        &self,
+        mutations: Vec<Mutation>,
+        early_stop: Option<Arc<EarlyStopState>>,
+        planned_total: usize,
+    ) -> RunOutcome {
         let start = Instant::now();
         let total = mutations.len();
         if total == 0 {
-            return self.outcome_from_records(Vec::new(), start.elapsed());
+            return self.outcome_from_records_with_status(
+                Vec::new(),
+                start.elapsed(),
+                planned_total,
+                early_stop.as_ref().and_then(|state| state.reason()),
+            );
         }
         if self.cancelled.load(Ordering::Acquire) {
-            return self.outcome_from_records(Vec::new(), start.elapsed());
+            return self.outcome_from_records_with_status(
+                Vec::new(),
+                start.elapsed(),
+                planned_total,
+                early_stop.as_ref().and_then(|state| state.reason()),
+            );
         }
 
         let counter = Arc::new(AtomicUsize::new(0));
@@ -1483,10 +1655,11 @@ impl TestRunner {
                 let max_tested = self.max_tested;
                 let show_output = self.show_output;
                 let source_contents = &source_contents;
+                let early_stop = early_stop.clone();
 
                 scope.spawn(move || {
                     loop {
-                        if cancelled.load(Ordering::Relaxed) {
+                        if cancelled.load(Ordering::Relaxed) || should_stop_early(&early_stop) {
                             break;
                         }
 
@@ -1495,6 +1668,10 @@ impl TestRunner {
                         else {
                             break;
                         };
+                        if should_stop_early(&early_stop) {
+                            reservation.release();
+                            break;
+                        }
                         let next = match queue.lock() {
                             Ok(mut queue) => queue.pop_front(),
                             Err(_) => {
@@ -1523,6 +1700,7 @@ impl TestRunner {
                                     show_output,
                                     counter: &counter,
                                     cancelled: &cancelled,
+                                    early_stop: early_stop.as_ref(),
                                     respect_workspace_ignores: self.respect_workspace_ignores,
                                     cache_context_fingerprint: cache_context_hash,
                                     source_contents,
@@ -1562,13 +1740,19 @@ impl TestRunner {
             let _ = std::io::stderr().flush();
         }
 
-        self.outcome_from_records(all_records, start.elapsed())
+        self.outcome_from_records_with_status(
+            all_records,
+            start.elapsed(),
+            planned_total,
+            early_stop.as_ref().and_then(|state| state.reason()),
+        )
     }
 
     fn run_schema_mutations(
         &self,
         language: &str,
         schema_mutations: &[crate::schemata::SchemaMutation],
+        early_stop: Option<Arc<EarlyStopState>>,
     ) -> Result<Vec<MutationRunRecord>, crate::schemata::SchemaRewriteError> {
         let rewrites = match language {
             "c" => crate::schemata::rewrite_c_files(&self.project_root, schema_mutations)?,
@@ -1596,7 +1780,7 @@ impl TestRunner {
         let cache_context_hash = cache_context_fingerprint(&self.project_root);
         let mut workspace_needs_reset = false;
         for schema_mutation in schema_mutations {
-            if self.cancelled.load(Ordering::Acquire) {
+            if self.cancelled.load(Ordering::Acquire) || should_stop_early(&early_stop) {
                 break;
             }
             let Some(reservation) =
@@ -1604,6 +1788,10 @@ impl TestRunner {
             else {
                 break;
             };
+            if should_stop_early(&early_stop) {
+                reservation.release();
+                break;
+            }
             let mutation = &schema_mutation.mutation;
             let selected = select_test_command(&self.project_root, &self.commands, mutation);
             let argv = if language == "go" {
@@ -1636,6 +1824,9 @@ impl TestRunner {
             if let Some(ref key) = cache_key {
                 if let Some(result) = cache::lookup(&self.project_root, key) {
                     reservation.release();
+                    if let Some(early_stop) = &early_stop {
+                        early_stop.record(result);
+                    }
                     if self.verbose {
                         eprintln!(
                             "  [schema] ↻ cached  {}:{} — {}",
@@ -1695,6 +1886,9 @@ impl TestRunner {
             } else {
                 reservation.commit();
             }
+            if let Some(early_stop) = &early_stop {
+                early_stop.record(outcome.result);
+            }
             if cacheable {
                 if let Some(ref key) = cache_key {
                     cache::store(&self.project_root, key, outcome.result);
@@ -1745,8 +1939,24 @@ impl TestRunner {
         all_records: Vec<MutationRunRecord>,
         duration: Duration,
     ) -> RunOutcome {
+        let planned_total = all_records.len();
+        self.outcome_from_records_with_status(all_records, duration, planned_total, None)
+    }
+
+    fn outcome_from_records_with_status(
+        &self,
+        all_records: Vec<MutationRunRecord>,
+        duration: Duration,
+        planned_total: usize,
+        early_stop_reason: Option<String>,
+    ) -> RunOutcome {
         RunOutcome {
-            report: self.report_from_records(all_records, duration),
+            report: self.report_from_records(
+                all_records,
+                duration,
+                planned_total,
+                early_stop_reason,
+            ),
             cancelled: self.cancelled.load(Ordering::Acquire),
         }
     }
@@ -1755,6 +1965,8 @@ impl TestRunner {
         &self,
         all_records: Vec<MutationRunRecord>,
         duration: Duration,
+        planned_total: usize,
+        early_stop_reason: Option<String>,
     ) -> MutationReport {
         let mut results = Vec::with_capacity(all_records.len());
         let mut build_error_diagnostics = Vec::new();
@@ -1795,6 +2007,8 @@ impl TestRunner {
             } else {
                 vec![]
             },
+            planned_total,
+            early_stop_reason,
             total,
             killed,
             survived,
@@ -4305,6 +4519,7 @@ sleep 10"#
             verbose: false,
             show_output: false,
             max_tested: None,
+            early_stop: Default::default(),
             respect_workspace_ignores: true,
             env: HashMap::new(),
             cancelled,
@@ -4366,6 +4581,7 @@ sleep 10"#
             verbose: false,
             show_output: false,
             max_tested: None,
+            early_stop: Default::default(),
             respect_workspace_ignores: true,
             env: HashMap::new(),
             cancelled: Arc::new(AtomicBool::new(false)),
@@ -4432,6 +4648,7 @@ int main(void) {
             verbose: false,
             show_output: false,
             max_tested: None,
+            early_stop: Default::default(),
             respect_workspace_ignores: true,
             env: HashMap::new(),
             cancelled: Arc::new(AtomicBool::new(false)),
@@ -4498,6 +4715,7 @@ int main() {
             verbose: false,
             show_output: false,
             max_tested: None,
+            early_stop: Default::default(),
             respect_workspace_ignores: true,
             env: HashMap::new(),
             cancelled: Arc::new(AtomicBool::new(false)),
@@ -4551,6 +4769,7 @@ esac
             verbose: false,
             show_output: false,
             max_tested: None,
+            early_stop: Default::default(),
             respect_workspace_ignores: true,
             env: HashMap::new(),
             cancelled: Arc::new(AtomicBool::new(false)),
@@ -4602,6 +4821,7 @@ touch side_effect
             verbose: false,
             show_output: false,
             max_tested: None,
+            early_stop: Default::default(),
             respect_workspace_ignores: true,
             env: HashMap::new(),
             cancelled: Arc::new(AtomicBool::new(false)),
@@ -4682,6 +4902,7 @@ esac
             verbose: false,
             show_output: false,
             max_tested: Some(1),
+            early_stop: Default::default(),
             respect_workspace_ignores: true,
             env,
             cancelled: Arc::new(AtomicBool::new(false)),
@@ -4754,6 +4975,7 @@ class Calc {
             verbose: false,
             show_output: false,
             max_tested: None,
+            early_stop: Default::default(),
             respect_workspace_ignores: true,
             env: HashMap::new(),
             cancelled: Arc::new(AtomicBool::new(false)),
@@ -4809,6 +5031,7 @@ mod tests {
             verbose: false,
             show_output: false,
             max_tested: None,
+            early_stop: Default::default(),
             respect_workspace_ignores: true,
             env: {
                 let mut env = HashMap::new();
@@ -4858,6 +5081,7 @@ mod tests {
             verbose: false,
             show_output: false,
             max_tested: Some(2),
+            early_stop: Default::default(),
             respect_workspace_ignores: true,
             env: HashMap::new(),
             cancelled: Arc::new(AtomicBool::new(false)),
@@ -4865,6 +5089,114 @@ mod tests {
 
         let report = runner.run(mutations).report;
         assert_eq!(report.total, 2, "should stop after max_tested");
+    }
+
+    #[test]
+    fn max_survivors_stops_scheduling_new_mutations() {
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let mutations: Vec<Mutation> = (0..3)
+            .map(|i| {
+                let file = dir.path().join(format!("survivor{i}.txt"));
+                std::fs::write(&file, b"hello world").expect("fixture file should be written");
+                let mut mutation = make_test_mutation(&file);
+                mutation.id = i;
+                mutation.description = format!("survivor limit {i}");
+                mutation
+            })
+            .collect();
+
+        let runner = TestRunner {
+            commands: CommandConfig {
+                command: vec!["true".into()],
+                force_default_command: false,
+                force_default_timeout: false,
+                project_commands: vec![],
+                language_commands: HashMap::new(),
+                build_command: vec![],
+                build_command_explicit: false,
+                timeout: Duration::from_secs(5),
+                language_timeouts: HashMap::new(),
+                test_selection: None,
+            },
+            parallelism: 1,
+            project_root: dir.path().to_path_buf(),
+            verbose: false,
+            show_output: false,
+            max_tested: None,
+            early_stop: EarlyStopConfig {
+                max_survivors: Some(1),
+                fail_under: None,
+            },
+            respect_workspace_ignores: true,
+            env: HashMap::new(),
+            cancelled: Arc::new(AtomicBool::new(false)),
+        };
+
+        let report = runner.run(mutations).report;
+
+        assert_eq!(report.planned_total, 3);
+        assert_eq!(report.total, 1);
+        assert_eq!(report.survived, 1);
+        assert!(
+            report
+                .early_stop_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("--max-survivors 1"))
+        );
+    }
+
+    #[test]
+    fn fail_under_stops_when_threshold_cannot_be_reached() {
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let mutations: Vec<Mutation> = (0..3)
+            .map(|i| {
+                let file = dir.path().join(format!("threshold{i}.txt"));
+                std::fs::write(&file, b"hello world").expect("fixture file should be written");
+                let mut mutation = make_test_mutation(&file);
+                mutation.id = i;
+                mutation.description = format!("threshold gate {i}");
+                mutation
+            })
+            .collect();
+
+        let runner = TestRunner {
+            commands: CommandConfig {
+                command: vec!["true".into()],
+                force_default_command: false,
+                force_default_timeout: false,
+                project_commands: vec![],
+                language_commands: HashMap::new(),
+                build_command: vec![],
+                build_command_explicit: false,
+                timeout: Duration::from_secs(5),
+                language_timeouts: HashMap::new(),
+                test_selection: None,
+            },
+            parallelism: 1,
+            project_root: dir.path().to_path_buf(),
+            verbose: false,
+            show_output: false,
+            max_tested: None,
+            early_stop: EarlyStopConfig {
+                max_survivors: None,
+                fail_under: Some(80.0),
+            },
+            respect_workspace_ignores: true,
+            env: HashMap::new(),
+            cancelled: Arc::new(AtomicBool::new(false)),
+        };
+
+        let report = runner.run(mutations).report;
+
+        assert_eq!(report.planned_total, 3);
+        assert_eq!(report.total, 1);
+        assert_eq!(report.survived, 1);
+        assert!(
+            report
+                .early_stop_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("--fail-under 80.0"))
+        );
     }
 
     #[cfg(unix)]
@@ -4915,6 +5247,7 @@ sleep 0.2
             verbose: false,
             show_output: false,
             max_tested: Some(1),
+            early_stop: Default::default(),
             respect_workspace_ignores: true,
             env,
             cancelled: Arc::new(AtomicBool::new(false)),
@@ -4986,6 +5319,7 @@ sleep 0.2
             verbose: false,
             show_output: false,
             max_tested: Some(1),
+            early_stop: Default::default(),
             respect_workspace_ignores: true,
             env: HashMap::new(),
             cancelled: Arc::new(AtomicBool::new(false)),
@@ -5070,6 +5404,7 @@ rmdir "$lock"
                 verbose: false,
                 show_output: false,
                 max_tested: Some(1),
+                early_stop: Default::default(),
                 respect_workspace_ignores: true,
                 env,
                 cancelled: Arc::new(AtomicBool::new(false)),
@@ -5140,6 +5475,7 @@ rmdir "$lock"
             verbose: false,
             show_output: false,
             max_tested: Some(1),
+            early_stop: Default::default(),
             respect_workspace_ignores: true,
             env: HashMap::new(),
             cancelled: Arc::new(AtomicBool::new(false)),
@@ -5209,6 +5545,7 @@ rmdir "$lock"
             verbose: false,
             show_output: false,
             max_tested: None,
+            early_stop: Default::default(),
             respect_workspace_ignores: true,
             env,
             cancelled: Arc::new(AtomicBool::new(false)),
@@ -5272,6 +5609,7 @@ rmdir "$lock"
             verbose: false,
             show_output: false,
             max_tested: None,
+            early_stop: Default::default(),
             respect_workspace_ignores: true,
             env: HashMap::new(),
             cancelled: Arc::new(AtomicBool::new(false)),
@@ -5315,6 +5653,7 @@ rmdir "$lock"
             verbose: false,
             show_output: false,
             max_tested: None,
+            early_stop: Default::default(),
             respect_workspace_ignores: true,
             env: HashMap::new(),
             cancelled: Arc::new(AtomicBool::new(false)),
@@ -5383,6 +5722,7 @@ while [ "$(find "{barrier}" -type f | wc -l)" -lt 4 ]; do sleep 0.1; done"#,
             verbose: false,
             show_output: false,
             max_tested: None,
+            early_stop: Default::default(),
             respect_workspace_ignores: true,
             env: HashMap::new(),
             cancelled: Arc::new(AtomicBool::new(false)),
@@ -5459,6 +5799,7 @@ exit 1"#
             verbose: false,
             show_output: false,
             max_tested: None,
+            early_stop: Default::default(),
             respect_workspace_ignores: true,
             env: HashMap::new(),
             cancelled: Arc::new(AtomicBool::new(false)),
@@ -5511,6 +5852,7 @@ exit 1"#
             verbose: false,
             show_output: false,
             max_tested: None,
+            early_stop: Default::default(),
             respect_workspace_ignores: true,
             env: HashMap::new(),
             cancelled: Arc::new(AtomicBool::new(false)),
@@ -5563,6 +5905,7 @@ exit 1"#
             verbose: false,
             show_output: false,
             max_tested: None,
+            early_stop: Default::default(),
             respect_workspace_ignores: true,
             env: HashMap::new(),
             cancelled: Arc::new(AtomicBool::new(false)),

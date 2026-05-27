@@ -53,6 +53,14 @@ pub enum Commands {
         #[arg(long)]
         max_per_run: Option<usize>,
 
+        /// Stop scheduling new mutations after the first survived mutant
+        #[arg(long, conflicts_with = "max_survivors")]
+        first_survivor: bool,
+
+        /// Stop scheduling new mutations after this many survived mutants
+        #[arg(long)]
+        max_survivors: Option<usize>,
+
         /// Use mutant schemata for supported languages
         #[arg(long)]
         schemata: bool,
@@ -205,6 +213,40 @@ mod tests {
             }
             _ => panic!("expected Check command"),
         }
+    }
+
+    #[test]
+    fn first_survivor_argument_is_accepted() {
+        let cli = Cli::try_parse_from(["togi", "check", "--first-survivor"])
+            .expect("--first-survivor should parse");
+        match cli.command {
+            Commands::Check { first_survivor, .. } => {
+                assert!(first_survivor);
+            }
+            _ => panic!("expected Check command"),
+        }
+    }
+
+    #[test]
+    fn max_survivors_argument_is_accepted() {
+        let cli = Cli::try_parse_from(["togi", "check", "--max-survivors", "2"])
+            .expect("--max-survivors should parse");
+        match cli.command {
+            Commands::Check { max_survivors, .. } => {
+                assert_eq!(max_survivors, Some(2));
+            }
+            _ => panic!("expected Check command"),
+        }
+    }
+
+    #[test]
+    fn first_survivor_conflicts_with_max_survivors() {
+        let res =
+            Cli::try_parse_from(["togi", "check", "--first-survivor", "--max-survivors", "2"]);
+        assert!(
+            res.is_err(),
+            "--first-survivor and --max-survivors should conflict"
+        );
     }
 
     #[test]

@@ -95,6 +95,17 @@ fn format_report(report: &MutationReport, color: bool) -> String {
         report.killed, report.survived, report.timeout, report.build_errors
     )
     .unwrap();
+    if report.total < report.planned_total {
+        writeln!(
+            out,
+            "Partial: stopped after {}/{} scheduled mutations",
+            report.total, report.planned_total
+        )
+        .expect("writing to String should not fail");
+    }
+    if let Some(reason) = &report.early_stop_reason {
+        writeln!(out, "Early stop: {reason}").expect("writing to String should not fail");
+    }
     writeln!(
         out,
         "Mutation score (test kills only): {:.1}%",
@@ -289,6 +300,8 @@ mod tests {
             duration: Duration::from_millis(500),
             test_command: None,
             build_command: vec![],
+            planned_total: total,
+            early_stop_reason: None,
             total,
             killed,
             survived,
@@ -362,6 +375,18 @@ mod tests {
         let output = format_report_plain(&report);
         assert!(output.contains("Results: 1 killed, 1 survived, 0 timeout, 0 build errors"));
         assert!(output.contains("Mutation score (test kills only): 50.0%"));
+    }
+
+    #[test]
+    fn terminal_output_marks_partial_early_stop_reports() {
+        let mut report = report(vec![(mutation(1, "src/a.rs", 1), MutationResult::Survived)]);
+        report.planned_total = 3;
+        report.early_stop_reason = Some("--max-survivors 1 reached".into());
+
+        let output = format_report_plain(&report);
+
+        assert!(output.contains("Partial: stopped after 1/3 scheduled mutations"));
+        assert!(output.contains("Early stop: --max-survivors 1 reached"));
     }
 
     #[test]

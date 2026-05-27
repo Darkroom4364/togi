@@ -6,11 +6,15 @@ use std::collections::BTreeMap;
 #[derive(Serialize)]
 struct JsonReport {
     total: usize,
+    planned_total: usize,
     tested: usize,
     killed: usize,
     survived: usize,
     timeout: usize,
     build_errors: usize,
+    partial: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    early_stop_reason: Option<String>,
     mutation_score: f64,
     duration_ms: u128,
     test_command: Option<Vec<String>>,
@@ -153,11 +157,14 @@ pub fn to_json_string(report: &MutationReport) -> Result<String> {
     let tested = report.total.saturating_sub(report.build_errors);
     let json_report = JsonReport {
         total: report.total,
+        planned_total: report.planned_total,
         tested,
         killed: report.killed,
         survived: report.survived,
         timeout: report.timeout,
         build_errors: report.build_errors,
+        partial: report.total < report.planned_total,
+        early_stop_reason: report.early_stop_reason.clone(),
         mutation_score: super::mutation_score(report),
         duration_ms: report.duration.as_millis(),
         test_command: report.test_command.clone(),
@@ -214,6 +221,8 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&json_str).unwrap();
 
         assert_eq!(value["total"], 2);
+        assert_eq!(value["planned_total"], 2);
+        assert_eq!(value["partial"], false);
         assert_eq!(value["killed"], 1);
         assert_eq!(value["survived"], 1);
         assert_eq!(value["timeout"], 0);
@@ -237,18 +246,20 @@ mod tests {
     #[test]
     fn json_output_schema_is_stable() {
         let report = sample_report();
-        let json_str = to_json_string(&report).unwrap();
-        let value: Value = serde_json::from_str(&json_str).unwrap();
+        let json_str = to_json_string(&report).expect("sample report should serialize");
+        let value: Value = serde_json::from_str(&json_str).expect("sample report JSON is valid");
 
         assert_object_keys(
             &value,
             &[
                 "total",
+                "planned_total",
                 "tested",
                 "killed",
                 "survived",
                 "timeout",
                 "build_errors",
+                "partial",
                 "mutation_score",
                 "duration_ms",
                 "test_command",
@@ -290,6 +301,21 @@ mod tests {
     }
 
     #[test]
+    fn json_output_marks_partial_early_stop_reports() {
+        let mut report = sample_report();
+        report.planned_total = 5;
+        report.early_stop_reason = Some("--max-survivors 1 reached".into());
+
+        let json_str = to_json_string(&report).expect("sample report should serialize");
+        let value: Value = serde_json::from_str(&json_str).expect("sample report JSON is valid");
+
+        assert_eq!(value["total"], 2);
+        assert_eq!(value["planned_total"], 5);
+        assert_eq!(value["partial"], true);
+        assert_eq!(value["early_stop_reason"], "--max-survivors 1 reached");
+    }
+
+    #[test]
     fn json_score_zero_when_all_build_errors() {
         let report = MutationReport {
             results: vec![(
@@ -312,6 +338,8 @@ mod tests {
             duration: Duration::from_millis(100),
             test_command: None,
             build_command: vec![],
+            planned_total: 1,
+            early_stop_reason: None,
             total: 1,
             killed: 0,
             survived: 0,
@@ -355,6 +383,8 @@ mod tests {
             duration: Duration::from_millis(100),
             test_command: None,
             build_command: vec![],
+            planned_total: 1,
+            early_stop_reason: None,
             total: 1,
             killed: 0,
             survived: 0,
@@ -388,6 +418,8 @@ mod tests {
             duration: Duration::from_millis(0),
             test_command: None,
             build_command: vec![],
+            planned_total: 0,
+            early_stop_reason: None,
             total: 0,
             killed: 0,
             survived: 0,
