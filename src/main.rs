@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use serde::Deserialize;
-use togi::{ChangedFile, Mutation};
+use togi::{BaselineTiming, ChangedFile, Mutation};
 
 struct CheckConfig {
     all: bool,
@@ -19,6 +19,10 @@ struct CheckConfig {
     profile: Option<togi::config::ResourceProfile>,
     jobs: Option<usize>,
     timeout: Option<u64>,
+    calibrate_timeout: bool,
+    skip_baseline_timing: bool,
+    timeout_multiplier: Option<f64>,
+    timeout_slack: Option<u64>,
     max_per_run: Option<usize>,
     first_survivor: bool,
     max_survivors: Option<usize>,
@@ -88,6 +92,10 @@ fn main() {
             profile,
             jobs,
             timeout,
+            calibrate_timeout,
+            skip_baseline_timing,
+            timeout_multiplier,
+            timeout_slack,
             max_per_run,
             first_survivor,
             max_survivors,
@@ -118,6 +126,10 @@ fn main() {
                 profile,
                 jobs,
                 timeout,
+                calibrate_timeout,
+                skip_baseline_timing,
+                timeout_multiplier,
+                timeout_slack,
                 max_per_run,
                 first_survivor,
                 max_survivors,
@@ -378,6 +390,44 @@ fn run_check(cfg: CheckConfig, cancelled: Arc<AtomicBool>) -> anyhow::Result<()>
         return Ok(());
     }
 
+    let baseline_timing = if config.test.calibrate_timeout {
+        eprintln!("Measuring baseline test runtime...");
+        let measurement = togi::runner::measure_baseline_timing(
+            &project_root,
+            togi::runner::BaselineTimingConfig {
+                test_command: &config.test.command,
+                build_command: &config.test.build_command,
+                build_command_explicit: has_explicit_build_cmd,
+                timeout: baseline_measurement_timeout(config.test.timeout),
+                env: &profile_env,
+                cancelled: &cancelled,
+                respect_workspace_ignores: config.mutations.respect_workspace_ignores,
+            },
+        )?;
+        let timeout_secs = calibrated_timeout_seconds(
+            measurement.build_duration,
+            measurement.test_duration,
+            config.test.timeout_multiplier,
+            config.test.timeout_slack,
+        );
+        config.test.timeout = timeout_secs;
+        let timing = BaselineTiming {
+            build_command: if has_explicit_build_cmd {
+                config.test.build_command.clone()
+            } else {
+                vec![]
+            },
+            build_duration: measurement.build_duration,
+            test_command: config.test.command.clone(),
+            test_duration: measurement.test_duration,
+            calibrated_timeout: Duration::from_secs(timeout_secs),
+        };
+        eprintln!("{}", baseline_timing_summary(&timing));
+        Some(timing)
+    } else {
+        None
+    };
+
     eprintln!("Running {} mutations...", mutations.len());
 
     let project_root_ref = project_root.clone();
@@ -397,7 +447,8 @@ fn run_check(cfg: CheckConfig, cancelled: Arc<AtomicBool>) -> anyhow::Result<()>
         },
     );
 
-    let report = outcome.report;
+    let mut report = outcome.report;
+    report.baseline_timing = baseline_timing;
     togi::report::print_report(&report, output_format)?;
 
     if outcome.cancelled {
@@ -485,6 +536,23 @@ fn resolve_config(cfg: CheckConfig) -> anyhow::Result<ResolvedCheckConfig> {
     if let Some(t) = cfg.timeout {
         config.test.timeout = t;
     }
+    if cfg.calibrate_timeout {
+        config.test.calibrate_timeout = true;
+    }
+    if cfg.skip_baseline_timing {
+        config.test.calibrate_timeout = false;
+    }
+    if let Some(multiplier) = cfg.timeout_multiplier {
+        config.test.timeout_multiplier = multiplier;
+    }
+    if let Some(slack) = cfg.timeout_slack {
+        config.test.timeout_slack = slack;
+    }
+    validate_timeout_calibration(config.test.timeout_multiplier)?;
+    if has_cli_timeout && config.test.calibrate_timeout {
+        eprintln!("warning: --timeout overrides baseline timing calibration for this run");
+        config.test.calibrate_timeout = false;
+    }
     if let Some(max) = cfg.max_per_run {
         config.mutations.max_per_run = max;
     }
@@ -548,6 +616,42 @@ fn warn_if_resource_oversubscribed(jobs: usize) {
             );
         }
     }
+}
+
+fn validate_timeout_calibration(multiplier: f64) -> anyhow::Result<()> {
+    if !multiplier.is_finite() || multiplier <= 0.0 {
+        anyhow::bail!("timeout_multiplier must be a positive finite number");
+    }
+    Ok(())
+}
+
+fn calibrated_timeout_seconds(
+    build_duration: Option<Duration>,
+    test_duration: Duration,
+    multiplier: f64,
+    slack: u64,
+) -> u64 {
+    let baseline = build_duration
+        .filter(|duration| *duration > test_duration)
+        .unwrap_or(test_duration);
+    let seconds = baseline.as_secs_f64() * multiplier + slack as f64;
+    seconds.ceil().max(1.0).min(u64::MAX as f64) as u64
+}
+
+fn baseline_timing_summary(timing: &BaselineTiming) -> String {
+    let build = timing
+        .build_duration
+        .map(|duration| format!(", build {:.2}s", duration.as_secs_f64()))
+        .unwrap_or_default();
+    format!(
+        "Baseline timing: test {:.2}s{build}; mutation timeout {:.2}s",
+        timing.test_duration.as_secs_f64(),
+        timing.calibrated_timeout.as_secs_f64()
+    )
+}
+
+fn baseline_measurement_timeout(configured_timeout_seconds: u64) -> Duration {
+    Duration::from_secs(configured_timeout_seconds.saturating_mul(10).max(60))
 }
 
 fn resource_profile_env(
@@ -1196,6 +1300,10 @@ mod tests {
             profile: None,
             jobs: None,
             timeout: None,
+            calibrate_timeout: false,
+            skip_baseline_timing: false,
+            timeout_multiplier: None,
+            timeout_slack: None,
             max_per_run: None,
             first_survivor: false,
             max_survivors: None,
@@ -1270,6 +1378,92 @@ jobs = 4
         let resolved = resolve_config(cfg).expect("config should resolve");
 
         assert_eq!(resolved.config.test.jobs, 3);
+    }
+
+    #[test]
+    fn resolve_config_applies_timeout_calibration_options() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let config_path = dir.path().join("togi.toml");
+        std::fs::write(&config_path, "")?;
+        let mut cfg = check_config();
+        cfg.config_path = Some(config_path);
+        cfg.calibrate_timeout = true;
+        cfg.timeout_multiplier = Some(2.5);
+        cfg.timeout_slack = Some(6);
+
+        let resolved = resolve_config(cfg)?;
+
+        assert!(resolved.config.test.calibrate_timeout);
+        assert_eq!(resolved.config.test.timeout_multiplier, 2.5);
+        assert_eq!(resolved.config.test.timeout_slack, 6);
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_config_skip_baseline_timing_disables_configured_calibration() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let config_path = dir.path().join("togi.toml");
+        std::fs::write(&config_path, "[test]\ncalibrate_timeout = true\n")?;
+        let mut cfg = check_config();
+        cfg.config_path = Some(config_path);
+        cfg.skip_baseline_timing = true;
+
+        let resolved = resolve_config(cfg)?;
+
+        assert!(!resolved.config.test.calibrate_timeout);
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_config_cli_timeout_disables_calibration() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let config_path = dir.path().join("togi.toml");
+        std::fs::write(&config_path, "[test]\ncalibrate_timeout = true\n")?;
+        let mut cfg = check_config();
+        cfg.config_path = Some(config_path);
+        cfg.timeout = Some(12);
+
+        let resolved = resolve_config(cfg)?;
+
+        assert_eq!(resolved.config.test.timeout, 12);
+        assert!(!resolved.config.test.calibrate_timeout);
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_config_rejects_invalid_timeout_multiplier() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let config_path = dir.path().join("togi.toml");
+        std::fs::write(&config_path, "")?;
+        let mut cfg = check_config();
+        cfg.config_path = Some(config_path);
+        cfg.timeout_multiplier = Some(0.0);
+
+        let err = match resolve_config(cfg) {
+            Ok(_) => panic!("invalid multiplier should fail"),
+            Err(err) => err,
+        };
+
+        assert!(err.to_string().contains("timeout_multiplier"));
+        Ok(())
+    }
+
+    #[test]
+    fn calibrated_timeout_uses_slowest_baseline_duration() {
+        let timeout = calibrated_timeout_seconds(
+            Some(Duration::from_millis(1_900)),
+            Duration::from_millis(400),
+            2.0,
+            1,
+        );
+
+        assert_eq!(timeout, 5);
+    }
+
+    #[test]
+    fn baseline_measurement_timeout_is_more_generous_than_mutation_timeout() {
+        assert_eq!(baseline_measurement_timeout(1), Duration::from_secs(60));
+        assert_eq!(baseline_measurement_timeout(30), Duration::from_secs(300));
     }
 
     #[test]

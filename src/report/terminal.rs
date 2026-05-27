@@ -113,6 +113,17 @@ fn format_report(report: &MutationReport, color: bool) -> String {
     )
     .unwrap();
     writeln!(out, "Duration: {:.2}s", report.duration.as_secs_f64()).unwrap();
+    if let Some(timing) = &report.baseline_timing {
+        let build = timing
+            .build_duration
+            .map(|duration| format!(", build {:.2}s", duration.as_secs_f64()))
+            .unwrap_or_default();
+        out.push_str(&format!(
+            "Baseline timing: test {:.2}s{build}; timeout {:.2}s\n",
+            timing.test_duration.as_secs_f64(),
+            timing.calibrated_timeout.as_secs_f64()
+        ));
+    }
     if let Some(schemata) = &report.schemata {
         writeln!(
             out,
@@ -297,6 +308,7 @@ mod tests {
             results,
             build_error_diagnostics: vec![],
             schemata: None,
+            baseline_timing: None,
             duration: Duration::from_millis(500),
             test_command: None,
             build_command: vec![],

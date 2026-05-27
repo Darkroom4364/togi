@@ -141,6 +141,7 @@ pub struct MutationReport {
     pub results: Vec<(Mutation, MutationResult)>,
     pub build_error_diagnostics: Vec<BuildErrorDiagnostic>,
     pub schemata: Option<SchemataReport>,
+    pub baseline_timing: Option<BaselineTiming>,
     pub duration: Duration,
     pub test_command: Option<Vec<String>>,
     pub build_command: Vec<String>,
@@ -151,6 +152,16 @@ pub struct MutationReport {
     pub survived: usize,
     pub timeout: usize,
     pub build_errors: usize,
+}
+
+/// Timing captured from the unmutated baseline run used for timeout calibration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BaselineTiming {
+    pub build_command: Vec<String>,
+    pub build_duration: Option<Duration>,
+    pub test_command: Vec<String>,
+    pub test_duration: Duration,
+    pub calibrated_timeout: Duration,
 }
 
 /// How schemata execution was used for a mutation run.

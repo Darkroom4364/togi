@@ -50,6 +50,9 @@ pub struct TestConfig {
     pub command: Vec<String>,
     pub build_command: Vec<String>,
     pub timeout: u64,
+    pub calibrate_timeout: bool,
+    pub timeout_multiplier: f64,
+    pub timeout_slack: u64,
     pub jobs: usize,
     pub languages: HashMap<String, LanguageTestConfig>,
     jobs_explicit: bool,
@@ -67,6 +70,12 @@ struct RawTestConfig {
     #[serde(default)]
     timeout: Option<u64>,
     #[serde(default)]
+    calibrate_timeout: Option<bool>,
+    #[serde(default)]
+    timeout_multiplier: Option<f64>,
+    #[serde(default)]
+    timeout_slack: Option<u64>,
+    #[serde(default)]
     jobs: Option<usize>,
     #[serde(default)]
     languages: HashMap<String, LanguageTestConfig>,
@@ -83,6 +92,9 @@ impl<'de> Deserialize<'de> for TestConfig {
             command: raw.command,
             build_command: raw.build_command,
             timeout: raw.timeout.unwrap_or_else(default_timeout),
+            calibrate_timeout: raw.calibrate_timeout.unwrap_or(false),
+            timeout_multiplier: raw.timeout_multiplier.unwrap_or(4.0),
+            timeout_slack: raw.timeout_slack.unwrap_or(2),
             jobs: raw.jobs.unwrap_or_else(default_jobs),
             languages: raw.languages,
             jobs_explicit: raw.jobs.is_some(),
@@ -324,6 +336,9 @@ impl Default for TestConfig {
             command: default_test_command(),
             build_command: vec![],
             timeout: default_timeout(),
+            calibrate_timeout: false,
+            timeout_multiplier: 4.0,
+            timeout_slack: 2,
             jobs: default_jobs(),
             languages: HashMap::new(),
             jobs_explicit: false,
@@ -442,6 +457,9 @@ impl Config {
         template.push_str(&format!(
             "# profile = \"cool\"  # cool, balanced, or ci; explicit jobs still win\n\
              timeout = 30\n\
+             # calibrate_timeout = false  # derive timeout from one unmutated baseline run\n\
+             # timeout_multiplier = 4.0\n\
+             # timeout_slack = 2\n\
              # jobs = {}  # conservative local default; raise in CI for throughput\n\
              \n",
             default_jobs()
@@ -541,6 +559,9 @@ mod tests {
 profile = "ci"
 command = ["make", "test"]
 timeout = 60
+calibrate_timeout = true
+timeout_multiplier = 3.5
+timeout_slack = 4
 jobs = 8
 
 [diff]
@@ -554,6 +575,9 @@ schemata = true
         assert_eq!(config.test.profile, Some(ResourceProfile::Ci));
         assert_eq!(config.test.command, vec!["make", "test"]);
         assert_eq!(config.test.timeout, 60);
+        assert!(config.test.calibrate_timeout);
+        assert_eq!(config.test.timeout_multiplier, 3.5);
+        assert_eq!(config.test.timeout_slack, 4);
         assert_eq!(config.test.jobs, 8);
         assert!(config.test.jobs_was_explicit());
         assert_eq!(config.diff.base, "origin/develop");
@@ -626,6 +650,9 @@ commnad = ["cargo", "test"]
         assert!(config.test.build_command.is_empty());
         assert!(config.test.languages.is_empty());
         assert_eq!(config.test.timeout, 30);
+        assert!(!config.test.calibrate_timeout);
+        assert_eq!(config.test.timeout_multiplier, 4.0);
+        assert_eq!(config.test.timeout_slack, 2);
         assert!(config.test.jobs >= 1);
         assert!(!config.test.jobs_was_explicit());
         assert_eq!(config.diff.base, "origin/main");

@@ -118,6 +118,19 @@ pub fn generate_report(report: &MutationReport) -> Result<String> {
             html_escape(reason)
         )?;
     }
+    if let Some(timing) = &report.baseline_timing {
+        let build = timing
+            .build_duration
+            .map(|duration| format!(", build {:.2}s", duration.as_secs_f64()))
+            .unwrap_or_default();
+        write!(
+            html,
+            "<div class=\"partial\">Baseline timing: test {:.2}s{}; timeout {:.2}s</div>",
+            timing.test_duration.as_secs_f64(),
+            html_escape(&build),
+            timing.calibrated_timeout.as_secs_f64()
+        )?;
+    }
     write!(html, "</header>")?;
 
     // Layout
@@ -370,6 +383,7 @@ mod tests {
                 "error[E0308]: mismatched types",
             )],
             schemata: None,
+            baseline_timing: None,
             duration: Duration::from_millis(100),
             test_command: None,
             build_command: vec![],
@@ -422,6 +436,7 @@ mod tests {
             results,
             build_error_diagnostics,
             schemata: None,
+            baseline_timing: None,
             duration: Duration::from_millis(100),
             test_command: None,
             build_command: vec![],
@@ -458,6 +473,7 @@ mod tests {
             )],
             build_error_diagnostics: vec![],
             schemata: None,
+            baseline_timing: None,
             duration: Duration::from_millis(100),
             test_command: None,
             build_command: vec![],
@@ -498,6 +514,7 @@ mod tests {
             results,
             build_error_diagnostics: vec![],
             schemata: None,
+            baseline_timing: None,
             duration: Duration::from_millis(100),
             test_command: None,
             build_command: vec![],

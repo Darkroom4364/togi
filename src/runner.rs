@@ -5,6 +5,7 @@ use crate::{
     BuildErrorDiagnostic, Mutation, MutationReport, MutationResult, SchemataFallbackReasonCount,
     SchemataReport,
 };
+use anyhow::{Context, bail};
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs;
 use std::hash::Hasher;
@@ -149,6 +150,22 @@ pub struct TestRunner {
 pub struct RunOutcome {
     pub report: MutationReport,
     pub cancelled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BaselineMeasurement {
+    pub build_duration: Option<Duration>,
+    pub test_duration: Duration,
+}
+
+pub struct BaselineTimingConfig<'a> {
+    pub test_command: &'a [String],
+    pub build_command: &'a [String],
+    pub build_command_explicit: bool,
+    pub timeout: Duration,
+    pub env: &'a HashMap<String, String>,
+    pub cancelled: &'a AtomicBool,
+    pub respect_workspace_ignores: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -766,6 +783,103 @@ fn copy_workspace_with_options(
         root,
         reset_strategy: WorkspaceResetStrategy::Copy,
     })
+}
+
+pub fn measure_baseline_timing(
+    project_root: &Path,
+    config: BaselineTimingConfig<'_>,
+) -> anyhow::Result<BaselineMeasurement> {
+    if config.test_command.is_empty() {
+        bail!("baseline test command is empty");
+    }
+
+    let workspace = copy_workspace_with_options(project_root, config.respect_workspace_ignores)
+        .with_context(|| "could not create baseline timing workspace")?;
+    let root = workspace.root();
+    let build_duration = if config.build_command_explicit && !config.build_command.is_empty() {
+        Some(measure_baseline_command(
+            "baseline build command",
+            config.build_command,
+            root,
+            config.timeout,
+            config.env,
+            config.cancelled,
+        )?)
+    } else {
+        None
+    };
+    let test_duration = measure_baseline_command(
+        "baseline test command",
+        config.test_command,
+        root,
+        config.timeout,
+        config.env,
+        config.cancelled,
+    )?;
+
+    Ok(BaselineMeasurement {
+        build_duration,
+        test_duration,
+    })
+}
+
+fn measure_baseline_command(
+    label: &str,
+    command: &[String],
+    cwd: &Path,
+    timeout: Duration,
+    env: &HashMap<String, String>,
+    cancelled: &AtomicBool,
+) -> anyhow::Result<Duration> {
+    let started = Instant::now();
+    let outcome = run_command(command, cwd, timeout, true, env, cancelled);
+    let duration = started.elapsed();
+    if outcome.cancelled {
+        bail!("baseline timing cancelled");
+    }
+
+    match outcome.result {
+        MutationResult::Survived => Ok(duration),
+        MutationResult::Killed => {
+            let output = baseline_failure_output(outcome.test_output.as_deref());
+            bail!(
+                "{label} failed (`{}`){output}",
+                command_for_message(command)
+            )
+        }
+        MutationResult::Timeout => bail!(
+            "{label} timed out after {:.2}s (`{}`)",
+            timeout.as_secs_f64(),
+            command_for_message(command)
+        ),
+        MutationResult::BuildError => {
+            let detail = outcome
+                .build_error_detail
+                .as_ref()
+                .map(|detail| detail.message.as_str())
+                .unwrap_or("command could not run");
+            bail!(
+                "{label} could not run (`{}`): {detail}",
+                command_for_message(command)
+            )
+        }
+    }
+}
+
+fn command_for_message(command: &[String]) -> String {
+    if command.is_empty() {
+        "<empty>".to_string()
+    } else {
+        command.join(" ")
+    }
+}
+
+fn baseline_failure_output(output: Option<&str>) -> String {
+    let Some(output) = output.map(str::trim).filter(|output| !output.is_empty()) else {
+        return String::new();
+    };
+    let excerpt = output.lines().take(6).collect::<Vec<_>>().join("\n");
+    format!(":\n{excerpt}")
 }
 
 fn create_git_worktree_workspace(
@@ -2151,6 +2265,7 @@ impl TestRunner {
             results,
             build_error_diagnostics,
             schemata: None,
+            baseline_timing: None,
             duration,
             test_command: if self.commands.language_commands.is_empty()
                 && self.commands.project_commands.is_empty()
@@ -3270,6 +3385,17 @@ mod tests {
     use super::*;
     use crate::Mutation;
 
+    fn successful_command() -> Vec<String> {
+        #[cfg(windows)]
+        {
+            vec!["cmd".into(), "/C".into(), "exit 0".into()]
+        }
+        #[cfg(not(windows))]
+        {
+            vec!["sh".into(), "-c".into(), "true".into()]
+        }
+    }
+
     #[test]
     fn file_guard_restores_content_on_drop() {
         let dir = tempfile::tempdir().unwrap();
@@ -4151,6 +4277,30 @@ mod tests {
             std::fs::read(copy.root().join("target/debug/cache"))?,
             b"keep"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn baseline_timing_measures_build_and_test_in_workspace() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        std::fs::write(dir.path().join("source.txt"), "clean")?;
+        let command = successful_command();
+
+        let measurement = measure_baseline_timing(
+            dir.path(),
+            BaselineTimingConfig {
+                test_command: &command,
+                build_command: &command,
+                build_command_explicit: true,
+                timeout: Duration::from_secs(5),
+                env: &HashMap::new(),
+                cancelled: &AtomicBool::new(false),
+                respect_workspace_ignores: false,
+            },
+        )?;
+
+        assert!(measurement.build_duration.is_some());
+        assert!(measurement.test_duration <= Duration::from_secs(5));
         Ok(())
     }
 
