@@ -1,0 +1,52 @@
+{
+  "name": "togi-vscode",
+  "displayName": "togi",
+  "description": "Show survived togi mutants as inline VS Code diagnostics.",
+  "version": "0.1.0",
+  "publisher": "darkroom4364",
+  "license": "MIT OR Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Darkroom4364/togi.git",
+    "directory": "editors/vscode"
+  },
+  "engines": {
+    "vscode": "^1.92.0"
+  },
+  "categories": [
+    "Testing",
+    "Linters"
+  ],
+  "activationEvents": [
+    "workspaceContains:**/togi-report.json",
+    "onCommand:togi.refreshReport",
+    "onCommand:togi.clearDiagnostics",
+    "onCommand:togi.showMutationDiff"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "togi.refreshReport",
+        "title": "togi: Refresh Mutation Report"
+      },
+      {
+        "command": "togi.clearDiagnostics",
+        "title": "togi: Clear Mutation Diagnostics"
+      }
+    ],
+    "configuration": {
+      "title": "togi",
+      "properties": {
+        "togi.reportPath": {
+          "type": "string",
+          "default": "togi-report.json",
+          "description": "Path to the JSON report produced by `togi check --format json`, relative to the workspace root unless absolute."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "test": "node --test test/*.test.js"
+  }
+}
