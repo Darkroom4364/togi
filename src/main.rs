@@ -983,23 +983,60 @@ fn parse_test_selection_json(
     content: &str,
     project_root: &Path,
 ) -> anyhow::Result<togi::runner::TestSelectionConfig> {
-    let raw: std::collections::HashMap<String, std::collections::HashMap<String, Vec<String>>> =
-        serde_json::from_str(content).context("could not parse test selection JSON")?;
+    let raw: std::collections::HashMap<
+        String,
+        std::collections::HashMap<String, Vec<RawSelectedTest>>,
+    > = serde_json::from_str(content).context("could not parse test selection JSON")?;
     let mut selection = togi::runner::TestSelectionConfig::new();
 
     for (file, lines) in raw {
-        for (line, tests) in lines {
+        for (line, raw_tests) in lines {
             let line = line
                 .parse::<usize>()
                 .with_context(|| format!("invalid line number '{line}' for {file}"))?;
             if line == 0 {
                 anyhow::bail!("invalid line number '0' for {file}");
             }
-            selection.insert(project_root, Path::new(&file), line, tests);
+            let tests = raw_tests
+                .into_iter()
+                .map(RawSelectedTest::into_selected)
+                .collect::<anyhow::Result<Vec<_>>>()
+                .with_context(|| format!("invalid test selection entry for {file}:{line}"))?;
+            selection.insert_tests(project_root, Path::new(&file), line, tests);
         }
     }
 
     Ok(selection)
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum RawSelectedTest {
+    Name(String),
+    Timed {
+        name: String,
+        #[serde(default)]
+        duration_ms: Option<u64>,
+    },
+}
+
+impl RawSelectedTest {
+    fn into_selected(self) -> anyhow::Result<togi::runner::SelectedTest> {
+        match self {
+            Self::Name(name) => selected_test(name, None),
+            Self::Timed { name, duration_ms } => selected_test(name, duration_ms),
+        }
+    }
+}
+
+fn selected_test(
+    name: String,
+    duration_ms: Option<u64>,
+) -> anyhow::Result<togi::runner::SelectedTest> {
+    if name.trim().is_empty() {
+        anyhow::bail!("test name cannot be empty");
+    }
+    Ok(togi::runner::SelectedTest::new(name, duration_ms))
 }
 
 type TestSelectionJson = BTreeMap<String, BTreeMap<String, Vec<String>>>;
@@ -1498,6 +1535,38 @@ jobs = 4
         }"#;
 
         assert!(parse_test_selection_json(json, root).is_ok());
+    }
+
+    #[test]
+    fn parse_test_selection_json_accepts_timed_test_entries() {
+        let root = Path::new("/repo");
+        let json = r#"{
+            "src/lib.rs": {
+                "9": [
+                    {"name": "math::fast_add", "duration_ms": 3},
+                    {"name": "math::slow_add", "duration_ms": 30}
+                ]
+            }
+        }"#;
+
+        assert!(parse_test_selection_json(json, root).is_ok());
+    }
+
+    #[test]
+    fn parse_test_selection_json_rejects_empty_test_name() {
+        let root = Path::new("/repo");
+        let json = r#"{
+            "src/lib.rs": {
+                "9": [{"name": ""}]
+            }
+        }"#;
+
+        let err = match parse_test_selection_json(json, root) {
+            Ok(_) => panic!("empty test name should be rejected"),
+            Err(err) => err,
+        };
+
+        assert!(err.to_string().contains("invalid test selection entry"));
     }
 
     #[test]
