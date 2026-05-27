@@ -217,7 +217,8 @@ mod tests {
 
     #[test]
     fn first_survivor_argument_is_accepted() {
-        let cli = Cli::try_parse_from(["togi", "check", "--first-survivor"]).unwrap();
+        let cli = Cli::try_parse_from(["togi", "check", "--first-survivor"])
+            .expect("--first-survivor should parse");
         match cli.command {
             Commands::Check { first_survivor, .. } => {
                 assert!(first_survivor);
@@ -228,7 +229,8 @@ mod tests {
 
     #[test]
     fn max_survivors_argument_is_accepted() {
-        let cli = Cli::try_parse_from(["togi", "check", "--max-survivors", "2"]).unwrap();
+        let cli = Cli::try_parse_from(["togi", "check", "--max-survivors", "2"])
+            .expect("--max-survivors should parse");
         match cli.command {
             Commands::Check { max_survivors, .. } => {
                 assert_eq!(max_survivors, Some(2));

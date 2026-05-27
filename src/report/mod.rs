@@ -220,10 +220,10 @@ pub fn format_pr_comment(report: &MutationReport, baseline_score: Option<f64>) -
             "\nPartial report: stopped after {}/{} scheduled mutations.",
             report.total, report.planned_total
         )
-        .unwrap();
+        .expect("writing to String should not fail");
     }
     if let Some(reason) = &report.early_stop_reason {
-        writeln!(md, "\nEarly stop: {reason}").unwrap();
+        writeln!(md, "\nEarly stop: {reason}").expect("writing to String should not fail");
     }
     writeln!(md).unwrap();
 

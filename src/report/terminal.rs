@@ -101,10 +101,10 @@ fn format_report(report: &MutationReport, color: bool) -> String {
             "Partial: stopped after {}/{} scheduled mutations",
             report.total, report.planned_total
         )
-        .unwrap();
+        .expect("writing to String should not fail");
     }
     if let Some(reason) = &report.early_stop_reason {
-        writeln!(out, "Early stop: {reason}").unwrap();
+        writeln!(out, "Early stop: {reason}").expect("writing to String should not fail");
     }
     writeln!(
         out,

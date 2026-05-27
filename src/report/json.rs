@@ -246,8 +246,8 @@ mod tests {
     #[test]
     fn json_output_schema_is_stable() {
         let report = sample_report();
-        let json_str = to_json_string(&report).unwrap();
-        let value: Value = serde_json::from_str(&json_str).unwrap();
+        let json_str = to_json_string(&report).expect("sample report should serialize");
+        let value: Value = serde_json::from_str(&json_str).expect("sample report JSON is valid");
 
         assert_object_keys(
             &value,
@@ -306,8 +306,8 @@ mod tests {
         report.planned_total = 5;
         report.early_stop_reason = Some("--max-survivors 1 reached".into());
 
-        let json_str = to_json_string(&report).unwrap();
-        let value: Value = serde_json::from_str(&json_str).unwrap();
+        let json_str = to_json_string(&report).expect("sample report should serialize");
+        let value: Value = serde_json::from_str(&json_str).expect("sample report JSON is valid");
 
         assert_eq!(value["total"], 2);
         assert_eq!(value["planned_total"], 5);

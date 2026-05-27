@@ -5093,11 +5093,11 @@ mod tests {
 
     #[test]
     fn max_survivors_stops_scheduling_new_mutations() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("tempdir should be created");
         let mutations: Vec<Mutation> = (0..3)
             .map(|i| {
                 let file = dir.path().join(format!("survivor{i}.txt"));
-                std::fs::write(&file, b"hello world").unwrap();
+                std::fs::write(&file, b"hello world").expect("fixture file should be written");
                 let mut mutation = make_test_mutation(&file);
                 mutation.id = i;
                 mutation.description = format!("survivor limit {i}");
@@ -5147,11 +5147,11 @@ mod tests {
 
     #[test]
     fn fail_under_stops_when_threshold_cannot_be_reached() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("tempdir should be created");
         let mutations: Vec<Mutation> = (0..3)
             .map(|i| {
                 let file = dir.path().join(format!("threshold{i}.txt"));
-                std::fs::write(&file, b"hello world").unwrap();
+                std::fs::write(&file, b"hello world").expect("fixture file should be written");
                 let mut mutation = make_test_mutation(&file);
                 mutation.id = i;
                 mutation.description = format!("threshold gate {i}");
