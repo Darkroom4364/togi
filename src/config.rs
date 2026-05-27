@@ -1,4 +1,5 @@
 use anyhow::Context;
+use clap::ValueEnum;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -43,19 +44,79 @@ pub struct LanguageTestConfig {
     pub timeout: Option<u64>,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug)]
 pub struct TestConfig {
-    #[serde(default = "default_test_command")]
+    pub profile: Option<ResourceProfile>,
     pub command: Vec<String>,
-    #[serde(default)]
     pub build_command: Vec<String>,
-    #[serde(default = "default_timeout")]
     pub timeout: u64,
-    #[serde(default = "default_jobs")]
     pub jobs: usize,
-    #[serde(default)]
     pub languages: HashMap<String, LanguageTestConfig>,
+    jobs_explicit: bool,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawTestConfig {
+    #[serde(default)]
+    profile: Option<ResourceProfile>,
+    #[serde(default)]
+    command: Vec<String>,
+    #[serde(default)]
+    build_command: Vec<String>,
+    #[serde(default)]
+    timeout: Option<u64>,
+    #[serde(default)]
+    jobs: Option<usize>,
+    #[serde(default)]
+    languages: HashMap<String, LanguageTestConfig>,
+}
+
+impl<'de> Deserialize<'de> for TestConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = RawTestConfig::deserialize(deserializer)?;
+        Ok(Self {
+            profile: raw.profile,
+            command: raw.command,
+            build_command: raw.build_command,
+            timeout: raw.timeout.unwrap_or_else(default_timeout),
+            jobs: raw.jobs.unwrap_or_else(default_jobs),
+            languages: raw.languages,
+            jobs_explicit: raw.jobs.is_some(),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+#[value(rename_all = "kebab-case")]
+pub enum ResourceProfile {
+    Cool,
+    Balanced,
+    Ci,
+}
+
+impl ResourceProfile {
+    pub fn default_jobs(self) -> usize {
+        std::thread::available_parallelism()
+            .map(|n| self.jobs_for_available_parallelism(n.get()))
+            .unwrap_or(1)
+    }
+
+    pub fn jobs_for_available_parallelism(self, available: usize) -> usize {
+        match self {
+            Self::Cool => 1,
+            Self::Balanced => default_jobs_for_available_parallelism(available),
+            Self::Ci => available.max(1),
+        }
+    }
+
+    pub fn default_fail_fast(self) -> bool {
+        matches!(self, Self::Cool)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -250,16 +311,22 @@ impl TestConfig {
             &self.command
         }
     }
+
+    pub fn jobs_was_explicit(&self) -> bool {
+        self.jobs_explicit
+    }
 }
 
 impl Default for TestConfig {
     fn default() -> Self {
         Self {
+            profile: None,
             command: default_test_command(),
             build_command: vec![],
             timeout: default_timeout(),
             jobs: default_jobs(),
             languages: HashMap::new(),
+            jobs_explicit: false,
         }
     }
 }
@@ -373,7 +440,8 @@ impl Config {
         }
 
         template.push_str(&format!(
-            "timeout = 30\n\
+            "# profile = \"cool\"  # cool, balanced, or ci; explicit jobs still win\n\
+             timeout = 30\n\
              # jobs = {}  # conservative local default; raise in CI for throughput\n\
              \n",
             default_jobs()
@@ -470,6 +538,7 @@ mod tests {
     fn parse_valid_toml() {
         let toml_str = r#"
 [test]
+profile = "ci"
 command = ["make", "test"]
 timeout = 60
 jobs = 8
@@ -482,9 +551,11 @@ max_per_run = 50
 schemata = true
 "#;
         let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.test.profile, Some(ResourceProfile::Ci));
         assert_eq!(config.test.command, vec!["make", "test"]);
         assert_eq!(config.test.timeout, 60);
         assert_eq!(config.test.jobs, 8);
+        assert!(config.test.jobs_was_explicit());
         assert_eq!(config.diff.base, "origin/develop");
         assert_eq!(config.mutations.max_per_run, 50);
         assert!(config.mutations.schemata);
@@ -550,11 +621,13 @@ commnad = ["cargo", "test"]
     fn defaults_when_empty() {
         let config: Config = toml::from_str("").unwrap();
         // Command is empty sentinel when not explicitly configured
+        assert_eq!(config.test.profile, None);
         assert!(config.test.command.is_empty());
         assert!(config.test.build_command.is_empty());
         assert!(config.test.languages.is_empty());
         assert_eq!(config.test.timeout, 30);
         assert!(config.test.jobs >= 1);
+        assert!(!config.test.jobs_was_explicit());
         assert_eq!(config.diff.base, "origin/main");
         assert_eq!(config.mutations.max_per_run, 20);
         assert_eq!(config.mutations.max_per_file, 20);
@@ -575,6 +648,28 @@ commnad = ["cargo", "test"]
         assert_eq!(default_jobs_for_available_parallelism(2), 1);
         assert_eq!(default_jobs_for_available_parallelism(3), 2);
         assert_eq!(default_jobs_for_available_parallelism(16), 2);
+    }
+
+    #[test]
+    fn profile_jobs_are_predictable() {
+        assert_eq!(ResourceProfile::Cool.jobs_for_available_parallelism(16), 1);
+        assert_eq!(
+            ResourceProfile::Balanced.jobs_for_available_parallelism(16),
+            2
+        );
+        assert_eq!(ResourceProfile::Ci.jobs_for_available_parallelism(16), 16);
+        assert_eq!(ResourceProfile::Ci.jobs_for_available_parallelism(0), 1);
+    }
+
+    #[test]
+    fn parse_profile_without_explicit_jobs() {
+        let toml_str = r#"
+[test]
+profile = "cool"
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.test.profile, Some(ResourceProfile::Cool));
+        assert!(!config.test.jobs_was_explicit());
     }
 
     #[test]

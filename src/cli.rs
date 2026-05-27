@@ -41,6 +41,10 @@ pub enum Commands {
         #[arg(short, long, default_value = "terminal")]
         format: OutputFormat,
 
+        /// Resource profile for worker count and nested runner limits
+        #[arg(long, value_enum)]
+        profile: Option<crate::config::ResourceProfile>,
+
         /// Number of parallel mutation workers
         #[arg(short, long)]
         jobs: Option<usize>,
@@ -210,6 +214,18 @@ mod tests {
         match cli.command {
             Commands::Check { max_per_run, .. } => {
                 assert_eq!(max_per_run, Some(25));
+            }
+            _ => panic!("expected Check command"),
+        }
+    }
+
+    #[test]
+    fn profile_argument_is_accepted() {
+        let cli = Cli::try_parse_from(["togi", "check", "--profile", "cool"])
+            .expect("--profile cool should parse");
+        match cli.command {
+            Commands::Check { profile, .. } => {
+                assert_eq!(profile, Some(crate::config::ResourceProfile::Cool));
             }
             _ => panic!("expected Check command"),
         }
