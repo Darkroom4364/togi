@@ -7,3 +7,5 @@
 .codex/
 .claude/
 togi.toml
+editors/vscode/node_modules/
+editors/vscode/*.vsix

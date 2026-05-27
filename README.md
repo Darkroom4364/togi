@@ -418,6 +418,16 @@ togi explain 1 --report togi-report.json
 
 The explanation includes the mutation location, operator, result, before/after values, diff when available, and the recorded test/build command context.
 
+## VS Code integration
+
+A lightweight VS Code extension lives in `editors/vscode`. It reads
+`togi-report.json`, shows survived mutants as inline warnings, and adds a quick
+fix to open mutation details or the diff:
+
+```bash
+togi check --format json > togi-report.json
+```
+
 ## Baselines
 
 Save a passing mutation baseline and fail later runs only when the score regresses:
