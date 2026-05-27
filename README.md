@@ -94,7 +94,7 @@ togi check --all
 togi check --jobs 2 --timeout 60
 
 # Keep laptop CPU/temperature lower
-togi check --jobs 1 --fail-fast
+togi check --profile cool
 
 # Cap mutation count for a bounded exploratory run
 togi check --max-per-run 50  # --max-per-run 0 = unlimited
@@ -168,6 +168,8 @@ Create a `togi.toml` for customization:
 
 ```toml
 [test]
+# Optional: cool, balanced, or ci
+profile = "balanced"
 command = ["go", "test", "./..."]
 timeout = 30
 jobs = 2
@@ -204,19 +206,29 @@ Test command precedence is: CLI `--test-cmd` / `--timeout`, matching
 then the global `[test]` command.
 When `--test-cmd` is set, `--fail-fast` does not modify the custom command;
 include runner-specific fail-fast flags in `--test-cmd` instead.
+Resource profiles provide defaults only: explicit CLI flags and `togi.toml`
+settings such as `jobs` keep taking precedence.
 
 ## Resource tuning
 
 The default worker count is conservative for local machines: `1` on 1-2 CPU
-systems, otherwise `2`. Increase `--jobs` or `[test] jobs` in CI when throughput
-matters more than fan noise, temperature, or foreground responsiveness.
+systems, otherwise `2`. For named presets, use `--profile cool`, `--profile
+balanced`, or `--profile ci`.
+
+`cool` uses one togi worker, enables fail-fast when togi owns the test command,
+and sets safe caps for known nested runners when those environment variables are
+not already set (`CARGO_BUILD_JOBS`, `RUST_TEST_THREADS`, `GOMAXPROCS`, and
+`PYTEST_XDIST_AUTO_NUM_WORKERS`). `balanced` matches the current conservative
+local defaults. `ci` uses the available CPU count for togi jobs. Explicit
+`--jobs`, `[test] jobs`, `--test-cmd`, and existing environment variables still
+win.
 
 Each togi worker runs the configured test command, and that test command may
 parallelize too. For cooler local runs, cap both layers:
 
 ```bash
 # Togi only runs one mutation test process at a time
-togi check --jobs 1 --fail-fast
+togi check --profile cool
 
 # Rust: cap Cargo build jobs and libtest threads
 togi check --jobs 1 --test-cmd "cargo test -j 2 -- --test-threads=2"

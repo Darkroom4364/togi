@@ -1,6 +1,6 @@
 use anyhow::Context;
 use clap::Parser;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::Arc;
@@ -16,6 +16,7 @@ struct CheckConfig {
     base: Option<String>,
     config_path: Option<PathBuf>,
     output_format: togi::cli::OutputFormat,
+    profile: Option<togi::config::ResourceProfile>,
     jobs: Option<usize>,
     timeout: Option<u64>,
     max_per_run: Option<usize>,
@@ -47,7 +48,17 @@ struct ExecuteOptions {
     force_default_command: bool,
     force_default_timeout: bool,
     early_stop: togi::runner::EarlyStopConfig,
+    env: HashMap<String, String>,
     cancelled: Arc<AtomicBool>,
+}
+
+struct ResolvedCheckConfig {
+    config: togi::config::Config,
+    fail_fast: bool,
+    has_explicit_build_cmd: bool,
+    has_custom_test_cmd: bool,
+    has_cli_timeout: bool,
+    profile: Option<togi::config::ResourceProfile>,
 }
 
 fn main() {
@@ -74,6 +85,7 @@ fn main() {
             base,
             config,
             format,
+            profile,
             jobs,
             timeout,
             max_per_run,
@@ -103,6 +115,7 @@ fn main() {
                 base,
                 config_path: config,
                 output_format: format,
+                profile,
                 jobs,
                 timeout,
                 max_per_run,
@@ -302,13 +315,28 @@ fn run_check(cfg: CheckConfig, cancelled: Arc<AtomicBool>) -> anyhow::Result<()>
     let check_baseline = cfg.check_baseline;
     let pr_comment = cfg.pr_comment.clone();
 
-    let (mut config, fail_fast, has_explicit_build_cmd, has_custom_test_cmd, has_cli_timeout) =
-        resolve_config(cfg)?;
+    let resolved = resolve_config(cfg)?;
+    let ResolvedCheckConfig {
+        mut config,
+        fail_fast,
+        has_explicit_build_cmd,
+        has_custom_test_cmd,
+        has_cli_timeout,
+        profile,
+    } = resolved;
     let project_root = get_project_root()?;
     let _lock = togi::lock::acquire(&project_root)?;
 
     config.resolve_test_command(&project_root);
     config.resolve_build_command(&project_root);
+    warn_if_resource_oversubscribed(config.test.jobs);
+    let profile_env = if has_custom_test_cmd {
+        HashMap::new()
+    } else {
+        profile
+            .map(|profile| resource_profile_env(profile, &config))
+            .unwrap_or_default()
+    };
 
     if fail_fast {
         let args = togi::config::failfast_args(&config.test.command);
@@ -364,6 +392,7 @@ fn run_check(cfg: CheckConfig, cancelled: Arc<AtomicBool>) -> anyhow::Result<()>
             force_default_command: has_custom_test_cmd,
             force_default_timeout: has_cli_timeout,
             early_stop,
+            env: profile_env,
             cancelled,
         },
     );
@@ -435,16 +464,20 @@ fn exit_with(lock: togi::lock::LockGuard, code: i32) -> ! {
     process::exit(code);
 }
 
-fn resolve_config(
-    cfg: CheckConfig,
-) -> anyhow::Result<(togi::config::Config, bool, bool, bool, bool)> {
+fn resolve_config(cfg: CheckConfig) -> anyhow::Result<ResolvedCheckConfig> {
     let mut config = togi::config::Config::load(cfg.config_path.as_deref())?;
     let has_custom_test_cmd = cfg.test_cmd.is_some();
     let has_cli_build_cmd = cfg.build_cmd.is_some();
     let has_cli_timeout = cfg.timeout.is_some();
+    let profile = cfg.profile.or(config.test.profile);
 
     if let Some(b) = cfg.base {
         config.diff.base = b;
+    }
+    if let Some(profile) = profile {
+        if cfg.jobs.is_none() && !config.test.jobs_was_explicit() {
+            config.test.jobs = profile.default_jobs();
+        }
     }
     if let Some(j) = cfg.jobs {
         config.test.jobs = j;
@@ -484,19 +517,95 @@ fn resolve_config(
     }
 
     let has_explicit_build_cmd = has_cli_build_cmd || !config.test.build_command.is_empty();
-    let fail_fast = cfg.fail_fast && !has_custom_test_cmd;
+    let profile_fail_fast = profile.is_some_and(|profile| profile.default_fail_fast());
+    let requested_fail_fast = cfg.fail_fast || profile_fail_fast;
+    let fail_fast = requested_fail_fast && !has_custom_test_cmd;
     if cfg.fail_fast && has_custom_test_cmd {
         eprintln!(
             "warning: --fail-fast is ignored when --test-cmd is set; include fail-fast flags in the custom command"
         );
+    } else if profile_fail_fast && has_custom_test_cmd {
+        eprintln!(
+            "warning: --profile cool fail-fast default is ignored when --test-cmd is set; include fail-fast flags in the custom command"
+        );
     }
-    Ok((
+    Ok(ResolvedCheckConfig {
         config,
         fail_fast,
         has_explicit_build_cmd,
         has_custom_test_cmd,
         has_cli_timeout,
-    ))
+        profile,
+    })
+}
+
+fn warn_if_resource_oversubscribed(jobs: usize) {
+    if let Ok(available) = std::thread::available_parallelism() {
+        if jobs > available.get() {
+            eprintln!(
+                "warning: {jobs} togi jobs exceed available parallelism ({}); test runners may oversubscribe CPUs",
+                available.get()
+            );
+        }
+    }
+}
+
+fn resource_profile_env(
+    profile: togi::config::ResourceProfile,
+    config: &togi::config::Config,
+) -> HashMap<String, String> {
+    let mut commands: Vec<&[String]> = Vec::new();
+    commands.push(&config.test.command);
+    commands.extend(
+        config
+            .test
+            .languages
+            .values()
+            .map(|lang_config| lang_config.command.as_slice()),
+    );
+    commands.extend(config.projects.values().filter_map(|project| {
+        project
+            .test
+            .as_ref()
+            .and_then(|test| test.command.as_deref())
+    }));
+    resource_profile_env_for_commands(profile, &commands, |name| std::env::var_os(name).is_some())
+}
+
+fn resource_profile_env_for_commands(
+    profile: togi::config::ResourceProfile,
+    commands: &[&[String]],
+    env_exists: impl Fn(&str) -> bool,
+) -> HashMap<String, String> {
+    let mut env = HashMap::new();
+    if profile != togi::config::ResourceProfile::Cool {
+        return env;
+    }
+
+    let has_runner = |runner: &str| {
+        commands
+            .iter()
+            .filter_map(|command| command.first())
+            .any(|program| program == runner)
+    };
+    let mut set_if_missing = |key: &str, value: &str| {
+        if !env_exists(key) {
+            env.insert(key.to_string(), value.to_string());
+        }
+    };
+
+    if has_runner("cargo") {
+        set_if_missing("CARGO_BUILD_JOBS", "1");
+        set_if_missing("RUST_TEST_THREADS", "1");
+    }
+    if has_runner("go") {
+        set_if_missing("GOMAXPROCS", "1");
+    }
+    if has_runner("pytest") {
+        set_if_missing("PYTEST_XDIST_AUTO_NUM_WORKERS", "1");
+    }
+
+    env
 }
 
 /// Parse a shard spec like "1/4" into (k, n) where k is 1-indexed.
@@ -727,7 +836,7 @@ fn execute(
         },
         early_stop: options.early_stop,
         respect_workspace_ignores: config.mutations.respect_workspace_ignores,
-        env: std::collections::HashMap::new(),
+        env: options.env,
         cancelled: options.cancelled,
     };
 
@@ -1076,6 +1185,114 @@ fn validate_diff_base(base: &str) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn check_config() -> CheckConfig {
+        CheckConfig {
+            all: false,
+            paths: vec![],
+            base: None,
+            config_path: None,
+            output_format: togi::cli::OutputFormat::Terminal,
+            profile: None,
+            jobs: None,
+            timeout: None,
+            max_per_run: None,
+            first_survivor: false,
+            max_survivors: None,
+            schemata: false,
+            no_schemata: false,
+            dry_run: false,
+            verbose: false,
+            show_output: false,
+            test_cmd: None,
+            coverage_file: None,
+            test_selection_file: None,
+            build_cmd: None,
+            fail_fast: false,
+            no_skip_defaults: false,
+            operators: None,
+            fail_under: None,
+            shard: None,
+            save_baseline: false,
+            check_baseline: false,
+            pr_comment: None,
+        }
+    }
+
+    #[test]
+    fn resolve_config_applies_profile_jobs_when_implicit() {
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let config_path = dir.path().join("togi.toml");
+        std::fs::write(&config_path, "").expect("empty config should be written");
+        let mut cfg = check_config();
+        cfg.config_path = Some(config_path);
+        cfg.profile = Some(togi::config::ResourceProfile::Cool);
+
+        let resolved = resolve_config(cfg).expect("config should resolve");
+
+        assert_eq!(resolved.config.test.jobs, 1);
+        assert!(resolved.fail_fast);
+    }
+
+    #[test]
+    fn resolve_config_keeps_explicit_jobs_over_profile() {
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let config_path = dir.path().join("togi.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[test]
+profile = "cool"
+jobs = 4
+"#,
+        )
+        .expect("config should be written");
+        let mut cfg = check_config();
+        cfg.config_path = Some(config_path);
+
+        let resolved = resolve_config(cfg).expect("config should resolve");
+
+        assert_eq!(resolved.profile, Some(togi::config::ResourceProfile::Cool));
+        assert_eq!(resolved.config.test.jobs, 4);
+        assert!(resolved.fail_fast);
+    }
+
+    #[test]
+    fn resolve_config_cli_jobs_override_profile() {
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let config_path = dir.path().join("togi.toml");
+        std::fs::write(&config_path, "").expect("empty config should be written");
+        let mut cfg = check_config();
+        cfg.config_path = Some(config_path);
+        cfg.profile = Some(togi::config::ResourceProfile::Ci);
+        cfg.jobs = Some(3);
+
+        let resolved = resolve_config(cfg).expect("config should resolve");
+
+        assert_eq!(resolved.config.test.jobs, 3);
+    }
+
+    #[test]
+    fn cool_profile_sets_safe_runner_env_without_overriding_user_env() {
+        let cargo = vec!["cargo".to_string(), "test".to_string()];
+        let go = vec!["go".to_string(), "test".to_string(), "./...".to_string()];
+        let pytest = vec!["pytest".to_string()];
+        let commands: [&[String]; 3] = [&cargo, &go, &pytest];
+
+        let env = resource_profile_env_for_commands(
+            togi::config::ResourceProfile::Cool,
+            &commands,
+            |name| name == "GOMAXPROCS",
+        );
+
+        assert_eq!(env.get("CARGO_BUILD_JOBS").map(String::as_str), Some("1"));
+        assert_eq!(env.get("RUST_TEST_THREADS").map(String::as_str), Some("1"));
+        assert_eq!(
+            env.get("PYTEST_XDIST_AUTO_NUM_WORKERS").map(String::as_str),
+            Some("1")
+        );
+        assert!(!env.contains_key("GOMAXPROCS"));
+    }
 
     #[test]
     fn parse_test_selection_json_accepts_file_line_test_map() {

@@ -4,6 +4,13 @@
 # string so togi does not need to re-split a shell command.
 
 [test]
+# Optional resource profile. `cool` keeps local runs quiet, `balanced` matches
+# the default local behavior, and `ci` uses more available parallelism.
+# Explicit jobs and existing environment variables still win over profile defaults.
+# Type: "cool", "balanced", or "ci"
+# Default: unset
+# profile = "cool"
+
 # Test command to run for each mutation.
 # Type: array of strings
 # Default: auto-detected from project files, or ["make", "test"] if unknown.
