@@ -113,6 +113,14 @@ pub enum Commands {
         #[arg(long)]
         test_selection_file: Option<PathBuf>,
 
+        /// Disable structured incremental history reuse
+        #[arg(long)]
+        no_incremental_history: bool,
+
+        /// Re-run mutations even when cache or history has a matching result
+        #[arg(long)]
+        force_rerun: bool,
+
         /// Override build check command (e.g., 'cargo check')
         #[arg(long)]
         build_cmd: Option<String>,
@@ -222,6 +230,24 @@ mod tests {
             }
             _ => panic!("expected TestMap command"),
         }
+    }
+
+    #[test]
+    fn incremental_history_arguments_are_accepted() -> anyhow::Result<()> {
+        let cli =
+            Cli::try_parse_from(["togi", "check", "--no-incremental-history", "--force-rerun"])?;
+        match cli.command {
+            Commands::Check {
+                no_incremental_history,
+                force_rerun,
+                ..
+            } => {
+                assert!(no_incremental_history);
+                assert!(force_rerun);
+            }
+            _ => panic!("expected Check command"),
+        }
+        Ok(())
     }
 
     #[test]

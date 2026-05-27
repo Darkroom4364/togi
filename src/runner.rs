@@ -175,6 +175,10 @@ pub struct TestRunner {
     pub respect_workspace_ignores: bool,
     /// Extra environment variables passed to every spawned command.
     pub env: HashMap<String, String>,
+    /// Use structured incremental history in addition to exact cache entries.
+    pub incremental_history: bool,
+    /// Re-run mutations instead of trusting cache or incremental history hits.
+    pub force_rerun: bool,
     /// Set to true externally (e.g. Ctrl+C handler) to stop spawning new mutations.
     pub cancelled: Arc<AtomicBool>,
 }
@@ -209,6 +213,7 @@ pub struct BaselineTimingConfig<'a> {
 struct SelectedTestCommand {
     argv: Vec<String>,
     timeout: Duration,
+    selected_tests: Vec<String>,
 }
 
 impl SelectedTestCommand {
@@ -235,10 +240,20 @@ impl SelectedTestCommand {
     }
 }
 
+#[cfg(test)]
 fn select_test_command(
     project_root: &Path,
     commands: &CommandConfig,
     mutation: &Mutation,
+) -> SelectedTestCommand {
+    select_test_command_with_history(project_root, commands, mutation, None)
+}
+
+fn select_test_command_with_history(
+    project_root: &Path,
+    commands: &CommandConfig,
+    mutation: &Mutation,
+    history: Option<&cache::IncrementalHistoryStore>,
 ) -> SelectedTestCommand {
     let project_info = matching_project_command(project_root, commands, mutation);
 
@@ -252,10 +267,21 @@ fn select_test_command(
         })
         .unwrap_or(&commands.command)
         .clone();
+    let mut selected_tests = Vec::new();
 
     if let Some(test_selection) = &commands.test_selection {
-        if let Some(tests) = test_selection.tests_for(project_root, mutation) {
+        if let Some(mut tests) = test_selection.tests_for(project_root, mutation) {
+            if let Some(preferred) = history.and_then(|history| {
+                history.preferred_killer_test(
+                    &cache_identity(project_root, mutation),
+                    &mutation.description,
+                    &tests,
+                )
+            }) {
+                tests.sort_by_key(|test| if *test == preferred { 0 } else { 1 });
+            }
             argv = narrow_test_command(argv, &tests);
+            selected_tests = tests;
         }
     }
 
@@ -274,6 +300,7 @@ fn select_test_command(
                 })
                 .unwrap_or(commands.timeout)
         },
+        selected_tests,
     }
 }
 
@@ -884,6 +911,130 @@ impl SourceContentCache {
             .expect("source content cache mutex poisoned")
             .len()
     }
+}
+
+#[derive(Default)]
+struct TestContextIndex {
+    files: Vec<TestContextFile>,
+}
+
+struct TestContextFile {
+    key: String,
+    content: Vec<u8>,
+    text: Option<String>,
+}
+
+impl TestContextIndex {
+    fn build(project_root: &Path) -> Self {
+        let mut files = Vec::new();
+        collect_cache_context_files(project_root, project_root, &mut files);
+        files.sort_by_key(|path| normalized_cache_path(project_root, path));
+
+        let files = files
+            .into_iter()
+            .filter_map(|relative| {
+                let content = fs::read(project_root.join(&relative)).ok()?;
+                let key = normalized_cache_path(project_root, &relative);
+                let text = String::from_utf8(content.clone()).ok();
+                Some(TestContextFile { key, content, text })
+            })
+            .collect();
+
+        Self { files }
+    }
+
+    fn fingerprint_for_tests(&self, tests: &[String], fallback: u64) -> u64 {
+        if tests.is_empty() || self.files.is_empty() {
+            return fallback;
+        }
+
+        let mut matched = BTreeSet::new();
+        for test in tests {
+            let matches = self.files_for_test(test);
+            if matches.is_empty() {
+                return fallback;
+            }
+            matched.extend(matches);
+        }
+
+        let mut hasher = StableCacheHasher::default();
+        update_cache_hash(&mut hasher, b"selected-test-context-v1");
+        for test in tests {
+            update_cache_hash(&mut hasher, test.as_bytes());
+        }
+        for index in matched {
+            if let Some(file) = self.files.get(index) {
+                update_cache_hash(&mut hasher, file.key.as_bytes());
+                update_cache_hash(&mut hasher, &file.content);
+            }
+        }
+        hasher.finish()
+    }
+
+    fn files_for_test(&self, test: &str) -> Vec<usize> {
+        if let Some(path_key) = direct_test_path_key(test) {
+            return self
+                .files
+                .iter()
+                .enumerate()
+                .filter_map(|(index, file)| (file.key == path_key).then_some(index))
+                .collect();
+        }
+
+        let tokens = test_name_tokens(test);
+        if tokens.is_empty() {
+            return Vec::new();
+        }
+
+        self.files
+            .iter()
+            .enumerate()
+            .filter_map(|(index, file)| {
+                let text = file.text.as_ref()?;
+                tokens
+                    .iter()
+                    .all(|token| text.contains(token))
+                    .then_some(index)
+            })
+            .collect()
+    }
+}
+
+fn direct_test_path_key(test: &str) -> Option<String> {
+    let path_part = test.split("::").next().unwrap_or(test);
+    if !looks_like_test_path(path_part) {
+        return None;
+    }
+    Some(normalized_cache_path(Path::new(""), Path::new(path_part)))
+}
+
+fn looks_like_test_path(value: &str) -> bool {
+    (value.contains('/') || value.contains('\\'))
+        && matches!(
+            Path::new(value)
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .unwrap_or(""),
+            "go" | "rs" | "py" | "ts" | "tsx" | "js" | "jsx" | "java" | "cs" | "rb"
+        )
+}
+
+fn test_name_tokens(test: &str) -> Vec<String> {
+    if test.chars().any(char::is_whitespace) {
+        return (test.len() >= 3)
+            .then(|| test.to_string())
+            .into_iter()
+            .collect();
+    }
+
+    let mut tokens = BTreeSet::new();
+    for token in test.split([':', '#', '.']) {
+        let token = token.trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_');
+        if token.len() >= 3 {
+            tokens.insert(token.to_string());
+        }
+    }
+    tokens.into_iter().collect()
 }
 
 fn read_source_content(project_root: &Path, mutation_file: &Path) -> Option<Vec<u8>> {
@@ -1685,7 +1836,10 @@ struct RunShared<'a> {
     early_stop: Option<&'a Arc<EarlyStopState>>,
     respect_workspace_ignores: bool,
     cache_context_fingerprint: u64,
+    test_context_index: &'a TestContextIndex,
     source_contents: &'a SourceContentCache,
+    history: Option<&'a cache::IncrementalHistoryStore>,
+    force_rerun: bool,
 }
 
 fn should_stop_early(early_stop: &Option<Arc<EarlyStopState>>) -> bool {
@@ -1696,6 +1850,51 @@ fn record_early_stop(shared: &RunShared<'_>, result: MutationResult) {
     if let Some(early_stop) = shared.early_stop {
         early_stop.record(result);
     }
+}
+
+fn incremental_history_query(
+    project_root: &Path,
+    mutation: &Mutation,
+    source_content: &[u8],
+    command_context: &str,
+    relevant_test_hash: u64,
+) -> cache::IncrementalHistoryQuery {
+    cache::IncrementalHistoryQuery {
+        mutation_identity: cache_identity(project_root, mutation),
+        mutation_description: mutation.description.clone(),
+        source_hash: cache::hash_bytes(source_content),
+        command_hash: cache::hash_str(command_context),
+        relevant_test_hash,
+    }
+}
+
+fn record_incremental_history(
+    history: Option<&cache::IncrementalHistoryStore>,
+    query: Option<&cache::IncrementalHistoryQuery>,
+    selected_tests: &[String],
+    result: MutationResult,
+    previous_killer: Option<String>,
+) {
+    let (Some(history), Some(query)) = (history, query) else {
+        return;
+    };
+    let killer_test = if result == MutationResult::Killed {
+        previous_killer
+            .filter(|killer| selected_tests.iter().any(|test| test == killer))
+            .or_else(|| (selected_tests.len() == 1).then(|| selected_tests[0].clone()))
+    } else {
+        None
+    };
+    history.record(cache::IncrementalHistoryEntry {
+        mutation_identity: query.mutation_identity.clone(),
+        mutation_description: query.mutation_description.clone(),
+        result,
+        source_hash: query.source_hash,
+        command_hash: query.command_hash,
+        relevant_test_hash: query.relevant_test_hash,
+        covering_tests: selected_tests.to_vec(),
+        killer_test,
+    });
 }
 
 fn run_queued_mutation(
@@ -1710,36 +1909,83 @@ fn run_queued_mutation(
         return None;
     }
 
-    let selected_test = select_test_command(shared.project_root, shared.commands, &mutation);
-    let cache_ctx = selected_test.cache_context(
+    let selected_test = select_test_command_with_history(
+        shared.project_root,
+        shared.commands,
+        &mutation,
+        shared.history,
+    );
+    let command_ctx = selected_test.cache_context(
         shared.build_command,
         shared.build_command_explicit,
         shared.env,
     );
+    let relevant_test_hash = shared.test_context_index.fingerprint_for_tests(
+        &selected_test.selected_tests,
+        shared.cache_context_fingerprint,
+    );
+    let previous_killer = shared.history.and_then(|history| {
+        history.preferred_killer_test(
+            &cache_identity(shared.project_root, &mutation),
+            &mutation.description,
+            &selected_test.selected_tests,
+        )
+    });
     let cache_ctx = format!(
-        "{cache_ctx};context={:016x}",
+        "{command_ctx};context={:016x}",
         shared.cache_context_fingerprint
     );
 
-    // Check cache before acquiring a workspace slot.
-    let cache_key = shared
+    let source_content = shared
         .source_contents
-        .content_for(shared.project_root, &mutation.file)
-        .map(|content| {
-            CacheKey::new(
-                &content,
-                &cache_identity(shared.project_root, &mutation),
-                &mutation.description,
-                &cache_ctx,
-            )
-        });
-    if let Some(ref key) = cache_key {
-        if let Some(result) = cache::lookup(shared.project_root, key) {
-            reservation.release();
-            record_progress(&shared, &mutation, result, None, true);
-            record_early_stop(&shared, result);
-            let diagnostic = cached_build_error_diagnostic(&mutation, "regular", result);
-            return Some((index, MutationRunRecord::new(mutation, result, diagnostic)));
+        .content_for(shared.project_root, &mutation.file);
+    let history_query = source_content.as_deref().map(|content| {
+        incremental_history_query(
+            shared.project_root,
+            &mutation,
+            content,
+            &command_ctx,
+            relevant_test_hash,
+        )
+    });
+    let cache_key = source_content.as_ref().map(|content| {
+        CacheKey::new(
+            content,
+            &cache_identity(shared.project_root, &mutation),
+            &mutation.description,
+            &cache_ctx,
+        )
+    });
+
+    // Check exact cache and then structured history before acquiring a workspace slot.
+    if !shared.force_rerun {
+        if let Some(ref key) = cache_key {
+            if let Some(result) = cache::lookup(shared.project_root, key) {
+                record_incremental_history(
+                    shared.history,
+                    history_query.as_ref(),
+                    &selected_test.selected_tests,
+                    result,
+                    previous_killer.clone(),
+                );
+                reservation.release();
+                record_progress(&shared, &mutation, result, None, true);
+                record_early_stop(&shared, result);
+                let diagnostic = cached_build_error_diagnostic(&mutation, "regular", result);
+                return Some((index, MutationRunRecord::new(mutation, result, diagnostic)));
+            }
+        }
+        if let (Some(history), Some(query)) = (shared.history, history_query.as_ref()) {
+            if let Some(result) = history.lookup(query) {
+                if let Some(ref key) = cache_key {
+                    cache::store(shared.project_root, key, result);
+                }
+                reservation.release();
+                record_progress(&shared, &mutation, result, None, true);
+                record_early_stop(&shared, result);
+                let diagnostic = cached_build_error_diagnostic(&mutation, "regular", result);
+                return Some((index, MutationRunRecord::new(mutation, result, diagnostic)));
+            }
         }
     }
 
@@ -1802,6 +2048,13 @@ fn run_queued_mutation(
     if let Some(ref key) = cache_key {
         cache::store(shared.project_root, key, outcome.result);
     }
+    record_incremental_history(
+        shared.history,
+        history_query.as_ref(),
+        &selected_test.selected_tests,
+        outcome.result,
+        previous_killer,
+    );
 
     let result = outcome.result;
     record_progress(
@@ -2088,6 +2341,10 @@ impl TestRunner {
         let results = Arc::new(Mutex::new(Vec::new()));
         let worker_count = workspace_pool.len().min(total).max(1);
         let cache_context_hash = cache_context_fingerprint(&self.project_root);
+        let test_context_index = TestContextIndex::build(&self.project_root);
+        let history = self
+            .incremental_history
+            .then(|| cache::IncrementalHistoryStore::load(&self.project_root));
 
         thread::scope(|scope| {
             for _ in 0..worker_count {
@@ -2104,6 +2361,9 @@ impl TestRunner {
                 let max_tested = self.max_tested;
                 let show_output = self.show_output;
                 let source_contents = &source_contents;
+                let test_context_index = &test_context_index;
+                let history = history.as_ref();
+                let force_rerun = self.force_rerun;
                 let early_stop = early_stop.clone();
 
                 scope.spawn(move || {
@@ -2152,7 +2412,10 @@ impl TestRunner {
                                     early_stop: early_stop.as_ref(),
                                     respect_workspace_ignores: self.respect_workspace_ignores,
                                     cache_context_fingerprint: cache_context_hash,
+                                    test_context_index,
                                     source_contents,
+                                    history,
+                                    force_rerun,
                                 },
                             )
                         }));
@@ -2227,6 +2490,10 @@ impl TestRunner {
         let tested_counter = Arc::new(AtomicUsize::new(0));
         let source_contents = SourceContentCache::default();
         let cache_context_hash = cache_context_fingerprint(&self.project_root);
+        let test_context_index = TestContextIndex::build(&self.project_root);
+        let history = self
+            .incremental_history
+            .then(|| cache::IncrementalHistoryStore::load(&self.project_root));
         let mut workspace_needs_reset = false;
         for schema_mutation in schema_mutations {
             if self.cancelled.load(Ordering::Acquire) || should_stop_early(&early_stop) {
@@ -2242,51 +2509,107 @@ impl TestRunner {
                 break;
             }
             let mutation = &schema_mutation.mutation;
-            let selected = select_test_command(&self.project_root, &self.commands, mutation);
+            let selected = select_test_command_with_history(
+                &self.project_root,
+                &self.commands,
+                mutation,
+                history.as_ref(),
+            );
             let argv = if language == "go" {
-                force_go_no_test_cache(selected.argv)
+                force_go_no_test_cache(selected.argv.clone())
             } else {
-                selected.argv
+                selected.argv.clone()
             };
             let mut env = self.env.clone();
             env.insert("TOGI_MUTANT".to_string(), mutation.id.to_string());
             let cache_selected = SelectedTestCommand {
                 argv: argv.clone(),
                 timeout: selected.timeout,
+                selected_tests: selected.selected_tests.clone(),
             };
-            let cache_ctx = cache_selected.cache_context(
+            let command_ctx = cache_selected.cache_context(
                 &self.commands.build_command,
                 self.commands.build_command_explicit,
                 &env,
             );
-            let cache_ctx = format!("{cache_ctx};context={cache_context_hash:016x}");
-            let cache_key = source_contents
-                .content_for(&self.project_root, &mutation.file)
-                .map(|content| {
-                    CacheKey::new(
-                        &content,
-                        &cache_identity(&self.project_root, mutation),
-                        &mutation.description,
-                        &cache_ctx,
-                    )
-                });
-            if let Some(ref key) = cache_key {
-                if let Some(result) = cache::lookup(&self.project_root, key) {
-                    reservation.release();
-                    if let Some(early_stop) = &early_stop {
-                        early_stop.record(result);
-                    }
-                    if self.verbose {
-                        eprintln!(
-                            "  [schema] ↻ cached  {}:{} — {}",
-                            mutation.file.display(),
-                            mutation.line,
-                            mutation.operator
+            let relevant_test_hash = test_context_index
+                .fingerprint_for_tests(&selected.selected_tests, cache_context_hash);
+            let previous_killer = history.as_ref().and_then(|history| {
+                history.preferred_killer_test(
+                    &cache_identity(&self.project_root, mutation),
+                    &mutation.description,
+                    &selected.selected_tests,
+                )
+            });
+            let cache_ctx = format!("{command_ctx};context={cache_context_hash:016x}");
+            let source_content = source_contents.content_for(&self.project_root, &mutation.file);
+            let history_query = source_content.as_deref().map(|content| {
+                incremental_history_query(
+                    &self.project_root,
+                    mutation,
+                    content,
+                    &command_ctx,
+                    relevant_test_hash,
+                )
+            });
+            let cache_key = source_content.as_ref().map(|content| {
+                CacheKey::new(
+                    content,
+                    &cache_identity(&self.project_root, mutation),
+                    &mutation.description,
+                    &cache_ctx,
+                )
+            });
+            if !self.force_rerun {
+                if let Some(ref key) = cache_key {
+                    if let Some(result) = cache::lookup(&self.project_root, key) {
+                        record_incremental_history(
+                            history.as_ref(),
+                            history_query.as_ref(),
+                            &selected.selected_tests,
+                            result,
+                            previous_killer.clone(),
                         );
+                        reservation.release();
+                        if let Some(early_stop) = &early_stop {
+                            early_stop.record(result);
+                        }
+                        if self.verbose {
+                            eprintln!(
+                                "  [schema] ↻ cached  {}:{} — {}",
+                                mutation.file.display(),
+                                mutation.line,
+                                mutation.operator
+                            );
+                        }
+                        let diagnostic =
+                            cached_build_error_diagnostic(mutation, "schemata", result);
+                        results.push(MutationRunRecord::new(mutation.clone(), result, diagnostic));
+                        continue;
                     }
-                    let diagnostic = cached_build_error_diagnostic(mutation, "schemata", result);
-                    results.push(MutationRunRecord::new(mutation.clone(), result, diagnostic));
-                    continue;
+                }
+                if let (Some(history), Some(query)) = (history.as_ref(), history_query.as_ref()) {
+                    if let Some(result) = history.lookup(query) {
+                        if let Some(ref key) = cache_key {
+                            cache::store(&self.project_root, key, result);
+                        }
+                        reservation.release();
+                        if let Some(early_stop) = &early_stop {
+                            early_stop.record(result);
+                        }
+                        if self.verbose {
+                            eprintln!(
+                                "  [schema] ↻ cached  {}:{} — {}",
+                                mutation.file.display(),
+                                mutation.line,
+                                mutation.operator
+                            );
+                        }
+                        let diagnostic =
+                            cached_build_error_diagnostic(mutation, "schemata", result);
+                        results.push(MutationRunRecord::new(mutation.clone(), result, diagnostic));
+                        continue;
+                    }
                 }
             }
 
@@ -2343,6 +2666,13 @@ impl TestRunner {
                     cache::store(&self.project_root, key, outcome.result);
                 }
             }
+            record_incremental_history(
+                history.as_ref(),
+                history_query.as_ref(),
+                &selected.selected_tests,
+                outcome.result,
+                previous_killer,
+            );
             if self.verbose {
                 let symbol = match outcome.result {
                     MutationResult::Killed => "✓ killed",
@@ -3574,6 +3904,17 @@ mod tests {
         }
     }
 
+    fn failing_command() -> Vec<String> {
+        #[cfg(windows)]
+        {
+            vec!["cmd".into(), "/C".into(), "exit 1".into()]
+        }
+        #[cfg(not(windows))]
+        {
+            vec!["sh".into(), "-c".into(), "false".into()]
+        }
+    }
+
     #[test]
     fn file_guard_restores_content_on_drop() {
         let dir = tempfile::tempdir().unwrap();
@@ -4035,10 +4376,12 @@ mod tests {
         let selected = SelectedTestCommand {
             argv: vec!["cargo test".into()],
             timeout: Duration::from_secs(2),
+            selected_tests: Vec::new(),
         };
         let ambiguous = SelectedTestCommand {
             argv: vec!["cargo".into(), "test".into()],
             timeout: Duration::from_secs(2),
+            selected_tests: Vec::new(),
         };
 
         assert_ne!(
@@ -4436,6 +4779,133 @@ mod tests {
         let selected = select_test_command(tmp.path(), &commands, &mutation);
 
         assert_eq!(selected.argv, vec!["make", "test"]);
+        Ok(())
+    }
+
+    #[test]
+    fn select_test_command_prioritizes_history_killer() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let mut selection = TestSelectionConfig::new();
+        selection.insert(
+            tmp.path(),
+            Path::new("src/calc.py"),
+            3,
+            vec!["test_slow".into(), "test_fast".into()],
+        );
+
+        let mut commands = test_command_config();
+        commands.command = vec!["pytest".into()];
+        commands.test_selection = Some(selection);
+
+        let mut mutation = make_test_mutation(Path::new("src/calc.py"));
+        mutation.line = 3;
+        let history = cache::IncrementalHistoryStore::load(tmp.path());
+        history.record(cache::IncrementalHistoryEntry {
+            mutation_identity: cache_identity(tmp.path(), &mutation),
+            mutation_description: mutation.description.clone(),
+            result: MutationResult::Killed,
+            source_hash: 1,
+            command_hash: 2,
+            relevant_test_hash: 3,
+            covering_tests: vec!["test_slow".into(), "test_fast".into()],
+            killer_test: Some("test_fast".into()),
+        });
+
+        let selected =
+            select_test_command_with_history(tmp.path(), &commands, &mutation, Some(&history));
+
+        assert_eq!(
+            selected.argv,
+            vec!["pytest", "-k", "test_fast or test_slow"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn incremental_history_reuses_result_and_force_rerun_bypasses_it() -> anyhow::Result<()> {
+        let (dir, file, mutation) = make_test_setup();
+        std::fs::create_dir_all(dir.path().join("tests"))?;
+        std::fs::write(
+            dir.path().join("tests/test_calc.rs"),
+            "fn test_add() { assert!(true); }\n",
+        )?;
+
+        let mut selection = TestSelectionConfig::new();
+        selection.insert(dir.path(), &file, mutation.line, vec!["test_add".into()]);
+        let commands = || CommandConfig {
+            command: failing_command(),
+            force_default_command: false,
+            force_default_timeout: false,
+            project_commands: vec![],
+            language_commands: HashMap::new(),
+            build_command: vec![],
+            build_command_explicit: false,
+            timeout: Duration::from_secs(5),
+            language_timeouts: HashMap::new(),
+            test_selection: Some(selection.clone()),
+        };
+
+        let command_config = commands();
+        let selected =
+            select_test_command_with_history(dir.path(), &command_config, &mutation, None);
+        let command_ctx =
+            selected.cache_context(&command_config.build_command, false, &HashMap::new());
+        let context_hash = cache_context_fingerprint(dir.path());
+        let test_context_index = TestContextIndex::build(dir.path());
+        let relevant_test_hash =
+            test_context_index.fingerprint_for_tests(&selected.selected_tests, context_hash);
+        let source = std::fs::read(&file)?;
+        let query = incremental_history_query(
+            dir.path(),
+            &mutation,
+            &source,
+            &command_ctx,
+            relevant_test_hash,
+        );
+        cache::IncrementalHistoryStore::load(dir.path()).record(cache::IncrementalHistoryEntry {
+            mutation_identity: query.mutation_identity.clone(),
+            mutation_description: query.mutation_description.clone(),
+            result: MutationResult::Survived,
+            source_hash: query.source_hash,
+            command_hash: query.command_hash,
+            relevant_test_hash: query.relevant_test_hash,
+            covering_tests: selected.selected_tests.clone(),
+            killer_test: None,
+        });
+
+        let cached_runner = TestRunner {
+            commands: commands(),
+            parallelism: 1,
+            project_root: dir.path().to_path_buf(),
+            verbose: false,
+            show_output: false,
+            max_tested: None,
+            early_stop: Default::default(),
+            respect_workspace_ignores: true,
+            env: HashMap::new(),
+            incremental_history: true,
+            force_rerun: false,
+            cancelled: Arc::new(AtomicBool::new(false)),
+        };
+        let cached = cached_runner.run(vec![mutation.clone()]).report;
+        assert_eq!(cached.results[0].1, MutationResult::Survived);
+
+        let forced_runner = TestRunner {
+            commands: commands(),
+            parallelism: 1,
+            project_root: dir.path().to_path_buf(),
+            verbose: false,
+            show_output: false,
+            max_tested: None,
+            early_stop: Default::default(),
+            respect_workspace_ignores: true,
+            env: HashMap::new(),
+            incremental_history: true,
+            force_rerun: true,
+            cancelled: Arc::new(AtomicBool::new(false)),
+        };
+        let forced = forced_runner.run(vec![mutation]).report;
+        assert_eq!(forced.results[0].1, MutationResult::Killed);
         Ok(())
     }
 
@@ -5301,6 +5771,8 @@ sleep 10"#
             early_stop: Default::default(),
             respect_workspace_ignores: true,
             env: HashMap::new(),
+            incremental_history: true,
+            force_rerun: false,
             cancelled,
         };
 
@@ -5363,6 +5835,8 @@ sleep 10"#
             early_stop: Default::default(),
             respect_workspace_ignores: true,
             env: HashMap::new(),
+            incremental_history: true,
+            force_rerun: false,
             cancelled: Arc::new(AtomicBool::new(false)),
         };
 
@@ -5430,6 +5904,8 @@ int main(void) {
             early_stop: Default::default(),
             respect_workspace_ignores: true,
             env: HashMap::new(),
+            incremental_history: true,
+            force_rerun: false,
             cancelled: Arc::new(AtomicBool::new(false)),
         };
 
@@ -5497,6 +5973,8 @@ int main() {
             early_stop: Default::default(),
             respect_workspace_ignores: true,
             env: HashMap::new(),
+            incremental_history: true,
+            force_rerun: false,
             cancelled: Arc::new(AtomicBool::new(false)),
         };
 
@@ -5551,6 +6029,8 @@ esac
             early_stop: Default::default(),
             respect_workspace_ignores: true,
             env: HashMap::new(),
+            incremental_history: true,
+            force_rerun: false,
             cancelled: Arc::new(AtomicBool::new(false)),
         };
 
@@ -5603,6 +6083,8 @@ touch side_effect
             early_stop: Default::default(),
             respect_workspace_ignores: true,
             env: HashMap::new(),
+            incremental_history: true,
+            force_rerun: false,
             cancelled: Arc::new(AtomicBool::new(false)),
         };
 
@@ -5656,6 +6138,7 @@ esac
         let cache_selected = SelectedTestCommand {
             argv: selected.argv,
             timeout: selected.timeout,
+            selected_tests: selected.selected_tests,
         };
         let cache_ctx = cache_selected.cache_context(
             &commands.build_command,
@@ -5684,6 +6167,8 @@ esac
             early_stop: Default::default(),
             respect_workspace_ignores: true,
             env,
+            incremental_history: true,
+            force_rerun: false,
             cancelled: Arc::new(AtomicBool::new(false)),
         };
 
@@ -5757,6 +6242,8 @@ class Calc {
             early_stop: Default::default(),
             respect_workspace_ignores: true,
             env: HashMap::new(),
+            incremental_history: true,
+            force_rerun: false,
             cancelled: Arc::new(AtomicBool::new(false)),
         };
 
@@ -5820,6 +6307,8 @@ mod tests {
                 );
                 env
             },
+            incremental_history: true,
+            force_rerun: false,
             cancelled: Arc::new(AtomicBool::new(false)),
         };
 
@@ -5863,6 +6352,8 @@ mod tests {
             early_stop: Default::default(),
             respect_workspace_ignores: true,
             env: HashMap::new(),
+            incremental_history: true,
+            force_rerun: false,
             cancelled: Arc::new(AtomicBool::new(false)),
         };
 
@@ -5908,6 +6399,8 @@ mod tests {
             },
             respect_workspace_ignores: true,
             env: HashMap::new(),
+            incremental_history: true,
+            force_rerun: false,
             cancelled: Arc::new(AtomicBool::new(false)),
         };
 
@@ -5962,6 +6455,8 @@ mod tests {
             },
             respect_workspace_ignores: true,
             env: HashMap::new(),
+            incremental_history: true,
+            force_rerun: false,
             cancelled: Arc::new(AtomicBool::new(false)),
         };
 
@@ -6029,6 +6524,8 @@ sleep 0.2
             early_stop: Default::default(),
             respect_workspace_ignores: true,
             env,
+            incremental_history: true,
+            force_rerun: false,
             cancelled: Arc::new(AtomicBool::new(false)),
         };
 
@@ -6101,6 +6598,8 @@ sleep 0.2
             early_stop: Default::default(),
             respect_workspace_ignores: true,
             env: HashMap::new(),
+            incremental_history: true,
+            force_rerun: false,
             cancelled: Arc::new(AtomicBool::new(false)),
         };
 
@@ -6186,6 +6685,8 @@ rmdir "$lock"
                 early_stop: Default::default(),
                 respect_workspace_ignores: true,
                 env,
+                incremental_history: true,
+                force_rerun: false,
                 cancelled: Arc::new(AtomicBool::new(false)),
             };
 
@@ -6257,6 +6758,8 @@ rmdir "$lock"
             early_stop: Default::default(),
             respect_workspace_ignores: true,
             env: HashMap::new(),
+            incremental_history: true,
+            force_rerun: false,
             cancelled: Arc::new(AtomicBool::new(false)),
         };
 
@@ -6327,6 +6830,8 @@ rmdir "$lock"
             early_stop: Default::default(),
             respect_workspace_ignores: true,
             env,
+            incremental_history: true,
+            force_rerun: false,
             cancelled: Arc::new(AtomicBool::new(false)),
         };
 
@@ -6391,6 +6896,8 @@ rmdir "$lock"
             early_stop: Default::default(),
             respect_workspace_ignores: true,
             env: HashMap::new(),
+            incremental_history: true,
+            force_rerun: false,
             cancelled: Arc::new(AtomicBool::new(false)),
         };
 
@@ -6435,6 +6942,8 @@ rmdir "$lock"
             early_stop: Default::default(),
             respect_workspace_ignores: true,
             env: HashMap::new(),
+            incremental_history: true,
+            force_rerun: false,
             cancelled: Arc::new(AtomicBool::new(false)),
         };
 
@@ -6504,6 +7013,8 @@ while [ "$(find "{barrier}" -type f | wc -l)" -lt 4 ]; do sleep 0.1; done"#,
             early_stop: Default::default(),
             respect_workspace_ignores: true,
             env: HashMap::new(),
+            incremental_history: true,
+            force_rerun: false,
             cancelled: Arc::new(AtomicBool::new(false)),
         };
 
@@ -6581,6 +7092,8 @@ exit 1"#
             early_stop: Default::default(),
             respect_workspace_ignores: true,
             env: HashMap::new(),
+            incremental_history: true,
+            force_rerun: false,
             cancelled: Arc::new(AtomicBool::new(false)),
         };
 
@@ -6634,6 +7147,8 @@ exit 1"#
             early_stop: Default::default(),
             respect_workspace_ignores: true,
             env: HashMap::new(),
+            incremental_history: true,
+            force_rerun: false,
             cancelled: Arc::new(AtomicBool::new(false)),
         };
 
@@ -6687,6 +7202,8 @@ exit 1"#
             early_stop: Default::default(),
             respect_workspace_ignores: true,
             env: HashMap::new(),
+            incremental_history: true,
+            force_rerun: false,
             cancelled: Arc::new(AtomicBool::new(false)),
         };
 

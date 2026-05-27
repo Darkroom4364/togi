@@ -93,6 +93,12 @@ coverage_file = "coverage/lcov.info"
 # Default: unset
 test_selection_file = "coverage/test-selection.json"
 
+# Reuse structured incremental history when the mutant source, command context,
+# and relevant covering tests have not changed.
+# Type: boolean
+# Default: true
+incremental_history = true
+
 # Glob patterns excluded from mutation collection.
 # Type: array of strings
 # Default: []
