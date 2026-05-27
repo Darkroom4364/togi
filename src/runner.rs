@@ -5,7 +5,7 @@ use crate::{
     BuildErrorDiagnostic, Mutation, MutationReport, MutationResult, SchemataFallbackReasonCount,
     SchemataReport,
 };
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs;
 use std::hash::Hasher;
 use std::io::{IsTerminal, Read, Write};
@@ -327,7 +327,28 @@ pub(crate) struct WorkspaceCopy {
 
 enum WorkspaceResetStrategy {
     Copy,
-    GitWorktree { project_root: PathBuf },
+    GitWorktree {
+        project_root: PathBuf,
+        overlay: GitWorktreeOverlay,
+    },
+}
+
+#[derive(Clone)]
+struct GitWorktreeOverlay {
+    copy_paths: Vec<PathBuf>,
+    remove_paths: Vec<PathBuf>,
+}
+
+impl GitWorktreeOverlay {
+    fn apply(&self, project_root: &Path, workspace_root: &Path) -> std::io::Result<()> {
+        for relative in &self.remove_paths {
+            remove_workspace_path(&workspace_root.join(relative))?;
+        }
+        for relative in &self.copy_paths {
+            copy_overlay_file(project_root, workspace_root, relative)?;
+        }
+        Ok(())
+    }
 }
 
 impl WorkspaceCopy {
@@ -340,39 +361,24 @@ impl WorkspaceCopy {
             WorkspaceResetStrategy::Copy => {
                 reset_copied_workspace(project_root, &self.root, respect_ignores)
             }
-            WorkspaceResetStrategy::GitWorktree { .. } => reset_git_worktree(&self.root),
+            WorkspaceResetStrategy::GitWorktree {
+                project_root,
+                overlay,
+            } => reset_git_worktree(project_root, &self.root, overlay),
         }
     }
 }
 
 impl Drop for WorkspaceCopy {
     fn drop(&mut self) {
-        let WorkspaceResetStrategy::GitWorktree { project_root } = &self.reset_strategy else {
+        let WorkspaceResetStrategy::GitWorktree { project_root, .. } = &self.reset_strategy else {
             return;
         };
         if !self.root.exists() {
             return;
         }
-        let output = std::process::Command::new("git")
-            .args(["worktree", "remove", "--force"])
-            .arg(&self.root)
-            .current_dir(project_root)
-            .output();
-        match output {
-            Ok(output) if output.status.success() => {}
-            Ok(output) => {
-                eprintln!(
-                    "warning: could not remove git worktree {}\nstderr:\n{}",
-                    self.root.display(),
-                    String::from_utf8_lossy(&output.stderr)
-                );
-            }
-            Err(e) => {
-                eprintln!(
-                    "warning: could not remove git worktree {}: {e}",
-                    self.root.display()
-                );
-            }
+        if let Err(e) = remove_git_worktree(project_root, &self.root) {
+            eprintln!("warning: {e}");
         }
     }
 }
@@ -733,16 +739,17 @@ fn copy_workspace_with_options(
 
     if respect_ignores {
         match create_git_worktree_workspace(project_root, &root) {
-            Ok(true) => {
+            Ok(Some(overlay)) => {
                 return Ok(WorkspaceCopy {
                     _tempdir: tempdir,
                     root,
                     reset_strategy: WorkspaceResetStrategy::GitWorktree {
                         project_root: project_root.to_path_buf(),
+                        overlay,
                     },
                 });
             }
-            Ok(false) => {}
+            Ok(None) => {}
             Err(e) => {
                 eprintln!(
                     "warning: could not create git worktree workspace: {e}; falling back to copy"
@@ -761,10 +768,14 @@ fn copy_workspace_with_options(
     })
 }
 
-fn create_git_worktree_workspace(project_root: &Path, root: &Path) -> std::io::Result<bool> {
-    if !git_worktree_workspace_is_safe(project_root) {
-        return Ok(false);
+fn create_git_worktree_workspace(
+    project_root: &Path,
+    root: &Path,
+) -> std::io::Result<Option<GitWorktreeOverlay>> {
+    if !git_worktree_workspace_is_available(project_root) {
+        return Ok(None);
     }
+    let overlay = collect_git_worktree_overlay(project_root)?;
 
     let output = std::process::Command::new("git")
         .args(["worktree", "add", "--detach", "--quiet"])
@@ -773,16 +784,20 @@ fn create_git_worktree_workspace(project_root: &Path, root: &Path) -> std::io::R
         .current_dir(project_root)
         .output()?;
     if output.status.success() {
-        return Ok(true);
+        if let Err(e) = overlay.apply(project_root, root) {
+            let _ = remove_git_worktree(project_root, root);
+            return Err(e);
+        }
+        return Ok(Some(overlay));
     }
 
     if root.exists() {
         let _ = fs::remove_dir_all(root);
     }
-    Ok(false)
+    Ok(None)
 }
 
-fn git_worktree_workspace_is_safe(project_root: &Path) -> bool {
+fn git_worktree_workspace_is_available(project_root: &Path) -> bool {
     let Some(top_level) = git_top_level(project_root) else {
         return false;
     };
@@ -793,20 +808,11 @@ fn git_worktree_workspace_is_safe(project_root: &Path) -> bool {
         return false;
     }
 
-    let output = std::process::Command::new("git")
-        .args([
-            "status",
-            "--porcelain=v1",
-            "-z",
-            "--untracked-files=all",
-            "--",
-        ])
+    std::process::Command::new("git")
+        .args(["rev-parse", "--verify", "HEAD"])
         .current_dir(&project_root)
-        .output();
-    let Ok(output) = output else {
-        return false;
-    };
-    output.status.success() && output.stdout.is_empty()
+        .output()
+        .is_ok_and(|output| output.status.success())
 }
 
 fn git_top_level(project_root: &Path) -> Option<PathBuf> {
@@ -820,6 +826,120 @@ fn git_top_level(project_root: &Path) -> Option<PathBuf> {
     }
     let top_level = String::from_utf8(output.stdout).ok()?;
     PathBuf::from(top_level.trim()).canonicalize().ok()
+}
+
+fn collect_git_worktree_overlay(project_root: &Path) -> std::io::Result<GitWorktreeOverlay> {
+    let changed_paths = git_z_output_paths(
+        project_root,
+        &["diff", "--name-only", "-z", "--no-renames", "HEAD", "--"],
+    )?;
+    let untracked_paths = git_z_output_paths(
+        project_root,
+        &["ls-files", "-z", "--others", "--exclude-standard", "--"],
+    )?;
+
+    let mut copy_paths = BTreeSet::new();
+    let mut remove_paths = BTreeSet::new();
+
+    for relative in changed_paths {
+        if !should_overlay_workspace_entry(&relative) {
+            continue;
+        }
+        let source = project_root.join(&relative);
+        if source.is_file() {
+            copy_paths.insert(relative);
+        } else {
+            remove_paths.insert(relative);
+        }
+    }
+
+    for relative in untracked_paths {
+        if !should_overlay_workspace_entry(&relative) {
+            continue;
+        }
+        if project_root.join(&relative).is_file() {
+            copy_paths.insert(relative);
+        }
+    }
+
+    for copied in &copy_paths {
+        remove_paths.remove(copied);
+    }
+
+    Ok(GitWorktreeOverlay {
+        copy_paths: copy_paths.into_iter().collect(),
+        remove_paths: remove_paths.into_iter().collect(),
+    })
+}
+
+fn git_z_output_paths(project_root: &Path, args: &[&str]) -> std::io::Result<Vec<PathBuf>> {
+    let output = std::process::Command::new("git")
+        .args(args)
+        .current_dir(project_root)
+        .output()?;
+    if !output.status.success() {
+        return Err(std::io::Error::other(format!(
+            "git {} failed in {}\nstderr:\n{}",
+            args.join(" "),
+            project_root.display(),
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+
+    Ok(output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|entry| !entry.is_empty())
+        .filter_map(safe_git_relative_path)
+        .collect())
+}
+
+fn should_overlay_workspace_entry(relative: &Path) -> bool {
+    is_safe_relative_path(relative) && !should_skip_workspace_entry(relative)
+}
+
+fn safe_git_relative_path(raw: &[u8]) -> Option<PathBuf> {
+    let raw = std::str::from_utf8(raw).ok()?;
+    if raw.is_empty()
+        || raw.starts_with('/')
+        || raw.starts_with('\\')
+        || raw.contains('\\')
+        || raw.contains('\0')
+    {
+        return None;
+    }
+
+    let mut path = PathBuf::new();
+    for part in raw.split('/') {
+        if part.is_empty() || part == "." || part == ".." {
+            return None;
+        }
+        path.push(part);
+    }
+    Some(path)
+}
+
+fn is_safe_relative_path(path: &Path) -> bool {
+    !path.as_os_str().is_empty()
+        && path
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
+}
+
+fn remove_git_worktree(project_root: &Path, root: &Path) -> std::io::Result<()> {
+    let output = std::process::Command::new("git")
+        .args(["worktree", "remove", "--force"])
+        .arg(root)
+        .current_dir(project_root)
+        .output()?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(std::io::Error::other(format!(
+        "could not remove git worktree {}\nstderr:\n{}",
+        root.display(),
+        String::from_utf8_lossy(&output.stderr)
+    )))
 }
 
 fn reset_copied_workspace(
@@ -836,7 +956,11 @@ fn reset_copied_workspace(
     populate_workspace(project_root, workspace_root, respect_ignores)
 }
 
-fn reset_git_worktree(workspace_root: &Path) -> std::io::Result<()> {
+fn reset_git_worktree(
+    project_root: &Path,
+    workspace_root: &Path,
+    overlay: &GitWorktreeOverlay,
+) -> std::io::Result<()> {
     run_git_workspace_command(workspace_root, &["reset", "--hard", "--quiet", "HEAD"])?;
 
     let mut clean_args = vec!["clean", "-ffdx", "--quiet"];
@@ -844,7 +968,8 @@ fn reset_git_worktree(workspace_root: &Path) -> std::io::Result<()> {
         clean_args.push("-e");
         clean_args.push(preserved);
     }
-    run_git_workspace_command(workspace_root, &clean_args)
+    run_git_workspace_command(workspace_root, &clean_args)?;
+    overlay.apply(project_root, workspace_root)
 }
 
 fn run_git_workspace_command(workspace_root: &Path, args: &[&str]) -> std::io::Result<()> {
@@ -863,6 +988,38 @@ fn run_git_workspace_command(workspace_root: &Path, args: &[&str]) -> std::io::R
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     )))
+}
+
+fn remove_workspace_path(path: &Path) -> std::io::Result<()> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+
+    if metadata.is_dir() {
+        fs::remove_dir_all(path)
+    } else {
+        fs::remove_file(path)
+    }
+}
+
+fn copy_overlay_file(
+    project_root: &Path,
+    workspace_root: &Path,
+    relative: &Path,
+) -> std::io::Result<()> {
+    let source = project_root.join(relative);
+    let destination = workspace_root.join(relative);
+    if !source.is_file() {
+        remove_workspace_path(&destination)?;
+        return Ok(());
+    }
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::copy(source, destination)?;
+    Ok(())
 }
 
 /// Move preserved dirs to sibling stashes before deleting the workspace.
@@ -3934,23 +4091,67 @@ mod tests {
     }
 
     #[test]
-    fn copy_workspace_falls_back_to_copy_when_git_repo_is_dirty() {
+    fn copy_workspace_uses_git_worktree_with_dirty_overlay() -> std::io::Result<()> {
         if !git_available() {
-            return;
+            return Ok(());
         }
 
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir()?;
         let root = tmp.path();
         init_clean_git_fixture(root);
-        std::fs::write(root.join("local.txt"), b"copy me").unwrap();
+        std::fs::write(root.join("src/old.rs"), b"pub fn old() {}\n")?;
+        std::fs::write(root.join("src/replaced"), b"old file\n")?;
+        run_git(root, &["add", "."]);
+        run_git(root, &["commit", "-m", "add old file"]);
 
-        let copy = copy_workspace(root).unwrap();
+        std::fs::write(root.join("src/lib.rs"), b"pub fn f() -> i32 { 1 }\n")?;
+        std::fs::remove_file(root.join("src/old.rs"))?;
+        std::fs::remove_file(root.join("src/replaced"))?;
+        std::fs::create_dir(root.join("src/replaced"))?;
+        std::fs::write(root.join("src/replaced/nested.rs"), b"pub fn nested() {}\n")?;
+        std::fs::write(root.join("local.txt"), b"copy me")?;
 
-        assert!(!copy.root().join(".git").exists());
+        let copy = copy_workspace(root)?;
+
+        assert!(copy.root().join(".git").exists());
         assert_eq!(
-            std::fs::read(copy.root().join("local.txt")).unwrap(),
-            b"copy me"
+            std::fs::read(copy.root().join("src/lib.rs"))?,
+            b"pub fn f() -> i32 { 1 }\n"
         );
+        assert_eq!(std::fs::read(copy.root().join("local.txt"))?, b"copy me");
+        assert!(!copy.root().join("src/old.rs").exists());
+        assert_eq!(
+            std::fs::read(copy.root().join("src/replaced/nested.rs"))?,
+            b"pub fn nested() {}\n"
+        );
+
+        std::fs::write(copy.root().join("src/lib.rs"), b"side effect")?;
+        std::fs::write(copy.root().join("local.txt"), b"changed")?;
+        std::fs::write(copy.root().join("src/old.rs"), b"stale")?;
+        std::fs::remove_dir_all(copy.root().join("src/replaced"))?;
+        std::fs::write(copy.root().join("src/replaced"), b"stale file")?;
+        std::fs::write(copy.root().join("side-effect"), b"drop")?;
+        std::fs::create_dir_all(copy.root().join("target/debug"))?;
+        std::fs::write(copy.root().join("target/debug/cache"), b"keep")?;
+
+        copy.reset(root, true)?;
+
+        assert_eq!(
+            std::fs::read(copy.root().join("src/lib.rs"))?,
+            b"pub fn f() -> i32 { 1 }\n"
+        );
+        assert_eq!(std::fs::read(copy.root().join("local.txt"))?, b"copy me");
+        assert!(!copy.root().join("src/old.rs").exists());
+        assert_eq!(
+            std::fs::read(copy.root().join("src/replaced/nested.rs"))?,
+            b"pub fn nested() {}\n"
+        );
+        assert!(!copy.root().join("side-effect").exists());
+        assert_eq!(
+            std::fs::read(copy.root().join("target/debug/cache"))?,
+            b"keep"
+        );
+        Ok(())
     }
 
     #[test]
