@@ -65,7 +65,22 @@ pub struct ProjectCommandConfig {
 
 #[derive(Debug, Clone, Default)]
 pub struct TestSelectionConfig {
-    tests_by_line: HashMap<(String, usize), Vec<String>>,
+    tests_by_line: HashMap<(String, usize), Vec<SelectedTest>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectedTest {
+    pub name: String,
+    pub duration_ms: Option<u64>,
+}
+
+impl SelectedTest {
+    pub fn new(name: impl Into<String>, duration_ms: Option<u64>) -> Self {
+        Self {
+            name: name.into(),
+            duration_ms,
+        }
+    }
 }
 
 impl TestSelectionConfig {
@@ -80,20 +95,42 @@ impl TestSelectionConfig {
         line: usize,
         tests: Vec<String>,
     ) {
+        self.insert_tests(
+            project_root,
+            file,
+            line,
+            tests
+                .into_iter()
+                .map(|name| SelectedTest::new(name, None))
+                .collect(),
+        );
+    }
+
+    pub fn insert_tests(
+        &mut self,
+        project_root: &Path,
+        file: impl AsRef<Path>,
+        line: usize,
+        tests: Vec<SelectedTest>,
+    ) {
         self.tests_by_line.insert(
             (normalized_cache_path(project_root, file.as_ref()), line),
             tests,
         );
     }
 
-    fn tests_for(&self, project_root: &Path, mutation: &Mutation) -> Option<&[String]> {
-        self.tests_by_line
+    fn tests_for(&self, project_root: &Path, mutation: &Mutation) -> Option<Vec<String>> {
+        let mut tests = self
+            .tests_by_line
             .get(&(
                 normalized_cache_path(project_root, &mutation.file),
                 mutation.line,
-            ))
-            .map(Vec::as_slice)
-            .filter(|tests| !tests.is_empty())
+            ))?
+            .iter()
+            .collect::<Vec<_>>();
+        tests.sort_by_key(|test| test.duration_ms.unwrap_or(u64::MAX));
+        Some(tests.into_iter().map(|test| test.name.clone()).collect())
+            .filter(|tests: &Vec<String>| !tests.is_empty())
     }
 }
 
@@ -218,7 +255,7 @@ fn select_test_command(
 
     if let Some(test_selection) = &commands.test_selection {
         if let Some(tests) = test_selection.tests_for(project_root, mutation) {
-            argv = narrow_go_test_command(argv, tests);
+            argv = narrow_test_command(argv, &tests);
         }
     }
 
@@ -272,6 +309,30 @@ fn matching_project_command<'a>(
         .map(|(_, project)| project)
 }
 
+fn narrow_test_command(argv: Vec<String>, tests: &[String]) -> Vec<String> {
+    let narrowed = narrow_go_test_command(argv.clone(), tests);
+    if narrowed != argv {
+        return narrowed;
+    }
+    let narrowed = narrow_pytest_command(argv.clone(), tests);
+    if narrowed != argv {
+        return narrowed;
+    }
+    let narrowed = narrow_jest_or_vitest_command(argv.clone(), tests);
+    if narrowed != argv {
+        return narrowed;
+    }
+    let narrowed = narrow_cargo_test_command(argv.clone(), tests);
+    if narrowed != argv {
+        return narrowed;
+    }
+    let narrowed = narrow_maven_test_command(argv.clone(), tests);
+    if narrowed != argv {
+        return narrowed;
+    }
+    narrow_gradle_test_command(argv, tests)
+}
+
 fn narrow_go_test_command(mut argv: Vec<String>, tests: &[String]) -> Vec<String> {
     if argv.len() < 2 || argv[0] != "go" || argv[1] != "test" {
         return argv;
@@ -305,7 +366,124 @@ fn narrow_go_test_command(mut argv: Vec<String>, tests: &[String]) -> Vec<String
     argv
 }
 
+fn narrow_pytest_command(mut argv: Vec<String>, tests: &[String]) -> Vec<String> {
+    if !is_pytest_command(&argv) {
+        return argv;
+    }
+    if tests.iter().all(|test| is_pytest_node_id(test)) {
+        argv.extend(tests.iter().cloned());
+        return argv;
+    }
+
+    if !tests.iter().all(|test| is_simple_pytest_keyword(test)) {
+        return argv;
+    }
+    let expression = tests.join(" or ");
+    argv.extend(["-k".to_string(), expression]);
+    argv
+}
+
+fn is_pytest_command(argv: &[String]) -> bool {
+    matches!(argv.first().map(String::as_str), Some("pytest" | "py.test"))
+        || matches!(
+            (
+                argv.first().map(String::as_str),
+                argv.get(1).map(String::as_str),
+                argv.get(2).map(String::as_str)
+            ),
+            (Some("python" | "python3"), Some("-m"), Some("pytest"))
+        )
+}
+
+fn is_pytest_node_id(test: &str) -> bool {
+    test.contains("::") || test.ends_with(".py")
+}
+
+fn is_simple_pytest_keyword(test: &str) -> bool {
+    !test.is_empty()
+        && test
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+}
+
+fn narrow_jest_or_vitest_command(mut argv: Vec<String>, tests: &[String]) -> Vec<String> {
+    if !is_jest_or_vitest_command(&argv) {
+        return argv;
+    }
+    let pattern = exact_regex_pattern(tests);
+    argv.extend(["-t".to_string(), pattern]);
+    argv
+}
+
+fn is_jest_or_vitest_command(argv: &[String]) -> bool {
+    matches!(argv.first().map(String::as_str), Some("jest" | "vitest"))
+        || matches!(
+            (
+                argv.first().map(String::as_str),
+                argv.get(1).map(String::as_str)
+            ),
+            (Some("npx"), Some("jest" | "vitest"))
+        )
+}
+
+fn narrow_cargo_test_command(mut argv: Vec<String>, tests: &[String]) -> Vec<String> {
+    if argv.len() < 2 || argv[0] != "cargo" || argv[1] != "test" || tests.len() != 1 {
+        return argv;
+    }
+    insert_before_double_dash(&mut argv, tests[0].clone());
+    argv
+}
+
+fn narrow_maven_test_command(mut argv: Vec<String>, tests: &[String]) -> Vec<String> {
+    if argv.is_empty() || argv[0] != "mvn" || !argv.iter().any(|arg| arg == "test") {
+        return argv;
+    }
+    let value = format!("-Dtest={}", tests.join(","));
+    if let Some(existing) = argv.iter_mut().find(|arg| arg.starts_with("-Dtest=")) {
+        *existing = value;
+    } else {
+        argv.push(value);
+    }
+    argv
+}
+
+fn narrow_gradle_test_command(mut argv: Vec<String>, tests: &[String]) -> Vec<String> {
+    if argv.is_empty()
+        || !matches!(argv[0].as_str(), "gradle" | "./gradlew" | "gradlew")
+        || !argv.iter().any(|arg| arg == "test")
+    {
+        return argv;
+    }
+    for test in tests {
+        argv.extend(["--tests".to_string(), test.clone()]);
+    }
+    argv
+}
+
+fn insert_before_double_dash(argv: &mut Vec<String>, value: String) {
+    let insert_at = argv
+        .iter()
+        .position(|arg| arg == "--")
+        .unwrap_or(argv.len());
+    argv.insert(insert_at, value);
+}
+
+fn exact_regex_pattern(tests: &[String]) -> String {
+    format!(
+        "^({})$",
+        tests
+            .iter()
+            .map(|test| escape_test_regex(test))
+            .collect::<Vec<_>>()
+            .join("|")
+    )
+}
+
 fn escape_go_test_regex(test: &str) -> String {
+    escape_test_regex(test)
+}
+
+fn escape_test_regex(test: &str) -> String {
     let mut escaped = String::new();
     for ch in test.chars() {
         if matches!(
@@ -3989,14 +4167,178 @@ mod tests {
     }
 
     #[test]
-    fn select_test_command_falls_back_for_unsupported_command() {
-        let tmp = tempfile::tempdir().unwrap();
+    fn select_test_command_orders_selected_tests_by_duration() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let mut selection = TestSelectionConfig::new();
+        selection.insert_tests(
+            tmp.path(),
+            Path::new("src/calc.py"),
+            3,
+            vec![
+                SelectedTest::new("slow_test", Some(50)),
+                SelectedTest::new("fast_test", Some(5)),
+                SelectedTest::new("unknown_test", None),
+            ],
+        );
+
+        let mut commands = test_command_config();
+        commands.command = vec!["pytest".into()];
+        commands.test_selection = Some(selection);
+
+        let mut mutation = make_test_mutation(Path::new("src/calc.py"));
+        mutation.line = 3;
+
+        let selected = select_test_command(tmp.path(), &commands, &mutation);
+
+        assert_eq!(
+            selected.argv,
+            vec!["pytest", "-k", "fast_test or slow_test or unknown_test"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn select_test_command_narrows_pytest_node_ids() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let mut selection = TestSelectionConfig::new();
+        selection.insert(
+            tmp.path(),
+            Path::new("src/calc.py"),
+            3,
+            vec![
+                "tests/test_calc.py::test_add".into(),
+                "tests/test_calc.py::test_max".into(),
+            ],
+        );
+
+        let mut commands = test_command_config();
+        commands.command = vec!["python".into(), "-m".into(), "pytest".into()];
+        commands.test_selection = Some(selection);
+
+        let mut mutation = make_test_mutation(Path::new("src/calc.py"));
+        mutation.line = 3;
+
+        let selected = select_test_command(tmp.path(), &commands, &mutation);
+
+        assert_eq!(
+            selected.argv,
+            vec![
+                "python",
+                "-m",
+                "pytest",
+                "tests/test_calc.py::test_add",
+                "tests/test_calc.py::test_max"
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn select_test_command_falls_back_for_unsupported_pytest_names() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let mut selection = TestSelectionConfig::new();
+        selection.insert(
+            tmp.path(),
+            Path::new("src/calc.py"),
+            3,
+            vec!["test_add".into(), "test with space".into()],
+        );
+
+        let mut commands = test_command_config();
+        commands.command = vec!["pytest".into()];
+        commands.test_selection = Some(selection);
+
+        let mut mutation = make_test_mutation(Path::new("src/calc.py"));
+        mutation.line = 3;
+
+        let selected = select_test_command(tmp.path(), &commands, &mutation);
+
+        assert_eq!(selected.argv, vec!["pytest"]);
+        Ok(())
+    }
+
+    #[test]
+    fn select_test_command_narrows_jest_and_vitest_names() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let mut selection = TestSelectionConfig::new();
+        selection.insert(
+            tmp.path(),
+            Path::new("src/calc.test.ts"),
+            3,
+            vec!["adds numbers".into(), "handles max+".into()],
+        );
+
+        let mut commands = test_command_config();
+        commands.command = vec!["npx".into(), "vitest".into(), "run".into()];
+        commands.test_selection = Some(selection);
+
+        let mut mutation = make_test_mutation(Path::new("src/calc.test.ts"));
+        mutation.line = 3;
+
+        let selected = select_test_command(tmp.path(), &commands, &mutation);
+
+        assert_eq!(
+            selected.argv,
+            vec![
+                "npx",
+                "vitest",
+                "run",
+                "-t",
+                "^(adds numbers|handles max\\+)$"
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn select_test_command_narrows_single_cargo_test_filter() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
         let mut selection = TestSelectionConfig::new();
         selection.insert(
             tmp.path(),
             Path::new("src/lib.rs"),
             3,
-            vec!["test_name".into()],
+            vec!["math::adds".into()],
+        );
+
+        let mut commands = test_command_config();
+        commands.command = vec![
+            "cargo".into(),
+            "test".into(),
+            "--workspace".into(),
+            "--".into(),
+            "--nocapture".into(),
+        ];
+        commands.test_selection = Some(selection);
+
+        let mut mutation = make_test_mutation(Path::new("src/lib.rs"));
+        mutation.line = 3;
+
+        let selected = select_test_command(tmp.path(), &commands, &mutation);
+
+        assert_eq!(
+            selected.argv,
+            vec![
+                "cargo",
+                "test",
+                "--workspace",
+                "math::adds",
+                "--",
+                "--nocapture"
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn select_test_command_falls_back_for_multiple_cargo_tests() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let mut selection = TestSelectionConfig::new();
+        selection.insert(
+            tmp.path(),
+            Path::new("src/lib.rs"),
+            3,
+            vec!["math::adds".into(), "math::max".into()],
         );
 
         let mut commands = test_command_config();
@@ -4009,6 +4351,92 @@ mod tests {
         let selected = select_test_command(tmp.path(), &commands, &mutation);
 
         assert_eq!(selected.argv, vec!["cargo", "test"]);
+        Ok(())
+    }
+
+    #[test]
+    fn select_test_command_narrows_maven_tests() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let mut selection = TestSelectionConfig::new();
+        selection.insert(
+            tmp.path(),
+            Path::new("src/main/java/Calc.java"),
+            3,
+            vec!["CalcTest#adds".into(), "CalcTest#max".into()],
+        );
+
+        let mut commands = test_command_config();
+        commands.command = vec!["mvn".into(), "-q".into(), "test".into()];
+        commands.test_selection = Some(selection);
+
+        let mut mutation = make_test_mutation(Path::new("src/main/java/Calc.java"));
+        mutation.line = 3;
+
+        let selected = select_test_command(tmp.path(), &commands, &mutation);
+
+        assert_eq!(
+            selected.argv,
+            vec!["mvn", "-q", "test", "-Dtest=CalcTest#adds,CalcTest#max"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn select_test_command_narrows_gradle_tests() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let mut selection = TestSelectionConfig::new();
+        selection.insert(
+            tmp.path(),
+            Path::new("src/main/java/Calc.java"),
+            3,
+            vec!["CalcTest.adds".into(), "CalcTest.max".into()],
+        );
+
+        let mut commands = test_command_config();
+        commands.command = vec!["./gradlew".into(), "test".into()];
+        commands.test_selection = Some(selection);
+
+        let mut mutation = make_test_mutation(Path::new("src/main/java/Calc.java"));
+        mutation.line = 3;
+
+        let selected = select_test_command(tmp.path(), &commands, &mutation);
+
+        assert_eq!(
+            selected.argv,
+            vec![
+                "./gradlew",
+                "test",
+                "--tests",
+                "CalcTest.adds",
+                "--tests",
+                "CalcTest.max"
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn select_test_command_falls_back_for_unsupported_command() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let mut selection = TestSelectionConfig::new();
+        selection.insert(
+            tmp.path(),
+            Path::new("src/lib.rs"),
+            3,
+            vec!["test_name".into()],
+        );
+
+        let mut commands = test_command_config();
+        commands.command = vec!["make".into(), "test".into()];
+        commands.test_selection = Some(selection);
+
+        let mut mutation = make_test_mutation(Path::new("src/lib.rs"));
+        mutation.line = 3;
+
+        let selected = select_test_command(tmp.path(), &commands, &mutation);
+
+        assert_eq!(selected.argv, vec!["make", "test"]);
+        Ok(())
     }
 
     #[test]

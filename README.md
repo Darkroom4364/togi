@@ -17,7 +17,7 @@ Mutation testing is usually too slow to run on every PR. togi is built for the P
 - **Single binary**: no service, database, or language-specific plugin stack
 - **Zero config start**: auto-detects common test commands, with `togi init` for explicit config
 - **CI-ready reports**: terminal, JSON, GitHub annotations, HTML, and PR comment markdown
-- **Performance controls**: caching, sharding, fail-fast commands, LCOV filtering, and Go test-selection maps
+- **Performance controls**: caching, sharding, fail-fast commands, LCOV filtering, and source-line test selection
 - **Guardrails**: build pre-checks, baselines, operator filters, noisy-file skips, and path-safe mutation execution
 
 If a mutation survives, your tests still pass after behavior changed. That is a concrete test gap.
@@ -127,7 +127,7 @@ togi check --build-cmd "cargo check"
 # Only mutate lines covered by an LCOV file
 togi check --coverage-file coverage/lcov.info
 
-# Generate and use a Go source-line to test-name map
+# Generate and use a source-line to test-name map (Go helper shown)
 togi test-map --path . --output coverage/test-selection.json
 togi check --test-selection-file coverage/test-selection.json
 
@@ -314,12 +314,19 @@ For large repos, togi can avoid work before the runner starts:
 
 - `--coverage-file coverage/lcov.info` keeps only mutations on covered lines
 - `togi test-map` generates a Go line-to-test map from per-test coverage
-- `--test-selection-file coverage/test-selection.json` narrows each Go mutant to the tests that cover that line
+- `--test-selection-file coverage/test-selection.json` narrows each mutant to tests that cover that line when the configured runner supports test selection
 
 ```bash
 togi test-map --path . --output coverage/test-selection.json
 togi check --coverage-file coverage/lcov.info --test-selection-file coverage/test-selection.json
 ```
+
+The selection file is a JSON map of source file to line number to test names.
+Entries can be strings or objects with `name` and optional `duration_ms`; timed
+entries run shortest first. togi currently narrows Go `go test`, pytest node IDs
+or simple `-k` names, Jest/Vitest `-t` names, Maven `-Dtest`, Gradle `--tests`,
+and single-test Cargo filters. Unsupported commands safely run the full test
+command.
 
 ## Example: finding real test gaps
 
