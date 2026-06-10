@@ -188,6 +188,7 @@ timeout_multiplier = 4.0
 timeout_slack = 2
 jobs = 2
 build_command = ["go", "build", "./..."]
+sandbox_command = ["bwrap", "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--"]
 
 [test.languages.python]
 command = ["pytest"]
@@ -223,6 +224,10 @@ When `--test-cmd` is set, `--fail-fast` does not modify the custom command;
 include runner-specific fail-fast flags in `--test-cmd` instead.
 Resource profiles provide defaults only: explicit CLI flags and `togi.toml`
 settings such as `jobs` keep taking precedence.
+
+`[test] sandbox_command` is an optional wrapper that runs every build and test
+command inside your own sandbox tool. togi appends the selected command after
+the wrapper argv, so tools that expect `--` as a separator can use it directly.
 
 `--calibrate-timeout` (or `[test] calibrate_timeout = true`) runs the
 unmutated build/test command once in a disposable workspace, then sets the
@@ -453,16 +458,20 @@ test command genuinely needs ignored files copied into the mutation workspace.
 togi executes repository-defined build and test commands with the permissions of
 the current user or CI runner.
 
-Workspace copies, timeouts, and descendant-process cleanup improve correctness
-and cleanup, but they are not a security sandbox. togi does not currently block
-network access or confine filesystem access beyond the restrictions already
-provided by your OS, container, or CI environment.
+Workspace copies, timeouts, descendant-process cleanup, and the optional
+`[test] sandbox_command` wrapper improve correctness and reduce exposure, but
+they are not a complete security sandbox. togi does not itself block network
+access or confine filesystem access beyond what the host OS, container, or CI
+environment already enforces.
 
 Run togi only against repositories you trust, or place it inside a separate
 container or VM when evaluating less-trusted code. Running less-trusted
 repositories directly on the host is out of scope for the current security
-model. See [SECURITY.md](SECURITY.md) for the supported-version policy and
-vulnerability reporting instructions.
+model. On Linux, a wrapper such as `bwrap` or `firejail` is a practical opt-in
+strategy; on macOS, use a platform sandbox or container boundary; on Windows,
+use a container, VM, or equivalent host-managed isolation. See
+[SECURITY.md](SECURITY.md) for the supported-version policy and vulnerability
+reporting instructions.
 
 ## How it works
 

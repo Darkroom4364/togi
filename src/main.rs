@@ -405,6 +405,7 @@ fn run_check(cfg: CheckConfig, cancelled: Arc<AtomicBool>) -> anyhow::Result<()>
             togi::runner::BaselineTimingConfig {
                 test_command: &config.test.command,
                 build_command: &config.test.build_command,
+                sandbox_command: &config.test.sandbox_command,
                 build_command_explicit: has_explicit_build_cmd,
                 timeout: baseline_measurement_timeout(config.test.timeout),
                 env: &profile_env,
@@ -927,6 +928,7 @@ fn execute(
     let runner = togi::runner::TestRunner {
         commands: togi::runner::CommandConfig {
             command: config.test.command,
+            sandbox_command: config.test.sandbox_command,
             force_default_command: options.force_default_command,
             force_default_timeout: options.force_default_timeout,
             project_commands,

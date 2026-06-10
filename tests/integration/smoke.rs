@@ -72,6 +72,7 @@ fn run_fixture(case: FixtureCase) {
             project_commands: vec![],
             language_commands: HashMap::new(),
             build_command: vec![],
+            sandbox_command: vec![],
             build_command_explicit: false,
             timeout: Duration::from_secs(30),
             language_timeouts: HashMap::new(),
@@ -91,7 +92,11 @@ fn run_fixture(case: FixtureCase) {
     };
 
     let report = runner.run(mutations).report;
-    assert!(report.total > 0, "{} fixture should execute mutations", case.name);
+    assert!(
+        report.total > 0,
+        "{} fixture should execute mutations",
+        case.name
+    );
     assert_eq!(
         report.timeout, 0,
         "{} fixture should not time out",

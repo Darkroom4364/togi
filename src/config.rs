@@ -49,6 +49,7 @@ pub struct TestConfig {
     pub profile: Option<ResourceProfile>,
     pub command: Vec<String>,
     pub build_command: Vec<String>,
+    pub sandbox_command: Vec<String>,
     pub timeout: u64,
     pub calibrate_timeout: bool,
     pub timeout_multiplier: f64,
@@ -67,6 +68,8 @@ struct RawTestConfig {
     command: Vec<String>,
     #[serde(default)]
     build_command: Vec<String>,
+    #[serde(default)]
+    sandbox_command: Vec<String>,
     #[serde(default)]
     timeout: Option<u64>,
     #[serde(default)]
@@ -91,6 +94,7 @@ impl<'de> Deserialize<'de> for TestConfig {
             profile: raw.profile,
             command: raw.command,
             build_command: raw.build_command,
+            sandbox_command: raw.sandbox_command,
             timeout: raw.timeout.unwrap_or_else(default_timeout),
             calibrate_timeout: raw.calibrate_timeout.unwrap_or(false),
             timeout_multiplier: raw.timeout_multiplier.unwrap_or(4.0),
@@ -337,6 +341,7 @@ impl Default for TestConfig {
             profile: None,
             command: default_test_command(),
             build_command: vec![],
+            sandbox_command: vec![],
             timeout: default_timeout(),
             calibrate_timeout: false,
             timeout_multiplier: 4.0,
@@ -456,6 +461,12 @@ impl Config {
                 build_cmd_toml.join(", ")
             ));
         }
+
+        template.push_str(
+            "# sandbox_command = [\"bwrap\", \"--ro-bind\", \"/\", \"/\", \"--dev\", \"/dev\", \"--proc\", \"/proc\", \"--\"]\n\
+             # Optional wrapper that runs every build and test command inside your own sandbox tool.\n\
+             # Leave unset to run directly on the host or CI runner.\n",
+        );
 
         template.push_str(&format!(
             "# profile = \"cool\"  # cool, balanced, or ci; explicit jobs still win\n\
@@ -584,6 +595,7 @@ schemata = true
         assert_eq!(config.test.timeout_slack, 4);
         assert_eq!(config.test.jobs, 8);
         assert!(config.test.jobs_was_explicit());
+        assert!(config.test.sandbox_command.is_empty());
         assert_eq!(config.diff.base, "origin/develop");
         assert_eq!(config.mutations.max_per_run, 50);
         assert!(config.mutations.schemata);
@@ -625,6 +637,7 @@ commnad = ["cargo", "test"]
         let config: Config = toml::from_str(content).unwrap();
         assert_eq!(config.test.command, vec!["go", "test", "./..."]);
         assert!(config.test.build_command.is_empty());
+        assert!(config.test.sandbox_command.is_empty());
         assert_eq!(config.test.timeout, 30);
         assert_eq!(config.test.jobs, 2);
         assert_eq!(config.test.languages["python"].command, vec!["pytest"]);
@@ -653,6 +666,7 @@ commnad = ["cargo", "test"]
         assert_eq!(config.test.profile, None);
         assert!(config.test.command.is_empty());
         assert!(config.test.build_command.is_empty());
+        assert!(config.test.sandbox_command.is_empty());
         assert!(config.test.languages.is_empty());
         assert_eq!(config.test.timeout, 30);
         assert!(!config.test.calibrate_timeout);
@@ -719,6 +733,20 @@ timeout = 120
     }
 
     #[test]
+    fn parse_sandbox_command() {
+        let toml_str = r#"
+[test]
+command = ["cargo", "test"]
+sandbox_command = ["bwrap", "--ro-bind", "/", "/", "--"]
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            config.test.sandbox_command,
+            vec!["bwrap", "--ro-bind", "/", "/", "--"]
+        );
+    }
+
+    #[test]
     fn write_template_creates_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("togi.toml");
@@ -726,6 +754,7 @@ timeout = 120
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(content.contains("[test]"));
         assert!(content.contains("command = "));
+        assert!(content.contains("sandbox_command = "));
         assert!(content.contains("[diff]"));
         assert!(content.contains("[mutations]"));
     }
