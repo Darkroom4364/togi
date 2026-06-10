@@ -149,6 +149,12 @@ pub struct MutationConfig {
     pub max_per_run: usize,
     pub coverage_file: Option<PathBuf>,
     pub test_selection_file: Option<PathBuf>,
+    #[serde(default)]
+    pub min_line_coverage: Option<f64>,
+    #[serde(default)]
+    pub min_diff_coverage: Option<f64>,
+    #[serde(default)]
+    pub fail_on_uncovered_diff: bool,
     #[serde(default = "default_max_per_file")]
     pub max_per_file: usize,
     #[serde(default)]
@@ -368,6 +374,9 @@ impl Default for MutationConfig {
             max_per_file: default_max_per_file(),
             coverage_file: None,
             test_selection_file: None,
+            min_line_coverage: None,
+            min_diff_coverage: None,
+            fail_on_uncovered_diff: false,
             exclude_paths: vec![],
             skip_noisy_files: true,
             respect_workspace_ignores: true,
@@ -466,6 +475,13 @@ impl Config {
             "# sandbox_command = [\"bwrap\", \"--ro-bind\", \"/\", \"/\", \"--dev\", \"/dev\", \"--proc\", \"/proc\", \"--\"]\n\
              # Optional wrapper that runs every build and test command inside your own sandbox tool.\n\
              # Leave unset to run directly on the host or CI runner.\n",
+        );
+
+        template.push_str(
+            "# coverage_file = \"coverage/lcov.info\"  # enable LCOV filtering and coverage gates\n\
+             # min_line_coverage = 80.0  # fail if overall LCOV line coverage drops below this\n\
+             # min_diff_coverage = 90.0  # fail if changed-line coverage drops below this\n\
+             # fail_on_uncovered_diff = false  # fail if any changed line is uncovered\n",
         );
 
         template.push_str(&format!(
@@ -650,6 +666,9 @@ commnad = ["cargo", "test"]
             config.mutations.test_selection_file,
             Some("coverage/test-selection.json".into())
         );
+        assert!(config.mutations.min_line_coverage.is_none());
+        assert!(config.mutations.min_diff_coverage.is_none());
+        assert!(!config.mutations.fail_on_uncovered_diff);
         assert!(config.mutations.skip_noisy_files);
         assert!(config.mutations.respect_workspace_ignores);
         assert!(config.mutations.incremental_history);
@@ -680,6 +699,9 @@ commnad = ["cargo", "test"]
         assert!(config.mutations.operators.is_empty());
         assert!(config.mutations.coverage_file.is_none());
         assert!(config.mutations.test_selection_file.is_none());
+        assert!(config.mutations.min_line_coverage.is_none());
+        assert!(config.mutations.min_diff_coverage.is_none());
+        assert!(!config.mutations.fail_on_uncovered_diff);
         assert!(config.mutations.exclude_paths.is_empty());
         assert!(config.mutations.skip_noisy_files);
         assert!(config.mutations.respect_workspace_ignores);
@@ -854,6 +876,20 @@ coverage_file = "coverage.lcov"
             config.mutations.coverage_file,
             Some(PathBuf::from("coverage.lcov"))
         );
+    }
+
+    #[test]
+    fn parse_coverage_gate_options() {
+        let toml_str = r#"
+[mutations]
+min_line_coverage = 80.0
+min_diff_coverage = 90.0
+fail_on_uncovered_diff = true
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.mutations.min_line_coverage, Some(80.0));
+        assert_eq!(config.mutations.min_diff_coverage, Some(90.0));
+        assert!(config.mutations.fail_on_uncovered_diff);
     }
 
     #[test]

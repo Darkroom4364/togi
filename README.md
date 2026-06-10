@@ -127,6 +127,10 @@ togi check --build-cmd "cargo check"
 # Only mutate lines covered by an LCOV file
 togi check --coverage-file coverage/lcov.info
 
+# Gate on line and diff coverage thresholds
+togi check --coverage-file coverage/lcov.info --min-line-coverage 80 --min-diff-coverage 90
+togi check --coverage-file coverage/lcov.info --fail-on-uncovered-diff
+
 # Generate and use a source-line to test-name map (Go helper shown)
 togi test-map --path . --output coverage/test-selection.json
 togi check --test-selection-file coverage/test-selection.json
@@ -209,6 +213,9 @@ max_per_run = 20
 max_per_file = 20
 schemata = true
 coverage_file = "coverage/lcov.info"
+min_line_coverage = 80.0
+min_diff_coverage = 90.0
+fail_on_uncovered_diff = false
 test_selection_file = "coverage/test-selection.json"
 incremental_history = true
 operators = ["-string_to_empty"]
@@ -324,15 +331,20 @@ Schemata are enabled by default. They batch compatible mutations into one build 
 
 ## Coverage and test selection
 
-For large repos, togi can avoid work before the runner starts:
+For large repos, togi can avoid work before the runner starts and can also
+fail the run when LCOV coverage is below a threshold:
 
 - `--coverage-file coverage/lcov.info` keeps only mutations on covered lines
+- `--min-line-coverage 80` fails when overall LCOV line coverage is below 80%
+- `--min-diff-coverage 90` fails when changed-line coverage is below 90%
+- `--fail-on-uncovered-diff` fails when any changed line is uncovered
 - `togi test-map` generates a Go line-to-test map from per-test coverage
 - `--test-selection-file coverage/test-selection.json` narrows each mutant to tests that cover that line when the configured runner supports test selection
 
 ```bash
 togi test-map --path . --output coverage/test-selection.json
 togi check --coverage-file coverage/lcov.info --test-selection-file coverage/test-selection.json
+togi check --coverage-file coverage/lcov.info --min-line-coverage 80 --min-diff-coverage 90
 ```
 
 The selection file is a JSON map of source file to line number to test names.
