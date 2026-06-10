@@ -1,4 +1,5 @@
 mod mutations;
+mod smoke;
 mod verify;
 
 use std::sync::{Mutex, MutexGuard, OnceLock};
