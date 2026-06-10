@@ -30,7 +30,7 @@ jobs:
           path: .
           severity: medium
           version: v0.8.1
-          fail-on-findings: "false"
+          fail-on-findings: "true"
           upload-sarif: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
 
   check:
@@ -106,6 +106,5 @@ jobs:
           cache-bin: false
       - name: Build togi
         run: cargo build --locked --release
-      - name: Run togi on last commit
-        continue-on-error: true
-        run: ./target/release/togi check --base HEAD~1 --test-cmd "cargo test --locked" --format terminal
+      - name: Run blocking dogfood smoke test
+        run: ./.github/scripts/run-dogfood-smoke.sh

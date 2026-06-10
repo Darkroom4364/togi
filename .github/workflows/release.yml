@@ -27,12 +27,88 @@ jobs:
           path: .
           severity: medium
           version: v0.8.1
-          fail-on-findings: "false"
+          fail-on-findings: "true"
           upload-sarif: "true"
+
+  check:
+    name: Build & Test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
+      - name: Build
+        run: cargo build --locked
+      - name: Test
+        run: cargo test --locked
+
+  msrv:
+    name: MSRV
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.87
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
+      - name: Test
+        run: cargo test --locked
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
+      - name: Clippy
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - name: Format
+        run: cargo fmt -- --check
+
+  integration:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+      - name: Integration tests
+        run: cargo test --locked -- --ignored
+
+  dogfood:
+    name: Dogfood (togi on togi)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
+      - name: Build togi
+        run: cargo build --locked --release
+      - name: Run blocking dogfood smoke test
+        run: ./.github/scripts/run-dogfood-smoke.sh
 
   build:
     name: Build ${{ matrix.target }}
-    needs: foxguard
+    needs: [foxguard, check, msrv, lint, integration, dogfood]
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
