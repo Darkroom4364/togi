@@ -52,7 +52,7 @@ togi's differentiator: multi-language + diff-targeted by default + single binary
 ## Install
 
 ```bash
-cargo install --git https://github.com/Darkroom4364/togi
+cargo install --git https://github.com/Darkroom4364/togi --rev <commit-sha> --locked
 ```
 
 Or build from source:
@@ -496,8 +496,10 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@stable
-      - run: cargo install --git https://github.com/Darkroom4364/togi
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+        with:
+          toolchain: stable
+      - run: cargo install --git https://github.com/Darkroom4364/togi --rev <reviewed-commit-sha> --locked
       - run: togi check --base origin/main --format github --fail-under 80
 ```
 
