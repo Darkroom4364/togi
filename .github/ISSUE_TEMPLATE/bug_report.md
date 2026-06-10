@@ -7,6 +7,9 @@ assignees: ''
 
 ---
 
+If you believe you found a security vulnerability, do not open a public bug
+report. Follow the instructions in `SECURITY.md` instead.
+
 **Describe the bug**
   A clear and concise description of what the bug is.
 
