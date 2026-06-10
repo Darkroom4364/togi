@@ -96,6 +96,18 @@ jobs:
       - name: Format
         run: cargo fmt -- --check
 
+  vscode:
+    name: VS Code Extension
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Test extension
+        working-directory: editors/vscode
+        run: node --test test/*.test.js
+
   integration:
     name: Integration Tests
     runs-on: ubuntu-latest
@@ -133,7 +145,7 @@ jobs:
 
   build:
     name: Build ${{ matrix.target }}
-    needs: [foxguard, check, msrv, supply-chain, lint, integration, dogfood]
+    needs: [foxguard, check, msrv, supply-chain, lint, vscode, integration, dogfood]
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
