@@ -448,6 +448,22 @@ dependency/build directories such as `node_modules`, `.venv`, `dist`, `build`,
 and `target`. Set `[mutations] respect_workspace_ignores = false` only when a
 test command genuinely needs ignored files copied into the mutation workspace.
 
+## Security model
+
+togi executes repository-defined build and test commands with the permissions of
+the current user or CI runner.
+
+Workspace copies, timeouts, and descendant-process cleanup improve correctness
+and cleanup, but they are not a security sandbox. togi does not currently block
+network access or confine filesystem access beyond the restrictions already
+provided by your OS, container, or CI environment.
+
+Run togi only against repositories you trust, or place it inside a separate
+container or VM when evaluating less-trusted code. Running less-trusted
+repositories directly on the host is out of scope for the current security
+model. See [SECURITY.md](SECURITY.md) for the supported-version policy and
+vulnerability reporting instructions.
+
 ## How it works
 
 1. Parse `git diff` to find changed lines
