@@ -141,73 +141,7 @@ struct RustSchema;
 struct PythonSchema;
 struct TypeScriptSchema;
 
-const C_OPERATOR_ALLOWLIST: &[&str] = &[
-    "eq_to_neq",
-    "lt_to_lte",
-    "gt_to_gte",
-    "and_to_or",
-    "or_to_and",
-    "mul_to_div",
-    "div_to_mul",
-    "mod_to_mul",
-    "plus_to_minus",
-    "minus_to_plus",
-    "true_to_false",
-    "false_to_true",
-    "zero_to_one",
-    "string_to_empty",
-    "increment_numeric",
-    "decrement_numeric",
-    "remove_unary_not",
-    "remove_unary_neg",
-    "negate_condition",
-];
-
-const CPP_OPERATOR_ALLOWLIST: &[&str] = &[
-    "eq_to_neq",
-    "lt_to_lte",
-    "gt_to_gte",
-    "and_to_or",
-    "or_to_and",
-    "mul_to_div",
-    "div_to_mul",
-    "mod_to_mul",
-    "plus_to_minus",
-    "minus_to_plus",
-    "true_to_false",
-    "false_to_true",
-    "zero_to_one",
-    "string_to_empty",
-    "increment_numeric",
-    "decrement_numeric",
-    "remove_unary_not",
-    "remove_unary_neg",
-    "negate_condition",
-];
-
-const JAVA_OPERATOR_ALLOWLIST: &[&str] = &[
-    "eq_to_neq",
-    "lt_to_lte",
-    "gt_to_gte",
-    "and_to_or",
-    "or_to_and",
-    "mul_to_div",
-    "div_to_mul",
-    "mod_to_mul",
-    "plus_to_minus",
-    "minus_to_plus",
-    "true_to_false",
-    "false_to_true",
-    "zero_to_one",
-    "string_to_empty",
-    "increment_numeric",
-    "decrement_numeric",
-    "remove_unary_not",
-    "remove_unary_neg",
-    "negate_condition",
-];
-
-const RUST_OPERATOR_ALLOWLIST: &[&str] = &[
+const COMMON_EXPRESSION_OPERATOR_ALLOWLIST: &[&str] = &[
     "eq_to_neq",
     "lt_to_lte",
     "gt_to_gte",
@@ -261,7 +195,7 @@ impl SchemaAdapter for CSchema {
 
     fn classify(&self, mutation: &Mutation, source: &[u8]) -> Result<SchemaKind, SchemaSkipReason> {
         validate_source_range(mutation, source)?;
-        if !C_OPERATOR_ALLOWLIST.contains(&mutation.operator.as_str()) {
+        if !COMMON_EXPRESSION_OPERATOR_ALLOWLIST.contains(&mutation.operator.as_str()) {
             return Err(SchemaSkipReason::UnsupportedOperator);
         }
         if !c_range_is_runtime_context(source, mutation.byte_range.clone()) {
@@ -310,7 +244,7 @@ impl SchemaAdapter for CppSchema {
 
     fn classify(&self, mutation: &Mutation, source: &[u8]) -> Result<SchemaKind, SchemaSkipReason> {
         validate_source_range(mutation, source)?;
-        if !CPP_OPERATOR_ALLOWLIST.contains(&mutation.operator.as_str()) {
+        if !COMMON_EXPRESSION_OPERATOR_ALLOWLIST.contains(&mutation.operator.as_str()) {
             return Err(SchemaSkipReason::UnsupportedOperator);
         }
         if !cpp_range_is_runtime_context(source, mutation.byte_range.clone()) {
@@ -390,7 +324,7 @@ impl SchemaAdapter for JavaSchema {
         if java_line_looks_compile_time(mutation, source) {
             return Err(SchemaSkipReason::CompileTimeContext);
         }
-        if JAVA_OPERATOR_ALLOWLIST.contains(&mutation.operator.as_str()) {
+        if COMMON_EXPRESSION_OPERATOR_ALLOWLIST.contains(&mutation.operator.as_str()) {
             Ok(SchemaKind::Expression)
         } else {
             Err(SchemaSkipReason::UnsupportedOperator)
@@ -437,7 +371,7 @@ where
         if rust_line_looks_compile_time(mutation, source) {
             return Err(SchemaSkipReason::CompileTimeContext);
         }
-        if RUST_OPERATOR_ALLOWLIST.contains(&mutation.operator.as_str()) {
+        if COMMON_EXPRESSION_OPERATOR_ALLOWLIST.contains(&mutation.operator.as_str()) {
             Ok(SchemaKind::Expression)
         } else {
             Err(SchemaSkipReason::UnsupportedOperator)
@@ -581,47 +515,155 @@ pub fn plan(project_root: &Path, mutations: Vec<Mutation>) -> SchemaPlan {
     }
 }
 
-/// Rewrite C files once so selected mutations can be activated by `TOGI_MUTANT`.
-pub fn rewrite_c_files(
-    project_root: &Path,
-    selected: &[SchemaMutation],
-) -> Result<Vec<SchemaFileRewrite>, SchemaRewriteError> {
-    let Some(adapter) = adapter_for_language("c") else {
-        return Err(SchemaRewriteError::new("c schema adapter is not available"));
-    };
+type ExpressionRangeResolver = for<'tree> fn(
+    tree_sitter::Node<'tree>,
+    &str,
+    &Mutation,
+) -> Result<std::ops::Range<usize>, SchemaRewriteError>;
 
+fn require_adapter(language: &str) -> Result<&'static dyn SchemaAdapter, SchemaRewriteError> {
+    adapter_for_language(language).ok_or_else(|| {
+        SchemaRewriteError::new(format!("{language} schema adapter is not available"))
+    })
+}
+
+fn group_expression_mutations_by_file<'a>(
+    project_root: &Path,
+    selected: &'a [SchemaMutation],
+    language: &str,
+) -> Result<BTreeMap<PathBuf, Vec<&'a SchemaMutation>>, SchemaRewriteError> {
     let mut by_file: BTreeMap<PathBuf, Vec<&SchemaMutation>> = BTreeMap::new();
     for mutation in selected {
-        if mutation.mutation.language != "c" {
+        if mutation.mutation.language != language {
             return Err(SchemaRewriteError::new(format!(
-                "schema rewrite only supports c, got {}",
+                "schema rewrite only supports {language}, got {}",
                 mutation.mutation.language
             )));
         }
         if mutation.kind != SchemaKind::Expression {
-            return Err(SchemaRewriteError::new(
-                "c schema rewrite currently supports expression mutations only",
-            ));
+            return Err(SchemaRewriteError::new(format!(
+                "{language} schema rewrite currently supports expression mutations only"
+            )));
         }
         by_file
             .entry(source_path(project_root, &mutation.mutation.file))
             .or_default()
             .push(mutation);
     }
+    Ok(by_file)
+}
 
+fn rewrite_expression_files_for_language(
+    project_root: &Path,
+    selected: &[SchemaMutation],
+    language: &str,
+    adapter: &dyn SchemaAdapter,
+    rewrite_file: impl Fn(
+        &str,
+        &[&SchemaMutation],
+        &dyn SchemaAdapter,
+    ) -> Result<String, SchemaRewriteError>,
+) -> Result<Vec<SchemaFileRewrite>, SchemaRewriteError> {
+    let by_file = group_expression_mutations_by_file(project_root, selected, language)?;
     let mut rewritten = Vec::new();
     for (file, mutations) in by_file {
         let source = std::fs::read_to_string(&file).map_err(|e| {
             SchemaRewriteError::new(format!("could not read {}: {e}", file.display()))
         })?;
-        let rewritten_source = rewrite_c_file(&source, &mutations, adapter)?;
+        let rewritten_source = rewrite_file(&source, &mutations, adapter)?;
         rewritten.push(SchemaFileRewrite {
             file,
             content: rewritten_source.into_bytes(),
         });
     }
-
     Ok(rewritten)
+}
+
+fn build_expression_edits(
+    source: &str,
+    selected: &[&SchemaMutation],
+    adapter: &dyn SchemaAdapter,
+    root: tree_sitter::Node<'_>,
+    range_for_mutation: ExpressionRangeResolver,
+) -> Result<Vec<(std::ops::Range<usize>, String)>, SchemaRewriteError> {
+    let source_bytes = source.as_bytes();
+    let mut edits = Vec::with_capacity(selected.len());
+
+    for schema_mutation in selected {
+        let mutation = &schema_mutation.mutation;
+        validate_source_range(mutation, source_bytes).map_err(|reason| {
+            SchemaRewriteError::new(format!(
+                "mutation {} is not rewriteable: {reason:?}",
+                mutation.id
+            ))
+        })?;
+        let expression_range = range_for_mutation(root, source, mutation)?;
+        let original = source_slice(source, expression_range.clone())?;
+        let replacement = mutated_expression(source, expression_range.clone(), mutation)?;
+        let wrapped = adapter.wrap_expression(mutation.id, original, &replacement);
+        edits.push((expression_range, wrapped));
+    }
+
+    edits.sort_by_key(|(range, _)| (range.start, range.end));
+    ensure_non_overlapping_expression_edits(&edits)?;
+    Ok(edits)
+}
+
+fn ensure_non_overlapping_expression_edits(
+    edits: &[(std::ops::Range<usize>, String)],
+) -> Result<(), SchemaRewriteError> {
+    let mut previous_end = 0usize;
+    for (position, (range, _)) in edits.iter().enumerate() {
+        if position > 0 && range.start < previous_end {
+            return Err(SchemaRewriteError::new(
+                "schema mutations overlap after expression expansion",
+            ));
+        }
+        previous_end = range.end;
+    }
+    Ok(())
+}
+
+fn apply_expression_edits(
+    source: &str,
+    edits: Vec<(std::ops::Range<usize>, String)>,
+    language: &str,
+) -> Result<String, SchemaRewriteError> {
+    let mut rewritten = source.as_bytes().to_vec();
+    for (range, replacement) in edits.into_iter().rev() {
+        rewritten.splice(range, replacement.bytes());
+    }
+    String::from_utf8(rewritten).map_err(|e| {
+        SchemaRewriteError::new(format!("rewritten {language} source is not utf-8: {e}"))
+    })
+}
+
+fn rewrite_expression_file(
+    source: &str,
+    selected: &[&SchemaMutation],
+    adapter: &dyn SchemaAdapter,
+    parse: fn(&str) -> Result<tree_sitter::Tree, SchemaRewriteError>,
+    range_for_mutation: ExpressionRangeResolver,
+    language: &str,
+) -> Result<String, SchemaRewriteError> {
+    let tree = parse(source)?;
+    let edits = build_expression_edits(
+        source,
+        selected,
+        adapter,
+        tree.root_node(),
+        range_for_mutation,
+    )?;
+    apply_expression_edits(source, edits, language)
+}
+
+/// Rewrite C files once so selected mutations can be activated by `TOGI_MUTANT`.
+pub fn rewrite_c_files(
+    project_root: &Path,
+    selected: &[SchemaMutation],
+) -> Result<Vec<SchemaFileRewrite>, SchemaRewriteError> {
+    let adapter = require_adapter("c")?;
+    rewrite_expression_files_for_language(project_root, selected, "c", adapter, rewrite_c_file)
 }
 
 /// Rewrite C++ files once so selected mutations can be activated by `TOGI_MUTANT`.
@@ -629,44 +671,8 @@ pub fn rewrite_cpp_files(
     project_root: &Path,
     selected: &[SchemaMutation],
 ) -> Result<Vec<SchemaFileRewrite>, SchemaRewriteError> {
-    let Some(adapter) = adapter_for_language("cpp") else {
-        return Err(SchemaRewriteError::new(
-            "cpp schema adapter is not available",
-        ));
-    };
-
-    let mut by_file: BTreeMap<PathBuf, Vec<&SchemaMutation>> = BTreeMap::new();
-    for mutation in selected {
-        if mutation.mutation.language != "cpp" {
-            return Err(SchemaRewriteError::new(format!(
-                "schema rewrite only supports cpp, got {}",
-                mutation.mutation.language
-            )));
-        }
-        if mutation.kind != SchemaKind::Expression {
-            return Err(SchemaRewriteError::new(
-                "cpp schema rewrite currently supports expression mutations only",
-            ));
-        }
-        by_file
-            .entry(source_path(project_root, &mutation.mutation.file))
-            .or_default()
-            .push(mutation);
-    }
-
-    let mut rewritten = Vec::new();
-    for (file, mutations) in by_file {
-        let source = std::fs::read_to_string(&file).map_err(|e| {
-            SchemaRewriteError::new(format!("could not read {}: {e}", file.display()))
-        })?;
-        let rewritten_source = rewrite_cpp_file(&source, &mutations, adapter)?;
-        rewritten.push(SchemaFileRewrite {
-            file,
-            content: rewritten_source.into_bytes(),
-        });
-    }
-
-    Ok(rewritten)
+    let adapter = require_adapter("cpp")?;
+    rewrite_expression_files_for_language(project_root, selected, "cpp", adapter, rewrite_cpp_file)
 }
 
 /// Rewrite Go files once so selected mutations can be activated by `TOGI_MUTANT`.
@@ -674,30 +680,8 @@ pub fn rewrite_go_files(
     project_root: &Path,
     selected: &[SchemaMutation],
 ) -> Result<Vec<SchemaFileRewrite>, SchemaRewriteError> {
-    let Some(adapter) = adapter_for_language("go") else {
-        return Err(SchemaRewriteError::new(
-            "go schema adapter is not available",
-        ));
-    };
-
-    let mut by_file: BTreeMap<PathBuf, Vec<&SchemaMutation>> = BTreeMap::new();
-    for mutation in selected {
-        if mutation.mutation.language != "go" {
-            return Err(SchemaRewriteError::new(format!(
-                "schema rewrite only supports go, got {}",
-                mutation.mutation.language
-            )));
-        }
-        if mutation.kind != SchemaKind::Expression {
-            return Err(SchemaRewriteError::new(
-                "go schema rewrite currently supports expression mutations only",
-            ));
-        }
-        by_file
-            .entry(source_path(project_root, &mutation.mutation.file))
-            .or_default()
-            .push(mutation);
-    }
+    let adapter = require_adapter("go")?;
+    let by_file = group_expression_mutations_by_file(project_root, selected, "go")?;
 
     let mut rewritten = BTreeMap::new();
     let mut helper_file_by_package = BTreeMap::<(PathBuf, String), PathBuf>::new();
@@ -737,44 +721,14 @@ pub fn rewrite_java_files(
     project_root: &Path,
     selected: &[SchemaMutation],
 ) -> Result<Vec<SchemaFileRewrite>, SchemaRewriteError> {
-    let Some(adapter) = adapter_for_language("java") else {
-        return Err(SchemaRewriteError::new(
-            "java schema adapter is not available",
-        ));
-    };
-
-    let mut by_file: BTreeMap<PathBuf, Vec<&SchemaMutation>> = BTreeMap::new();
-    for mutation in selected {
-        if mutation.mutation.language != "java" {
-            return Err(SchemaRewriteError::new(format!(
-                "schema rewrite only supports java, got {}",
-                mutation.mutation.language
-            )));
-        }
-        if mutation.kind != SchemaKind::Expression {
-            return Err(SchemaRewriteError::new(
-                "java schema rewrite currently supports expression mutations only",
-            ));
-        }
-        by_file
-            .entry(source_path(project_root, &mutation.mutation.file))
-            .or_default()
-            .push(mutation);
-    }
-
-    let mut rewritten = Vec::new();
-    for (file, mutations) in by_file {
-        let source = std::fs::read_to_string(&file).map_err(|e| {
-            SchemaRewriteError::new(format!("could not read {}: {e}", file.display()))
-        })?;
-        let rewritten_source = rewrite_java_file(&source, &mutations, adapter)?;
-        rewritten.push(SchemaFileRewrite {
-            file,
-            content: rewritten_source.into_bytes(),
-        });
-    }
-
-    Ok(rewritten)
+    let adapter = require_adapter("java")?;
+    rewrite_expression_files_for_language(
+        project_root,
+        selected,
+        "java",
+        adapter,
+        rewrite_java_file,
+    )
 }
 
 /// Rewrite Rust files once so selected mutations can be activated by `TOGI_MUTANT`.
@@ -782,45 +736,17 @@ pub fn rewrite_rust_files(
     project_root: &Path,
     selected: &[SchemaMutation],
 ) -> Result<Vec<SchemaFileRewrite>, SchemaRewriteError> {
-    let Some(adapter) = adapter_for_language("rust") else {
-        return Err(SchemaRewriteError::new(
-            "rust schema adapter is not available",
-        ));
-    };
-
-    let mut by_file: BTreeMap<PathBuf, Vec<&SchemaMutation>> = BTreeMap::new();
-    for mutation in selected {
-        if mutation.mutation.language != "rust" {
-            return Err(SchemaRewriteError::new(format!(
-                "schema rewrite only supports rust, got {}",
-                mutation.mutation.language
-            )));
-        }
-        if mutation.kind != SchemaKind::Expression {
-            return Err(SchemaRewriteError::new(
-                "rust schema rewrite currently supports expression mutations only",
-            ));
-        }
-        by_file
-            .entry(source_path(project_root, &mutation.mutation.file))
-            .or_default()
-            .push(mutation);
-    }
-
-    let mut rewritten = Vec::new();
-    for (file, mutations) in by_file {
-        let source = std::fs::read_to_string(&file).map_err(|e| {
-            SchemaRewriteError::new(format!("could not read {}: {e}", file.display()))
-        })?;
-        let rewritten_source = rewrite_rust_file(&source, &mutations, adapter)?;
-        let rewritten_source = inject_rust_runtime(&rewritten_source, adapter);
-        rewritten.push(SchemaFileRewrite {
-            file,
-            content: rewritten_source.into_bytes(),
-        });
-    }
-
-    Ok(rewritten)
+    let adapter = require_adapter("rust")?;
+    rewrite_expression_files_for_language(
+        project_root,
+        selected,
+        "rust",
+        adapter,
+        |source, mutations, adapter| {
+            rewrite_rust_file(source, mutations, adapter)
+                .map(|rewritten| inject_rust_runtime(&rewritten, adapter))
+        },
+    )
 }
 
 fn source_path(project_root: &Path, mutation_file: &Path) -> PathBuf {
@@ -836,43 +762,14 @@ fn rewrite_c_file(
     selected: &[&SchemaMutation],
     adapter: &dyn SchemaAdapter,
 ) -> Result<String, SchemaRewriteError> {
-    let source_bytes = source.as_bytes();
-    let tree = parse_c_source(source)?;
-    let mut edits = Vec::with_capacity(selected.len());
-
-    for schema_mutation in selected {
-        let mutation = &schema_mutation.mutation;
-        validate_source_range(mutation, source_bytes).map_err(|reason| {
-            SchemaRewriteError::new(format!(
-                "mutation {} is not rewriteable: {reason:?}",
-                mutation.id
-            ))
-        })?;
-        let expression_range = c_expression_range_for_mutation(tree.root_node(), source, mutation)?;
-        let original = source_slice(source, expression_range.clone())?;
-        let replacement = mutated_expression(source, expression_range.clone(), mutation)?;
-        let wrapped = adapter.wrap_expression(mutation.id, original, &replacement);
-        edits.push((expression_range, wrapped));
-    }
-
-    edits.sort_by_key(|(range, _)| (range.start, range.end));
-    let mut previous_end = 0usize;
-    for (position, (range, _)) in edits.iter().enumerate() {
-        if position > 0 && range.start < previous_end {
-            return Err(SchemaRewriteError::new(
-                "schema mutations overlap after expression expansion",
-            ));
-        }
-        previous_end = range.end;
-    }
-
-    let mut rewritten = source.as_bytes().to_vec();
-    for (range, replacement) in edits.into_iter().rev() {
-        rewritten.splice(range, replacement.bytes());
-    }
-
-    let rewritten = String::from_utf8(rewritten)
-        .map_err(|e| SchemaRewriteError::new(format!("rewritten C source is not utf-8: {e}")))?;
+    let rewritten = rewrite_expression_file(
+        source,
+        selected,
+        adapter,
+        parse_c_source,
+        c_expression_range_for_mutation,
+        "C",
+    )?;
     inject_c_runtime(&rewritten, adapter)
 }
 
@@ -881,44 +778,14 @@ fn rewrite_cpp_file(
     selected: &[&SchemaMutation],
     adapter: &dyn SchemaAdapter,
 ) -> Result<String, SchemaRewriteError> {
-    let source_bytes = source.as_bytes();
-    let tree = parse_cpp_source(source)?;
-    let mut edits = Vec::with_capacity(selected.len());
-
-    for schema_mutation in selected {
-        let mutation = &schema_mutation.mutation;
-        validate_source_range(mutation, source_bytes).map_err(|reason| {
-            SchemaRewriteError::new(format!(
-                "mutation {} is not rewriteable: {reason:?}",
-                mutation.id
-            ))
-        })?;
-        let expression_range =
-            cpp_expression_range_for_mutation(tree.root_node(), source, mutation)?;
-        let original = source_slice(source, expression_range.clone())?;
-        let replacement = mutated_expression(source, expression_range.clone(), mutation)?;
-        let wrapped = adapter.wrap_expression(mutation.id, original, &replacement);
-        edits.push((expression_range, wrapped));
-    }
-
-    edits.sort_by_key(|(range, _)| (range.start, range.end));
-    let mut previous_end = 0usize;
-    for (position, (range, _)) in edits.iter().enumerate() {
-        if position > 0 && range.start < previous_end {
-            return Err(SchemaRewriteError::new(
-                "schema mutations overlap after expression expansion",
-            ));
-        }
-        previous_end = range.end;
-    }
-
-    let mut rewritten = source.as_bytes().to_vec();
-    for (range, replacement) in edits.into_iter().rev() {
-        rewritten.splice(range, replacement.bytes());
-    }
-
-    let rewritten = String::from_utf8(rewritten)
-        .map_err(|e| SchemaRewriteError::new(format!("rewritten C++ source is not utf-8: {e}")))?;
+    let rewritten = rewrite_expression_file(
+        source,
+        selected,
+        adapter,
+        parse_cpp_source,
+        cpp_expression_range_for_mutation,
+        "C++",
+    )?;
     inject_cpp_runtime(&rewritten, adapter)
 }
 
@@ -927,44 +794,14 @@ fn rewrite_go_file(
     selected: &[&SchemaMutation],
     adapter: &dyn SchemaAdapter,
 ) -> Result<String, SchemaRewriteError> {
-    let source_bytes = source.as_bytes();
-    let tree = parse_go_source(source)?;
-    let mut edits = Vec::with_capacity(selected.len());
-
-    for schema_mutation in selected {
-        let mutation = &schema_mutation.mutation;
-        validate_source_range(mutation, source_bytes).map_err(|reason| {
-            SchemaRewriteError::new(format!(
-                "mutation {} is not rewriteable: {reason:?}",
-                mutation.id
-            ))
-        })?;
-        let expression_range =
-            go_expression_range_for_mutation(tree.root_node(), source, mutation)?;
-        let original = source_slice(source, expression_range.clone())?;
-        let replacement = mutated_expression(source, expression_range.clone(), mutation)?;
-        let wrapped = adapter.wrap_expression(mutation.id, original, &replacement);
-        edits.push((expression_range, wrapped));
-    }
-
-    edits.sort_by_key(|(range, _)| (range.start, range.end));
-    let mut previous_end = 0usize;
-    for (position, (range, _)) in edits.iter().enumerate() {
-        if position > 0 && range.start < previous_end {
-            return Err(SchemaRewriteError::new(
-                "schema mutations overlap after expression expansion",
-            ));
-        }
-        previous_end = range.end;
-    }
-
-    let mut rewritten = source.as_bytes().to_vec();
-    for (range, replacement) in edits.into_iter().rev() {
-        rewritten.splice(range, replacement.bytes());
-    }
-
-    String::from_utf8(rewritten)
-        .map_err(|e| SchemaRewriteError::new(format!("rewritten Go source is not utf-8: {e}")))
+    rewrite_expression_file(
+        source,
+        selected,
+        adapter,
+        parse_go_source,
+        go_expression_range_for_mutation,
+        "Go",
+    )
 }
 
 fn rewrite_java_file(
@@ -1035,44 +872,14 @@ fn rewrite_rust_file(
     selected: &[&SchemaMutation],
     adapter: &dyn SchemaAdapter,
 ) -> Result<String, SchemaRewriteError> {
-    let source_bytes = source.as_bytes();
-    let tree = parse_rust_source(source)?;
-    let mut edits = Vec::with_capacity(selected.len());
-
-    for schema_mutation in selected {
-        let mutation = &schema_mutation.mutation;
-        validate_source_range(mutation, source_bytes).map_err(|reason| {
-            SchemaRewriteError::new(format!(
-                "mutation {} is not rewriteable: {reason:?}",
-                mutation.id
-            ))
-        })?;
-        let expression_range =
-            rust_expression_range_for_mutation(tree.root_node(), source, mutation)?;
-        let original = source_slice(source, expression_range.clone())?;
-        let replacement = mutated_expression(source, expression_range.clone(), mutation)?;
-        let wrapped = adapter.wrap_expression(mutation.id, original, &replacement);
-        edits.push((expression_range, wrapped));
-    }
-
-    edits.sort_by_key(|(range, _)| (range.start, range.end));
-    let mut previous_end = 0usize;
-    for (position, (range, _)) in edits.iter().enumerate() {
-        if position > 0 && range.start < previous_end {
-            return Err(SchemaRewriteError::new(
-                "schema mutations overlap after expression expansion",
-            ));
-        }
-        previous_end = range.end;
-    }
-
-    let mut rewritten = source.as_bytes().to_vec();
-    for (range, replacement) in edits.into_iter().rev() {
-        rewritten.splice(range, replacement.bytes());
-    }
-
-    String::from_utf8(rewritten)
-        .map_err(|e| SchemaRewriteError::new(format!("rewritten Rust source is not utf-8: {e}")))
+    rewrite_expression_file(
+        source,
+        selected,
+        adapter,
+        parse_rust_source,
+        rust_expression_range_for_mutation,
+        "Rust",
+    )
 }
 
 fn mutated_expression(
@@ -1173,7 +980,7 @@ fn c_expression_range_for_mutation(
     source: &str,
     mutation: &Mutation,
 ) -> Result<std::ops::Range<usize>, SchemaRewriteError> {
-    if !C_OPERATOR_ALLOWLIST.contains(&mutation.operator.as_str()) {
+    if !COMMON_EXPRESSION_OPERATOR_ALLOWLIST.contains(&mutation.operator.as_str()) {
         return Err(SchemaRewriteError::new(format!(
             "unsupported C schema operator {}",
             mutation.operator
@@ -1212,7 +1019,7 @@ fn cpp_expression_range_for_mutation(
     source: &str,
     mutation: &Mutation,
 ) -> Result<std::ops::Range<usize>, SchemaRewriteError> {
-    if !CPP_OPERATOR_ALLOWLIST.contains(&mutation.operator.as_str()) {
+    if !COMMON_EXPRESSION_OPERATOR_ALLOWLIST.contains(&mutation.operator.as_str()) {
         return Err(SchemaRewriteError::new(format!(
             "unsupported C++ schema operator {}",
             mutation.operator
@@ -1277,7 +1084,7 @@ fn java_expression_range_for_mutation(
     source: &str,
     mutation: &Mutation,
 ) -> Result<std::ops::Range<usize>, SchemaRewriteError> {
-    if !JAVA_OPERATOR_ALLOWLIST.contains(&mutation.operator.as_str()) {
+    if !COMMON_EXPRESSION_OPERATOR_ALLOWLIST.contains(&mutation.operator.as_str()) {
         return Err(SchemaRewriteError::new(format!(
             "unsupported Java schema operator {}",
             mutation.operator
@@ -1316,7 +1123,7 @@ fn rust_expression_range_for_mutation(
     source: &str,
     mutation: &Mutation,
 ) -> Result<std::ops::Range<usize>, SchemaRewriteError> {
-    if !RUST_OPERATOR_ALLOWLIST.contains(&mutation.operator.as_str()) {
+    if !COMMON_EXPRESSION_OPERATOR_ALLOWLIST.contains(&mutation.operator.as_str()) {
         return Err(SchemaRewriteError::new(format!(
             "unsupported Rust schema operator {}",
             mutation.operator

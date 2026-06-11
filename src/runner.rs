@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs;
 use std::hash::Hasher;
 use std::io::{IsTerminal, Read, Write};
-use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::panic::{AssertUnwindSafe as PanicBoundary, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -1919,6 +1919,129 @@ fn record_incremental_history(
     });
 }
 
+struct PreparedMutationRun {
+    selected_test: SelectedTestCommand,
+    previous_killer: Option<String>,
+    history_query: Option<cache::IncrementalHistoryQuery>,
+    cache_key: Option<CacheKey>,
+}
+
+struct PreparedMutationContext<'a> {
+    commands: &'a CommandConfig,
+    history: Option<&'a cache::IncrementalHistoryStore>,
+    source_contents: &'a SourceContentCache,
+    cache_context_fingerprint: u64,
+    test_context_index: &'a TestContextIndex,
+    env: &'a HashMap<String, String>,
+}
+
+impl PreparedMutationRun {
+    fn new(project_root: &Path, mutation: &Mutation, context: PreparedMutationContext<'_>) -> Self {
+        let selected_test = select_test_command_with_history(
+            project_root,
+            context.commands,
+            mutation,
+            context.history,
+        );
+        let mutation_identity = cache_identity(project_root, mutation);
+        let command_ctx = selected_test.cache_context(
+            &context.commands.build_command,
+            context.commands.build_command_explicit,
+            context.commands.sandbox_command.as_slice(),
+            context.env,
+        );
+        let relevant_test_hash = context.test_context_index.fingerprint_for_tests(
+            &selected_test.selected_tests,
+            context.cache_context_fingerprint,
+        );
+        let previous_killer = context.history.and_then(|history| {
+            history.preferred_killer_test(
+                &mutation_identity,
+                &mutation.description,
+                &selected_test.selected_tests,
+            )
+        });
+        let cache_ctx = format!(
+            "{command_ctx};context={:016x}",
+            context.cache_context_fingerprint
+        );
+        let source_content = context
+            .source_contents
+            .content_for(project_root, &mutation.file);
+        let history_query = source_content.as_deref().map(|content| {
+            incremental_history_query(
+                project_root,
+                mutation,
+                content,
+                &command_ctx,
+                relevant_test_hash,
+            )
+        });
+        let cache_key = source_content.as_ref().map(|content| {
+            CacheKey::new(
+                content,
+                &mutation_identity,
+                &mutation.description,
+                &cache_ctx,
+            )
+        });
+
+        Self {
+            selected_test,
+            previous_killer,
+            history_query,
+            cache_key,
+        }
+    }
+
+    fn restore_result(
+        &self,
+        project_root: &Path,
+        history: Option<&cache::IncrementalHistoryStore>,
+        force_rerun: bool,
+    ) -> Option<MutationResult> {
+        if force_rerun {
+            return None;
+        }
+        if let Some(ref key) = self.cache_key {
+            if let Some(result) = cache::lookup(project_root, key) {
+                self.record_history(history, result);
+                return Some(result);
+            }
+        }
+        if let (Some(history), Some(query)) = (history, self.history_query.as_ref()) {
+            if let Some(result) = history.lookup(query) {
+                if let Some(ref key) = self.cache_key {
+                    cache::store(project_root, key, result);
+                }
+                self.record_history(Some(history), result);
+                return Some(result);
+            }
+        }
+        None
+    }
+
+    fn store_cache(&self, project_root: &Path, result: MutationResult) {
+        if let Some(ref key) = self.cache_key {
+            cache::store(project_root, key, result);
+        }
+    }
+
+    fn record_history(
+        &self,
+        history: Option<&cache::IncrementalHistoryStore>,
+        result: MutationResult,
+    ) {
+        record_incremental_history(
+            history,
+            self.history_query.as_ref(),
+            &self.selected_test.selected_tests,
+            result,
+            self.previous_killer.clone(),
+        );
+    }
+}
+
 fn run_queued_mutation(
     queued: QueuedMutation,
     reservation: TestSlotReservation,
@@ -1931,85 +2054,28 @@ fn run_queued_mutation(
         return None;
     }
 
-    let selected_test = select_test_command_with_history(
+    let prepared = PreparedMutationRun::new(
         shared.project_root,
-        shared.commands,
         &mutation,
-        shared.history,
+        PreparedMutationContext {
+            commands: shared.commands,
+            history: shared.history,
+            source_contents: shared.source_contents,
+            cache_context_fingerprint: shared.cache_context_fingerprint,
+            test_context_index: shared.test_context_index,
+            env: shared.env,
+        },
     );
-    let command_ctx = selected_test.cache_context(
-        shared.build_command,
-        shared.build_command_explicit,
-        shared.commands.sandbox_command.as_slice(),
-        shared.env,
-    );
-    let relevant_test_hash = shared.test_context_index.fingerprint_for_tests(
-        &selected_test.selected_tests,
-        shared.cache_context_fingerprint,
-    );
-    let previous_killer = shared.history.and_then(|history| {
-        history.preferred_killer_test(
-            &cache_identity(shared.project_root, &mutation),
-            &mutation.description,
-            &selected_test.selected_tests,
-        )
-    });
-    let cache_ctx = format!(
-        "{command_ctx};context={:016x}",
-        shared.cache_context_fingerprint
-    );
-
-    let source_content = shared
-        .source_contents
-        .content_for(shared.project_root, &mutation.file);
-    let history_query = source_content.as_deref().map(|content| {
-        incremental_history_query(
-            shared.project_root,
-            &mutation,
-            content,
-            &command_ctx,
-            relevant_test_hash,
-        )
-    });
-    let cache_key = source_content.as_ref().map(|content| {
-        CacheKey::new(
-            content,
-            &cache_identity(shared.project_root, &mutation),
-            &mutation.description,
-            &cache_ctx,
-        )
-    });
 
     // Check exact cache and then structured history before acquiring a workspace slot.
-    if !shared.force_rerun {
-        if let Some(ref key) = cache_key {
-            if let Some(result) = cache::lookup(shared.project_root, key) {
-                record_incremental_history(
-                    shared.history,
-                    history_query.as_ref(),
-                    &selected_test.selected_tests,
-                    result,
-                    previous_killer.clone(),
-                );
-                reservation.release();
-                record_progress(&shared, &mutation, result, None, true);
-                record_early_stop(&shared, result);
-                let diagnostic = cached_build_error_diagnostic(&mutation, "regular", result);
-                return Some((index, MutationRunRecord::new(mutation, result, diagnostic)));
-            }
-        }
-        if let (Some(history), Some(query)) = (shared.history, history_query.as_ref()) {
-            if let Some(result) = history.lookup(query) {
-                if let Some(ref key) = cache_key {
-                    cache::store(shared.project_root, key, result);
-                }
-                reservation.release();
-                record_progress(&shared, &mutation, result, None, true);
-                record_early_stop(&shared, result);
-                let diagnostic = cached_build_error_diagnostic(&mutation, "regular", result);
-                return Some((index, MutationRunRecord::new(mutation, result, diagnostic)));
-            }
-        }
+    if let Some(result) =
+        prepared.restore_result(shared.project_root, shared.history, shared.force_rerun)
+    {
+        reservation.release();
+        record_progress(&shared, &mutation, result, None, true);
+        record_early_stop(&shared, result);
+        let diagnostic = cached_build_error_diagnostic(&mutation, "regular", result);
+        return Some((index, MutationRunRecord::new(mutation, result, diagnostic)));
     }
 
     let outcome = {
@@ -2045,13 +2111,13 @@ fn run_queued_mutation(
         let workspace_target =
             ResolvedMutation::new_for_execution(shared.project_root, &workspace_root, &mutation);
         run_single_mutation(
-            &selected_test.argv,
+            &prepared.selected_test.argv,
             shared.commands.sandbox_command.as_slice(),
             BuildCommand {
                 argv: shared.build_command,
                 explicit: shared.build_command_explicit,
             },
-            selected_test.timeout,
+            prepared.selected_test.timeout,
             &workspace_root,
             workspace_target,
             shared.show_output,
@@ -2069,16 +2135,8 @@ fn run_queued_mutation(
         reservation.commit();
     }
 
-    if let Some(ref key) = cache_key {
-        cache::store(shared.project_root, key, outcome.result);
-    }
-    record_incremental_history(
-        shared.history,
-        history_query.as_ref(),
-        &selected_test.selected_tests,
-        outcome.result,
-        previous_killer,
-    );
+    prepared.store_cache(shared.project_root, outcome.result);
+    prepared.record_history(shared.history, outcome.result);
 
     let result = outcome.result;
     record_progress(
@@ -2416,7 +2474,7 @@ impl TestRunner {
                             break;
                         };
 
-                        let outcome = catch_unwind(AssertUnwindSafe(|| {
+                        let outcome = catch_unwind(PanicBoundary(|| {
                             run_queued_mutation(
                                 QueuedMutation { index, mutation },
                                 reservation,
@@ -2533,109 +2591,43 @@ impl TestRunner {
                 break;
             }
             let mutation = &schema_mutation.mutation;
-            let selected = select_test_command_with_history(
-                &self.project_root,
-                &self.commands,
-                mutation,
-                history.as_ref(),
-            );
-            let argv = if language == "go" {
-                force_go_no_test_cache(selected.argv.clone())
-            } else {
-                selected.argv.clone()
-            };
             let mut env = self.env.clone();
             env.insert("TOGI_MUTANT".to_string(), mutation.id.to_string());
-            let cache_selected = SelectedTestCommand {
-                argv: argv.clone(),
-                timeout: selected.timeout,
-                selected_tests: selected.selected_tests.clone(),
-            };
-            let command_ctx = cache_selected.cache_context(
-                &self.commands.build_command,
-                self.commands.build_command_explicit,
-                self.commands.sandbox_command.as_slice(),
-                &env,
+            let prepared = PreparedMutationRun::new(
+                &self.project_root,
+                mutation,
+                PreparedMutationContext {
+                    commands: &self.commands,
+                    history: history.as_ref(),
+                    source_contents: &source_contents,
+                    cache_context_fingerprint: cache_context_hash,
+                    test_context_index: &test_context_index,
+                    env: &env,
+                },
             );
-            let relevant_test_hash = test_context_index
-                .fingerprint_for_tests(&selected.selected_tests, cache_context_hash);
-            let previous_killer = history.as_ref().and_then(|history| {
-                history.preferred_killer_test(
-                    &cache_identity(&self.project_root, mutation),
-                    &mutation.description,
-                    &selected.selected_tests,
-                )
-            });
-            let cache_ctx = format!("{command_ctx};context={cache_context_hash:016x}");
-            let source_content = source_contents.content_for(&self.project_root, &mutation.file);
-            let history_query = source_content.as_deref().map(|content| {
-                incremental_history_query(
-                    &self.project_root,
-                    mutation,
-                    content,
-                    &command_ctx,
-                    relevant_test_hash,
-                )
-            });
-            let cache_key = source_content.as_ref().map(|content| {
-                CacheKey::new(
-                    content,
-                    &cache_identity(&self.project_root, mutation),
-                    &mutation.description,
-                    &cache_ctx,
-                )
-            });
-            if !self.force_rerun {
-                if let Some(ref key) = cache_key {
-                    if let Some(result) = cache::lookup(&self.project_root, key) {
-                        record_incremental_history(
-                            history.as_ref(),
-                            history_query.as_ref(),
-                            &selected.selected_tests,
-                            result,
-                            previous_killer.clone(),
-                        );
-                        reservation.release();
-                        if let Some(early_stop) = &early_stop {
-                            early_stop.record(result);
-                        }
-                        if self.verbose {
-                            eprintln!(
-                                "  [schema] ↻ cached  {}:{} — {}",
-                                mutation.file.display(),
-                                mutation.line,
-                                mutation.operator
-                            );
-                        }
-                        let diagnostic =
-                            cached_build_error_diagnostic(mutation, "schemata", result);
-                        results.push(MutationRunRecord::new(mutation.clone(), result, diagnostic));
-                        continue;
-                    }
+            let argv = if language == "go" {
+                force_go_no_test_cache(prepared.selected_test.argv.clone())
+            } else {
+                prepared.selected_test.argv.clone()
+            };
+            if let Some(result) =
+                prepared.restore_result(&self.project_root, history.as_ref(), self.force_rerun)
+            {
+                reservation.release();
+                if let Some(early_stop) = &early_stop {
+                    early_stop.record(result);
                 }
-                if let (Some(history), Some(query)) = (history.as_ref(), history_query.as_ref()) {
-                    if let Some(result) = history.lookup(query) {
-                        if let Some(ref key) = cache_key {
-                            cache::store(&self.project_root, key, result);
-                        }
-                        reservation.release();
-                        if let Some(early_stop) = &early_stop {
-                            early_stop.record(result);
-                        }
-                        if self.verbose {
-                            eprintln!(
-                                "  [schema] ↻ cached  {}:{} — {}",
-                                mutation.file.display(),
-                                mutation.line,
-                                mutation.operator
-                            );
-                        }
-                        let diagnostic =
-                            cached_build_error_diagnostic(mutation, "schemata", result);
-                        results.push(MutationRunRecord::new(mutation.clone(), result, diagnostic));
-                        continue;
-                    }
+                if self.verbose {
+                    eprintln!(
+                        "  [schema] ↻ cached  {}:{} — {}",
+                        mutation.file.display(),
+                        mutation.line,
+                        mutation.operator
+                    );
                 }
+                let diagnostic = cached_build_error_diagnostic(mutation, "schemata", result);
+                results.push(MutationRunRecord::new(mutation.clone(), result, diagnostic));
+                continue;
             }
 
             let mut cacheable = true;
@@ -2658,7 +2650,7 @@ impl TestRunner {
                         workspace.root(),
                         &rewrites,
                         &argv,
-                        selected.timeout,
+                        prepared.selected_test.timeout,
                         &env,
                         &mut cacheable,
                     )
@@ -2670,7 +2662,7 @@ impl TestRunner {
                     workspace.root(),
                     &rewrites,
                     &argv,
-                    selected.timeout,
+                    prepared.selected_test.timeout,
                     &env,
                     &mut cacheable,
                 )
@@ -2687,17 +2679,9 @@ impl TestRunner {
                 early_stop.record(outcome.result);
             }
             if cacheable {
-                if let Some(ref key) = cache_key {
-                    cache::store(&self.project_root, key, outcome.result);
-                }
+                prepared.store_cache(&self.project_root, outcome.result);
             }
-            record_incremental_history(
-                history.as_ref(),
-                history_query.as_ref(),
-                &selected.selected_tests,
-                outcome.result,
-                previous_killer,
-            );
+            prepared.record_history(history.as_ref(), outcome.result);
             if self.verbose {
                 let symbol = match outcome.result {
                     MutationResult::Killed => "✓ killed",
@@ -3363,6 +3347,9 @@ fn run_command(
     }
 
     let command = sandboxed_command(sandbox_command, command);
+    // foxguard: ignore[rs/no-command-injection]
+    // User-provided argv is executed directly without a shell; this is the
+    // core feature of the runner, not a string interpolation sink.
     let mut cmd = std::process::Command::new(&command[0]);
     cmd.args(&command[1..]).current_dir(cwd).envs(env);
     configure_command_for_process_tree(&mut cmd);

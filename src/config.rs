@@ -192,53 +192,139 @@ fn has_file_with_ext(dir: &Path, ext: &str) -> bool {
         .unwrap_or(false)
 }
 
-pub fn detect_test_command(project_root: &Path) -> Vec<String> {
-    let mut detected: Vec<(&str, Vec<String>)> = Vec::new();
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JavaScriptRunner {
+    Bun,
+    Npm,
+    Pnpm,
+    Yarn,
+}
 
-    if project_root.join("Cargo.toml").exists() {
-        detected.push(("Cargo.toml", vec!["cargo".into(), "test".into()]));
-    }
-    if project_root.join("go.mod").exists() {
-        detected.push(("go.mod", vec!["go".into(), "test".into(), "./...".into()]));
-    }
-    if project_root.join("pyproject.toml").exists()
-        || project_root.join("setup.py").exists()
-        || project_root.join("setup.cfg").exists()
-    {
-        detected.push(("pyproject.toml/setup.py", vec!["pytest".into()]));
-    }
-    if project_root.join("package.json").exists() {
-        let runner = if project_root.join("pnpm-lock.yaml").exists() {
-            "pnpm"
+impl JavaScriptRunner {
+    fn detect(project_root: &Path) -> Option<Self> {
+        if !project_root.join("package.json").exists() {
+            return None;
+        }
+        Some(if project_root.join("pnpm-lock.yaml").exists() {
+            Self::Pnpm
         } else if project_root.join("yarn.lock").exists() {
-            "yarn"
+            Self::Yarn
         } else if project_root.join("bun.lockb").exists() || project_root.join("bun.lock").exists()
         {
-            "bun"
+            Self::Bun
         } else {
-            "npm"
-        };
-        detected.push(("package.json", vec![runner.into(), "test".into()]));
+            Self::Npm
+        })
     }
-    if project_root.join("pom.xml").exists() {
-        detected.push(("pom.xml", vec!["mvn".into(), "test".into()]));
+
+    fn binary(self) -> &'static str {
+        match self {
+            Self::Bun => "bun",
+            Self::Npm => "npm",
+            Self::Pnpm => "pnpm",
+            Self::Yarn => "yarn",
+        }
     }
-    if project_root.join("build.gradle").exists() || project_root.join("build.gradle.kts").exists()
-    {
-        detected.push(("build.gradle", vec!["./gradlew".into(), "test".into()]));
+
+    fn test_command(self) -> Vec<String> {
+        vec![self.binary().into(), "test".into()]
     }
-    if project_root.join("Gemfile").exists() {
-        detected.push((
-            "Gemfile",
-            vec!["bundle".into(), "exec".into(), "rspec".into()],
-        ));
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ProjectInspection {
+    has_cargo_toml: bool,
+    has_go_mod: bool,
+    has_python_project: bool,
+    javascript_runner: Option<JavaScriptRunner>,
+    has_pom_xml: bool,
+    has_gradle: bool,
+    has_gemfile: bool,
+    has_cmake: bool,
+    has_dotnet_project: bool,
+    has_tsconfig: bool,
+}
+
+impl ProjectInspection {
+    fn scan(project_root: &Path) -> Self {
+        Self {
+            has_cargo_toml: project_root.join("Cargo.toml").exists(),
+            has_go_mod: project_root.join("go.mod").exists(),
+            has_python_project: project_root.join("pyproject.toml").exists()
+                || project_root.join("setup.py").exists()
+                || project_root.join("setup.cfg").exists(),
+            javascript_runner: JavaScriptRunner::detect(project_root),
+            has_pom_xml: project_root.join("pom.xml").exists(),
+            has_gradle: project_root.join("build.gradle").exists()
+                || project_root.join("build.gradle.kts").exists(),
+            has_gemfile: project_root.join("Gemfile").exists(),
+            has_cmake: project_root.join("CMakeLists.txt").exists(),
+            has_dotnet_project: has_file_with_ext(project_root, "sln")
+                || has_file_with_ext(project_root, "csproj"),
+            has_tsconfig: project_root.join("tsconfig.json").exists(),
+        }
     }
-    if project_root.join("CMakeLists.txt").exists() {
-        detected.push(("CMakeLists.txt", vec!["ctest".into()]));
+
+    fn detected_test_commands(&self) -> Vec<(&'static str, Vec<String>)> {
+        let mut detected = Vec::new();
+        if self.has_cargo_toml {
+            detected.push(("Cargo.toml", vec!["cargo".into(), "test".into()]));
+        }
+        if self.has_go_mod {
+            detected.push(("go.mod", vec!["go".into(), "test".into(), "./...".into()]));
+        }
+        if self.has_python_project {
+            detected.push(("pyproject.toml/setup.py", vec!["pytest".into()]));
+        }
+        if let Some(runner) = self.javascript_runner {
+            detected.push(("package.json", runner.test_command()));
+        }
+        if self.has_pom_xml {
+            detected.push(("pom.xml", vec!["mvn".into(), "test".into()]));
+        }
+        if self.has_gradle {
+            detected.push(("build.gradle", vec!["./gradlew".into(), "test".into()]));
+        }
+        if self.has_gemfile {
+            detected.push((
+                "Gemfile",
+                vec!["bundle".into(), "exec".into(), "rspec".into()],
+            ));
+        }
+        if self.has_cmake {
+            detected.push(("CMakeLists.txt", vec!["ctest".into()]));
+        }
+        if self.has_dotnet_project {
+            detected.push((".sln/.csproj", vec!["dotnet".into(), "test".into()]));
+        }
+        detected
     }
-    if has_file_with_ext(project_root, "sln") || has_file_with_ext(project_root, "csproj") {
-        detected.push((".sln/.csproj", vec!["dotnet".into(), "test".into()]));
+
+    fn detect_build_command(&self) -> Vec<String> {
+        if self.has_cargo_toml {
+            return vec!["cargo".into(), "check".into()];
+        }
+        if self.has_go_mod {
+            return vec!["go".into(), "build".into(), "./...".into()];
+        }
+        if self.has_tsconfig {
+            return vec!["npx".into(), "tsc".into(), "--noEmit".into()];
+        }
+        if self.has_pom_xml {
+            return vec!["mvn".into(), "compile".into(), "-q".into()];
+        }
+        if self.has_gradle {
+            return vec!["./gradlew".into(), "compileJava".into()];
+        }
+        if self.has_dotnet_project {
+            return vec!["dotnet".into(), "build".into(), "--no-restore".into()];
+        }
+        vec![]
     }
+}
+
+pub fn detect_test_command(project_root: &Path) -> Vec<String> {
+    let detected = ProjectInspection::scan(project_root).detected_test_commands();
 
     if detected.len() > 1 {
         let names: Vec<&str> = detected.iter().map(|(name, _)| *name).collect();
@@ -279,26 +365,7 @@ pub fn failfast_args(command: &[String]) -> Vec<String> {
 }
 
 pub fn detect_build_command(project_root: &Path) -> Vec<String> {
-    if project_root.join("Cargo.toml").exists() {
-        return vec!["cargo".into(), "check".into()];
-    }
-    if project_root.join("go.mod").exists() {
-        return vec!["go".into(), "build".into(), "./...".into()];
-    }
-    if project_root.join("tsconfig.json").exists() {
-        return vec!["npx".into(), "tsc".into(), "--noEmit".into()];
-    }
-    if project_root.join("pom.xml").exists() {
-        return vec!["mvn".into(), "compile".into(), "-q".into()];
-    }
-    if project_root.join("build.gradle").exists() || project_root.join("build.gradle.kts").exists()
-    {
-        return vec!["./gradlew".into(), "compileJava".into()];
-    }
-    if has_file_with_ext(project_root, "sln") || has_file_with_ext(project_root, "csproj") {
-        return vec!["dotnet".into(), "build".into(), "--no-restore".into()];
-    }
-    vec![]
+    ProjectInspection::scan(project_root).detect_build_command()
 }
 
 fn default_timeout() -> u64 {
@@ -449,8 +516,9 @@ impl Config {
     /// Write a template togi.toml to the given path.
     pub fn write_template(path: &Path) -> anyhow::Result<()> {
         let project_root = path.parent().unwrap_or(Path::new("."));
+        let inspection = ProjectInspection::scan(project_root);
         let test_cmd = detect_test_command(project_root);
-        let build_cmd = detect_build_command(project_root);
+        let build_cmd = inspection.detect_build_command();
 
         let test_cmd_toml: Vec<String> = test_cmd.iter().map(|s| format!("\"{}\"", s)).collect();
 
@@ -495,46 +563,31 @@ impl Config {
             default_jobs()
         ));
 
-        // Detect additional languages for polyglot repos
-        let has_python = project_root.join("pyproject.toml").exists()
-            || project_root.join("setup.py").exists()
-            || project_root.join("setup.cfg").exists();
-        let has_js = project_root.join("package.json").exists();
-        let has_go = project_root.join("go.mod").exists();
-        let has_rust = project_root.join("Cargo.toml").exists();
-
         let mut lang_sections: Vec<String> = Vec::new();
         // Only add language sections for languages that aren't the primary test command
-        if has_python && test_cmd.first().map(|s| s.as_str()) != Some("pytest") {
+        if inspection.has_python_project && test_cmd.first().map(|s| s.as_str()) != Some("pytest") {
             lang_sections.push("[test.languages.python]\ncommand = [\"pytest\"]\n".to_string());
         }
-        if has_js
+        if inspection.javascript_runner.is_some()
             && !matches!(
                 test_cmd.first().map(|s| s.as_str()),
                 Some("npm" | "pnpm" | "yarn" | "bun")
             )
         {
-            let runner = if project_root.join("bun.lockb").exists()
-                || project_root.join("bun.lock").exists()
-            {
-                "bun"
-            } else if project_root.join("pnpm-lock.yaml").exists() {
-                "pnpm"
-            } else if project_root.join("yarn.lock").exists() {
-                "yarn"
-            } else {
-                "npm"
-            };
+            let runner = inspection
+                .javascript_runner
+                .map(JavaScriptRunner::binary)
+                .unwrap_or("npm");
             lang_sections.push(format!(
                 "[test.languages.typescript]\ncommand = [\"{}\", \"test\"]\n",
                 runner
             ));
         }
-        if has_go && test_cmd.first().map(|s| s.as_str()) != Some("go") {
+        if inspection.has_go_mod && test_cmd.first().map(|s| s.as_str()) != Some("go") {
             lang_sections
                 .push("[test.languages.go]\ncommand = [\"go\", \"test\", \"./...\"]\n".to_string());
         }
-        if has_rust && test_cmd.first().map(|s| s.as_str()) != Some("cargo") {
+        if inspection.has_cargo_toml && test_cmd.first().map(|s| s.as_str()) != Some("cargo") {
             lang_sections
                 .push("[test.languages.rust]\ncommand = [\"cargo\", \"test\"]\n".to_string());
         }
