@@ -127,6 +127,10 @@ togi check --build-cmd "cargo check"
 # Only mutate lines covered by an LCOV file
 togi check --coverage-file coverage/lcov.info
 
+# Gate on line and diff coverage thresholds
+togi check --coverage-file coverage/lcov.info --min-line-coverage 80 --min-diff-coverage 90
+togi check --coverage-file coverage/lcov.info --fail-on-uncovered-diff
+
 # Generate and use a source-line to test-name map (Go helper shown)
 togi test-map --path . --output coverage/test-selection.json
 togi check --test-selection-file coverage/test-selection.json
@@ -188,6 +192,7 @@ timeout_multiplier = 4.0
 timeout_slack = 2
 jobs = 2
 build_command = ["go", "build", "./..."]
+sandbox_command = ["bwrap", "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--"]
 
 [test.languages.python]
 command = ["pytest"]
@@ -208,6 +213,9 @@ max_per_run = 20
 max_per_file = 20
 schemata = true
 coverage_file = "coverage/lcov.info"
+min_line_coverage = 80.0
+min_diff_coverage = 90.0
+fail_on_uncovered_diff = false
 test_selection_file = "coverage/test-selection.json"
 incremental_history = true
 operators = ["-string_to_empty"]
@@ -223,6 +231,10 @@ When `--test-cmd` is set, `--fail-fast` does not modify the custom command;
 include runner-specific fail-fast flags in `--test-cmd` instead.
 Resource profiles provide defaults only: explicit CLI flags and `togi.toml`
 settings such as `jobs` keep taking precedence.
+
+`[test] sandbox_command` is an optional wrapper that runs every build and test
+command inside your own sandbox tool. togi appends the selected command after
+the wrapper argv, so tools that expect `--` as a separator can use it directly.
 
 `--calibrate-timeout` (or `[test] calibrate_timeout = true`) runs the
 unmutated build/test command once in a disposable workspace, then sets the
@@ -319,15 +331,20 @@ Schemata are enabled by default. They batch compatible mutations into one build 
 
 ## Coverage and test selection
 
-For large repos, togi can avoid work before the runner starts:
+For large repos, togi can avoid work before the runner starts and can also
+fail the run when LCOV coverage is below a threshold:
 
 - `--coverage-file coverage/lcov.info` keeps only mutations on covered lines
+- `--min-line-coverage 80` fails when overall LCOV line coverage is below 80%
+- `--min-diff-coverage 90` fails when changed-line coverage is below 90%
+- `--fail-on-uncovered-diff` fails when any changed line is uncovered
 - `togi test-map` generates a Go line-to-test map from per-test coverage
 - `--test-selection-file coverage/test-selection.json` narrows each mutant to tests that cover that line when the configured runner supports test selection
 
 ```bash
 togi test-map --path . --output coverage/test-selection.json
 togi check --coverage-file coverage/lcov.info --test-selection-file coverage/test-selection.json
+togi check --coverage-file coverage/lcov.info --min-line-coverage 80 --min-diff-coverage 90
 ```
 
 The selection file is a JSON map of source file to line number to test names.
@@ -453,16 +470,20 @@ test command genuinely needs ignored files copied into the mutation workspace.
 togi executes repository-defined build and test commands with the permissions of
 the current user or CI runner.
 
-Workspace copies, timeouts, and descendant-process cleanup improve correctness
-and cleanup, but they are not a security sandbox. togi does not currently block
-network access or confine filesystem access beyond the restrictions already
-provided by your OS, container, or CI environment.
+Workspace copies, timeouts, descendant-process cleanup, and the optional
+`[test] sandbox_command` wrapper improve correctness and reduce exposure, but
+they are not a complete security sandbox. togi does not itself block network
+access or confine filesystem access beyond what the host OS, container, or CI
+environment already enforces.
 
 Run togi only against repositories you trust, or place it inside a separate
 container or VM when evaluating less-trusted code. Running less-trusted
 repositories directly on the host is out of scope for the current security
-model. See [SECURITY.md](SECURITY.md) for the supported-version policy and
-vulnerability reporting instructions.
+model. On Linux, a wrapper such as `bwrap` or `firejail` is a practical opt-in
+strategy; on macOS, use a platform sandbox or container boundary; on Windows,
+use a container, VM, or equivalent host-managed isolation. See
+[SECURITY.md](SECURITY.md) for the supported-version policy and vulnerability
+reporting instructions.
 
 ## How it works
 

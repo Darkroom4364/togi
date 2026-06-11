@@ -36,6 +36,8 @@ fn write_workspace_file(path: &Path, data: &[u8]) -> std::io::Result<()> {
 pub struct CommandConfig {
     /// Default test command, stored as argv.
     pub command: Vec<String>,
+    /// Optional wrapper prefixed to every build and test command.
+    pub sandbox_command: Vec<String>,
     /// True when the default command came from a CLI override and must win.
     pub force_default_command: bool,
     /// True when the default timeout came from a CLI override and must win.
@@ -202,6 +204,7 @@ pub struct BaselineMeasurement {
 pub struct BaselineTimingConfig<'a> {
     pub test_command: &'a [String],
     pub build_command: &'a [String],
+    pub sandbox_command: &'a [String],
     pub build_command_explicit: bool,
     pub timeout: Duration,
     pub env: &'a HashMap<String, String>,
@@ -221,6 +224,7 @@ impl SelectedTestCommand {
         &self,
         build_command: &[String],
         build_command_explicit: bool,
+        sandbox_command: &[String],
         env: &HashMap<String, String>,
     ) -> String {
         let build_str = if build_command_explicit {
@@ -228,12 +232,18 @@ impl SelectedTestCommand {
         } else {
             String::new()
         };
+        let sandbox_str = if sandbox_command.is_empty() {
+            String::new()
+        } else {
+            format!("{sandbox_command:?}")
+        };
         let mut env_parts: Vec<String> = env.iter().map(|(k, v)| format!("{k}={v}")).collect();
         env_parts.sort();
         format!(
-            "test={:?};build={};timeout={};env={}",
+            "test={:?};build={};sandbox={};timeout={};env={}",
             self.argv,
             build_str,
+            sandbox_str,
             self.timeout.as_millis(),
             env_parts.join(",")
         )
@@ -1129,6 +1139,7 @@ pub fn measure_baseline_timing(
         Some(measure_baseline_command(
             "baseline build command",
             config.build_command,
+            config.sandbox_command,
             root,
             config.timeout,
             config.env,
@@ -1140,6 +1151,7 @@ pub fn measure_baseline_timing(
     let test_duration = measure_baseline_command(
         "baseline test command",
         config.test_command,
+        config.sandbox_command,
         root,
         config.timeout,
         config.env,
@@ -1155,13 +1167,14 @@ pub fn measure_baseline_timing(
 fn measure_baseline_command(
     label: &str,
     command: &[String],
+    sandbox_command: &[String],
     cwd: &Path,
     timeout: Duration,
     env: &HashMap<String, String>,
     cancelled: &AtomicBool,
 ) -> anyhow::Result<Duration> {
     let started = Instant::now();
-    let outcome = run_command(command, cwd, timeout, true, env, cancelled);
+    let outcome = run_command(command, sandbox_command, cwd, timeout, true, env, cancelled);
     let duration = started.elapsed();
     if outcome.cancelled {
         bail!("baseline timing cancelled");
@@ -1201,6 +1214,15 @@ fn command_for_message(command: &[String]) -> String {
     } else {
         command.join(" ")
     }
+}
+
+fn sandboxed_command(sandbox_command: &[String], command: &[String]) -> Vec<String> {
+    if sandbox_command.is_empty() {
+        return command.to_vec();
+    }
+    let mut argv = sandbox_command.to_vec();
+    argv.extend_from_slice(command);
+    argv
 }
 
 fn baseline_failure_output(output: Option<&str>) -> String {
@@ -1918,6 +1940,7 @@ fn run_queued_mutation(
     let command_ctx = selected_test.cache_context(
         shared.build_command,
         shared.build_command_explicit,
+        shared.commands.sandbox_command.as_slice(),
         shared.env,
     );
     let relevant_test_hash = shared.test_context_index.fingerprint_for_tests(
@@ -2023,6 +2046,7 @@ fn run_queued_mutation(
             ResolvedMutation::new_for_execution(shared.project_root, &workspace_root, &mutation);
         run_single_mutation(
             &selected_test.argv,
+            shared.commands.sandbox_command.as_slice(),
             BuildCommand {
                 argv: shared.build_command,
                 explicit: shared.build_command_explicit,
@@ -2530,6 +2554,7 @@ impl TestRunner {
             let command_ctx = cache_selected.cache_context(
                 &self.commands.build_command,
                 self.commands.build_command_explicit,
+                self.commands.sandbox_command.as_slice(),
                 &env,
             );
             let relevant_test_hash = test_context_index
@@ -2778,12 +2803,15 @@ impl TestRunner {
             test_command: if self.commands.language_commands.is_empty()
                 && self.commands.project_commands.is_empty()
             {
-                Some(self.commands.command.clone())
+                Some(sandboxed_command(
+                    &self.commands.sandbox_command,
+                    &self.commands.command,
+                ))
             } else {
                 None
             },
             build_command: if self.commands.build_command_explicit {
-                self.commands.build_command.clone()
+                sandboxed_command(&self.commands.sandbox_command, &self.commands.build_command)
             } else {
                 vec![]
             },
@@ -2851,6 +2879,7 @@ fn run_schema_workspace_mutation(
     if runner.commands.build_command_explicit && !runner.commands.build_command.is_empty() {
         let build = run_command(
             &runner.commands.build_command,
+            &runner.commands.sandbox_command,
             workspace_root,
             runner.commands.timeout,
             true,
@@ -2876,6 +2905,7 @@ fn run_schema_workspace_mutation(
 
     run_command(
         argv,
+        &runner.commands.sandbox_command,
         workspace_root,
         timeout,
         runner.show_output,
@@ -3196,6 +3226,7 @@ impl<'a> ResolvedMutation<'a> {
 #[allow(clippy::too_many_arguments)]
 fn run_single_mutation(
     command: &[String],
+    sandbox_command: &[String],
     build_command: BuildCommand<'_>,
     timeout: Duration,
     project_root: &Path,
@@ -3274,6 +3305,7 @@ fn run_single_mutation(
     if build_command.explicit && !build_command.argv.is_empty() {
         let build_outcome = run_command(
             build_command.argv,
+            sandbox_command,
             project_root,
             timeout,
             true,
@@ -3304,6 +3336,7 @@ fn run_single_mutation(
     // Run test command; guard will restore the file on drop
     run_command(
         command,
+        sandbox_command,
         project_root,
         timeout,
         capture_output,
@@ -3314,6 +3347,7 @@ fn run_single_mutation(
 
 fn run_command(
     command: &[String],
+    sandbox_command: &[String],
     cwd: &Path,
     timeout_dur: Duration,
     capture_output: bool,
@@ -3328,6 +3362,7 @@ fn run_command(
         return MutationOutcome::build_error_with("command", vec![], "command is empty");
     }
 
+    let command = sandboxed_command(sandbox_command, command);
     let mut cmd = std::process::Command::new(&command[0]);
     cmd.args(&command[1..]).current_dir(cwd).envs(env);
     configure_command_for_process_tree(&mut cmd);
@@ -4183,6 +4218,7 @@ mod tests {
             project_commands: vec![],
             language_commands: HashMap::new(),
             build_command: vec![],
+            sandbox_command: vec![],
             build_command_explicit: false,
             timeout: Duration::from_secs(30),
             language_timeouts: HashMap::new(),
@@ -4385,9 +4421,21 @@ mod tests {
         };
 
         assert_ne!(
-            selected.cache_context(&[], false, &HashMap::new()),
-            ambiguous.cache_context(&[], false, &HashMap::new())
+            selected.cache_context(&[], false, &[], &HashMap::new()),
+            ambiguous.cache_context(&[], false, &[], &HashMap::new())
         );
+    }
+
+    #[test]
+    fn sandboxed_command_prefixes_wrapper_argv() {
+        let sandbox = vec!["bwrap".into(), "--".into()];
+        let command = vec!["cargo".into(), "test".into()];
+
+        assert_eq!(
+            sandboxed_command(&sandbox, &command),
+            vec!["bwrap", "--", "cargo", "test"]
+        );
+        assert_eq!(sandboxed_command(&[], &command), command);
     }
 
     #[test]
@@ -4839,6 +4887,7 @@ mod tests {
             project_commands: vec![],
             language_commands: HashMap::new(),
             build_command: vec![],
+            sandbox_command: vec![],
             build_command_explicit: false,
             timeout: Duration::from_secs(5),
             language_timeouts: HashMap::new(),
@@ -4848,8 +4897,12 @@ mod tests {
         let command_config = commands();
         let selected =
             select_test_command_with_history(dir.path(), &command_config, &mutation, None);
-        let command_ctx =
-            selected.cache_context(&command_config.build_command, false, &HashMap::new());
+        let command_ctx = selected.cache_context(
+            &command_config.build_command,
+            false,
+            &command_config.sandbox_command,
+            &HashMap::new(),
+        );
         let context_hash = cache_context_fingerprint(dir.path());
         let test_context_index = TestContextIndex::build(dir.path());
         let relevant_test_hash =
@@ -5189,6 +5242,7 @@ mod tests {
             BaselineTimingConfig {
                 test_command: &command,
                 build_command: &command,
+                sandbox_command: &[],
                 build_command_explicit: true,
                 timeout: Duration::from_secs(5),
                 env: &HashMap::new(),
@@ -5254,6 +5308,7 @@ mod tests {
 
         let outcome = run_single_mutation(
             &["true".to_string()],
+            &[],
             BuildCommand {
                 argv: &[],
                 explicit: false,
@@ -5276,6 +5331,7 @@ mod tests {
 
         let outcome = run_single_mutation(
             &["false".to_string()],
+            &[],
             BuildCommand {
                 argv: &[],
                 explicit: false,
@@ -5314,6 +5370,7 @@ mod tests {
 
         let outcome = run_single_mutation(
             &["true".to_string()],
+            &[],
             BuildCommand {
                 argv: &[],
                 explicit: false,
@@ -5337,6 +5394,7 @@ mod tests {
 
         let outcome = run_single_mutation(
             &["nonexistent_binary_xyz_12345".to_string()],
+            &[],
             BuildCommand {
                 argv: &[],
                 explicit: false,
@@ -5360,6 +5418,7 @@ mod tests {
 
         let outcome = run_single_mutation(
             &["sleep".to_string(), "10".to_string()],
+            &[],
             BuildCommand {
                 argv: &[],
                 explicit: false,
@@ -5404,6 +5463,7 @@ mod tests {
                 "-c".to_string(),
                 format!("touch {}", marker.display()),
             ],
+            &[],
             BuildCommand {
                 argv: &[
                     "sh".to_string(),
@@ -5438,6 +5498,7 @@ mod tests {
         // Build succeeds → test runs and fails → Killed
         let outcome = run_single_mutation(
             &["false".to_string()], // test fails = killed
+            &[],
             BuildCommand {
                 argv: &["true".to_string()], // build succeeds
                 explicit: true,
@@ -5467,6 +5528,7 @@ mod tests {
                 "-c".to_string(),
                 format!("touch {}", test_marker.display()),
             ],
+            &[],
             BuildCommand {
                 argv: &[
                     "sh".to_string(),
@@ -5502,6 +5564,7 @@ mod tests {
 
         let outcome = run_single_mutation(
             &["true".to_string()],
+            &[],
             BuildCommand {
                 argv: &[],
                 explicit: false,
@@ -5524,6 +5587,7 @@ mod tests {
 
         let outcome = run_single_mutation(
             &["true".to_string()],
+            &[],
             BuildCommand {
                 argv: &[],
                 explicit: false,
@@ -5542,6 +5606,7 @@ mod tests {
     #[test]
     fn empty_command_returns_build_error() {
         let outcome = run_command(
+            &[],
             &[],
             &PathBuf::from("."),
             Duration::from_secs(5),
@@ -5562,6 +5627,7 @@ mod tests {
                 "-c".to_string(),
                 "echo out; echo err >&2".to_string(),
             ],
+            &[],
             &PathBuf::from("."),
             Duration::from_secs(5),
             true,
@@ -5585,6 +5651,7 @@ mod tests {
                 "-c".to_string(),
                 format!("yes x | head -c {bytes_to_write}"),
             ],
+            &[],
             &PathBuf::from("."),
             Duration::from_secs(5),
             true,
@@ -5614,6 +5681,7 @@ mod tests {
                 "-c".to_string(),
                 "printf out; (sleep 1; printf late) &".to_string(),
             ],
+            &[],
             &PathBuf::from("."),
             Duration::from_secs(5),
             true,
@@ -5642,6 +5710,7 @@ mod tests {
                 "-c".to_string(),
                 "(sleep 1; printf late) & sleep 10".to_string(),
             ],
+            &[],
             &PathBuf::from("."),
             Duration::from_millis(100),
             true,
@@ -5700,6 +5769,7 @@ while [ ! -s "$ESCAPED_PID" ]; do sleep 0.01; done
 sleep 10"#
                     .to_string(),
             ],
+            &[],
             dir.path(),
             Duration::from_millis(200),
             true,
@@ -5728,6 +5798,7 @@ sleep 10"#
                 "-c".to_string(),
                 "(sleep 0.5; touch \"$MARKER\") &".to_string(),
             ],
+            &[],
             dir.path(),
             Duration::from_secs(5),
             false,
@@ -5758,6 +5829,7 @@ sleep 10"#
                 project_commands: vec![],
                 language_commands: HashMap::new(),
                 build_command: vec![],
+                sandbox_command: vec![],
                 build_command_explicit: false,
                 timeout: Duration::from_secs(30),
                 language_timeouts: HashMap::new(),
@@ -5822,6 +5894,7 @@ sleep 10"#
                 project_commands: vec![],
                 language_commands: HashMap::new(),
                 build_command: vec![],
+                sandbox_command: vec![],
                 build_command_explicit: false,
                 timeout: Duration::from_secs(5),
                 language_timeouts: HashMap::new(),
@@ -5891,6 +5964,7 @@ int main(void) {
                 project_commands: vec![],
                 language_commands: HashMap::new(),
                 build_command: vec!["cc".into(), "calc.c".into(), "-o".into(), "calc".into()],
+                sandbox_command: vec![],
                 build_command_explicit: true,
                 timeout: Duration::from_secs(30),
                 language_timeouts: HashMap::new(),
@@ -5960,6 +6034,7 @@ int main() {
                     "-o".into(),
                     "calc".into(),
                 ],
+                sandbox_command: vec![],
                 build_command_explicit: true,
                 timeout: Duration::from_secs(30),
                 language_timeouts: HashMap::new(),
@@ -6016,6 +6091,7 @@ esac
                 project_commands: vec![],
                 language_commands: HashMap::new(),
                 build_command: vec![],
+                sandbox_command: vec![],
                 build_command_explicit: false,
                 timeout: Duration::from_secs(5),
                 language_timeouts: HashMap::new(),
@@ -6070,6 +6146,7 @@ touch side_effect
                 project_commands: vec![],
                 language_commands: HashMap::new(),
                 build_command: vec![],
+                sandbox_command: vec![],
                 build_command_explicit: false,
                 timeout: Duration::from_secs(5),
                 language_timeouts: HashMap::new(),
@@ -6127,6 +6204,7 @@ esac
             project_commands: vec![],
             language_commands: HashMap::new(),
             build_command: vec![],
+            sandbox_command: vec![],
             build_command_explicit: false,
             timeout: Duration::from_secs(5),
             language_timeouts: HashMap::new(),
@@ -6143,6 +6221,7 @@ esac
         let cache_ctx = cache_selected.cache_context(
             &commands.build_command,
             commands.build_command_explicit,
+            &commands.sandbox_command,
             &cache_env,
         );
         let cache_ctx = format!(
@@ -6229,6 +6308,7 @@ class Calc {
                 project_commands: vec![],
                 language_commands: HashMap::new(),
                 build_command: vec!["javac".into(), "Calc.java".into()],
+                sandbox_command: vec![],
                 build_command_explicit: true,
                 timeout: Duration::from_secs(30),
                 language_timeouts: HashMap::new(),
@@ -6287,6 +6367,7 @@ mod tests {
                 project_commands: vec![],
                 language_commands: HashMap::new(),
                 build_command: vec![],
+                sandbox_command: vec![],
                 build_command_explicit: false,
                 timeout: Duration::from_secs(60),
                 language_timeouts: HashMap::new(),
@@ -6339,6 +6420,7 @@ mod tests {
                 project_commands: vec![],
                 language_commands: HashMap::new(),
                 build_command: vec![],
+                sandbox_command: vec![],
                 build_command_explicit: false,
                 timeout: Duration::from_secs(5),
                 language_timeouts: HashMap::new(),
@@ -6383,6 +6465,7 @@ mod tests {
                 project_commands: vec![],
                 language_commands: HashMap::new(),
                 build_command: vec![],
+                sandbox_command: vec![],
                 build_command_explicit: false,
                 timeout: Duration::from_secs(5),
                 language_timeouts: HashMap::new(),
@@ -6439,6 +6522,7 @@ mod tests {
                 project_commands: vec![],
                 language_commands: HashMap::new(),
                 build_command: vec![],
+                sandbox_command: vec![],
                 build_command_explicit: false,
                 timeout: Duration::from_secs(5),
                 language_timeouts: HashMap::new(),
@@ -6511,6 +6595,7 @@ sleep 0.2
                 project_commands: vec![],
                 language_commands: HashMap::new(),
                 build_command: vec![],
+                sandbox_command: vec![],
                 build_command_explicit: false,
                 timeout: Duration::from_secs(5),
                 language_timeouts: HashMap::new(),
@@ -6585,6 +6670,7 @@ sleep 0.2
                 project_commands: vec![],
                 language_commands: HashMap::new(),
                 build_command: vec![],
+                sandbox_command: vec![],
                 build_command_explicit: false,
                 timeout: Duration::from_secs(5),
                 language_timeouts: HashMap::new(),
@@ -6650,6 +6736,7 @@ rmdir "$lock"
                 project_commands: vec![],
                 language_commands: HashMap::new(),
                 build_command: vec![],
+                sandbox_command: vec![],
                 build_command_explicit: false,
                 timeout: Duration::from_secs(5),
                 language_timeouts: HashMap::new(),
@@ -6660,6 +6747,7 @@ rmdir "$lock"
             let cache_ctx = selected.cache_context(
                 &commands.build_command,
                 commands.build_command_explicit,
+                &commands.sandbox_command,
                 &env,
             );
             let cache_ctx = format!(
@@ -6745,6 +6833,7 @@ rmdir "$lock"
                     "-c".into(),
                     "grep -q build_error *.txt && exit 1; exit 0".into(),
                 ],
+                sandbox_command: vec![],
                 build_command_explicit: true,
                 timeout: Duration::from_secs(5),
                 language_timeouts: HashMap::new(),
@@ -6817,6 +6906,7 @@ rmdir "$lock"
                 project_commands: vec![],
                 language_commands: HashMap::new(),
                 build_command: vec![],
+                sandbox_command: vec![],
                 build_command_explicit: false,
                 timeout: Duration::from_secs(5),
                 language_timeouts: HashMap::new(),
@@ -6883,6 +6973,7 @@ rmdir "$lock"
                 project_commands: vec![],
                 language_commands: lang_cmds,
                 build_command: vec![],
+                sandbox_command: vec![],
                 build_command_explicit: false,
                 timeout: Duration::from_secs(5),
                 language_timeouts: HashMap::new(),
@@ -6929,6 +7020,7 @@ rmdir "$lock"
                 project_commands: vec![],
                 language_commands: lang_cmds,
                 build_command: vec![],
+                sandbox_command: vec![],
                 build_command_explicit: false,
                 timeout: Duration::from_secs(5),
                 language_timeouts: HashMap::new(),
@@ -7000,6 +7092,7 @@ while [ "$(find "{barrier}" -type f | wc -l)" -lt 4 ]; do sleep 0.1; done"#,
                 project_commands: vec![],
                 language_commands: HashMap::new(),
                 build_command: vec![],
+                sandbox_command: vec![],
                 build_command_explicit: false,
                 timeout: Duration::from_secs(5),
                 language_timeouts: HashMap::new(),
@@ -7079,6 +7172,7 @@ exit 1"#
                 project_commands: vec![],
                 language_commands: HashMap::new(),
                 build_command: vec![],
+                sandbox_command: vec![],
                 build_command_explicit: false,
                 timeout: Duration::from_secs(5),
                 language_timeouts: HashMap::new(),
@@ -7134,6 +7228,7 @@ exit 1"#
                 project_commands: vec![],
                 language_commands: HashMap::new(),
                 build_command: vec![],
+                sandbox_command: vec![],
                 build_command_explicit: false,
                 timeout: Duration::from_secs(5),
                 language_timeouts: HashMap::new(),
@@ -7189,6 +7284,7 @@ exit 1"#
                 project_commands: vec![],
                 language_commands: HashMap::new(),
                 build_command: vec![],
+                sandbox_command: vec![],
                 build_command_explicit: false,
                 timeout: Duration::from_secs(5),
                 language_timeouts,

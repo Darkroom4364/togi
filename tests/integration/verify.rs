@@ -75,6 +75,7 @@ fn verify_mutation_outcomes_match_independent_replay() {
             project_commands: vec![],
             language_commands: std::collections::HashMap::new(),
             build_command: vec![],
+            sandbox_command: vec![],
             build_command_explicit: false,
             timeout: Duration::from_secs(30),
             language_timeouts: std::collections::HashMap::new(),

@@ -116,6 +116,7 @@ fn end_to_end_go_fixture_reports_expected_outcomes_with_fresh_tests() {
             project_commands: vec![],
             language_commands: std::collections::HashMap::new(),
             build_command: vec![],
+            sandbox_command: vec![],
             build_command_explicit: false,
             timeout: Duration::from_secs(30),
             language_timeouts: std::collections::HashMap::new(),
