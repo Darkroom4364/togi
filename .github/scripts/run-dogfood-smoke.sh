@@ -14,6 +14,9 @@ set +e
   --all \
   --path src/report/json.rs \
   --test-cmd "cargo test --locked" \
+  --calibrate-timeout \
+  --timeout-multiplier 4 \
+  --timeout-slack 2 \
   --format json \
   >"$raw_report_path"
 status=$?

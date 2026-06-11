@@ -109,6 +109,18 @@ pub enum Commands {
         #[arg(long)]
         coverage_file: Option<PathBuf>,
 
+        /// Fail if overall LCOV line coverage is below this percentage
+        #[arg(long)]
+        min_line_coverage: Option<f64>,
+
+        /// Fail if changed-line coverage is below this percentage
+        #[arg(long)]
+        min_diff_coverage: Option<f64>,
+
+        /// Fail if any changed line is uncovered in LCOV
+        #[arg(long)]
+        fail_on_uncovered_diff: bool,
+
         /// JSON source-line to test-name map for targeted test runs
         #[arg(long)]
         test_selection_file: Option<PathBuf>,
@@ -244,6 +256,37 @@ mod tests {
             } => {
                 assert!(no_incremental_history);
                 assert!(force_rerun);
+            }
+            _ => panic!("expected Check command"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn coverage_gate_arguments_are_accepted() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from([
+            "togi",
+            "check",
+            "--coverage-file",
+            "coverage.lcov",
+            "--min-line-coverage",
+            "80",
+            "--min-diff-coverage",
+            "90",
+            "--fail-on-uncovered-diff",
+        ])?;
+        match cli.command {
+            Commands::Check {
+                coverage_file,
+                min_line_coverage,
+                min_diff_coverage,
+                fail_on_uncovered_diff,
+                ..
+            } => {
+                assert_eq!(coverage_file, Some(PathBuf::from("coverage.lcov")));
+                assert_eq!(min_line_coverage, Some(80.0));
+                assert_eq!(min_diff_coverage, Some(90.0));
+                assert!(fail_on_uncovered_diff);
             }
             _ => panic!("expected Check command"),
         }
