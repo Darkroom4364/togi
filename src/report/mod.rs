@@ -1,3 +1,4 @@
+pub mod coverage;
 pub mod github;
 pub mod html;
 pub mod json;
@@ -176,6 +177,24 @@ pub fn print_report(
             eprintln!("HTML report written to {}", path.display());
         }
         OutputFormat::Terminal => terminal::print_report(report),
+    }
+    Ok(())
+}
+
+pub fn print_coverage_gate_report(
+    report: &crate::coverage::CoverageGateReport,
+    format: crate::cli::OutputFormat,
+) -> anyhow::Result<()> {
+    use crate::cli::OutputFormat;
+    match format {
+        OutputFormat::Json => coverage::print_json(report)?,
+        OutputFormat::Github => coverage::print_github(report),
+        OutputFormat::Html => {
+            let path = std::path::Path::new("togi-coverage-report.html");
+            coverage::write_html(report, path)?;
+            eprintln!("HTML coverage report written to {}", path.display());
+        }
+        OutputFormat::Terminal => coverage::print_terminal(report),
     }
     Ok(())
 }

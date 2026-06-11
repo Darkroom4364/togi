@@ -33,6 +33,9 @@ struct CheckConfig {
     show_output: bool,
     test_cmd: Option<String>,
     coverage_file: Option<PathBuf>,
+    min_line_coverage: Option<f64>,
+    min_diff_coverage: Option<f64>,
+    fail_on_uncovered_diff: bool,
     test_selection_file: Option<PathBuf>,
     no_incremental_history: bool,
     force_rerun: bool,
@@ -109,6 +112,9 @@ fn main() {
             show_output,
             test_cmd,
             coverage_file,
+            min_line_coverage,
+            min_diff_coverage,
+            fail_on_uncovered_diff,
             test_selection_file,
             no_incremental_history,
             force_rerun,
@@ -145,6 +151,9 @@ fn main() {
                 show_output,
                 test_cmd,
                 coverage_file,
+                min_line_coverage,
+                min_diff_coverage,
+                fail_on_uncovered_diff,
                 test_selection_file,
                 no_incremental_history,
                 force_rerun,
@@ -376,8 +385,56 @@ fn run_check(cfg: CheckConfig, cancelled: Arc<AtomicBool>) -> anyhow::Result<()>
         return Ok(());
     }
 
+    let coverage_gate_active = config.mutations.min_line_coverage.is_some()
+        || config.mutations.min_diff_coverage.is_some()
+        || config.mutations.fail_on_uncovered_diff;
+    let coverage_stats = if let Some(ref cov_path) = config.mutations.coverage_file {
+        let resolved_cov_path = if cov_path.is_relative() {
+            project_root.join(cov_path)
+        } else {
+            cov_path.to_path_buf()
+        };
+        match std::fs::read_to_string(&resolved_cov_path) {
+            Ok(cov_content) => Some(togi::coverage::parse_lcov_stats(
+                &cov_content,
+                &project_root,
+            )),
+            Err(e) => {
+                if coverage_gate_active {
+                    return Err(anyhow::anyhow!(
+                        "could not read coverage file {}: {e}",
+                        resolved_cov_path.display()
+                    ));
+                }
+                eprintln!(
+                    "warning: could not read coverage file {}: {e} — running all mutations",
+                    resolved_cov_path.display()
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    if coverage_gate_active {
+        let stats = coverage_stats
+            .as_ref()
+            .expect("coverage stats should exist when coverage gates are enabled");
+        let mut coverage_report =
+            togi::coverage::diff_coverage_report(stats, &changed_files, &project_root);
+        coverage_report.line_coverage.threshold = config.mutations.min_line_coverage;
+        coverage_report.diff_coverage.threshold = config.mutations.min_diff_coverage;
+        coverage_report.fail_on_uncovered_diff = config.mutations.fail_on_uncovered_diff;
+        if !coverage_report.passes() {
+            togi::report::print_coverage_gate_report(&coverage_report, output_format)?;
+            exit_with(_lock, 1);
+        }
+    }
+
     let mutations = generate_mutations(&changed_files, &config, &project_root)?;
-    let mut mutations = filter_mutations(mutations, &config, &project_root)?;
+    let mut mutations =
+        filter_mutations(mutations, &config, &project_root, coverage_stats.as_ref())?;
 
     if let Some((k, n)) = shard {
         let total = mutations.len();
@@ -579,6 +636,17 @@ fn resolve_config(cfg: CheckConfig) -> anyhow::Result<ResolvedCheckConfig> {
     if let Some(path) = cfg.coverage_file {
         config.mutations.coverage_file = Some(path);
     }
+    if let Some(value) = cfg.min_line_coverage {
+        validate_coverage_percentage(value, "--min-line-coverage")?;
+        config.mutations.min_line_coverage = Some(value);
+    }
+    if let Some(value) = cfg.min_diff_coverage {
+        validate_coverage_percentage(value, "--min-diff-coverage")?;
+        config.mutations.min_diff_coverage = Some(value);
+    }
+    if cfg.fail_on_uncovered_diff {
+        config.mutations.fail_on_uncovered_diff = true;
+    }
     if let Some(path) = cfg.test_selection_file {
         config.mutations.test_selection_file = Some(path);
     }
@@ -595,6 +663,16 @@ fn resolve_config(cfg: CheckConfig) -> anyhow::Result<ResolvedCheckConfig> {
     }
     if let Some(ops) = cfg.operators {
         config.mutations.operators = ops;
+    }
+
+    if (config.mutations.min_line_coverage.is_some()
+        || config.mutations.min_diff_coverage.is_some()
+        || config.mutations.fail_on_uncovered_diff)
+        && config.mutations.coverage_file.is_none()
+    {
+        anyhow::bail!(
+            "coverage gates require an LCOV file; set [mutations] coverage_file or --coverage-file"
+        );
     }
 
     let has_explicit_build_cmd = has_cli_build_cmd || !config.test.build_command.is_empty();
@@ -618,6 +696,13 @@ fn resolve_config(cfg: CheckConfig) -> anyhow::Result<ResolvedCheckConfig> {
         has_cli_timeout,
         profile,
     })
+}
+
+fn validate_coverage_percentage(value: f64, flag: &str) -> anyhow::Result<()> {
+    if !value.is_finite() || !(0.0..=100.0).contains(&value) {
+        anyhow::bail!("{flag} must be a finite percentage between 0 and 100");
+    }
+    Ok(())
 }
 
 fn warn_if_resource_oversubscribed(jobs: usize) {
@@ -826,8 +911,21 @@ fn filter_mutations(
     mutations: Vec<Mutation>,
     config: &togi::config::Config,
     project_root: &Path,
+    coverage_stats: Option<&togi::coverage::CoverageStats>,
 ) -> anyhow::Result<Vec<Mutation>> {
-    let mut mutations = if let Some(ref cov_path) = config.mutations.coverage_file {
+    let mut mutations = if let Some(coverage) = coverage_stats {
+        let before = mutations.len();
+        let filtered =
+            togi::coverage::filter_by_coverage(mutations, &coverage.covered_lines, project_root);
+        if before > filtered.len() {
+            eprintln!(
+                "Coverage filter: {} of {} mutations on covered lines",
+                filtered.len(),
+                before
+            );
+        }
+        filtered
+    } else if let Some(ref cov_path) = config.mutations.coverage_file {
         let resolved_cov_path = if std::path::Path::new(cov_path).is_relative() {
             project_root.join(cov_path)
         } else {
@@ -1367,6 +1465,9 @@ mod tests {
             show_output: false,
             test_cmd: None,
             coverage_file: None,
+            min_line_coverage: None,
+            min_diff_coverage: None,
+            fail_on_uncovered_diff: false,
             test_selection_file: None,
             no_incremental_history: false,
             force_rerun: false,
