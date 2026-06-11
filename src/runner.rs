@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs;
 use std::hash::Hasher;
 use std::io::{IsTerminal, Read, Write};
-use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::panic::{AssertUnwindSafe as PanicBoundary, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -2474,7 +2474,7 @@ impl TestRunner {
                             break;
                         };
 
-                        let outcome = catch_unwind(AssertUnwindSafe(|| {
+                        let outcome = catch_unwind(PanicBoundary(|| {
                             run_queued_mutation(
                                 QueuedMutation { index, mutation },
                                 reservation,
@@ -3347,6 +3347,9 @@ fn run_command(
     }
 
     let command = sandboxed_command(sandbox_command, command);
+    // foxguard: ignore[rs/no-command-injection]
+    // User-provided argv is executed directly without a shell; this is the
+    // core feature of the runner, not a string interpolation sink.
     let mut cmd = std::process::Command::new(&command[0]);
     cmd.args(&command[1..]).current_dir(cwd).envs(env);
     configure_command_for_process_tree(&mut cmd);

@@ -412,6 +412,8 @@ fn interrupted_check_exits_130_without_writing_side_effects() {
 
     let stdout = fs::File::create(&stdout_path).unwrap();
     let stderr = fs::File::create(&stderr_path).unwrap();
+    // foxguard: ignore[rs/no-command-injection]
+    // The test launches the just-built `togi` binary from Cargo metadata.
     let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("togi"))
         .args([
             "check",
