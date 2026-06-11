@@ -1,10 +1,63 @@
 // Parse LCOV coverage data into a map of file -> covered lines.
 
+use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 
 /// Map from file path (relative to project root) to set of covered line numbers.
 pub type CoverageMap = HashMap<PathBuf, HashSet<usize>>;
+
+#[derive(Debug, Clone)]
+pub struct CoverageStats {
+    pub covered_lines: CoverageMap,
+    pub total_lines: CoverageMap,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CoverageMetric {
+    pub covered: usize,
+    pub total: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub threshold: Option<f64>,
+}
+
+impl CoverageMetric {
+    pub fn percent(&self) -> f64 {
+        if self.total == 0 {
+            100.0
+        } else {
+            (self.covered as f64 / self.total as f64) * 100.0
+        }
+    }
+
+    pub fn meets_threshold(&self) -> bool {
+        self.threshold
+            .is_none_or(|threshold| self.percent() >= threshold)
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CoverageUncoveredFile {
+    pub file: PathBuf,
+    pub lines: Vec<usize>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CoverageGateReport {
+    pub line_coverage: CoverageMetric,
+    pub diff_coverage: CoverageMetric,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub uncovered_changed_lines: Vec<CoverageUncoveredFile>,
+    pub fail_on_uncovered_diff: bool,
+}
+
+impl CoverageGateReport {
+    pub fn passes(&self) -> bool {
+        self.line_coverage.meets_threshold()
+            && self.diff_coverage.meets_threshold()
+            && (!self.fail_on_uncovered_diff || self.uncovered_changed_lines.is_empty())
+    }
+}
 
 fn normalize_path_components(path: &Path) -> PathBuf {
     let mut normalized = PathBuf::new();
@@ -56,7 +109,13 @@ fn normalize_repo_relative_path(path: &Path, project_root: &Path) -> PathBuf {
 /// Parses both `DA:` (line coverage) and `BRDA:` (branch coverage) records.
 /// Malformed records are logged as warnings and skipped.
 pub fn parse_lcov(content: &str, project_root: &Path) -> CoverageMap {
+    parse_lcov_stats(content, project_root).covered_lines
+}
+
+/// Parse an LCOV file and return both total and covered line sets.
+pub fn parse_lcov_stats(content: &str, project_root: &Path) -> CoverageStats {
     let mut map = CoverageMap::new();
+    let mut totals = CoverageMap::new();
     let mut current_file: Option<PathBuf> = None;
 
     for (line_num, line) in content.lines().enumerate() {
@@ -72,6 +131,7 @@ pub fn parse_lcov(content: &str, project_root: &Path) -> CoverageMap {
                 if let (Some(line_str), Some(count_str)) = (parts.next(), parts.next()) {
                     match (line_str.parse::<usize>(), count_str.parse::<u64>()) {
                         (Ok(line_no), Ok(count)) => {
+                            totals.entry(file.clone()).or_default().insert(line_no);
                             if count > 0 {
                                 map.entry(file.clone()).or_default().insert(line_no);
                             }
@@ -102,6 +162,7 @@ pub fn parse_lcov(content: &str, project_root: &Path) -> CoverageMap {
                         );
                         continue;
                     };
+                    totals.entry(file.clone()).or_default().insert(line_no);
                     let taken = parts[3].trim();
                     if taken == "-" || taken == "0" {
                         // Never executed or zero count — not covered
@@ -127,7 +188,10 @@ pub fn parse_lcov(content: &str, project_root: &Path) -> CoverageMap {
         }
     }
 
-    map
+    CoverageStats {
+        covered_lines: map,
+        total_lines: totals,
+    }
 }
 
 /// Filter mutations to only those on lines present in the coverage map.
@@ -158,6 +222,71 @@ pub fn filter_by_coverage(
             }
         })
         .collect()
+}
+
+pub fn line_coverage_metric(coverage: &CoverageStats) -> CoverageMetric {
+    let covered = coverage
+        .covered_lines
+        .values()
+        .map(HashSet::len)
+        .sum::<usize>();
+    let total = coverage
+        .total_lines
+        .values()
+        .map(HashSet::len)
+        .sum::<usize>();
+    CoverageMetric {
+        covered,
+        total,
+        threshold: None,
+    }
+}
+
+pub fn diff_coverage_report(
+    coverage: &CoverageStats,
+    changed_files: &[crate::ChangedFile],
+    project_root: &Path,
+) -> CoverageGateReport {
+    let mut covered = 0usize;
+    let mut total = 0usize;
+    let mut uncovered_changed_lines: Vec<CoverageUncoveredFile> = Vec::new();
+
+    for changed in changed_files {
+        let rel = normalize_repo_relative_path(&changed.path, project_root);
+        let covered_lines = coverage.covered_lines.get(&rel);
+
+        let mut missing = Vec::new();
+        for hunk in &changed.hunks {
+            for line in hunk.start..=hunk.end {
+                total += 1;
+                let is_covered = covered_lines.is_some_and(|lines| lines.contains(&line));
+                if is_covered {
+                    covered += 1;
+                } else {
+                    missing.push(line);
+                }
+            }
+        }
+        if !missing.is_empty() {
+            missing.sort_unstable();
+            missing.dedup();
+            uncovered_changed_lines.push(CoverageUncoveredFile {
+                file: rel,
+                lines: missing,
+            });
+        }
+    }
+
+    CoverageGateReport {
+        line_coverage: line_coverage_metric(coverage),
+        diff_coverage: CoverageMetric {
+            covered,
+            total,
+            threshold: None,
+        },
+        uncovered_changed_lines,
+        fail_on_uncovered_diff: false,
+    }
 }
 
 #[cfg(test)]
@@ -199,6 +328,29 @@ end_of_record
         let lcov = "SF:src/lib.rs\nDA:5,1\nend_of_record\n";
         let map = parse_lcov(lcov, Path::new("/project"));
         assert!(map.contains_key(Path::new("src/lib.rs")));
+    }
+
+    #[test]
+    fn parse_lcov_stats_tracks_totals_and_coverage() {
+        let lcov = "\
+SF:/project/src/main.go
+DA:1,1
+DA:2,0
+BRDA:3,0,0,4
+end_of_record
+";
+        let root = Path::new("/project");
+        let stats = parse_lcov_stats(lcov, root);
+        let covered = stats.covered_lines.get(Path::new("src/main.go")).unwrap();
+        let total = stats.total_lines.get(Path::new("src/main.go")).unwrap();
+        assert!(covered.contains(&1));
+        assert!(covered.contains(&3));
+        assert!(total.contains(&1));
+        assert!(total.contains(&2));
+        assert!(total.contains(&3));
+        let metric = line_coverage_metric(&stats);
+        assert_eq!(metric.covered, 2);
+        assert_eq!(metric.total, 3);
     }
 
     #[test]
@@ -298,5 +450,40 @@ end_of_record
         let filtered = filter_by_coverage(mutations, &coverage, root);
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].line, 10);
+    }
+
+    #[test]
+    fn diff_coverage_report_lists_uncovered_changed_lines() {
+        let root = Path::new("/project");
+        let mut coverage = CoverageStats {
+            covered_lines: CoverageMap::new(),
+            total_lines: CoverageMap::new(),
+        };
+        coverage
+            .covered_lines
+            .entry(PathBuf::from("src/main.go"))
+            .or_default()
+            .insert(10);
+        coverage
+            .total_lines
+            .entry(PathBuf::from("src/main.go"))
+            .or_default()
+            .extend([10, 11]);
+
+        let changed_files = vec![crate::ChangedFile {
+            path: root.join("src/main.go"),
+            hunks: vec![crate::LineRange { start: 10, end: 11 }],
+        }];
+
+        let report = diff_coverage_report(&coverage, &changed_files, root);
+        assert_eq!(report.diff_coverage.covered, 1);
+        assert_eq!(report.diff_coverage.total, 2);
+        assert_eq!(report.uncovered_changed_lines.len(), 1);
+        assert_eq!(
+            report.uncovered_changed_lines[0].file,
+            PathBuf::from("src/main.go")
+        );
+        assert_eq!(report.uncovered_changed_lines[0].lines, vec![11]);
+        assert!(!report.fail_on_uncovered_diff);
     }
 }

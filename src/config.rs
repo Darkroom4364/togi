@@ -49,6 +49,7 @@ pub struct TestConfig {
     pub profile: Option<ResourceProfile>,
     pub command: Vec<String>,
     pub build_command: Vec<String>,
+    pub sandbox_command: Vec<String>,
     pub timeout: u64,
     pub calibrate_timeout: bool,
     pub timeout_multiplier: f64,
@@ -67,6 +68,8 @@ struct RawTestConfig {
     command: Vec<String>,
     #[serde(default)]
     build_command: Vec<String>,
+    #[serde(default)]
+    sandbox_command: Vec<String>,
     #[serde(default)]
     timeout: Option<u64>,
     #[serde(default)]
@@ -91,6 +94,7 @@ impl<'de> Deserialize<'de> for TestConfig {
             profile: raw.profile,
             command: raw.command,
             build_command: raw.build_command,
+            sandbox_command: raw.sandbox_command,
             timeout: raw.timeout.unwrap_or_else(default_timeout),
             calibrate_timeout: raw.calibrate_timeout.unwrap_or(false),
             timeout_multiplier: raw.timeout_multiplier.unwrap_or(4.0),
@@ -145,6 +149,12 @@ pub struct MutationConfig {
     pub max_per_run: usize,
     pub coverage_file: Option<PathBuf>,
     pub test_selection_file: Option<PathBuf>,
+    #[serde(default)]
+    pub min_line_coverage: Option<f64>,
+    #[serde(default)]
+    pub min_diff_coverage: Option<f64>,
+    #[serde(default)]
+    pub fail_on_uncovered_diff: bool,
     #[serde(default = "default_max_per_file")]
     pub max_per_file: usize,
     #[serde(default)]
@@ -337,6 +347,7 @@ impl Default for TestConfig {
             profile: None,
             command: default_test_command(),
             build_command: vec![],
+            sandbox_command: vec![],
             timeout: default_timeout(),
             calibrate_timeout: false,
             timeout_multiplier: 4.0,
@@ -363,6 +374,9 @@ impl Default for MutationConfig {
             max_per_file: default_max_per_file(),
             coverage_file: None,
             test_selection_file: None,
+            min_line_coverage: None,
+            min_diff_coverage: None,
+            fail_on_uncovered_diff: false,
             exclude_paths: vec![],
             skip_noisy_files: true,
             respect_workspace_ignores: true,
@@ -456,6 +470,19 @@ impl Config {
                 build_cmd_toml.join(", ")
             ));
         }
+
+        template.push_str(
+            "# sandbox_command = [\"bwrap\", \"--ro-bind\", \"/\", \"/\", \"--dev\", \"/dev\", \"--proc\", \"/proc\", \"--\"]\n\
+             # Optional wrapper that runs every build and test command inside your own sandbox tool.\n\
+             # Leave unset to run directly on the host or CI runner.\n",
+        );
+
+        template.push_str(
+            "# coverage_file = \"coverage/lcov.info\"  # enable LCOV filtering and coverage gates\n\
+             # min_line_coverage = 80.0  # fail if overall LCOV line coverage drops below this\n\
+             # min_diff_coverage = 90.0  # fail if changed-line coverage drops below this\n\
+             # fail_on_uncovered_diff = false  # fail if any changed line is uncovered\n",
+        );
 
         template.push_str(&format!(
             "# profile = \"cool\"  # cool, balanced, or ci; explicit jobs still win\n\
@@ -584,6 +611,7 @@ schemata = true
         assert_eq!(config.test.timeout_slack, 4);
         assert_eq!(config.test.jobs, 8);
         assert!(config.test.jobs_was_explicit());
+        assert!(config.test.sandbox_command.is_empty());
         assert_eq!(config.diff.base, "origin/develop");
         assert_eq!(config.mutations.max_per_run, 50);
         assert!(config.mutations.schemata);
@@ -625,6 +653,7 @@ commnad = ["cargo", "test"]
         let config: Config = toml::from_str(content).unwrap();
         assert_eq!(config.test.command, vec!["go", "test", "./..."]);
         assert!(config.test.build_command.is_empty());
+        assert!(config.test.sandbox_command.is_empty());
         assert_eq!(config.test.timeout, 30);
         assert_eq!(config.test.jobs, 2);
         assert_eq!(config.test.languages["python"].command, vec!["pytest"]);
@@ -637,6 +666,9 @@ commnad = ["cargo", "test"]
             config.mutations.test_selection_file,
             Some("coverage/test-selection.json".into())
         );
+        assert!(config.mutations.min_line_coverage.is_none());
+        assert!(config.mutations.min_diff_coverage.is_none());
+        assert!(!config.mutations.fail_on_uncovered_diff);
         assert!(config.mutations.skip_noisy_files);
         assert!(config.mutations.respect_workspace_ignores);
         assert!(config.mutations.incremental_history);
@@ -653,6 +685,7 @@ commnad = ["cargo", "test"]
         assert_eq!(config.test.profile, None);
         assert!(config.test.command.is_empty());
         assert!(config.test.build_command.is_empty());
+        assert!(config.test.sandbox_command.is_empty());
         assert!(config.test.languages.is_empty());
         assert_eq!(config.test.timeout, 30);
         assert!(!config.test.calibrate_timeout);
@@ -666,6 +699,9 @@ commnad = ["cargo", "test"]
         assert!(config.mutations.operators.is_empty());
         assert!(config.mutations.coverage_file.is_none());
         assert!(config.mutations.test_selection_file.is_none());
+        assert!(config.mutations.min_line_coverage.is_none());
+        assert!(config.mutations.min_diff_coverage.is_none());
+        assert!(!config.mutations.fail_on_uncovered_diff);
         assert!(config.mutations.exclude_paths.is_empty());
         assert!(config.mutations.skip_noisy_files);
         assert!(config.mutations.respect_workspace_ignores);
@@ -719,6 +755,20 @@ timeout = 120
     }
 
     #[test]
+    fn parse_sandbox_command() {
+        let toml_str = r#"
+[test]
+command = ["cargo", "test"]
+sandbox_command = ["bwrap", "--ro-bind", "/", "/", "--"]
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            config.test.sandbox_command,
+            vec!["bwrap", "--ro-bind", "/", "/", "--"]
+        );
+    }
+
+    #[test]
     fn write_template_creates_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("togi.toml");
@@ -726,6 +776,7 @@ timeout = 120
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(content.contains("[test]"));
         assert!(content.contains("command = "));
+        assert!(content.contains("sandbox_command = "));
         assert!(content.contains("[diff]"));
         assert!(content.contains("[mutations]"));
     }
@@ -825,6 +876,20 @@ coverage_file = "coverage.lcov"
             config.mutations.coverage_file,
             Some(PathBuf::from("coverage.lcov"))
         );
+    }
+
+    #[test]
+    fn parse_coverage_gate_options() {
+        let toml_str = r#"
+[mutations]
+min_line_coverage = 80.0
+min_diff_coverage = 90.0
+fail_on_uncovered_diff = true
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.mutations.min_line_coverage, Some(80.0));
+        assert_eq!(config.mutations.min_diff_coverage, Some(90.0));
+        assert!(config.mutations.fail_on_uncovered_diff);
     }
 
     #[test]
