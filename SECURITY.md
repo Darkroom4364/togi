@@ -30,16 +30,18 @@ disclosure after a patch or mitigation is available when possible.
 
 togi is a local and CI command runner. It parses repository files, creates
 isolated mutation workspaces, and executes repository-defined build and test
-commands.
+commands. An optional `[test] sandbox_command` wrapper can prefix those
+commands with an external sandbox tool, but the actual isolation boundary is
+still provided by that tool and the host environment.
 
 Those workspace copies, timeouts, and descendant-process cleanup are operational
 guardrails for correctness and cleanup. They are not a security sandbox.
 
 togi does not currently restrict filesystem or network access for spawned
-commands beyond whatever the host operating system, container, or CI runner
-already enforces. Treat the target repository and its configured test commands
-as trusted code. Running less-trusted repositories directly on the host is out
-of scope for the current security model.
+commands beyond whatever the host operating system, container, CI runner, or
+configured sandbox wrapper already enforces. Treat the target repository and
+its configured test commands as trusted code. Running less-trusted repositories
+directly on the host is out of scope for the current security model.
 
 If you need to evaluate less-trusted repositories, run togi inside a separate
 container, VM, or similarly restricted environment with least-privilege

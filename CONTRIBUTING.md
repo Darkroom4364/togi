@@ -54,3 +54,14 @@ togi supports any language with a tree-sitter grammar. Adding one takes ~50 line
 - `cargo test` must pass
 - `cargo clippy -- -D warnings` must pass
 - `cargo fmt` must pass
+
+## Supply-chain policy
+
+- Run `cargo audit` before merging dependency updates.
+- External GitHub Actions outside the `actions/*` namespace must be pinned to a
+  full commit SHA.
+- Prefer pinned togi installs in docs and CI examples; do not recommend
+  `cargo install --git ...` against a moving branch without `--rev` or an
+  explicit tag.
+- SBOM generation is deferred for now; revisit it when the project starts
+  publishing versioned releases.
