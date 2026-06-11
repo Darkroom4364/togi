@@ -28,7 +28,7 @@ jobs:
         uses: 0sec-labs/foxguard/action@e13233eb0b83a495ff7ad8fe30d62128cb625c14
         with:
           path: .
-          severity: medium
+          severity: high
           version: v0.8.1
           fail-on-findings: "true"
           upload-sarif: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
