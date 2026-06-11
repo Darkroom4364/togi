@@ -24,6 +24,13 @@ command = ["go", "test", "./..."]
 # Default: []
 # build_command = ["go", "build", "./..."]
 
+# Optional sandbox wrapper prefixed to every build and test command.
+# Leave unset to run directly on the host or CI runner.
+# Example: bwrap, firejail, docker, podman, sandbox-exec, or a custom wrapper.
+# Type: array of strings
+# Default: []
+# sandbox_command = ["bwrap", "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--"]
+
 # Per-mutation timeout in seconds.
 # Type: integer
 # Default: 30
@@ -87,6 +94,13 @@ schemata = true
 # Type: string path
 # Default: unset
 coverage_file = "coverage/lcov.info"
+
+# Optional LCOV gate thresholds.
+# Type: float percentage
+# Default: unset
+# min_line_coverage = 80.0
+# min_diff_coverage = 90.0
+# fail_on_uncovered_diff = false
 
 # Optional JSON source-line to test-name map for targeted test runs.
 # Type: string path
