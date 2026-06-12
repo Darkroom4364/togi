@@ -106,6 +106,10 @@ pub struct CheckArgs {
     #[arg(long)]
     pub coverage_file: Option<PathBuf>,
 
+    /// Command to generate an LCOV file before mutation filtering
+    #[arg(long)]
+    pub coverage_cmd: Option<String>,
+
     /// Fail if overall LCOV line coverage is below this percentage
     #[arg(long)]
     pub min_line_coverage: Option<f64>,
