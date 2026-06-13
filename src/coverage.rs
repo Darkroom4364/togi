@@ -12,7 +12,6 @@ pub struct CoverageStats {
     pub covered_lines: CoverageMap,
     pub total_lines: CoverageMap,
 }
-
 #[derive(Debug, Clone, Serialize)]
 pub struct CoverageMetric {
     pub covered: usize,
@@ -486,5 +485,4 @@ end_of_record
         assert_eq!(report.uncovered_changed_lines[0].lines, vec![11]);
         assert!(!report.fail_on_uncovered_diff);
     }
-
 }

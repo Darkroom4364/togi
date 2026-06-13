@@ -1566,7 +1566,10 @@ jobs = 4
 
         let err = resolve_config(cfg).unwrap_err();
 
-        assert!(err.to_string().contains("coverage collection command requires"));
+        assert!(
+            err.to_string()
+                .contains("coverage collection command requires")
+        );
         Ok(())
     }
 
@@ -1587,7 +1590,6 @@ jobs = 4
         assert!(err.to_string().contains("timeout_multiplier"));
         Ok(())
     }
-
     #[test]
     fn calibrated_timeout_uses_slowest_baseline_duration() {
         let timeout = calibrated_timeout_seconds(
@@ -1771,5 +1773,4 @@ example.com/calc/calc.go:9.29,10.11 1 0
         assert_eq!(file.get("6").unwrap(), &vec!["TestAdd".to_string()]);
         assert!(!file.contains_key("9"));
     }
-
 }
