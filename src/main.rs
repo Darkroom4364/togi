@@ -10,46 +10,6 @@ use std::time::Duration;
 use serde::Deserialize;
 use togi::{BaselineTiming, ChangedFile, Mutation};
 
-struct CheckConfig {
-    all: bool,
-    paths: Vec<PathBuf>,
-    base: Option<String>,
-    config_path: Option<PathBuf>,
-    output_format: togi::cli::OutputFormat,
-    profile: Option<togi::config::ResourceProfile>,
-    jobs: Option<usize>,
-    timeout: Option<u64>,
-    calibrate_timeout: bool,
-    skip_baseline_timing: bool,
-    timeout_multiplier: Option<f64>,
-    timeout_slack: Option<u64>,
-    max_per_run: Option<usize>,
-    first_survivor: bool,
-    max_survivors: Option<usize>,
-    schemata: bool,
-    no_schemata: bool,
-    dry_run: bool,
-    verbose: bool,
-    show_output: bool,
-    test_cmd: Option<String>,
-    coverage_file: Option<PathBuf>,
-    min_line_coverage: Option<f64>,
-    min_diff_coverage: Option<f64>,
-    fail_on_uncovered_diff: bool,
-    test_selection_file: Option<PathBuf>,
-    no_incremental_history: bool,
-    force_rerun: bool,
-    build_cmd: Option<String>,
-    fail_fast: bool,
-    no_skip_defaults: bool,
-    operators: Option<Vec<String>>,
-    fail_under: Option<f64>,
-    shard: Option<String>,
-    save_baseline: bool,
-    check_baseline: bool,
-    pr_comment: Option<PathBuf>,
-}
-
 struct ExecuteOptions {
     verbose: bool,
     show_output: bool,
@@ -89,84 +49,7 @@ fn main() {
     let cli = togi::cli::Cli::parse();
 
     match cli.command {
-        togi::cli::Commands::Check {
-            all,
-            path,
-            base,
-            config,
-            format,
-            profile,
-            jobs,
-            timeout,
-            calibrate_timeout,
-            skip_baseline_timing,
-            timeout_multiplier,
-            timeout_slack,
-            max_per_run,
-            first_survivor,
-            max_survivors,
-            schemata,
-            no_schemata,
-            dry_run,
-            verbose,
-            show_output,
-            test_cmd,
-            coverage_file,
-            min_line_coverage,
-            min_diff_coverage,
-            fail_on_uncovered_diff,
-            test_selection_file,
-            no_incremental_history,
-            force_rerun,
-            build_cmd,
-            fail_fast,
-            no_skip_defaults,
-            operators,
-            fail_under,
-            shard,
-            save_baseline,
-            check_baseline,
-            pr_comment,
-        } => {
-            let cfg = CheckConfig {
-                all,
-                paths: path,
-                base,
-                config_path: config,
-                output_format: format,
-                profile,
-                jobs,
-                timeout,
-                calibrate_timeout,
-                skip_baseline_timing,
-                timeout_multiplier,
-                timeout_slack,
-                max_per_run,
-                first_survivor,
-                max_survivors,
-                schemata,
-                no_schemata,
-                dry_run,
-                verbose,
-                show_output,
-                test_cmd,
-                coverage_file,
-                min_line_coverage,
-                min_diff_coverage,
-                fail_on_uncovered_diff,
-                test_selection_file,
-                no_incremental_history,
-                force_rerun,
-                build_cmd,
-                fail_fast,
-                no_skip_defaults,
-                operators,
-                fail_under,
-                shard,
-                save_baseline,
-                check_baseline,
-                pr_comment,
-            };
+        togi::cli::Commands::Check(cfg) => {
             if let Err(e) = run_check(cfg, cancelled) {
                 eprintln!("Error: {e:#}");
                 process::exit(2);
@@ -321,13 +204,13 @@ fn print_operators() {
     }
 }
 
-fn run_check(cfg: CheckConfig, cancelled: Arc<AtomicBool>) -> anyhow::Result<()> {
+fn run_check(cfg: togi::cli::CheckArgs, cancelled: Arc<AtomicBool>) -> anyhow::Result<()> {
     let all = cfg.all;
-    let paths = cfg.paths.clone();
+    let paths = cfg.path.clone();
     let dry_run = cfg.dry_run;
     let verbose = cfg.verbose;
     let show_output = cfg.show_output;
-    let output_format = cfg.output_format;
+    let output_format = cfg.format;
     let fail_under = cfg.fail_under;
     let max_survivors = match (cfg.first_survivor, cfg.max_survivors) {
         (true, _) => Some(1),
@@ -582,8 +465,8 @@ fn exit_with(lock: togi::lock::LockGuard, code: i32) -> ! {
     process::exit(code);
 }
 
-fn resolve_config(cfg: CheckConfig) -> anyhow::Result<ResolvedCheckConfig> {
-    let mut config = togi::config::Config::load(cfg.config_path.as_deref())?;
+fn resolve_config(cfg: togi::cli::CheckArgs) -> anyhow::Result<ResolvedCheckConfig> {
+    let mut config = togi::config::Config::load(cfg.config.as_deref())?;
     let has_custom_test_cmd = cfg.test_cmd.is_some();
     let has_cli_build_cmd = cfg.build_cmd.is_some();
     let has_cli_timeout = cfg.timeout.is_some();
@@ -1441,13 +1324,13 @@ fn validate_diff_base(base: &str) -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
-    fn check_config() -> CheckConfig {
-        CheckConfig {
+    fn check_config() -> togi::cli::CheckArgs {
+        togi::cli::CheckArgs {
             all: false,
-            paths: vec![],
+            path: vec![],
             base: None,
-            config_path: None,
-            output_format: togi::cli::OutputFormat::Terminal,
+            config: None,
+            format: togi::cli::OutputFormat::Terminal,
             profile: None,
             jobs: None,
             timeout: None,
@@ -1489,7 +1372,7 @@ mod tests {
         let config_path = dir.path().join("togi.toml");
         std::fs::write(&config_path, "").expect("empty config should be written");
         let mut cfg = check_config();
-        cfg.config_path = Some(config_path);
+        cfg.config = Some(config_path);
         cfg.profile = Some(togi::config::ResourceProfile::Cool);
 
         let resolved = resolve_config(cfg).expect("config should resolve");
@@ -1512,7 +1395,7 @@ jobs = 4
         )
         .expect("config should be written");
         let mut cfg = check_config();
-        cfg.config_path = Some(config_path);
+        cfg.config = Some(config_path);
 
         let resolved = resolve_config(cfg).expect("config should resolve");
 
@@ -1527,7 +1410,7 @@ jobs = 4
         let config_path = dir.path().join("togi.toml");
         std::fs::write(&config_path, "").expect("empty config should be written");
         let mut cfg = check_config();
-        cfg.config_path = Some(config_path);
+        cfg.config = Some(config_path);
         cfg.profile = Some(togi::config::ResourceProfile::Ci);
         cfg.jobs = Some(3);
 
@@ -1542,7 +1425,7 @@ jobs = 4
         let config_path = dir.path().join("togi.toml");
         std::fs::write(&config_path, "")?;
         let mut cfg = check_config();
-        cfg.config_path = Some(config_path);
+        cfg.config = Some(config_path);
         cfg.calibrate_timeout = true;
         cfg.timeout_multiplier = Some(2.5);
         cfg.timeout_slack = Some(6);
@@ -1561,7 +1444,7 @@ jobs = 4
         let config_path = dir.path().join("togi.toml");
         std::fs::write(&config_path, "[test]\ncalibrate_timeout = true\n")?;
         let mut cfg = check_config();
-        cfg.config_path = Some(config_path);
+        cfg.config = Some(config_path);
         cfg.skip_baseline_timing = true;
 
         let resolved = resolve_config(cfg)?;
@@ -1576,7 +1459,7 @@ jobs = 4
         let config_path = dir.path().join("togi.toml");
         std::fs::write(&config_path, "[test]\ncalibrate_timeout = true\n")?;
         let mut cfg = check_config();
-        cfg.config_path = Some(config_path);
+        cfg.config = Some(config_path);
         cfg.timeout = Some(12);
 
         let resolved = resolve_config(cfg)?;
@@ -1592,7 +1475,7 @@ jobs = 4
         let config_path = dir.path().join("togi.toml");
         std::fs::write(&config_path, "")?;
         let mut cfg = check_config();
-        cfg.config_path = Some(config_path);
+        cfg.config = Some(config_path);
         cfg.timeout_multiplier = Some(0.0);
 
         let err = match resolve_config(cfg) {
