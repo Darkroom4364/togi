@@ -135,6 +135,13 @@ impl ResourceProfile {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+#[value(rename_all = "kebab-case")]
+pub enum CoverageMode {
+    Auto,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DiffConfig {
@@ -147,6 +154,8 @@ pub struct DiffConfig {
 pub struct MutationConfig {
     #[serde(default = "default_max_per_run")]
     pub max_per_run: usize,
+    #[serde(default)]
+    pub coverage: Option<CoverageMode>,
     pub coverage_file: Option<PathBuf>,
     #[serde(default)]
     pub coverage_command: Vec<String>,
@@ -247,6 +256,11 @@ struct ProjectInspection {
     has_tsconfig: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuiltinCoverageAdapter {
+    Go,
+}
+
 impl ProjectInspection {
     fn scan(project_root: &Path) -> Self {
         Self {
@@ -323,6 +337,13 @@ impl ProjectInspection {
         }
         vec![]
     }
+
+    fn detect_builtin_coverage_adapter(&self) -> Option<BuiltinCoverageAdapter> {
+        if self.has_go_mod {
+            return Some(BuiltinCoverageAdapter::Go);
+        }
+        None
+    }
 }
 
 pub fn detect_test_command(project_root: &Path) -> Vec<String> {
@@ -368,6 +389,10 @@ pub fn failfast_args(command: &[String]) -> Vec<String> {
 
 pub fn detect_build_command(project_root: &Path) -> Vec<String> {
     ProjectInspection::scan(project_root).detect_build_command()
+}
+
+pub fn detect_builtin_coverage_adapter(project_root: &Path) -> Option<BuiltinCoverageAdapter> {
+    ProjectInspection::scan(project_root).detect_builtin_coverage_adapter()
 }
 
 fn default_timeout() -> u64 {
@@ -441,6 +466,7 @@ impl Default for MutationConfig {
         Self {
             max_per_run: default_max_per_run(),
             max_per_file: default_max_per_file(),
+            coverage: None,
             coverage_file: None,
             coverage_command: vec![],
             test_selection_file: None,
@@ -549,7 +575,8 @@ impl Config {
         );
 
         template.push_str(
-            "# coverage_file = \"coverage/lcov.info\"  # enable LCOV filtering and coverage gates\n\
+            "# coverage = \"auto\"  # collect coverage through a built-in adapter when supported\n\
+             # coverage_file = \"coverage/lcov.info\"  # enable LCOV filtering and coverage gates\n\
              # coverage_command = [\"./scripts/collect-coverage.sh\"]  # generate LCOV before mutation filtering\n\
              # min_line_coverage = 80.0  # fail if overall LCOV line coverage drops below this\n\
              # min_diff_coverage = 90.0  # fail if changed-line coverage drops below this\n\
@@ -936,12 +963,14 @@ coverage_file = "coverage.lcov"
     }
 
     #[test]
-    fn parse_coverage_command_option() {
+    fn parse_coverage_collection_options() {
         let toml_str = r#"
 [mutations]
+coverage = "auto"
 coverage_command = ["./scripts/collect-coverage.sh"]
 "#;
         let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.mutations.coverage, Some(CoverageMode::Auto));
         assert_eq!(
             config.mutations.coverage_command,
             vec!["./scripts/collect-coverage.sh"]
@@ -998,6 +1027,16 @@ fail_on_uncovered_diff = true
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("CMakeLists.txt"), "").unwrap();
         assert_eq!(detect_test_command(dir.path()), vec!["ctest"]);
+    }
+
+    #[test]
+    fn detect_builtin_go_coverage_adapter() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("go.mod"), "").unwrap();
+        assert_eq!(
+            detect_builtin_coverage_adapter(dir.path()),
+            Some(BuiltinCoverageAdapter::Go)
+        );
     }
 
     #[test]

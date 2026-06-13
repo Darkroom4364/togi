@@ -102,12 +102,16 @@ pub struct CheckArgs {
     #[arg(long)]
     pub test_cmd: Option<String>,
 
+    /// Coverage collection mode for supported ecosystems
+    #[arg(long, value_enum, conflicts_with = "coverage_cmd")]
+    pub coverage: Option<crate::config::CoverageMode>,
+
     /// LCOV coverage file — only mutate lines with test coverage
     #[arg(long)]
     pub coverage_file: Option<PathBuf>,
 
     /// Command to generate an LCOV file before mutation filtering
-    #[arg(long)]
+    #[arg(long, conflicts_with = "coverage")]
     pub coverage_cmd: Option<String>,
 
     /// Fail if overall LCOV line coverage is below this percentage
@@ -284,6 +288,26 @@ mod tests {
                 assert_eq!(args.min_line_coverage, Some(80.0));
                 assert_eq!(args.min_diff_coverage, Some(90.0));
                 assert!(args.fail_on_uncovered_diff);
+            }
+            _ => panic!("expected Check command"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn coverage_collection_arguments_are_accepted() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from([
+            "togi",
+            "check",
+            "--coverage",
+            "auto",
+            "--coverage-file",
+            "coverage/lcov.info",
+        ])?;
+        match cli.command {
+            Commands::Check(args) => {
+                assert_eq!(args.coverage, Some(crate::config::CoverageMode::Auto));
+                assert_eq!(args.coverage_file, Some(PathBuf::from("coverage/lcov.info")));
             }
             _ => panic!("expected Check command"),
         }
