@@ -535,7 +535,10 @@ end_of_record
         let lcov = stats_to_lcov(&coverage);
         let reparsed = parse_lcov_stats(&lcov, Path::new("/project"));
 
-        let covered = reparsed.covered_lines.get(Path::new("src/main.go")).unwrap();
+        let covered = reparsed
+            .covered_lines
+            .get(Path::new("src/main.go"))
+            .unwrap();
         assert!(covered.contains(&4));
         assert!(!covered.contains(&5));
 

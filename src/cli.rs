@@ -307,7 +307,10 @@ mod tests {
         match cli.command {
             Commands::Check(args) => {
                 assert_eq!(args.coverage, Some(crate::config::CoverageMode::Auto));
-                assert_eq!(args.coverage_file, Some(PathBuf::from("coverage/lcov.info")));
+                assert_eq!(
+                    args.coverage_file,
+                    Some(PathBuf::from("coverage/lcov.info"))
+                );
             }
             _ => panic!("expected Check command"),
         }

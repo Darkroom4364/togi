@@ -530,9 +530,7 @@ fn resolve_config(cfg: togi::cli::CheckArgs) -> anyhow::Result<ResolvedCheckConf
     }
 
     if config.mutations.coverage.is_some() && !config.mutations.coverage_command.is_empty() {
-        anyhow::bail!(
-            "choose either built-in coverage collection or coverage_command, not both"
-        );
+        anyhow::bail!("choose either built-in coverage collection or coverage_command, not both");
     }
     if !config.mutations.coverage_command.is_empty() && config.mutations.coverage_file.is_none() {
         anyhow::bail!(
@@ -803,7 +801,10 @@ fn parse_go_coverprofile_stats(
         for line_no in start_line..=end_line {
             total_lines.entry(file.clone()).or_default().insert(line_no);
             if execution_count > 0 {
-                covered_lines.entry(file.clone()).or_default().insert(line_no);
+                covered_lines
+                    .entry(file.clone())
+                    .or_default()
+                    .insert(line_no);
             }
         }
     }
