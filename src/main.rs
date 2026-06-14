@@ -22,6 +22,7 @@ struct ExecuteOptions {
     cancelled: Arc<AtomicBool>,
 }
 
+#[derive(Debug)]
 struct ResolvedCheckConfig {
     config: togi::config::Config,
     fail_fast: bool,
@@ -271,34 +272,7 @@ fn run_check(cfg: togi::cli::CheckArgs, cancelled: Arc<AtomicBool>) -> anyhow::R
     let coverage_gate_active = config.mutations.min_line_coverage.is_some()
         || config.mutations.min_diff_coverage.is_some()
         || config.mutations.fail_on_uncovered_diff;
-    let coverage_stats = if let Some(ref cov_path) = config.mutations.coverage_file {
-        let resolved_cov_path = if cov_path.is_relative() {
-            project_root.join(cov_path)
-        } else {
-            cov_path.to_path_buf()
-        };
-        match std::fs::read_to_string(&resolved_cov_path) {
-            Ok(cov_content) => Some(togi::coverage::parse_lcov_stats(
-                &cov_content,
-                &project_root,
-            )),
-            Err(e) => {
-                if coverage_gate_active {
-                    return Err(anyhow::anyhow!(
-                        "could not read coverage file {}: {e}",
-                        resolved_cov_path.display()
-                    ));
-                }
-                eprintln!(
-                    "warning: could not read coverage file {}: {e} — running all mutations",
-                    resolved_cov_path.display()
-                );
-                None
-            }
-        }
-    } else {
-        None
-    };
+    let coverage_stats = resolve_coverage_stats(&config, &project_root, coverage_gate_active)?;
 
     if coverage_gate_active {
         let stats = coverage_stats
@@ -519,6 +493,10 @@ fn resolve_config(cfg: togi::cli::CheckArgs) -> anyhow::Result<ResolvedCheckConf
     if let Some(path) = cfg.coverage_file {
         config.mutations.coverage_file = Some(path);
     }
+    if let Some(cmd) = cfg.coverage_cmd {
+        config.mutations.coverage_command =
+            shell_words::split(&cmd).map_err(|e| anyhow::anyhow!("bad --coverage-cmd: {e}"))?;
+    }
     if let Some(value) = cfg.min_line_coverage {
         validate_coverage_percentage(value, "--min-line-coverage")?;
         config.mutations.min_line_coverage = Some(value);
@@ -548,13 +526,19 @@ fn resolve_config(cfg: togi::cli::CheckArgs) -> anyhow::Result<ResolvedCheckConf
         config.mutations.operators = ops;
     }
 
+    if !config.mutations.coverage_command.is_empty() && config.mutations.coverage_file.is_none() {
+        anyhow::bail!(
+            "coverage collection command requires an LCOV output path; set [mutations] coverage_file or --coverage-file"
+        );
+    }
     if (config.mutations.min_line_coverage.is_some()
         || config.mutations.min_diff_coverage.is_some()
         || config.mutations.fail_on_uncovered_diff)
         && config.mutations.coverage_file.is_none()
+        && config.mutations.coverage_command.is_empty()
     {
         anyhow::bail!(
-            "coverage gates require an LCOV file; set [mutations] coverage_file or --coverage-file"
+            "coverage gates require a coverage source; set [mutations] coverage_file, coverage_command, or use the corresponding CLI flags"
         );
     }
 
@@ -585,6 +569,107 @@ fn validate_coverage_percentage(value: f64, flag: &str) -> anyhow::Result<()> {
     if !value.is_finite() || !(0.0..=100.0).contains(&value) {
         anyhow::bail!("{flag} must be a finite percentage between 0 and 100");
     }
+    Ok(())
+}
+
+fn resolve_coverage_stats(
+    config: &togi::config::Config,
+    project_root: &Path,
+    coverage_gate_active: bool,
+) -> anyhow::Result<Option<togi::coverage::CoverageStats>> {
+    if !config.mutations.coverage_command.is_empty() {
+        let coverage_file = config
+            .mutations
+            .coverage_file
+            .as_ref()
+            .expect("coverage command should be validated to require coverage_file");
+        let resolved_cov_path = resolve_coverage_path(coverage_file, project_root);
+        run_coverage_command(
+            &config.mutations.coverage_command,
+            &resolved_cov_path,
+            project_root,
+        )?;
+    }
+
+    let Some(cov_path) = config.mutations.coverage_file.as_ref() else {
+        return Ok(None);
+    };
+    let resolved_cov_path = resolve_coverage_path(cov_path, project_root);
+    let coverage_required = coverage_gate_active || !config.mutations.coverage_command.is_empty();
+
+    match std::fs::read_to_string(&resolved_cov_path) {
+        Ok(cov_content) => Ok(Some(togi::coverage::parse_lcov_stats(
+            &cov_content,
+            project_root,
+        ))),
+        Err(e) => {
+            if coverage_required {
+                return Err(anyhow::anyhow!(
+                    "could not read coverage file {}: {e}",
+                    resolved_cov_path.display()
+                ));
+            }
+            eprintln!(
+                "warning: could not read coverage file {}: {e} — running all mutations",
+                resolved_cov_path.display()
+            );
+            Ok(None)
+        }
+    }
+}
+
+fn resolve_coverage_path(path: &Path, project_root: &Path) -> PathBuf {
+    if path.is_relative() {
+        project_root.join(path)
+    } else {
+        path.to_path_buf()
+    }
+}
+
+fn run_coverage_command(
+    command: &[String],
+    coverage_file: &Path,
+    project_root: &Path,
+) -> anyhow::Result<()> {
+    let Some(program) = command.first() else {
+        anyhow::bail!("coverage command is empty");
+    };
+    if let Some(parent) = coverage_file.parent() {
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "could not create parent directory for coverage file {}",
+                coverage_file.display()
+            )
+        })?;
+    }
+
+    // foxguard: ignore[rs/no-command-injection]
+    // The coverage command is explicit user configuration and is executed
+    // directly as argv without a shell.
+    let output = std::process::Command::new(program)
+        .args(&command[1..])
+        .current_dir(project_root)
+        .env("TOGI_COVERAGE_FILE", coverage_file)
+        .output()
+        .with_context(|| format!("failed to run coverage command `{}`", command.join(" ")))?;
+
+    if !output.status.success() {
+        anyhow::bail!(
+            "coverage command `{}` failed with status {}.\nstdout:\n{}\nstderr:\n{}",
+            command.join(" "),
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    if !coverage_file.is_file() {
+        anyhow::bail!(
+            "coverage command `{}` completed but did not produce {}",
+            command.join(" "),
+            coverage_file.display()
+        );
+    }
+
     Ok(())
 }
 
@@ -1348,6 +1433,7 @@ mod tests {
             show_output: false,
             test_cmd: None,
             coverage_file: None,
+            coverage_cmd: None,
             min_line_coverage: None,
             min_diff_coverage: None,
             fail_on_uncovered_diff: false,
@@ -1470,6 +1556,24 @@ jobs = 4
     }
 
     #[test]
+    fn resolve_config_rejects_coverage_command_without_file() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let config_path = dir.path().join("togi.toml");
+        std::fs::write(&config_path, "")?;
+        let mut cfg = check_config();
+        cfg.config = Some(config_path);
+        cfg.coverage_cmd = Some("go test ./...".into());
+
+        let err = resolve_config(cfg).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("coverage collection command requires")
+        );
+        Ok(())
+    }
+
+    #[test]
     fn resolve_config_rejects_invalid_timeout_multiplier() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let config_path = dir.path().join("togi.toml");
@@ -1486,7 +1590,6 @@ jobs = 4
         assert!(err.to_string().contains("timeout_multiplier"));
         Ok(())
     }
-
     #[test]
     fn calibrated_timeout_uses_slowest_baseline_duration() {
         let timeout = calibrated_timeout_seconds(

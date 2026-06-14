@@ -12,7 +12,6 @@ pub struct CoverageStats {
     pub covered_lines: CoverageMap,
     pub total_lines: CoverageMap,
 }
-
 #[derive(Debug, Clone, Serialize)]
 pub struct CoverageMetric {
     pub covered: usize,

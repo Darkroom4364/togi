@@ -127,6 +127,9 @@ togi check --build-cmd "cargo check"
 # Only mutate lines covered by an LCOV file
 togi check --coverage-file coverage/lcov.info
 
+# Run your own coverage command, then consume the generated LCOV
+togi check --coverage-cmd ./scripts/collect-coverage.sh --coverage-file coverage/lcov.info
+
 # Gate on line and diff coverage thresholds
 togi check --coverage-file coverage/lcov.info --min-line-coverage 80 --min-diff-coverage 90
 togi check --coverage-file coverage/lcov.info --fail-on-uncovered-diff
@@ -212,6 +215,7 @@ base = "origin/main"
 max_per_run = 20
 max_per_file = 20
 schemata = true
+# coverage_command = ["./scripts/collect-coverage.sh"]
 coverage_file = "coverage/lcov.info"
 min_line_coverage = 80.0
 min_diff_coverage = 90.0
@@ -335,6 +339,9 @@ For large repos, togi can avoid work before the runner starts and can also
 fail the run when LCOV coverage is below a threshold:
 
 - `--coverage-file coverage/lcov.info` keeps only mutations on covered lines
+- `--coverage-cmd ./scripts/collect-coverage.sh --coverage-file coverage/lcov.info`
+  runs a user-provided command before mutation generation, then reads the
+  resulting LCOV file. `TOGI_COVERAGE_FILE` is exported for the command.
 - `--min-line-coverage 80` fails when overall LCOV line coverage is below 80%
 - `--min-diff-coverage 90` fails when changed-line coverage is below 90%
 - `--fail-on-uncovered-diff` fails when any changed line is uncovered
@@ -342,6 +349,7 @@ fail the run when LCOV coverage is below a threshold:
 - `--test-selection-file coverage/test-selection.json` narrows each mutant to tests that cover that line when the configured runner supports test selection
 
 ```bash
+togi check --coverage-cmd ./scripts/collect-coverage.sh --coverage-file coverage/lcov.info
 togi test-map --path . --output coverage/test-selection.json
 togi check --coverage-file coverage/lcov.info --test-selection-file coverage/test-selection.json
 togi check --coverage-file coverage/lcov.info --min-line-coverage 80 --min-diff-coverage 90

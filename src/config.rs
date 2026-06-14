@@ -148,6 +148,8 @@ pub struct MutationConfig {
     #[serde(default = "default_max_per_run")]
     pub max_per_run: usize,
     pub coverage_file: Option<PathBuf>,
+    #[serde(default)]
+    pub coverage_command: Vec<String>,
     pub test_selection_file: Option<PathBuf>,
     #[serde(default)]
     pub min_line_coverage: Option<f64>,
@@ -440,6 +442,7 @@ impl Default for MutationConfig {
             max_per_run: default_max_per_run(),
             max_per_file: default_max_per_file(),
             coverage_file: None,
+            coverage_command: vec![],
             test_selection_file: None,
             min_line_coverage: None,
             min_diff_coverage: None,
@@ -547,6 +550,7 @@ impl Config {
 
         template.push_str(
             "# coverage_file = \"coverage/lcov.info\"  # enable LCOV filtering and coverage gates\n\
+             # coverage_command = [\"./scripts/collect-coverage.sh\"]  # generate LCOV before mutation filtering\n\
              # min_line_coverage = 80.0  # fail if overall LCOV line coverage drops below this\n\
              # min_diff_coverage = 90.0  # fail if changed-line coverage drops below this\n\
              # fail_on_uncovered_diff = false  # fail if any changed line is uncovered\n",
@@ -928,6 +932,19 @@ coverage_file = "coverage.lcov"
         assert_eq!(
             config.mutations.coverage_file,
             Some(PathBuf::from("coverage.lcov"))
+        );
+    }
+
+    #[test]
+    fn parse_coverage_command_option() {
+        let toml_str = r#"
+[mutations]
+coverage_command = ["./scripts/collect-coverage.sh"]
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            config.mutations.coverage_command,
+            vec!["./scripts/collect-coverage.sh"]
         );
     }
 
