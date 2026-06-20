@@ -22,6 +22,7 @@ struct ExecuteOptions {
     cancelled: Arc<AtomicBool>,
 }
 
+#[derive(Debug)]
 struct ResolvedCheckConfig {
     config: togi::config::Config,
     fail_fast: bool,
@@ -271,34 +272,7 @@ fn run_check(cfg: togi::cli::CheckArgs, cancelled: Arc<AtomicBool>) -> anyhow::R
     let coverage_gate_active = config.mutations.min_line_coverage.is_some()
         || config.mutations.min_diff_coverage.is_some()
         || config.mutations.fail_on_uncovered_diff;
-    let coverage_stats = if let Some(ref cov_path) = config.mutations.coverage_file {
-        let resolved_cov_path = if cov_path.is_relative() {
-            project_root.join(cov_path)
-        } else {
-            cov_path.to_path_buf()
-        };
-        match std::fs::read_to_string(&resolved_cov_path) {
-            Ok(cov_content) => Some(togi::coverage::parse_lcov_stats(
-                &cov_content,
-                &project_root,
-            )),
-            Err(e) => {
-                if coverage_gate_active {
-                    return Err(anyhow::anyhow!(
-                        "could not read coverage file {}: {e}",
-                        resolved_cov_path.display()
-                    ));
-                }
-                eprintln!(
-                    "warning: could not read coverage file {}: {e} — running all mutations",
-                    resolved_cov_path.display()
-                );
-                None
-            }
-        }
-    } else {
-        None
-    };
+    let coverage_stats = resolve_coverage_stats(&config, &project_root, coverage_gate_active)?;
 
     if coverage_gate_active {
         let stats = coverage_stats
@@ -516,8 +490,15 @@ fn resolve_config(cfg: togi::cli::CheckArgs) -> anyhow::Result<ResolvedCheckConf
         config.test.command =
             shell_words::split(&cmd).map_err(|e| anyhow::anyhow!("bad --test-cmd: {e}"))?;
     }
+    if let Some(mode) = cfg.coverage {
+        config.mutations.coverage = Some(mode);
+    }
     if let Some(path) = cfg.coverage_file {
         config.mutations.coverage_file = Some(path);
+    }
+    if let Some(cmd) = cfg.coverage_cmd {
+        config.mutations.coverage_command =
+            shell_words::split(&cmd).map_err(|e| anyhow::anyhow!("bad --coverage-cmd: {e}"))?;
     }
     if let Some(value) = cfg.min_line_coverage {
         validate_coverage_percentage(value, "--min-line-coverage")?;
@@ -548,13 +529,23 @@ fn resolve_config(cfg: togi::cli::CheckArgs) -> anyhow::Result<ResolvedCheckConf
         config.mutations.operators = ops;
     }
 
+    if config.mutations.coverage.is_some() && !config.mutations.coverage_command.is_empty() {
+        anyhow::bail!("choose either built-in coverage collection or coverage_command, not both");
+    }
+    if !config.mutations.coverage_command.is_empty() && config.mutations.coverage_file.is_none() {
+        anyhow::bail!(
+            "coverage collection command requires an LCOV output path; set [mutations] coverage_file or --coverage-file"
+        );
+    }
     if (config.mutations.min_line_coverage.is_some()
         || config.mutations.min_diff_coverage.is_some()
         || config.mutations.fail_on_uncovered_diff)
         && config.mutations.coverage_file.is_none()
+        && config.mutations.coverage.is_none()
+        && config.mutations.coverage_command.is_empty()
     {
         anyhow::bail!(
-            "coverage gates require an LCOV file; set [mutations] coverage_file or --coverage-file"
+            "coverage gates require a coverage source; set [mutations] coverage_file, coverage_command, coverage = \"auto\", or use the corresponding CLI flags"
         );
     }
 
@@ -586,6 +577,242 @@ fn validate_coverage_percentage(value: f64, flag: &str) -> anyhow::Result<()> {
         anyhow::bail!("{flag} must be a finite percentage between 0 and 100");
     }
     Ok(())
+}
+
+fn resolve_coverage_stats(
+    config: &togi::config::Config,
+    project_root: &Path,
+    coverage_gate_active: bool,
+) -> anyhow::Result<Option<togi::coverage::CoverageStats>> {
+    if let Some(mode) = config.mutations.coverage {
+        let output_path = config
+            .mutations
+            .coverage_file
+            .as_ref()
+            .map(|path| resolve_coverage_path(path, project_root));
+        return collect_builtin_coverage_stats(mode, project_root, output_path.as_deref())
+            .map(Some);
+    }
+
+    if !config.mutations.coverage_command.is_empty() {
+        let coverage_file = config
+            .mutations
+            .coverage_file
+            .as_ref()
+            .expect("coverage command should be validated to require coverage_file");
+        let resolved_cov_path = resolve_coverage_path(coverage_file, project_root);
+        run_coverage_command(
+            &config.mutations.coverage_command,
+            &resolved_cov_path,
+            project_root,
+        )?;
+    }
+
+    let Some(cov_path) = config.mutations.coverage_file.as_ref() else {
+        return Ok(None);
+    };
+    let resolved_cov_path = resolve_coverage_path(cov_path, project_root);
+    let coverage_required = coverage_gate_active || !config.mutations.coverage_command.is_empty();
+
+    match std::fs::read_to_string(&resolved_cov_path) {
+        Ok(cov_content) => Ok(Some(togi::coverage::parse_lcov_stats(
+            &cov_content,
+            project_root,
+        ))),
+        Err(e) => {
+            if coverage_required {
+                return Err(anyhow::anyhow!(
+                    "could not read coverage file {}: {e}",
+                    resolved_cov_path.display()
+                ));
+            }
+            eprintln!(
+                "warning: could not read coverage file {}: {e} — running all mutations",
+                resolved_cov_path.display()
+            );
+            Ok(None)
+        }
+    }
+}
+
+fn resolve_coverage_path(path: &Path, project_root: &Path) -> PathBuf {
+    if path.is_relative() {
+        project_root.join(path)
+    } else {
+        path.to_path_buf()
+    }
+}
+
+fn run_coverage_command(
+    command: &[String],
+    coverage_file: &Path,
+    project_root: &Path,
+) -> anyhow::Result<()> {
+    let Some(program) = command.first() else {
+        anyhow::bail!("coverage command is empty");
+    };
+    if let Some(parent) = coverage_file.parent() {
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "could not create parent directory for coverage file {}",
+                coverage_file.display()
+            )
+        })?;
+    }
+
+    // foxguard: ignore[rs/no-command-injection]
+    // The coverage command is explicit user configuration and is executed
+    // directly as argv without a shell.
+    let output = std::process::Command::new(program)
+        .args(&command[1..])
+        .current_dir(project_root)
+        .env("TOGI_COVERAGE_FILE", coverage_file)
+        .output()
+        .with_context(|| format!("failed to run coverage command `{}`", command.join(" ")))?;
+
+    if !output.status.success() {
+        anyhow::bail!(
+            "coverage command `{}` failed with status {}.\nstdout:\n{}\nstderr:\n{}",
+            command.join(" "),
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    if !coverage_file.is_file() {
+        anyhow::bail!(
+            "coverage command `{}` completed but did not produce {}",
+            command.join(" "),
+            coverage_file.display()
+        );
+    }
+
+    Ok(())
+}
+
+fn collect_builtin_coverage_stats(
+    mode: togi::config::CoverageMode,
+    project_root: &Path,
+    output_path: Option<&Path>,
+) -> anyhow::Result<togi::coverage::CoverageStats> {
+    match mode {
+        togi::config::CoverageMode::Auto => collect_auto_coverage_stats(project_root, output_path),
+    }
+}
+
+fn collect_auto_coverage_stats(
+    project_root: &Path,
+    output_path: Option<&Path>,
+) -> anyhow::Result<togi::coverage::CoverageStats> {
+    match togi::config::detect_builtin_coverage_adapter(project_root) {
+        Some(togi::config::BuiltinCoverageAdapter::Go) => {
+            collect_go_builtin_coverage_stats(project_root, output_path)
+        }
+        None => anyhow::bail!(
+            "built-in coverage auto is not supported for this project yet. Supported ecosystems: Go. Use --coverage-cmd ... plus --coverage-file ... for other projects."
+        ),
+    }
+}
+
+fn collect_go_builtin_coverage_stats(
+    project_root: &Path,
+    output_path: Option<&Path>,
+) -> anyhow::Result<togi::coverage::CoverageStats> {
+    let module_path = go_module_path(project_root)?;
+    let tempdir = tempfile::tempdir()?;
+    let profile_path = tempdir.path().join("coverage.out");
+    let output = std::process::Command::new("go")
+        .arg("test")
+        .arg("./...")
+        .arg("-coverpkg")
+        .arg("./...")
+        .arg("-coverprofile")
+        .arg(&profile_path)
+        .current_dir(project_root)
+        .output()
+        .context("failed to run built-in Go coverage collection")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "built-in Go coverage collection failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let profile = std::fs::read_to_string(&profile_path)
+        .context("could not read Go coverage profile produced by built-in coverage collection")?;
+    let stats = parse_go_coverprofile_stats(project_root, project_root, &module_path, &profile)?;
+
+    if let Some(output_path) = output_path {
+        if let Some(parent) = output_path.parent() {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "could not create parent directory for coverage file {}",
+                    output_path.display()
+                )
+            })?;
+        }
+        std::fs::write(output_path, togi::coverage::stats_to_lcov(&stats)).with_context(|| {
+            format!(
+                "could not write generated coverage file {}",
+                output_path.display()
+            )
+        })?;
+    }
+
+    Ok(stats)
+}
+
+fn parse_go_coverprofile_stats(
+    repo_root: &Path,
+    module_root: &Path,
+    module_path: &str,
+    profile: &str,
+) -> anyhow::Result<togi::coverage::CoverageStats> {
+    let mut covered_lines = togi::coverage::CoverageMap::new();
+    let mut total_lines = togi::coverage::CoverageMap::new();
+
+    for line in profile.lines().skip(1) {
+        let Some((location, fields)) = line.split_once(' ') else {
+            continue;
+        };
+        let fields: Vec<&str> = fields.split_whitespace().collect();
+        if fields.len() < 2 {
+            continue;
+        }
+
+        let execution_count = fields[1]
+            .parse::<u64>()
+            .with_context(|| format!("invalid Go coverage execution count in `{line}`"))?;
+        let Some((file, range)) = location.rsplit_once(':') else {
+            continue;
+        };
+        let Some((start, end)) = range.split_once(',') else {
+            continue;
+        };
+        let start_line = parse_go_cover_line(start)?;
+        let end_line = parse_go_cover_line(end)?;
+        let file = PathBuf::from(normalize_go_cover_file(
+            repo_root,
+            module_root,
+            module_path,
+            file,
+        ));
+
+        for line_no in start_line..=end_line {
+            total_lines.entry(file.clone()).or_default().insert(line_no);
+            if execution_count > 0 {
+                covered_lines
+                    .entry(file.clone())
+                    .or_default()
+                    .insert(line_no);
+            }
+        }
+    }
+
+    Ok(togi::coverage::CoverageStats {
+        covered_lines,
+        total_lines,
+    })
 }
 
 fn warn_if_resource_oversubscribed(jobs: usize) {
@@ -1347,7 +1574,9 @@ mod tests {
             verbose: false,
             show_output: false,
             test_cmd: None,
+            coverage: None,
             coverage_file: None,
+            coverage_cmd: None,
             min_line_coverage: None,
             min_diff_coverage: None,
             fail_on_uncovered_diff: false,
@@ -1470,6 +1699,43 @@ jobs = 4
     }
 
     #[test]
+    fn resolve_config_accepts_builtin_coverage_auto_without_file() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let config_path = dir.path().join("togi.toml");
+        std::fs::write(&config_path, "")?;
+        let mut cfg = check_config();
+        cfg.config = Some(config_path);
+        cfg.coverage = Some(togi::config::CoverageMode::Auto);
+
+        let resolved = resolve_config(cfg)?;
+
+        assert_eq!(
+            resolved.config.mutations.coverage,
+            Some(togi::config::CoverageMode::Auto)
+        );
+        assert!(resolved.config.mutations.coverage_file.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_config_rejects_coverage_command_without_file() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let config_path = dir.path().join("togi.toml");
+        std::fs::write(&config_path, "")?;
+        let mut cfg = check_config();
+        cfg.config = Some(config_path);
+        cfg.coverage_cmd = Some("go test ./...".into());
+
+        let err = resolve_config(cfg).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("coverage collection command requires")
+        );
+        Ok(())
+    }
+
+    #[test]
     fn resolve_config_rejects_invalid_timeout_multiplier() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let config_path = dir.path().join("togi.toml");
@@ -1486,7 +1752,6 @@ jobs = 4
         assert!(err.to_string().contains("timeout_multiplier"));
         Ok(())
     }
-
     #[test]
     fn calibrated_timeout_uses_slowest_baseline_duration() {
         let timeout = calibrated_timeout_seconds(
@@ -1669,5 +1934,29 @@ example.com/calc/calc.go:9.29,10.11 1 0
         assert_eq!(file.get("4").unwrap(), &vec!["TestAdd".to_string()]);
         assert_eq!(file.get("6").unwrap(), &vec!["TestAdd".to_string()]);
         assert!(!file.contains_key("9"));
+    }
+    #[test]
+    fn parse_go_coverprofile_stats_tracks_total_and_covered_lines() {
+        let profile = r#"mode: set
+example.com/calc/calc.go:4.24,6.2 1 1
+example.com/calc/calc.go:9.29,10.11 1 0
+"#;
+
+        let stats = parse_go_coverprofile_stats(
+            Path::new("/repo/module"),
+            Path::new("/repo/module"),
+            "example.com/calc",
+            profile,
+        )
+        .unwrap();
+
+        let file = stats.covered_lines.get(Path::new("calc.go")).unwrap();
+        assert!(file.contains(&4));
+        assert!(file.contains(&6));
+        assert!(!file.contains(&9));
+
+        let total = stats.total_lines.get(Path::new("calc.go")).unwrap();
+        assert!(total.contains(&4));
+        assert!(total.contains(&10));
     }
 }
