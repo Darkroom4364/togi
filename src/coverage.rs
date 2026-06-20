@@ -288,6 +288,36 @@ pub fn diff_coverage_report(
     }
 }
 
+pub fn stats_to_lcov(coverage: &CoverageStats) -> String {
+    let mut files: Vec<&PathBuf> = coverage.total_lines.keys().collect();
+    files.sort();
+
+    let mut out = String::new();
+    for file in files {
+        out.push_str("SF:");
+        out.push_str(&file.to_string_lossy());
+        out.push('\n');
+
+        let mut lines: Vec<usize> = coverage
+            .total_lines
+            .get(file)
+            .into_iter()
+            .flat_map(|lines| lines.iter().copied())
+            .collect();
+        lines.sort_unstable();
+        lines.dedup();
+
+        let covered = coverage.covered_lines.get(file);
+        for line in lines {
+            let hits = covered.is_some_and(|covered| covered.contains(&line)) as u8;
+            out.push_str(&format!("DA:{line},{hits}\n"));
+        }
+        out.push_str("end_of_record\n");
+    }
+
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -484,5 +514,36 @@ end_of_record
         );
         assert_eq!(report.uncovered_changed_lines[0].lines, vec![11]);
         assert!(!report.fail_on_uncovered_diff);
+    }
+    #[test]
+    fn stats_to_lcov_round_trips() {
+        let mut coverage = CoverageStats {
+            covered_lines: CoverageMap::new(),
+            total_lines: CoverageMap::new(),
+        };
+        coverage
+            .covered_lines
+            .entry(PathBuf::from("src/main.go"))
+            .or_default()
+            .insert(4);
+        coverage
+            .total_lines
+            .entry(PathBuf::from("src/main.go"))
+            .or_default()
+            .extend([4, 5]);
+
+        let lcov = stats_to_lcov(&coverage);
+        let reparsed = parse_lcov_stats(&lcov, Path::new("/project"));
+
+        let covered = reparsed
+            .covered_lines
+            .get(Path::new("src/main.go"))
+            .unwrap();
+        assert!(covered.contains(&4));
+        assert!(!covered.contains(&5));
+
+        let total = reparsed.total_lines.get(Path::new("src/main.go")).unwrap();
+        assert!(total.contains(&4));
+        assert!(total.contains(&5));
     }
 }
