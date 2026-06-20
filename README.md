@@ -127,6 +127,9 @@ togi check --build-cmd "cargo check"
 # Only mutate lines covered by an LCOV file
 togi check --coverage-file coverage/lcov.info
 
+# Ask togi to collect coverage itself when the project is supported
+togi check --coverage auto
+
 # Run your own coverage command, then consume the generated LCOV
 togi check --coverage-cmd ./scripts/collect-coverage.sh --coverage-file coverage/lcov.info
 
@@ -215,6 +218,7 @@ base = "origin/main"
 max_per_run = 20
 max_per_file = 20
 schemata = true
+# coverage = "auto"
 # coverage_command = ["./scripts/collect-coverage.sh"]
 coverage_file = "coverage/lcov.info"
 min_line_coverage = 80.0
@@ -338,6 +342,8 @@ Schemata are enabled by default. They batch compatible mutations into one build 
 For large repos, togi can avoid work before the runner starts and can also
 fail the run when LCOV coverage is below a threshold:
 
+- `--coverage auto` asks togi to collect coverage through a built-in adapter
+  when the current project is supported. Today that built-in path supports Go.
 - `--coverage-file coverage/lcov.info` keeps only mutations on covered lines
 - `--coverage-cmd ./scripts/collect-coverage.sh --coverage-file coverage/lcov.info`
   runs a user-provided command before mutation generation, then reads the
@@ -349,6 +355,7 @@ fail the run when LCOV coverage is below a threshold:
 - `--test-selection-file coverage/test-selection.json` narrows each mutant to tests that cover that line when the configured runner supports test selection
 
 ```bash
+togi check --coverage auto
 togi check --coverage-cmd ./scripts/collect-coverage.sh --coverage-file coverage/lcov.info
 togi test-map --path . --output coverage/test-selection.json
 togi check --coverage-file coverage/lcov.info --test-selection-file coverage/test-selection.json
