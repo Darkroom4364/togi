@@ -25,7 +25,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Run Foxguard
-        uses: 0sec-labs/foxguard/action@ea6d283b582269ed64afc240fd410aa259111ba3
+        uses: 0sec-labs/foxguard/action@17f08ffb1a77fbdfbd9d9f8cddb73cd90ff004dc
         with:
           path: .
           severity: high
@@ -104,7 +104,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: 20
       - name: Test extension

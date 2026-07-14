@@ -22,7 +22,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Run Foxguard
-        uses: 0sec-labs/foxguard/action@ea6d283b582269ed64afc240fd410aa259111ba3
+        uses: 0sec-labs/foxguard/action@17f08ffb1a77fbdfbd9d9f8cddb73cd90ff004dc
         with:
           path: .
           severity: high
@@ -101,7 +101,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: 20
       - name: Test extension
@@ -204,7 +204,7 @@ jobs:
             *.zip
             checksums.txt
       - name: Create Release
-        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228
         with:
           files: |
             *.tar.gz
