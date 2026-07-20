@@ -80,6 +80,7 @@ pub enum SchemaSkipReason {
     OriginalMismatch,
     CompileTimeContext,
     OverlappingRange,
+    UnsupportedSyntaxContext,
 }
 
 impl SchemaSkipReason {
@@ -92,6 +93,7 @@ impl SchemaSkipReason {
             SchemaSkipReason::OriginalMismatch => "original_mismatch",
             SchemaSkipReason::CompileTimeContext => "compile_time_context",
             SchemaSkipReason::OverlappingRange => "overlapping_range",
+            SchemaSkipReason::UnsupportedSyntaxContext => "unsupported_syntax_context",
         }
     }
 }
@@ -1130,31 +1132,70 @@ fn rust_expression_range_for_mutation(
         )));
     }
 
-    match mutation.operator.as_str() {
+    let range = match mutation.operator.as_str() {
         "eq_to_neq" | "lt_to_lte" | "gt_to_gte" | "and_to_or" | "or_to_and" | "mul_to_div"
         | "div_to_mul" | "mod_to_mul" | "plus_to_minus" | "minus_to_plus" => {
             smallest_rust_node_range(root, mutation.byte_range.clone(), |node| {
                 node.kind() == "binary_expression"
-            })
+            })?
         }
         "true_to_false" | "false_to_true" | "zero_to_one" | "string_to_empty"
         | "increment_numeric" | "decrement_numeric" => {
-            exact_rust_node_range(root, mutation.byte_range.clone())
+            exact_rust_node_range(root, mutation.byte_range.clone())?
         }
         "remove_unary_not" | "remove_unary_neg" => {
             smallest_rust_node_range(root, mutation.byte_range.clone(), |node| {
                 node.kind() == "unary_expression"
-            })
+            })?
         }
         "negate_condition" => {
             source_slice(source, mutation.byte_range.clone())?;
-            Ok(mutation.byte_range.clone())
+            mutation.byte_range.clone()
         }
-        _ => Err(SchemaRewriteError::new(format!(
-            "accepted Rust schema operator has no rewrite strategy: {}",
-            mutation.operator
-        ))),
+        _ => {
+            return Err(SchemaRewriteError::new(format!(
+                "accepted Rust schema operator has no rewrite strategy: {}",
+                mutation.operator
+            )));
+        }
+    };
+
+    if rust_range_conflicts_with_let_condition(root, range.clone()) {
+        return Err(SchemaRewriteError::new(format!(
+            "mutation {} overlaps a Rust let condition and cannot be expression-wrapped",
+            mutation.id
+        )));
     }
+    Ok(range)
+}
+
+/// Return true when an expression range cannot be lifted into a `__togi_select`
+/// closure because it overlaps a Rust `let` condition (`if let`, `while let`,
+/// or a let-chain). `let` conditions are only legal directly in `if`/`while`
+/// condition position, so a range that spans one — or sits inside one outside
+/// its `value` expression, such as a pattern — is not valid closure body code.
+fn rust_range_conflicts_with_let_condition(
+    root: tree_sitter::Node<'_>,
+    range: std::ops::Range<usize>,
+) -> bool {
+    let mut conflicts = false;
+    visit_nodes(root, &mut |node| {
+        if conflicts || node.kind() != "let_condition" {
+            return;
+        }
+        let node_range = node.byte_range();
+        if range.end <= node_range.start || node_range.end <= range.start {
+            return;
+        }
+        let contained_in_value = node.child_by_field_name("value").is_some_and(|value| {
+            let value_range = value.byte_range();
+            value_range.start <= range.start && range.end <= value_range.end
+        });
+        if !contained_in_value {
+            conflicts = true;
+        }
+    });
+    conflicts
 }
 
 fn smallest_c_node_range(
@@ -2239,6 +2280,12 @@ fn schema_conflict_range(
         }
         let source = source.ok_or(SchemaSkipReason::MissingSource)?;
         let tree = rust_tree.ok_or(SchemaSkipReason::InvalidRange)?;
+        if rust_range_conflicts_with_let_condition(
+            tree.root_node(),
+            schema_mutation.mutation.byte_range.clone(),
+        ) {
+            return Err(SchemaSkipReason::UnsupportedSyntaxContext);
+        }
         return rust_expression_range_for_mutation(
             tree.root_node(),
             source,
@@ -3703,5 +3750,172 @@ mod tests {
             assert!(rewritten.contains("func __togi_active("));
             parse_go_source(&rewritten).unwrap();
         }
+    }
+
+    #[test]
+    fn plan_falls_back_for_rust_if_let_condition_mutation() {
+        let dir = TempDir::new().unwrap();
+        let source = "fn f(peer_ip: Option<std::net::IpAddr>) {\n    if let Some(peer_ip) = peer_ip {\n        log_ip(peer_ip);\n    }\n}\n";
+        write_source(&dir, "src/lib.rs", source);
+
+        let condition = "let Some(peer_ip) = peer_ip";
+        let start = source.find(condition).unwrap();
+        let plan = plan(
+            dir.path(),
+            vec![mutation(
+                "rust",
+                "src/lib.rs",
+                condition,
+                "!(let Some(peer_ip) = peer_ip)",
+                start..start + condition.len(),
+                "negate_condition",
+            )],
+        );
+
+        assert!(plan.selected.is_empty());
+        assert_eq!(plan.fallback.len(), 1);
+        assert_eq!(
+            plan.fallback[0].reason,
+            SchemaSkipReason::UnsupportedSyntaxContext
+        );
+    }
+
+    #[test]
+    fn plan_falls_back_for_rust_while_let_pattern_mutation() {
+        let dir = TempDir::new().unwrap();
+        let source = "fn f(mut it: std::vec::IntoIter<i32>) {\n    while let Some(0) = it.next() {\n        tick();\n    }\n}\n";
+        write_source(&dir, "src/lib.rs", source);
+
+        let start = source.find("Some(0)").unwrap() + "Some(".len();
+        let plan = plan(
+            dir.path(),
+            vec![mutation(
+                "rust",
+                "src/lib.rs",
+                "0",
+                "1",
+                start..start + 1,
+                "zero_to_one",
+            )],
+        );
+
+        assert!(plan.selected.is_empty());
+        assert_eq!(plan.fallback.len(), 1);
+        assert_eq!(
+            plan.fallback[0].reason,
+            SchemaSkipReason::UnsupportedSyntaxContext
+        );
+    }
+
+    #[test]
+    fn plan_falls_back_for_rust_let_chain_condition_mutation() {
+        let dir = TempDir::new().unwrap();
+        let source = "fn f(mut it: std::vec::IntoIter<i32>, x: i32) {\n    if x > 0 && let Some(y) = it.next() {\n        use_pair(x, y);\n    }\n}\n";
+        write_source(&dir, "src/lib.rs", source);
+
+        let condition = "x > 0 && let Some(y) = it.next()";
+        let start = source.find(condition).unwrap();
+        let plan = plan(
+            dir.path(),
+            vec![mutation(
+                "rust",
+                "src/lib.rs",
+                condition,
+                "!(x > 0 && let Some(y) = it.next())",
+                start..start + condition.len(),
+                "negate_condition",
+            )],
+        );
+
+        assert!(plan.selected.is_empty());
+        assert_eq!(plan.fallback.len(), 1);
+        assert_eq!(
+            plan.fallback[0].reason,
+            SchemaSkipReason::UnsupportedSyntaxContext
+        );
+    }
+
+    #[test]
+    fn plan_keeps_rust_mutations_inside_let_condition_value() {
+        let dir = TempDir::new().unwrap();
+        let source = "fn f(a: i32, b: i32) -> i32 {\n    if let Some(sum) = Some(a + b) {\n        sum\n    } else {\n        0\n    }\n}\n";
+        write_source(&dir, "src/lib.rs", source);
+
+        let start = source.find("a + b").unwrap();
+        let plan = plan(
+            dir.path(),
+            vec![mutation(
+                "rust",
+                "src/lib.rs",
+                "+",
+                "-",
+                start + 2..start + 3,
+                "plus_to_minus",
+            )],
+        );
+
+        assert!(plan.fallback.is_empty());
+        assert_eq!(plan.selected.len(), 1);
+
+        let rewrites = rewrite_rust_files(dir.path(), &plan.selected).unwrap();
+        assert_eq!(rewrites.len(), 1);
+        let rewritten = String::from_utf8(rewrites[0].content.clone()).unwrap();
+        assert!(rewritten.contains("__togi_select(7, || { a + b }, || { a - b })"));
+        parse_rust_source(&rewritten).unwrap();
+    }
+
+    #[test]
+    fn plan_keeps_rust_binary_mutation_beside_let_chain() {
+        let dir = TempDir::new().unwrap();
+        let source = "fn f(mut it: std::vec::IntoIter<i32>, x: i32) {\n    if x > 0 && let Some(y) = it.next() {\n        use_pair(x, y);\n    }\n}\n";
+        write_source(&dir, "src/lib.rs", source);
+
+        let start = source.find("x > 0").unwrap() + "x ".len();
+        let plan = plan(
+            dir.path(),
+            vec![mutation(
+                "rust",
+                "src/lib.rs",
+                ">",
+                ">=",
+                start..start + 1,
+                "gt_to_gte",
+            )],
+        );
+
+        assert!(plan.fallback.is_empty());
+        assert_eq!(plan.selected.len(), 1);
+
+        let rewrites = rewrite_rust_files(dir.path(), &plan.selected).unwrap();
+        let rewritten = String::from_utf8(rewrites[0].content.clone()).unwrap();
+        assert!(
+            rewritten.contains(
+                "__togi_select(7, || { x > 0 }, || { x >= 0 }) && let Some(y) = it.next()"
+            )
+        );
+        parse_rust_source(&rewritten).unwrap();
+    }
+
+    #[test]
+    fn rewrite_rust_files_rejects_let_condition_wrap() {
+        let dir = TempDir::new().unwrap();
+        let source = "fn f(peer_ip: Option<std::net::IpAddr>) {\n    if let Some(peer_ip) = peer_ip {\n        log_ip(peer_ip);\n    }\n}\n";
+        write_source(&dir, "src/lib.rs", source);
+
+        let condition = "let Some(peer_ip) = peer_ip";
+        let start = source.find(condition).unwrap();
+        let selected = vec![SchemaMutation {
+            mutation: mutation(
+                "rust",
+                "src/lib.rs",
+                condition,
+                "!(let Some(peer_ip) = peer_ip)",
+                start..start + condition.len(),
+                "negate_condition",
+            ),
+            kind: SchemaKind::Expression,
+        }];
+
+        assert!(rewrite_rust_files(dir.path(), &selected).is_err());
     }
 }
