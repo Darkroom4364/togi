@@ -3393,11 +3393,11 @@ fn run_command(
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("warning: could not spawn command {:?}: {e}", &command[0]);
+            eprintln!("warning: could not spawn command {:?}: {e}", command[0]);
             return MutationOutcome::build_error_with(
                 "command",
                 command.to_vec(),
-                format!("could not spawn command {:?}: {e}", &command[0]),
+                format!("could not spawn command {:?}: {e}", command[0]),
             );
         }
     };
