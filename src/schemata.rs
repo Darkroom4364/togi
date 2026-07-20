@@ -3758,6 +3758,10 @@ mod tests {
         let source = "fn f(peer_ip: Option<std::net::IpAddr>) {\n    if let Some(peer_ip) = peer_ip {\n        log_ip(peer_ip);\n    }\n}\n";
         write_source(&dir, "src/lib.rs", source);
 
+        // These tests depend on the tree-sitter-rust grammar shape.
+        let rust = adapter_for_language("rust").unwrap();
+        assert_parsed_node_kind(&dir, "src/lib.rs", rust, "let_condition");
+
         let condition = "let Some(peer_ip) = peer_ip";
         let start = source.find(condition).unwrap();
         let plan = plan(
@@ -3786,6 +3790,9 @@ mod tests {
         let source = "fn f(mut it: std::vec::IntoIter<i32>) {\n    while let Some(0) = it.next() {\n        tick();\n    }\n}\n";
         write_source(&dir, "src/lib.rs", source);
 
+        let rust = adapter_for_language("rust").unwrap();
+        assert_parsed_node_kind(&dir, "src/lib.rs", rust, "let_condition");
+
         let start = source.find("Some(0)").unwrap() + "Some(".len();
         let plan = plan(
             dir.path(),
@@ -3812,6 +3819,9 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let source = "fn f(mut it: std::vec::IntoIter<i32>, x: i32) {\n    if x > 0 && let Some(y) = it.next() {\n        use_pair(x, y);\n    }\n}\n";
         write_source(&dir, "src/lib.rs", source);
+
+        let rust = adapter_for_language("rust").unwrap();
+        assert_parsed_node_kind(&dir, "src/lib.rs", rust, "let_chain");
 
         let condition = "x > 0 && let Some(y) = it.next()";
         let start = source.find(condition).unwrap();
@@ -3841,6 +3851,9 @@ mod tests {
         let source = "fn f(a: i32, b: i32) -> i32 {\n    if let Some(sum) = Some(a + b) {\n        sum\n    } else {\n        0\n    }\n}\n";
         write_source(&dir, "src/lib.rs", source);
 
+        let rust = adapter_for_language("rust").unwrap();
+        assert_parsed_node_kind(&dir, "src/lib.rs", rust, "let_condition");
+
         let start = source.find("a + b").unwrap();
         let plan = plan(
             dir.path(),
@@ -3869,6 +3882,9 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let source = "fn f(mut it: std::vec::IntoIter<i32>, x: i32) {\n    if x > 0 && let Some(y) = it.next() {\n        use_pair(x, y);\n    }\n}\n";
         write_source(&dir, "src/lib.rs", source);
+
+        let rust = adapter_for_language("rust").unwrap();
+        assert_parsed_node_kind(&dir, "src/lib.rs", rust, "let_chain");
 
         let start = source.find("x > 0").unwrap() + "x ".len();
         let plan = plan(
@@ -3901,6 +3917,9 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let source = "fn f(peer_ip: Option<std::net::IpAddr>) {\n    if let Some(peer_ip) = peer_ip {\n        log_ip(peer_ip);\n    }\n}\n";
         write_source(&dir, "src/lib.rs", source);
+
+        let rust = adapter_for_language("rust").unwrap();
+        assert_parsed_node_kind(&dir, "src/lib.rs", rust, "let_condition");
 
         let condition = "let Some(peer_ip) = peer_ip";
         let start = source.find(condition).unwrap();
