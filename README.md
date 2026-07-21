@@ -539,6 +539,22 @@ jobs:
       - run: togi check --base origin/main --format github --fail-under 80
 ```
 
+## Dependabot auto-merge
+
+togi can auto-merge routine Dependabot PRs after green CI through
+`.github/workflows/dependabot-auto-merge.yml`.
+
+The workflow is intentionally narrow:
+
+- it only runs for `dependabot[bot]` pull requests into `main`
+- it only acts when all changed files stay inside an allowlist of dependency
+  manifests, lockfiles, or workflow files
+- if the PR branch is behind, it asks GitHub to update the branch first
+- it then enables GitHub's native auto-merge instead of merging directly
+
+That keeps the behavior conservative while still removing routine manual merges
+for dependency and pinned-action updates.
+
 ## License
 
 MIT OR Apache-2.0
