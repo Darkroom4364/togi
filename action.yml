@@ -17,7 +17,7 @@ inputs:
     description: 'Test command override'
     required: false
   format:
-    description: 'Output format (terminal, json, github, or html)'
+    description: 'Output format (terminal, json, github, html, or sarif)'
     required: false
     default: 'terminal'
   version:

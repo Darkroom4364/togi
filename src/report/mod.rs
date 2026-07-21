@@ -2,6 +2,7 @@ pub mod coverage;
 pub mod github;
 pub mod html;
 pub mod json;
+pub mod sarif;
 pub mod terminal;
 
 use crate::{BuildErrorDiagnostic, Mutation, MutationReport, MutationResult};
@@ -176,6 +177,7 @@ pub fn print_report(
             html::write_report(report, path)?;
             eprintln!("HTML report written to {}", path.display());
         }
+        OutputFormat::Sarif => sarif::print_report(report)?,
         OutputFormat::Terminal => terminal::print_report(report),
     }
     Ok(())
@@ -194,6 +196,8 @@ pub fn print_coverage_gate_report(
             coverage::write_html(report, path)?;
             eprintln!("HTML coverage report written to {}", path.display());
         }
+        // SARIF reports surviving mutants, not coverage gates; keep the gate readable.
+        OutputFormat::Sarif => coverage::print_terminal(report),
         OutputFormat::Terminal => coverage::print_terminal(report),
     }
     Ok(())
