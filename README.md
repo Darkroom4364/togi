@@ -51,6 +51,21 @@ togi's differentiator: multi-language + diff-targeted by default + single binary
 
 ## Install
 
+Prefer a versioned GitHub Release and verify the published checksums:
+
+```bash
+TOGI_VERSION=vX.Y.Z
+curl -fsSLo togi.tar.gz \
+  "https://github.com/Darkroom4364/togi/releases/download/${TOGI_VERSION}/togi-linux-x86_64.tar.gz"
+curl -fsSLo checksums.txt \
+  "https://github.com/Darkroom4364/togi/releases/download/${TOGI_VERSION}/checksums.txt"
+sha256sum --ignore-missing -c checksums.txt
+tar xzf togi.tar.gz
+install -m 0755 ./togi "$HOME/.local/bin/togi"
+```
+
+If you intentionally want a source-based install tied to a reviewed revision:
+
 ```bash
 cargo install --git https://github.com/Darkroom4364/togi --rev <commit-sha> --locked
 ```
@@ -535,7 +550,17 @@ jobs:
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
         with:
           toolchain: stable
-      - run: cargo install --git https://github.com/Darkroom4364/togi --rev <reviewed-commit-sha> --locked
+      - run: |
+          TOGI_VERSION=vX.Y.Z
+          curl -fsSLo togi.tar.gz \
+            "https://github.com/Darkroom4364/togi/releases/download/${TOGI_VERSION}/togi-linux-x86_64.tar.gz"
+          curl -fsSLo checksums.txt \
+            "https://github.com/Darkroom4364/togi/releases/download/${TOGI_VERSION}/checksums.txt"
+          sha256sum --ignore-missing -c checksums.txt
+          tar xzf togi.tar.gz
+          mkdir -p "$HOME/.local/bin"
+          install -m 0755 ./togi "$HOME/.local/bin/togi"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - run: togi check --base origin/main --format github --fail-under 80
 ```
 
