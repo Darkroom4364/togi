@@ -1,0 +1,50 @@
+name: Dogfood Badge
+
+on:
+  schedule:
+    - cron: "0 6 * * 1" # weekly, Monday 06:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: dogfood-badge
+  cancel-in-progress: false
+
+jobs:
+  mutation-score:
+    name: Update mutation score badge
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+        with:
+          cache-bin: false
+      - name: Build togi
+        run: cargo build --locked --release
+      - name: Run dogfood mutation check
+        run: ./.github/scripts/dogfood-mutation-score.sh "$RUNNER_TEMP/mutation-score.json"
+      - name: Publish to badges branch
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git ls-remote --exit-code --heads origin badges >/dev/null 2>&1; then
+            git fetch origin badges
+            git checkout badges
+          else
+            git checkout --orphan badges
+            git rm -rf .
+          fi
+          cp "$RUNNER_TEMP/mutation-score.json" mutation-score.json
+          git add mutation-score.json
+          if git diff --cached --quiet; then
+            echo "Mutation score unchanged; nothing to commit."
+            exit 0
+          fi
+          git commit -m "Update dogfood mutation score badge"
+          git push origin badges
