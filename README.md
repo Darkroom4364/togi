@@ -50,6 +50,23 @@ Good mutation testing tools exist, but each makes trade-offs:
 
 togi's differentiator: multi-language + diff-targeted by default + single binary + zero config. It mutates only changed lines, keeps reports tied to reviewable code, and has the CI mechanics needed for real repositories: cache identity, baselines, coverage filtering, sharding, GitHub annotations, and machine-readable output.
 
+## Polyglot monorepos
+
+One PR can touch several languages without splitting the mutation run. Set a per-language test command in `togi.toml`, and a single `togi check` runs each mutant against its own language's suite, then reports one unified result with one score gate:
+
+```toml
+[test.languages.go]
+command = ["go", "test", "./..."]
+
+[test.languages.rust]
+command = ["cargo", "test"]
+
+[test.languages.python]
+command = ["python3", "-m", "unittest", "discover"]
+```
+
+Try it: `examples/polyglot-demo.sh` runs a PR-sized Go + Rust + Python change through one `togi check` — mutants from all three languages appear in the same report, the same mutation score, and the same `--fail-under` gate. No per-language glue, no stitched-together CI jobs.
+
 ## Install
 
 Prefer a versioned GitHub Release and verify the published checksums:
