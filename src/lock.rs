@@ -17,21 +17,28 @@ pub struct LockGuard {
     _file: File,
 }
 
-/// Try to acquire an exclusive non-blocking flock. Returns true on success.
+/// Try to acquire an exclusive non-blocking flock, returning the OS error on
+/// failure so callers can report the real cause (contention vs resource
+/// exhaustion such as ENOLCK).
 #[cfg(unix)]
-fn try_flock(file: &File) -> bool {
-    unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0 }
+fn try_flock(file: &File) -> std::io::Result<()> {
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
 }
 
 #[cfg(windows)]
-fn try_flock(file: &File) -> bool {
+fn try_flock(file: &File) -> std::io::Result<()> {
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Storage::FileSystem::{
         LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx,
     };
     unsafe {
         let mut overlapped: windows_sys::Win32::System::IO::OVERLAPPED = std::mem::zeroed();
-        LockFileEx(
+        if LockFileEx(
             file.as_raw_handle(),
             LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
             0,
@@ -39,12 +46,34 @@ fn try_flock(file: &File) -> bool {
             0,
             &mut overlapped,
         ) != 0
+        {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
     }
 }
 
 #[cfg(not(any(unix, windows)))]
-fn try_flock(_file: &File) -> bool {
-    true
+fn try_flock(_file: &File) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// flock can fail transiently under load (ENOLCK, NFS hiccups), which used to
+/// surface as a misleading "another togi process is already running" (#416).
+/// Retry briefly; genuine contention still fails, just after ~250ms.
+fn flock_with_retry(file: &File) -> std::io::Result<()> {
+    let mut attempts = 0;
+    loop {
+        match try_flock(file) {
+            Ok(()) => return Ok(()),
+            Err(_) if attempts < 10 => {
+                attempts += 1;
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 /// Acquire a lock for the given project root directory.
@@ -65,11 +94,10 @@ pub fn acquire(project_root: &Path) -> Result<LockGuard> {
                 .open(&path)
             {
                 Ok(mut f) => {
-                    if !try_flock(&f) {
+                    if let Err(e) = flock_with_retry(&f) {
                         let _ = fs::remove_file(&path);
                         bail!(
-                            "failed to acquire advisory lock on new file {}; \
-                             possible NFS or resource issue",
+                            "failed to acquire advisory lock on new file {}: {e}",
                             path.display()
                         );
                     }
@@ -104,10 +132,10 @@ pub fn acquire(project_root: &Path) -> Result<LockGuard> {
         );
     };
 
-    if !try_flock(&file) {
+    if let Err(e) = flock_with_retry(&file) {
         bail!(
-            "another togi process is already running in this directory.\n\
-             If this is stale, remove {} manually.",
+            "could not lock {}: {e}. Another togi process may be running in this \
+             directory; if this lock is stale, remove the file manually.",
             path.display()
         );
     }
