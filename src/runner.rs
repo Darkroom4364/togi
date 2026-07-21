@@ -2345,9 +2345,13 @@ impl TestRunner {
             }
             let mutation_count = schema_mutations.len();
             match self.run_schema_mutations(&language, &schema_mutations, early_stop.clone()) {
-                Ok(records) => {
+                Ok((records, demoted)) => {
                     schemata_summary.fast_path += records.len();
                     all_records.extend(records);
+                    if !demoted.is_empty() {
+                        schemata_summary.record_fallbacks("schema_build_failure", demoted.len());
+                        fallback_mutations.extend(demoted);
+                    }
                 }
                 Err(err) => {
                     eprintln!("warning: could not run {language} schemata: {err} — falling back");
@@ -2582,7 +2586,7 @@ impl TestRunner {
         language: &str,
         schema_mutations: &[crate::schemata::SchemaMutation],
         early_stop: Option<Arc<EarlyStopState>>,
-    ) -> Result<Vec<MutationRunRecord>, crate::schemata::SchemaRewriteError> {
+    ) -> Result<(Vec<MutationRunRecord>, Vec<Mutation>), crate::schemata::SchemaRewriteError> {
         let rewrites = match language {
             "c" => crate::schemata::rewrite_c_files(&self.project_root, schema_mutations)?,
             "cpp" => crate::schemata::rewrite_cpp_files(&self.project_root, schema_mutations)?,
@@ -2612,7 +2616,11 @@ impl TestRunner {
             .incremental_history
             .then(|| cache::IncrementalHistoryStore::load(&self.project_root));
         let mut workspace_needs_reset = false;
-        for schema_mutation in schema_mutations {
+        let mut demoted = Vec::new();
+        for (position, schema_mutation) in schema_mutations.iter().enumerate() {
+            if self.cancelled.load(Ordering::Acquire) || should_stop_early(&early_stop) {
+                break;
+            }
             if self.cancelled.load(Ordering::Acquire) || should_stop_early(&early_stop) {
                 break;
             }
@@ -2708,6 +2716,38 @@ impl TestRunner {
             if outcome.cancelled {
                 break;
             }
+            if outcome.result == MutationResult::BuildError
+                && outcome
+                    .build_error_detail
+                    .as_ref()
+                    .is_some_and(|detail| detail.phase == "schema_build")
+            {
+                // The shared schema rewrite no longer compiles: every remaining
+                // mutant would fail the same build. Demote the rest to regular
+                // individual runs so they still get real verdicts (#412).
+                reservation.release();
+                let remaining = schema_mutations.len() - position;
+                let error_line = outcome
+                    .build_error_detail
+                    .as_ref()
+                    .and_then(|detail| {
+                        detail
+                            .message
+                            .lines()
+                            .find(|line| line.starts_with("error"))
+                            .map(str::to_owned)
+                    })
+                    .unwrap_or_else(|| "no compiler diagnostic captured".into());
+                eprintln!(
+                    "warning: schema build failed ({error_line}) — demoting {remaining} {language} mutants to regular runs"
+                );
+                demoted.extend(
+                    schema_mutations[position..]
+                        .iter()
+                        .map(|schema_mutation| schema_mutation.mutation.clone()),
+                );
+                break;
+            }
             if outcome.result == MutationResult::BuildError {
                 reservation.release();
             } else {
@@ -2757,7 +2797,7 @@ impl TestRunner {
             ));
         }
 
-        Ok(results)
+        Ok((results, demoted))
     }
 
     fn outcome_from_records(
@@ -6426,6 +6466,67 @@ esac
         assert_eq!(report.results[0].1, MutationResult::Survived);
         assert_eq!(report.results[1].1, MutationResult::Survived);
         assert_eq!(runs, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_with_schemata_demotes_batch_on_schema_build_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = "\
+package calc
+func first(a, b int) bool { return a == b }
+func second(c, d int) bool { return c == d }
+";
+        std::fs::write(dir.path().join("calc.go"), source).unwrap();
+        let first = go_operator_mutation(0, "calc.go", source, 0);
+        let second = go_operator_mutation(1, "calc.go", source, 1);
+        // The build command fails only when the workspace contains schema wraps
+        // (__togi_active): the shared schemata build breaks while regular
+        // per-mutant runs (raw splice, no wraps) build fine (#412).
+        let build = "if grep -rq __togi_active .; then exit 1; fi";
+        let commands = CommandConfig {
+            command: vec!["sh".into(), "-c".into(), "exit 1".into()],
+            force_default_command: false,
+            force_default_timeout: false,
+            project_commands: vec![],
+            language_commands: HashMap::new(),
+            build_command: vec!["sh".into(), "-c".into(), build.into()],
+            sandbox_command: vec![],
+            build_command_explicit: true,
+            timeout: Duration::from_secs(5),
+            language_timeouts: HashMap::new(),
+            test_selection: None,
+        };
+        let runner = TestRunner {
+            commands,
+            parallelism: 1,
+            project_root: dir.path().to_path_buf(),
+            verbose: false,
+            show_output: false,
+            max_tested: None,
+            early_stop: Default::default(),
+            respect_workspace_ignores: true,
+            env: HashMap::new(),
+            incremental_history: false,
+            force_rerun: true,
+            cancelled: Arc::new(AtomicBool::new(false)),
+        };
+
+        let report = runner.run_with_schemata(vec![first, second]).report;
+
+        // No batch-wide build errors: both mutants were demoted to regular
+        // runs, where the failing test command kills them.
+        assert_eq!(report.total, 2);
+        assert_eq!(report.killed, 2);
+        assert_eq!(report.build_errors, 0);
+        let schemata = report.schemata.expect("schemata summary");
+        assert_eq!(schemata.fast_path, 0);
+        assert!(
+            schemata
+                .fallback_reasons
+                .iter()
+                .any(|reason| reason.reason == "schema_build_failure" && reason.count == 2)
+        );
     }
 
     #[cfg(unix)]
