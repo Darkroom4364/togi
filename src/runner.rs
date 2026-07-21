@@ -767,6 +767,11 @@ fn collect_cache_context_files(project_root: &Path, dir: &Path, out: &mut Vec<Pa
     }
 }
 
+/// Files whose content can change mutation verdicts beyond the mutated file
+/// itself: build manifests, CI workflows, tests — and any source file, since
+/// sources both shape which tests compile and run (e.g. Rust `mod` wiring) and
+/// can carry colocated tests (`#[cfg(test)]` modules, specs). A verdict cached
+/// before such a change must not be reused (#410).
 fn is_cache_context_file(relative: &Path) -> bool {
     let path_key = normalized_cache_path(Path::new(""), relative).to_ascii_lowercase();
     let file_name = relative
@@ -775,8 +780,12 @@ fn is_cache_context_file(relative: &Path) -> bool {
         .unwrap_or("")
         .to_ascii_lowercase();
 
+    if has_source_context_extension(&file_name) {
+        return true;
+    }
+
     if matches!(
-        path_key.as_str(),
+        file_name.as_str(),
         "togi.toml"
             | "cargo.toml"
             | "cargo.lock"
@@ -829,6 +838,32 @@ fn is_cache_context_file(relative: &Path) -> bool {
         || file_name.contains(".spec.")
         || file_name.ends_with("test.java")
         || file_name.ends_with("tests.java")
+}
+
+/// Extensions of source files togi can mutate. Any of them can influence test
+/// compilation or execution, so all of them are verdict-cache context.
+fn has_source_context_extension(file_name: &str) -> bool {
+    matches!(
+        Path::new(file_name)
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or(""),
+        "go" | "rs"
+            | "py"
+            | "ts"
+            | "tsx"
+            | "js"
+            | "jsx"
+            | "java"
+            | "c"
+            | "cc"
+            | "cpp"
+            | "cxx"
+            | "h"
+            | "hpp"
+            | "cs"
+            | "rb"
+    )
 }
 
 fn has_test_context_extension(file_name: &str) -> bool {
@@ -2593,6 +2628,9 @@ impl TestRunner {
             let mutation = &schema_mutation.mutation;
             let mut env = self.env.clone();
             env.insert("TOGI_MUTANT".to_string(), mutation.id.to_string());
+            // Cache keys must not embed the per-mutant TOGI_MUTANT id: ids are
+            // reassigned whenever the mutation set changes, which would orphan
+            // every cached verdict from earlier runs.
             let prepared = PreparedMutationRun::new(
                 &self.project_root,
                 mutation,
@@ -2602,7 +2640,7 @@ impl TestRunner {
                     source_contents: &source_contents,
                     cache_context_fingerprint: cache_context_hash,
                     test_context_index: &test_context_index,
-                    env: &env,
+                    env: &self.env,
                 },
             );
             let argv = if language == "go" {
@@ -4076,10 +4114,10 @@ mod tests {
             b"pub fn value() -> i32 { 1 }",
         )
         .unwrap();
-        assert_eq!(
+        assert_ne!(
             cache_context_fingerprint(dir.path()),
             initial,
-            "regular source files are already covered by per-mutation content hashes"
+            "source files are verdict context: they shape test compilation and module wiring (#410)"
         );
 
         std::fs::create_dir_all(dir.path().join("tests")).unwrap();
@@ -4148,9 +4186,14 @@ mod tests {
 
         let clean = git_cache_context_fingerprint(root).expect("clean git fingerprint");
         std::fs::write(root.join("src/lib.rs"), b"pub fn value() -> i32 { 2 }\n").unwrap();
-        assert_eq!(
-            git_cache_context_fingerprint(root).expect("dirty source should still use git"),
-            clean
+        assert!(
+            git_cache_context_fingerprint(root).is_none(),
+            "dirty source files should fall back to filesystem hashing"
+        );
+        assert_ne!(
+            cache_context_fingerprint(root),
+            clean,
+            "source edits must change the cache context fingerprint"
         );
 
         std::fs::write(
@@ -4162,6 +4205,63 @@ mod tests {
             git_cache_context_fingerprint(root).is_none(),
             "dirty test files should fall back to filesystem hashing"
         );
+    }
+
+    #[test]
+    fn cache_context_fingerprint_changes_for_new_source_file() {
+        if !git_available() {
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        run_git(root, &["init"]);
+        run_git(root, &["config", "user.email", "test@example.com"]);
+        run_git(root, &["config", "user.name", "Test"]);
+
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("Cargo.toml"), b"[package]\nname = \"fixture\"\n").unwrap();
+        std::fs::write(root.join("src/lib.rs"), b"pub fn value() -> i32 { 1 }\n").unwrap();
+        run_git(root, &["add", "."]);
+        run_git(root, &["commit", "-m", "initial"]);
+
+        let before = cache_context_fingerprint(root);
+        // A brand-new source file joining the diff (tracked via `git add -N`)
+        // must invalidate verdicts cached before it existed (#410).
+        std::fs::write(root.join("src/codec.rs"), b"pub fn decode() -> i32 { 1 }\n").unwrap();
+        assert_ne!(cache_context_fingerprint(root), before);
+    }
+
+    #[test]
+    fn cache_context_fingerprint_changes_when_src_test_module_edited() {
+        if !git_available() {
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        run_git(root, &["init"]);
+        run_git(root, &["config", "user.email", "test@example.com"]);
+        run_git(root, &["config", "user.name", "Test"]);
+
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("Cargo.toml"), b"[package]\nname = \"fixture\"\n").unwrap();
+        std::fs::write(
+            root.join("src/lib.rs"),
+            b"pub fn value() -> i32 { 1 }\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn value() {\n        assert_eq!(super::value(), 1);\n    }\n}\n",
+        )
+        .unwrap();
+        run_git(root, &["add", "."]);
+        run_git(root, &["commit", "-m", "initial"]);
+
+        let before = cache_context_fingerprint(root);
+        // Tests colocated in a source file are verdict context too (#410).
+        std::fs::write(
+            root.join("src/lib.rs"),
+            b"pub fn value() -> i32 { 1 }\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn value() {\n        assert_eq!(super::value(), 2);\n    }\n}\n",
+        )
+        .unwrap();
+        assert_ne!(cache_context_fingerprint(root), before);
     }
 
     fn git_available() -> bool {
@@ -4946,6 +5046,82 @@ mod tests {
         };
         let forced = forced_runner.run(vec![mutation]).report;
         assert_eq!(forced.results[0].1, MutationResult::Killed);
+        Ok(())
+    }
+
+    #[test]
+    fn incremental_history_invalidated_by_source_context_change() -> anyhow::Result<()> {
+        let (dir, file, mutation) = make_test_setup();
+
+        let commands = || CommandConfig {
+            command: failing_command(),
+            force_default_command: false,
+            force_default_timeout: false,
+            project_commands: vec![],
+            language_commands: HashMap::new(),
+            build_command: vec![],
+            sandbox_command: vec![],
+            build_command_explicit: false,
+            timeout: Duration::from_secs(5),
+            language_timeouts: HashMap::new(),
+            test_selection: None,
+        };
+
+        let command_config = commands();
+        let selected = select_test_command(dir.path(), &command_config, &mutation);
+        let command_ctx = selected.cache_context(
+            &command_config.build_command,
+            false,
+            &command_config.sandbox_command,
+            &HashMap::new(),
+        );
+        let context_hash = cache_context_fingerprint(dir.path());
+        let test_context_index = TestContextIndex::build(dir.path());
+        let relevant_test_hash =
+            test_context_index.fingerprint_for_tests(&selected.selected_tests, context_hash);
+        let source = std::fs::read(&file)?;
+        let query = incremental_history_query(
+            dir.path(),
+            &mutation,
+            &source,
+            &command_ctx,
+            relevant_test_hash,
+        );
+        cache::IncrementalHistoryStore::load(dir.path()).record(cache::IncrementalHistoryEntry {
+            mutation_identity: query.mutation_identity.clone(),
+            mutation_description: query.mutation_description.clone(),
+            result: MutationResult::Survived,
+            source_hash: query.source_hash,
+            command_hash: query.command_hash,
+            relevant_test_hash: query.relevant_test_hash,
+            covering_tests: selected.selected_tests.clone(),
+            killer_test: None,
+        });
+
+        // A source file added after the verdict was recorded — e.g. a module
+        // wiring change or a colocated test — must invalidate the restore (#410).
+        std::fs::create_dir_all(dir.path().join("src"))?;
+        std::fs::write(
+            dir.path().join("src/codec.rs"),
+            "pub fn decode() -> i32 { 1 }\n",
+        )?;
+
+        let runner = TestRunner {
+            commands: commands(),
+            parallelism: 1,
+            project_root: dir.path().to_path_buf(),
+            verbose: false,
+            show_output: false,
+            max_tested: None,
+            early_stop: Default::default(),
+            respect_workspace_ignores: true,
+            env: HashMap::new(),
+            incremental_history: true,
+            force_rerun: false,
+            cancelled: Arc::new(AtomicBool::new(false)),
+        };
+        let report = runner.run(vec![mutation]).report;
+        assert_eq!(report.results[0].1, MutationResult::Killed);
         Ok(())
     }
 
@@ -6197,8 +6373,9 @@ esac
             language_timeouts: HashMap::new(),
             test_selection: None,
         };
-        let mut cache_env = env.clone();
-        cache_env.insert("TOGI_MUTANT".to_string(), first.id.to_string());
+        // The seeded entry is computed without TOGI_MUTANT; the schemata runner
+        // sets it per mutant at execution time but must still hit the cache.
+        let cache_env = env.clone();
         let selected = select_test_command(dir.path(), &commands, &first);
         let cache_selected = SelectedTestCommand {
             argv: selected.argv,
