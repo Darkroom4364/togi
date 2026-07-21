@@ -3,6 +3,7 @@
 [![CI](https://github.com/Darkroom4364/togi/actions/workflows/ci.yml/badge.svg)](https://github.com/Darkroom4364/togi/actions/workflows/ci.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 [![Rust](https://img.shields.io/badge/rust-1.87%2B-orange.svg)](Cargo.toml)
+[![mutation score](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/Darkroom4364/togi/badges/mutation-score.json)](https://github.com/Darkroom4364/togi/actions/workflows/dogfood-badge.yml)
 
 togi (鍛 — Japanese for "sharpening") is a fast, diff-targeted mutation testing engine for pull requests.
 
