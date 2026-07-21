@@ -186,6 +186,45 @@ fn check_format_json_outputs_valid_json() {
     assert!(value.get("mutations").is_some());
 }
 
+#[test]
+fn check_format_sarif_outputs_valid_sarif() {
+    let dir = setup_git_repo();
+
+    // `true` lets every mutant survive so the SARIF report has results.
+    let output = togi()
+        .args([
+            "check",
+            "--base",
+            "HEAD",
+            "--format",
+            "sarif",
+            "--test-cmd",
+            "true",
+            "--no-schemata",
+        ])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|e| {
+        panic!(
+            "invalid SARIF output: {e}\nstdout: {}",
+            String::from_utf8_lossy(&output.stdout)
+        )
+    });
+    assert_eq!(value["version"], "2.1.0");
+    let run = &value["runs"][0];
+    assert_eq!(run["tool"]["driver"]["name"], "togi");
+    assert!(run["invocations"][0]["properties"]["mutation_score"].is_number());
+
+    let results = run["results"].as_array().unwrap();
+    assert!(!results.is_empty(), "expected surviving mutant results");
+    assert_eq!(results[0]["level"], "warning");
+    let location = &results[0]["locations"][0]["physicalLocation"];
+    assert_eq!(location["artifactLocation"]["uri"], "main.go");
+    assert!(location["region"]["startLine"].as_u64().unwrap() >= 1);
+}
+
 #[cfg(unix)]
 #[test]
 fn check_format_json_includes_build_error_diagnostics() {

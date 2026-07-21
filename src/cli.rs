@@ -7,6 +7,7 @@ pub enum OutputFormat {
     Json,
     Github,
     Html,
+    Sarif,
 }
 
 #[derive(Parser)]
@@ -239,6 +240,17 @@ mod tests {
         match cli.command {
             Commands::Check(args) => {
                 assert_eq!(args.shard.as_deref(), Some("1/3"));
+            }
+            _ => panic!("expected Check command"),
+        }
+    }
+
+    #[test]
+    fn sarif_format_argument_is_accepted() {
+        let cli = Cli::try_parse_from(["togi", "check", "--format", "sarif"]).unwrap();
+        match cli.command {
+            Commands::Check(args) => {
+                assert_eq!(args.format, OutputFormat::Sarif);
             }
             _ => panic!("expected Check command"),
         }

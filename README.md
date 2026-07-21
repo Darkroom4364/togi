@@ -16,7 +16,7 @@ Mutation testing is usually too slow to run on every PR. togi is built for the P
 - **Multi-language**: Go, Rust, Python, TypeScript, Java, C, C++, Ruby, and C#
 - **Single binary**: no service, database, or language-specific plugin stack
 - **Zero config start**: auto-detects common test commands, with `togi init` for explicit config
-- **CI-ready reports**: terminal, JSON, GitHub annotations, HTML, and PR comment markdown
+- **CI-ready reports**: terminal, JSON, GitHub annotations, SARIF, HTML, and PR comment markdown
 - **Performance controls**: caching, sharding, fail-fast commands, LCOV filtering, and source-line test selection
 - **Guardrails**: build pre-checks, baselines, operator filters, noisy-file skips, and path-safe mutation execution
 
@@ -101,6 +101,9 @@ togi explain 1 --report togi-report.json
 # GitHub annotations or HTML report
 togi check --format github
 togi check --format html
+
+# SARIF report for GitHub code scanning
+togi check --format sarif > togi-report.sarif
 
 # Mutate all supported files (not just the diff)
 togi check --all
@@ -563,6 +566,33 @@ jobs:
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - run: togi check --base origin/main --format github --fail-under 80
 ```
+
+## Code scanning (SARIF)
+
+`togi check --format sarif` emits a [SARIF 2.1.0](https://docs.github.com/en/code-security/code-scanning/integrating-with-code-scanning/sarif-support-for-code-scanning) report: one result per surviving mutant with its file and line, plus the mutation score in the run's invocation properties. Upload it to GitHub code scanning to see surviving mutants as annotations on the PR diff:
+
+```yaml
+# .github/workflows/togi-sarif.yml
+name: Mutation Testing (SARIF)
+on: [pull_request]
+permissions:
+  security-events: write  # needed to upload SARIF
+jobs:
+  togi:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      # Install togi as shown in "CI Integration" above
+      - run: togi check --base origin/main --format sarif > togi-report.sarif
+      - uses: github/codeql-action/upload-sarif@v3
+        if: always()  # upload even when togi exits 1 on surviving mutants
+        with:
+          sarif_file: togi-report.sarif
+```
+
+The togi step still exits 1 when mutants survive, so the job keeps gating the PR while the annotations land on the changed lines.
 
 ## Dependabot auto-merge
 
