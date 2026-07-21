@@ -10,12 +10,15 @@ use std::collections::BTreeMap;
 use std::fmt::Write;
 use std::fs;
 
-/// Compute mutation score as a percentage, excluding build errors from the denominator.
+/// Compute mutation score as a percentage, excluding build errors and
+/// coverage-suppressed (uncovered) mutants from the denominator.
 pub fn mutation_score(report: &MutationReport) -> f64 {
-    let tested = report.total.saturating_sub(report.build_errors);
+    let tested = report.tested_count();
     if tested > 0 {
         (report.killed as f64 / tested as f64) * 100.0
-    } else if report.total == 0 {
+    } else if report.total == report.uncovered_count() {
+        // Nothing was executed: either the report is empty or every mutant
+        // sat on a zero-coverage line. Vacuous pass, same as an empty report.
         100.0
     } else {
         0.0
@@ -164,6 +167,12 @@ fn label_or_unknown(value: &str) -> String {
     }
 }
 
+/// serde `skip_serializing_if` helper: omit zero counts so reports without
+/// coverage-suppressed mutants keep their previous shape byte-for-byte.
+pub(crate) fn is_zero(value: &usize) -> bool {
+    *value == 0
+}
+
 pub fn print_report(
     report: &crate::MutationReport,
     format: crate::cli::OutputFormat,
@@ -212,7 +221,8 @@ pub fn format_pr_comment(report: &MutationReport, baseline_score: Option<f64>) -
     use std::fmt::Write;
 
     let score = mutation_score(report);
-    let tested = report.total.saturating_sub(report.build_errors);
+    let tested = report.tested_count();
+    let uncovered = report.uncovered_count();
     let emoji = if report.survived == 0 && report.timeout == 0 && report.build_errors == 0 {
         "✓"
     } else if score >= 80.0 {
@@ -232,9 +242,14 @@ pub fn format_pr_comment(report: &MutationReport, baseline_score: Option<f64>) -
     } else {
         String::new()
     };
+    let uncovered_str = if uncovered > 0 {
+        format!(", {uncovered} uncovered")
+    } else {
+        String::new()
+    };
     writeln!(
         md,
-        "**{score:.1}%** mutation score{delta_str} — {}/{tested} killed, {} survived, {} timeout, {} build errors — {:.2}s",
+        "**{score:.1}%** mutation score{delta_str} — {}/{tested} killed, {} survived, {} timeout, {} build errors{uncovered_str} — {:.2}s",
         report.killed, report.survived, report.timeout, report.build_errors, report.duration.as_secs_f64()
     ).unwrap();
     if report.total < report.planned_total {
@@ -762,5 +777,71 @@ mod tests {
         let md = format_pr_comment(&report, Some(40.0));
         assert!(md.contains("vs baseline"), "should include baseline delta");
         assert!(md.contains("+10.0%"), "50% - 40% = +10%");
+    }
+
+    fn uncovered_report(results: Vec<(Mutation, MutationResult)>) -> MutationReport {
+        let total = results.len();
+        let killed = results
+            .iter()
+            .filter(|(_, r)| *r == MutationResult::Killed)
+            .count();
+        MutationReport {
+            results,
+            build_error_diagnostics: vec![],
+            schemata: None,
+            baseline_timing: None,
+            duration: std::time::Duration::from_secs(1),
+            test_command: None,
+            build_command: vec![],
+            planned_total: total,
+            early_stop_reason: None,
+            total,
+            killed,
+            survived: 0,
+            timeout: 0,
+            build_errors: 0,
+        }
+    }
+
+    #[test]
+    fn mutation_score_excludes_uncovered_mutants() {
+        // 1 of 1 executed mutants killed + 2 uncovered → 100%, not 33%.
+        let report = uncovered_report(vec![
+            report_mutation(0, "src/a.rs", MutationResult::Killed),
+            report_mutation(1, "src/b.rs", MutationResult::Uncovered),
+            report_mutation(2, "src/c.rs", MutationResult::Uncovered),
+        ]);
+        assert_eq!(report.uncovered_count(), 2);
+        assert_eq!(report.tested_count(), 1);
+        assert_eq!(mutation_score(&report), 100.0);
+    }
+
+    #[test]
+    fn mutation_score_is_100_when_all_mutants_uncovered() {
+        let report = uncovered_report(vec![
+            report_mutation(0, "src/a.rs", MutationResult::Uncovered),
+            report_mutation(1, "src/b.rs", MutationResult::Uncovered),
+        ]);
+        assert_eq!(report.tested_count(), 0);
+        assert_eq!(mutation_score(&report), 100.0);
+    }
+
+    #[test]
+    fn pr_comment_includes_uncovered_count_when_present() {
+        let report = uncovered_report(vec![
+            report_mutation(0, "src/a.rs", MutationResult::Killed),
+            report_mutation(1, "src/b.rs", MutationResult::Uncovered),
+        ]);
+        let md = format_pr_comment(&report, None);
+        assert!(md.contains("1 uncovered"), "got: {md}");
+        // Uncovered mutants are not failures and do not block the checkmark.
+        assert!(md.contains("✓"), "got: {md}");
+    }
+
+    #[test]
+    fn pr_comment_omits_uncovered_count_when_zero() {
+        let report = crate::test_helpers::sample_report();
+        let md = format_pr_comment(&report, None);
+        assert!(!md.contains("uncovered"), "got: {md}");
     }
 }

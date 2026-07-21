@@ -6,16 +6,17 @@ use std::fmt::Write;
 struct FileStats {
     total: usize,
     build_errors: usize,
+    uncovered: usize,
     killed: usize,
     mutations: Vec<MutationEntry>,
 }
 
 impl FileStats {
     fn score_pct(&self) -> f64 {
-        let tested = self.total.saturating_sub(self.build_errors);
+        let tested = self.tested();
         if tested > 0 {
             (self.killed as f64 / tested as f64) * 100.0
-        } else if self.total == 0 {
+        } else if self.total == self.uncovered {
             100.0
         } else {
             0.0
@@ -23,7 +24,9 @@ impl FileStats {
     }
 
     fn tested(&self) -> usize {
-        self.total.saturating_sub(self.build_errors)
+        self.total
+            .saturating_sub(self.build_errors)
+            .saturating_sub(self.uncovered)
     }
 }
 
@@ -46,13 +49,16 @@ pub fn generate_report(report: &MutationReport) -> Result<String> {
             MutationResult::Survived => "survived",
             MutationResult::Timeout => "timeout",
             MutationResult::BuildError => "build_error",
+            MutationResult::Uncovered => "uncovered",
         };
         let killed = matches!(result, MutationResult::Killed);
         let build_error = matches!(result, MutationResult::BuildError);
+        let uncovered = matches!(result, MutationResult::Uncovered);
 
         let stats = files.entry(file_path).or_insert(FileStats {
             total: 0,
             build_errors: 0,
+            uncovered: 0,
             killed: 0,
             mutations: Vec::new(),
         });
@@ -62,6 +68,9 @@ pub fn generate_report(report: &MutationReport) -> Result<String> {
         }
         if build_error {
             stats.build_errors += 1;
+        }
+        if uncovered {
+            stats.uncovered += 1;
         }
         stats.mutations.push(MutationEntry {
             line: mutation.line,
@@ -73,8 +82,14 @@ pub fn generate_report(report: &MutationReport) -> Result<String> {
         });
     }
 
-    let tested = report.total.saturating_sub(report.build_errors);
+    let tested = report.tested_count();
     let score_pct = super::mutation_score(report);
+    let uncovered = report.uncovered_count();
+    let uncovered_str = if uncovered > 0 {
+        format!(", {uncovered} uncovered")
+    } else {
+        String::new()
+    };
 
     let mut html = String::new();
     write!(
@@ -94,7 +109,7 @@ pub fn generate_report(report: &MutationReport) -> Result<String> {
     write!(
         html,
         "<div class=\"summary\"><span class=\"score\">{:.1}%</span> mutation score \
-         &mdash; {}/{} killed, {} survived, {} timeout, {} build errors \
+         &mdash; {}/{} killed, {} survived, {} timeout, {} build errors{} \
          &mdash; {:.2}s</div>",
         score_pct,
         report.killed,
@@ -102,6 +117,7 @@ pub fn generate_report(report: &MutationReport) -> Result<String> {
         report.survived,
         report.timeout,
         report.build_errors,
+        uncovered_str,
         report.duration.as_secs_f64()
     )?;
     if report.total < report.planned_total {
@@ -225,6 +241,7 @@ pub fn generate_report(report: &MutationReport) -> Result<String> {
                 "killed" => "result-killed",
                 "survived" => "result-survived",
                 "timeout" => "result-timeout",
+                "uncovered" => "result-uncovered",
                 _ => "result-build-error",
             };
             write!(
@@ -310,6 +327,7 @@ code{font-family:'SF Mono',Menlo,monospace;font-size:.82rem}
 .orig{color:#e94560;text-decoration:line-through}
 .repl{color:#53d769}
 .result-killed{opacity:.6}
+.result-uncovered{opacity:.6}
 .result-survived{background:rgba(233,69,96,.08)}
 .result-timeout{background:rgba(255,200,50,.06)}
 .result-build-error{background:rgba(255,200,50,.06)}
@@ -348,6 +366,35 @@ mod tests {
         assert!(html.contains("changed &lt; to &lt;="));
         assert!(html.contains("killed"));
         assert!(html.contains("survived"));
+    }
+
+    #[test]
+    fn html_lists_uncovered_mutants_and_excludes_them_from_score() {
+        let mut report = sample_report();
+        report.results.push((
+            Mutation {
+                id: 2,
+                file: PathBuf::from("src/dead.rs"),
+                language: String::new(),
+                line: 3,
+                column: 1,
+                operator: "op".to_string(),
+                description: "d".to_string(),
+                original: "x".to_string(),
+                replacement: "y".to_string(),
+                byte_range: 0..1,
+            },
+            MutationResult::Uncovered,
+        ));
+        report.total = 3;
+        report.planned_total = 3;
+
+        let html = generate_report(&report).unwrap();
+        assert!(html.contains("uncovered"));
+        assert!(html.contains("result-uncovered"));
+        assert!(html.contains(", 1 uncovered"));
+        // 1 killed of 2 tested (killed + survived) → 50%.
+        assert!(html.contains("50.0%"));
     }
 
     #[test]

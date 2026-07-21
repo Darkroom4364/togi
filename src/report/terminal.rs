@@ -54,6 +54,20 @@ fn format_report(report: &MutationReport, color: bool) -> String {
             }
             MutationResult::Timeout => ("⏱ TIMEOUT", None),
             MutationResult::BuildError => ("⚠ BUILD ERROR", None),
+            MutationResult::Uncovered => {
+                let mut detail = String::new();
+                writeln!(
+                    detail,
+                    "              {}",
+                    if color {
+                        dim("Line has zero test coverage; mutant not executed.")
+                    } else {
+                        "Line has zero test coverage; mutant not executed.".to_string()
+                    }
+                )
+                .unwrap();
+                ("○ UNCOVERED", Some(detail))
+            }
         };
 
         if color {
@@ -61,6 +75,7 @@ fn format_report(report: &MutationReport, color: bool) -> String {
                 MutationResult::Killed => green(tag),
                 MutationResult::Survived => red(tag),
                 MutationResult::Timeout | MutationResult::BuildError => yellow(tag),
+                MutationResult::Uncovered => dim(tag),
             };
             writeln!(
                 out,
@@ -89,9 +104,15 @@ fn format_report(report: &MutationReport, color: bool) -> String {
 
     let separator = "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━";
     writeln!(out, "{separator}").unwrap();
+    let uncovered = report.uncovered_count();
+    let uncovered_str = if uncovered > 0 {
+        format!(", {uncovered} uncovered")
+    } else {
+        String::new()
+    };
     writeln!(
         out,
-        "Results: {} killed, {} survived, {} timeout, {} build errors",
+        "Results: {} killed, {} survived, {} timeout, {} build errors{uncovered_str}",
         report.killed, report.survived, report.timeout, report.build_errors
     )
     .unwrap();
@@ -439,6 +460,36 @@ mod tests {
         ]);
         let output = format_report_plain(&report);
         assert!(!output.contains("All mutations caused build errors"));
+    }
+
+    #[test]
+    fn terminal_output_lists_uncovered_mutants_distinctly() {
+        let report = report(vec![
+            (mutation(1, "src/a.rs", 1), MutationResult::Killed),
+            (mutation(2, "src/b.rs", 2), MutationResult::Uncovered),
+        ]);
+        let output = format_report_plain(&report);
+        assert!(
+            output
+                .lines()
+                .any(|line| line.contains("UNCOVERED") && line.contains("src/b.rs:2")),
+            "got: {output}"
+        );
+        assert!(output.contains("Line has zero test coverage; mutant not executed."));
+        assert!(
+            output
+                .contains("Results: 1 killed, 0 survived, 0 timeout, 0 build errors, 1 uncovered")
+        );
+        // Uncovered mutants are excluded from the tested denominator.
+        assert!(output.contains("Mutation score (test kills only): 100.0%"));
+    }
+
+    #[test]
+    fn terminal_output_omits_uncovered_count_when_zero() {
+        let report = report(vec![(mutation(1, "src/a.rs", 1), MutationResult::Killed)]);
+        let output = format_report_plain(&report);
+        assert!(output.contains("Results: 1 killed, 0 survived, 0 timeout, 0 build errors\n"));
+        assert!(!output.contains("uncovered"));
     }
 
     #[test]

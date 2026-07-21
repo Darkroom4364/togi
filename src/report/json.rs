@@ -12,6 +12,8 @@ struct JsonReport {
     survived: usize,
     timeout: usize,
     build_errors: usize,
+    #[serde(skip_serializing_if = "super::is_zero")]
+    uncovered: usize,
     partial: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     early_stop_reason: Option<String>,
@@ -125,6 +127,7 @@ pub fn to_json_string(report: &MutationReport) -> Result<String> {
                 MutationResult::Survived => "survived".to_string(),
                 MutationResult::Timeout => "timeout".to_string(),
                 MutationResult::BuildError => "build_error".to_string(),
+                MutationResult::Uncovered => "uncovered".to_string(),
             },
             column: Some(m.column),
             original: Some(m.original.clone()),
@@ -166,7 +169,7 @@ pub fn to_json_string(report: &MutationReport) -> Result<String> {
         })
         .collect();
 
-    let tested = report.total.saturating_sub(report.build_errors);
+    let tested = report.tested_count();
     let json_report = JsonReport {
         total: report.total,
         planned_total: report.planned_total,
@@ -175,6 +178,7 @@ pub fn to_json_string(report: &MutationReport) -> Result<String> {
         survived: report.survived,
         timeout: report.timeout,
         build_errors: report.build_errors,
+        uncovered: report.uncovered_count(),
         partial: report.total < report.planned_total,
         early_stop_reason: report.early_stop_reason.clone(),
         mutation_score: super::mutation_score(report),
@@ -228,6 +232,47 @@ mod tests {
         actual.sort_unstable();
         expected.sort_unstable();
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn json_output_lists_uncovered_mutants() {
+        let mut report = sample_report();
+        report.results.push((
+            Mutation {
+                id: 2,
+                file: PathBuf::from("src/dead.rs"),
+                language: String::new(),
+                line: 3,
+                column: 1,
+                operator: "op".to_string(),
+                description: "d".to_string(),
+                original: "x".to_string(),
+                replacement: "y".to_string(),
+                byte_range: 0..1,
+            },
+            MutationResult::Uncovered,
+        ));
+        report.total = 3;
+        report.planned_total = 3;
+
+        let json_str = to_json_string(&report).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+
+        assert_eq!(value["uncovered"], 1);
+        // Uncovered mutants are excluded from the tested denominator:
+        // 1 killed of 2 tested (killed + survived) → 50%.
+        assert_eq!(value["tested"], 2);
+        assert_eq!(value["mutation_score"], 50.0);
+        let mutations = value["mutations"].as_array().unwrap();
+        assert_eq!(mutations[2]["result"], "uncovered");
+    }
+
+    #[test]
+    fn json_output_omits_uncovered_key_when_zero() {
+        let report = sample_report();
+        let json_str = to_json_string(&report).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        assert!(value.get("uncovered").is_none());
     }
 
     #[test]
