@@ -436,6 +436,7 @@ mod tests {
             MutationResult::Survived,
             MutationResult::Timeout,
             MutationResult::BuildError,
+            MutationResult::Uncovered,
         ]
         .iter()
         .enumerate()

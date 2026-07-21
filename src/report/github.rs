@@ -43,10 +43,16 @@ pub fn print_report(report: &MutationReport) {
         println!("{line}");
     }
 
-    let tested = report.total.saturating_sub(report.build_errors);
+    let tested = report.tested_count();
     let score = super::mutation_score(report);
+    let uncovered = report.uncovered_count();
+    let uncovered_str = if uncovered > 0 {
+        format!(", {uncovered} uncovered")
+    } else {
+        String::new()
+    };
     eprintln!(
-        "Mutation score: {:.1}% ({} killed, {} survived, {} timeout, {} build errors)",
+        "Mutation score: {:.1}% ({} killed, {} survived, {} timeout, {} build errors{uncovered_str})",
         score, report.killed, report.survived, report.timeout, report.build_errors
     );
     if report.total < report.planned_total {
@@ -156,6 +162,15 @@ mod tests {
         assert!(lines[0].contains("file=src/b.rs"));
         assert!(lines[0].contains("op_b"));
         assert!(lines[0].contains("survived one"));
+    }
+
+    #[test]
+    fn uncovered_mutations_emit_no_annotations() {
+        let report = report_with(vec![(
+            mutation("src/dead.rs", 7, "op", "desc"),
+            MutationResult::Uncovered,
+        )]);
+        assert!(annotations(&report).is_empty());
     }
 
     #[test]

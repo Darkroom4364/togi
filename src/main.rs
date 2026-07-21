@@ -177,6 +177,11 @@ fn explain_mutation(mutant_id: u32, report_path: &Path) -> anyhow::Result<()> {
             println!("Why it was not testable:");
             println!("  The mutation made the project fail its build check.");
         }
+        "uncovered" => {
+            println!("Why it was not executed:");
+            println!("  Coverage data shows this line is never executed by the test suite.");
+            println!("  Add a test that reaches this line to make the mutant meaningful.");
+        }
         other => {
             println!("Result: {other}");
         }
@@ -290,16 +295,19 @@ fn run_check(cfg: togi::cli::CheckArgs, cancelled: Arc<AtomicBool>) -> anyhow::R
     }
 
     let mutations = generate_mutations(&changed_files, &config, &project_root)?;
-    let mut mutations =
+    let mut classified =
         filter_mutations(mutations, &config, &project_root, coverage_stats.as_ref())?;
 
     if let Some((k, n)) = shard {
-        let total = mutations.len();
-        mutations.retain(|m| m.id as usize % n == k - 1);
-        eprintln!("Shard {k}/{n}: {} of {total} mutations", mutations.len());
+        let total = classified.to_run.len();
+        classified.to_run.retain(|m| m.id as usize % n == k - 1);
+        eprintln!(
+            "Shard {k}/{n}: {} of {total} mutations",
+            classified.to_run.len()
+        );
     }
 
-    if mutations.is_empty() {
+    if classified.to_run.is_empty() && classified.uncovered.is_empty() {
         println!("No mutations generated. Possible causes:");
         println!("  - Changed files are in an unsupported language");
         println!("  - All mutable nodes were filtered out (test files, noisy patterns)");
@@ -308,11 +316,11 @@ fn run_check(cfg: togi::cli::CheckArgs, cancelled: Arc<AtomicBool>) -> anyhow::R
     }
 
     if dry_run {
-        print_dry_run(&mutations);
+        print_dry_run(&classified.to_run);
         return Ok(());
     }
 
-    let baseline_timing = if config.test.calibrate_timeout {
+    let baseline_timing = if config.test.calibrate_timeout && !classified.to_run.is_empty() {
         eprintln!("Measuring baseline test runtime...");
         let measurement = togi::runner::measure_baseline_timing(
             &project_root,
@@ -351,31 +359,35 @@ fn run_check(cfg: togi::cli::CheckArgs, cancelled: Arc<AtomicBool>) -> anyhow::R
         None
     };
 
-    eprintln!("Running {} mutations...", mutations.len());
-
     let project_root_ref = project_root.clone();
-    let outcome = execute(
-        mutations,
-        config,
-        project_root,
-        ExecuteOptions {
-            verbose,
-            show_output,
-            build_command_explicit: has_explicit_build_cmd,
-            force_default_command: has_custom_test_cmd,
-            force_default_timeout: has_cli_timeout,
-            early_stop,
-            env: profile_env,
-            force_rerun,
-            cancelled,
-        },
-    );
-
-    let mut report = outcome.report;
+    let (mut report, run_cancelled) = if classified.to_run.is_empty() {
+        // Every generated mutant sits on a zero-coverage line: nothing to run.
+        (coverage_only_report(&config, has_explicit_build_cmd), false)
+    } else {
+        eprintln!("Running {} mutations...", classified.to_run.len());
+        let outcome = execute(
+            classified.to_run,
+            config,
+            project_root,
+            ExecuteOptions {
+                verbose,
+                show_output,
+                build_command_explicit: has_explicit_build_cmd,
+                force_default_command: has_custom_test_cmd,
+                force_default_timeout: has_cli_timeout,
+                early_stop,
+                env: profile_env,
+                force_rerun,
+                cancelled,
+            },
+        );
+        (outcome.report, outcome.cancelled)
+    };
     report.baseline_timing = baseline_timing;
+    merge_uncovered(&mut report, classified.uncovered);
     togi::report::print_report(&report, output_format)?;
 
-    if outcome.cancelled {
+    if run_cancelled {
         eprintln!("Interrupted; skipping baseline and PR comment updates.");
         exit_with(_lock, 130);
     }
@@ -1017,24 +1029,22 @@ fn generate_mutations(
     )
 }
 
+/// Mutations partitioned for the run: `to_run` executes against the test
+/// suite; `uncovered` sits on lines with known zero coverage and is reported
+/// as `uncovered` without being executed.
+struct ClassifiedMutations {
+    to_run: Vec<Mutation>,
+    uncovered: Vec<Mutation>,
+}
+
 fn filter_mutations(
     mutations: Vec<Mutation>,
     config: &togi::config::Config,
     project_root: &Path,
     coverage_stats: Option<&togi::coverage::CoverageStats>,
-) -> anyhow::Result<Vec<Mutation>> {
-    let mut mutations = if let Some(coverage) = coverage_stats {
-        let before = mutations.len();
-        let filtered =
-            togi::coverage::filter_by_coverage(mutations, &coverage.covered_lines, project_root);
-        if before > filtered.len() {
-            eprintln!(
-                "Coverage filter: {} of {} mutations on covered lines",
-                filtered.len(),
-                before
-            );
-        }
-        filtered
+) -> anyhow::Result<ClassifiedMutations> {
+    let mut classified = if let Some(coverage) = coverage_stats {
+        split_by_coverage(mutations, coverage, project_root)
     } else if let Some(ref cov_path) = config.mutations.coverage_file {
         let resolved_cov_path = if std::path::Path::new(cov_path).is_relative() {
             project_root.join(cov_path)
@@ -1043,39 +1053,106 @@ fn filter_mutations(
         };
         match std::fs::read_to_string(&resolved_cov_path) {
             Ok(cov_content) => {
-                let coverage = togi::coverage::parse_lcov(&cov_content, project_root);
-                let before = mutations.len();
-                let filtered =
-                    togi::coverage::filter_by_coverage(mutations, &coverage, project_root);
-                if before > filtered.len() {
-                    eprintln!(
-                        "Coverage filter: {} of {} mutations on covered lines",
-                        filtered.len(),
-                        before
-                    );
-                }
-                filtered
+                let coverage = togi::coverage::parse_lcov_stats(&cov_content, project_root);
+                split_by_coverage(mutations, &coverage, project_root)
             }
             Err(e) => {
                 eprintln!(
                     "warning: could not read coverage file {}: {e} — running all mutations",
                     resolved_cov_path.display()
                 );
-                mutations
+                ClassifiedMutations {
+                    to_run: mutations,
+                    uncovered: Vec::new(),
+                }
             }
         }
     } else {
-        mutations
+        ClassifiedMutations {
+            to_run: mutations,
+            uncovered: Vec::new(),
+        }
     };
-    if config.mutations.max_per_run > 0 && mutations.len() > config.mutations.max_per_run {
+    if config.mutations.max_per_run > 0 && classified.to_run.len() > config.mutations.max_per_run {
         eprintln!(
             "warning: mutation count capped at max_per_run ({}). Increase in togi.toml or use --dry-run to preview.",
             config.mutations.max_per_run
         );
-        mutations.truncate(config.mutations.max_per_run);
+        classified.to_run.truncate(config.mutations.max_per_run);
     }
 
-    Ok(mutations)
+    Ok(classified)
+}
+
+fn split_by_coverage(
+    mutations: Vec<Mutation>,
+    coverage: &togi::coverage::CoverageStats,
+    project_root: &Path,
+) -> ClassifiedMutations {
+    let before = mutations.len();
+    let classified = togi::coverage::classify_by_coverage(mutations, coverage, project_root);
+    let covered = classified.covered.len();
+    if covered < before {
+        eprintln!("Coverage: {covered} of {before} mutations on covered lines");
+        let uncovered = classified.uncovered.len();
+        if uncovered > 0 {
+            eprintln!(
+                "Coverage: {uncovered} mutant{} on zero-coverage lines will be reported as uncovered (not executed)",
+                if uncovered == 1 { "" } else { "s" }
+            );
+        }
+    }
+    ClassifiedMutations {
+        to_run: classified.covered,
+        uncovered: classified.uncovered,
+    }
+}
+
+/// Merge coverage-suppressed mutants into the report as `Uncovered`.
+///
+/// They count toward `total`/`planned_total` (they were part of the scheduled
+/// work) but stay out of the tested denominator; see
+/// `MutationReport::tested_count`.
+fn merge_uncovered(report: &mut togi::MutationReport, uncovered: Vec<Mutation>) {
+    let n = uncovered.len();
+    if n == 0 {
+        return;
+    }
+    report.results.extend(
+        uncovered
+            .into_iter()
+            .map(|m| (m, togi::MutationResult::Uncovered)),
+    );
+    report.total += n;
+    report.planned_total += n;
+}
+
+/// Build an empty execution report for runs where every generated mutant was
+/// coverage-suppressed and nothing had to be executed.
+fn coverage_only_report(
+    config: &togi::config::Config,
+    build_command_explicit: bool,
+) -> togi::MutationReport {
+    togi::MutationReport {
+        results: Vec::new(),
+        build_error_diagnostics: Vec::new(),
+        schemata: None,
+        baseline_timing: None,
+        duration: Duration::ZERO,
+        test_command: Some(config.test.command.clone()),
+        build_command: if build_command_explicit {
+            config.test.build_command.clone()
+        } else {
+            Vec::new()
+        },
+        planned_total: 0,
+        early_stop_reason: None,
+        total: 0,
+        killed: 0,
+        survived: 0,
+        timeout: 0,
+        build_errors: 0,
+    }
 }
 
 fn print_dry_run(mutations: &[Mutation]) {

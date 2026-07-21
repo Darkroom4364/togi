@@ -80,6 +80,11 @@ pub enum MutationResult {
     Survived,
     Timeout,
     BuildError,
+    /// The mutation sits on a line that coverage data reports as never
+    /// executed by the test suite. Such mutants are not run: they are
+    /// guaranteed survivors and carry no signal. Only produced when line
+    /// coverage data is available for the mutated file and line.
+    Uncovered,
 }
 
 impl fmt::Display for MutationResult {
@@ -89,6 +94,7 @@ impl fmt::Display for MutationResult {
             MutationResult::Survived => write!(f, "survived"),
             MutationResult::Timeout => write!(f, "timeout"),
             MutationResult::BuildError => write!(f, "build error"),
+            MutationResult::Uncovered => write!(f, "uncovered"),
         }
     }
 }
@@ -152,6 +158,25 @@ pub struct MutationReport {
     pub survived: usize,
     pub timeout: usize,
     pub build_errors: usize,
+}
+
+impl MutationReport {
+    /// Mutants classified as [`MutationResult::Uncovered`] (zero-coverage
+    /// lines). Derived from `results` so it can never drift out of sync.
+    pub fn uncovered_count(&self) -> usize {
+        self.results
+            .iter()
+            .filter(|(_, result)| *result == MutationResult::Uncovered)
+            .count()
+    }
+
+    /// Mutants actually executed against the test suite: everything except
+    /// build errors and coverage-suppressed (uncovered) mutants.
+    pub fn tested_count(&self) -> usize {
+        self.total
+            .saturating_sub(self.build_errors)
+            .saturating_sub(self.uncovered_count())
+    }
 }
 
 /// Timing captured from the unmutated baseline run used for timeout calibration.
@@ -387,6 +412,7 @@ mod tests {
         assert_eq!(MutationResult::Survived.to_string(), "survived");
         assert_eq!(MutationResult::Timeout.to_string(), "timeout");
         assert_eq!(MutationResult::BuildError.to_string(), "build error");
+        assert_eq!(MutationResult::Uncovered.to_string(), "uncovered");
     }
 
     #[test]

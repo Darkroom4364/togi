@@ -61,6 +61,8 @@ struct SarifInvocationProperties {
     survived: usize,
     timeout: usize,
     build_errors: usize,
+    #[serde(skip_serializing_if = "super::is_zero")]
+    uncovered: usize,
     mutation_score: f64,
 }
 
@@ -150,8 +152,10 @@ pub fn print_report(report: &MutationReport) -> Result<()> {
 
 /// Serialize report to a SARIF 2.1.0 string (for testing and programmatic use).
 ///
-/// Emits one result per surviving mutant; killed, timeout, and build-error
-/// mutants are not findings and only appear in the invocation totals.
+/// Emits one result per surviving mutant; killed, timeout, build-error, and
+/// uncovered mutants are not findings. Uncovered mutants are deliberately not
+/// code-scanning results (a zero-coverage line is not an actionable surviving
+/// mutant); they only appear in the invocation totals.
 pub fn to_sarif_string(report: &MutationReport) -> Result<String> {
     let registry = registry_descriptions();
     let surviving: Vec<&Mutation> = report
@@ -195,6 +199,7 @@ pub fn to_sarif_string(report: &MutationReport) -> Result<String> {
                     survived: report.survived,
                     timeout: report.timeout,
                     build_errors: report.build_errors,
+                    uncovered: report.uncovered_count(),
                     mutation_score: super::mutation_score(report),
                 },
             }],
@@ -390,6 +395,34 @@ mod tests {
         assert_eq!(run["results"], serde_json::json!([]));
         assert_eq!(run["tool"]["driver"]["rules"], serde_json::json!([]));
         assert_eq!(run["invocations"][0]["properties"]["mutation_score"], 100.0);
+    }
+
+    #[test]
+    fn sarif_uncovered_mutants_produce_no_results_but_appear_in_totals() {
+        let report = report_with(vec![
+            (
+                mutation(0, "src/a.rs", 1, "op_a", "covered and killed"),
+                MutationResult::Killed,
+            ),
+            (
+                mutation(1, "src/dead.rs", 9, "op_b", "zero coverage"),
+                MutationResult::Uncovered,
+            ),
+        ]);
+        let value = parse(&report);
+        // Uncovered mutants are not code-scanning findings.
+        assert_eq!(value["runs"][0]["results"], serde_json::json!([]));
+        let properties = &value["runs"][0]["invocations"][0]["properties"];
+        assert_eq!(properties["uncovered"], 1);
+        // Score excludes uncovered mutants: 1 killed of 1 tested → 100%.
+        assert_eq!(properties["mutation_score"], 100.0);
+    }
+
+    #[test]
+    fn sarif_omits_uncovered_property_when_zero() {
+        let value = parse(&sample_report());
+        let properties = &value["runs"][0]["invocations"][0]["properties"];
+        assert!(properties.get("uncovered").is_none());
     }
 
     #[test]

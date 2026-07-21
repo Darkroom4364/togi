@@ -193,34 +193,67 @@ pub fn parse_lcov_stats(content: &str, project_root: &Path) -> CoverageStats {
     }
 }
 
-/// Filter mutations to only those on lines present in the coverage map.
-/// Warns about files that have mutations but are missing from coverage data.
-pub fn filter_by_coverage(
-    mutations: Vec<crate::Mutation>,
-    coverage: &CoverageMap,
-    project_root: &Path,
-) -> Vec<crate::Mutation> {
-    let mut warned_files: HashSet<PathBuf> = HashSet::new();
+/// Mutations partitioned by line-coverage data.
+#[derive(Debug, Default)]
+pub struct CoverageClassification {
+    /// Mutations on lines known to be covered by the test suite.
+    pub covered: Vec<crate::Mutation>,
+    /// Mutations on lines tracked by coverage data but never executed.
+    pub uncovered: Vec<crate::Mutation>,
+}
 
-    mutations
-        .into_iter()
-        .filter(|m| {
-            let rel = normalize_repo_relative_path(&m.file, project_root);
-            match coverage.get(&rel) {
-                Some(lines) => lines.contains(&m.line),
-                None => {
-                    if warned_files.insert(rel.clone()) {
-                        eprintln!(
-                            "warning: {} has mutations but is missing from coverage data — \
-                             all its mutations will be filtered out",
-                            rel.display()
-                        );
-                    }
-                    false
-                }
+/// Partition mutations into those on covered lines and those on lines with
+/// known zero coverage.
+///
+/// A mutation lands in `uncovered` only when coverage data for its file exists
+/// and its line is tracked but has zero executions. Mutations on files or
+/// lines missing from the coverage data keep the historical filter behavior:
+/// they are dropped (with a per-file warning for files absent from the data),
+/// exactly as before coverage-informed classification existed.
+pub fn classify_by_coverage(
+    mutations: Vec<crate::Mutation>,
+    coverage: &CoverageStats,
+    project_root: &Path,
+) -> CoverageClassification {
+    let mut warned_files: HashSet<PathBuf> = HashSet::new();
+    let mut classification = CoverageClassification::default();
+
+    for m in mutations {
+        let rel = normalize_repo_relative_path(&m.file, project_root);
+        let file_known =
+            coverage.total_lines.contains_key(&rel) || coverage.covered_lines.contains_key(&rel);
+        if !file_known {
+            if warned_files.insert(rel.clone()) {
+                eprintln!(
+                    "warning: {} has mutations but is missing from coverage data — \
+                     all its mutations will be filtered out",
+                    rel.display()
+                );
             }
-        })
-        .collect()
+            continue;
+        }
+
+        let line_tracked = coverage
+            .total_lines
+            .get(&rel)
+            .is_some_and(|lines| lines.contains(&m.line));
+        if !line_tracked {
+            // No coverage information for this line — historical behavior.
+            continue;
+        }
+
+        let line_covered = coverage
+            .covered_lines
+            .get(&rel)
+            .is_some_and(|lines| lines.contains(&m.line));
+        if line_covered {
+            classification.covered.push(m);
+        } else {
+            classification.uncovered.push(m);
+        }
+    }
+
+    classification
 }
 
 pub fn line_coverage_metric(coverage: &CoverageStats) -> CoverageMetric {
@@ -383,11 +416,11 @@ end_of_record
     }
 
     #[test]
-    fn filter_matches_dot_relative_lcov_paths() {
+    fn classify_matches_dot_relative_lcov_paths() {
         let root = Path::new("/project");
         let lcov = "SF:./src/lib.rs\nDA:42,1\nend_of_record\n";
-        let coverage = parse_lcov(lcov, root);
-        assert!(coverage.contains_key(Path::new("src/lib.rs")));
+        let coverage = parse_lcov_stats(lcov, root);
+        assert!(coverage.covered_lines.contains_key(Path::new("src/lib.rs")));
 
         let mutations = vec![crate::Mutation {
             id: 0,
@@ -402,9 +435,10 @@ end_of_record
             byte_range: 0..2,
         }];
 
-        let filtered = filter_by_coverage(mutations, &coverage, root);
-        assert_eq!(filtered.len(), 1);
-        assert_eq!(filtered[0].line, 42);
+        let classified = classify_by_coverage(mutations, &coverage, root);
+        assert_eq!(classified.covered.len(), 1);
+        assert_eq!(classified.covered[0].line, 42);
+        assert!(classified.uncovered.is_empty());
     }
 
     #[test]
@@ -441,44 +475,104 @@ end_of_record
     }
 
     #[test]
-    fn filter_removes_uncovered_mutations() {
+    fn classify_separates_covered_from_zero_coverage_lines() {
         let root = Path::new("/project");
-        let mut coverage = CoverageMap::new();
-        coverage
-            .entry(PathBuf::from("src/main.go"))
-            .or_default()
-            .insert(10);
-
+        let lcov = "\
+SF:/project/src/main.go
+DA:10,1
+DA:20,0
+end_of_record
+";
+        let coverage = parse_lcov_stats(lcov, root);
+        let make_mutation = |id: u32, line: usize| crate::Mutation {
+            id,
+            file: root.join("src/main.go"),
+            language: "go".into(),
+            line,
+            column: 1,
+            operator: "lt_to_lte".into(),
+            description: "< to <=".into(),
+            original: "<".into(),
+            replacement: "<=".into(),
+            byte_range: 0..1,
+        };
         let mutations = vec![
-            crate::Mutation {
-                id: 0,
-                file: root.join("src/main.go"),
-                language: "go".into(),
-                line: 10,
-                column: 1,
-                operator: "lt_to_lte".into(),
-                description: "< to <=".into(),
-                original: "<".into(),
-                replacement: "<=".into(),
-                byte_range: 0..1,
-            },
-            crate::Mutation {
-                id: 1,
-                file: root.join("src/main.go"),
-                language: "go".into(),
-                line: 20,
-                column: 1,
-                operator: "lt_to_lte".into(),
-                description: "< to <=".into(),
-                original: "<".into(),
-                replacement: "<=".into(),
-                byte_range: 0..1,
-            },
+            make_mutation(0, 10), // covered
+            make_mutation(1, 20), // tracked but zero coverage
         ];
 
-        let filtered = filter_by_coverage(mutations, &coverage, root);
-        assert_eq!(filtered.len(), 1);
-        assert_eq!(filtered[0].line, 10);
+        let classified = classify_by_coverage(mutations, &coverage, root);
+        assert_eq!(classified.covered.len(), 1);
+        assert_eq!(classified.covered[0].line, 10);
+        assert_eq!(classified.uncovered.len(), 1);
+        assert_eq!(classified.uncovered[0].line, 20);
+    }
+
+    #[test]
+    fn classify_drops_mutations_without_coverage_data() {
+        let root = Path::new("/project");
+        let lcov = "\
+SF:/project/src/main.go
+DA:10,1
+end_of_record
+";
+        let coverage = parse_lcov_stats(lcov, root);
+        let make_mutation = |id: u32, file: &str, line: usize| crate::Mutation {
+            id,
+            file: root.join(file),
+            language: "go".into(),
+            line,
+            column: 1,
+            operator: "lt_to_lte".into(),
+            description: "< to <=".into(),
+            original: "<".into(),
+            replacement: "<=".into(),
+            byte_range: 0..1,
+        };
+        let mutations = vec![
+            make_mutation(0, "src/main.go", 99),  // line not tracked
+            make_mutation(1, "src/other.go", 10), // file missing from coverage
+        ];
+
+        // Missing data means no classification change: neither mutation is
+        // classified as uncovered, and (historical filter behavior) neither runs.
+        let classified = classify_by_coverage(mutations, &coverage, root);
+        assert!(classified.covered.is_empty());
+        assert!(classified.uncovered.is_empty());
+    }
+
+    #[test]
+    fn classify_treats_file_with_only_zero_coverage_lines_as_known() {
+        let root = Path::new("/project");
+        let lcov = "\
+SF:/project/src/dead.go
+DA:5,0
+end_of_record
+";
+        let coverage = parse_lcov_stats(lcov, root);
+        // File has no covered lines at all, so it is absent from covered_lines.
+        assert!(
+            !coverage
+                .covered_lines
+                .contains_key(Path::new("src/dead.go"))
+        );
+
+        let mutations = vec![crate::Mutation {
+            id: 0,
+            file: root.join("src/dead.go"),
+            language: "go".into(),
+            line: 5,
+            column: 1,
+            operator: "lt_to_lte".into(),
+            description: "< to <=".into(),
+            original: "<".into(),
+            replacement: "<=".into(),
+            byte_range: 0..1,
+        }];
+
+        let classified = classify_by_coverage(mutations, &coverage, root);
+        assert!(classified.covered.is_empty());
+        assert_eq!(classified.uncovered.len(), 1);
     }
 
     #[test]
