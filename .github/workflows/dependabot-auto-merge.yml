@@ -1,0 +1,71 @@
+name: Dependabot Auto-merge
+
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize, ready_for_review]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: dependabot-auto-merge-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  auto-merge:
+    if: >
+      github.event.pull_request.user.login == 'dependabot[bot]' &&
+      github.event.pull_request.base.ref == 'main' &&
+      !github.event.pull_request.draft
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      REPO: ${{ github.repository }}
+    steps:
+      - name: Check changed files against allowlist
+        id: allowlist
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          allowed_re='(^|/)(Cargo\.toml|Cargo\.lock|go\.mod|go\.sum|package\.json|package-lock\.json|npm-shrinkwrap\.json|pnpm-lock\.yaml|yarn\.lock|bun\.lockb|pyproject\.toml|poetry\.lock|Pipfile|Pipfile\.lock|requirements(\.[^/]+)?\.txt|Gemfile|Gemfile\.lock|composer\.json|composer\.lock|pom\.xml|build\.gradle|build\.gradle\.kts|settings\.gradle|settings\.gradle\.kts|gradle\.lockfile|packages\.lock\.json|paket\.dependencies|paket\.lock)$|^\.github/workflows/[^/]+\.(yml|yaml)$'
+
+          mapfile -t files < <(gh api "repos/${REPO}/pulls/${PR_NUMBER}/files" --paginate --jq '.[].filename')
+          if [[ "${#files[@]}" -eq 0 ]]; then
+            echo "eligible=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          for file in "${files[@]}"; do
+            if ! [[ "$file" =~ $allowed_re ]]; then
+              echo "Skipping auto-merge because changed file is outside the dependency/workflow allowlist: $file"
+              echo "eligible=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          done
+
+          echo "eligible=true" >> "$GITHUB_OUTPUT"
+
+      - name: Update branch if required
+        id: update
+        if: steps.allowlist.outputs.eligible == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          merge_state="$(gh pr view "$PR_NUMBER" --repo "$REPO" --json mergeStateStatus --jq '.mergeStateStatus')"
+          if [[ "$merge_state" == "BEHIND" ]]; then
+            gh pr update-branch "$PR_NUMBER" --repo "$REPO"
+            echo "updated=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "updated=false" >> "$GITHUB_OUTPUT"
+
+      - name: Enable native auto-merge
+        if: steps.allowlist.outputs.eligible == 'true' && steps.update.outputs.updated != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh pr merge "$PR_NUMBER" --repo "$REPO" --auto --merge
