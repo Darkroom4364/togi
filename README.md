@@ -363,7 +363,12 @@ fail the run when LCOV coverage is below a threshold:
 
 - `--coverage auto` asks togi to collect coverage through a built-in adapter
   when the current project is supported. Today that built-in path supports Go.
-- `--coverage-file coverage/lcov.info` keeps only mutations on covered lines
+- `--coverage-file coverage/lcov.info` runs only mutations on covered lines.
+  Mutants on lines the coverage data reports as never executed are not run —
+  they are guaranteed survivors — and are reported as `uncovered` instead of
+  `survived`: visible in the terminal and JSON reports, but excluded from the
+  survivor count, the mutation-score denominator, and `--fail-under` gating.
+  Files or lines missing from the coverage data are filtered out as before.
 - `--coverage-cmd ./scripts/collect-coverage.sh --coverage-file coverage/lcov.info`
   runs a user-provided command before mutation generation, then reads the
   resulting LCOV file. `TOGI_COVERAGE_FILE` is exported for the command.
@@ -380,6 +385,15 @@ togi test-map --path . --output coverage/test-selection.json
 togi check --coverage-file coverage/lcov.info --test-selection-file coverage/test-selection.json
 togi check --coverage-file coverage/lcov.info --min-line-coverage 80 --min-diff-coverage 90
 ```
+
+`uncovered` classification and the coverage gates answer different questions.
+The gates (`--min-line-coverage`, `--min-diff-coverage`,
+`--fail-on-uncovered-diff`) run before mutation generation and fail the whole
+run when the diff's coverage is too weak. The `uncovered` classification keeps
+individual zero-coverage mutants from inflating the survivor count when the
+gates let the run proceed — use the gates to block under-covered diffs, and
+the classification to keep surviving-mutant reports free of zero-coverage
+noise.
 
 The selection file is a JSON map of source file to line number to test names.
 Entries can be strings or objects with `name` and optional `duration_ms`; timed

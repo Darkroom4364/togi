@@ -90,7 +90,9 @@ max_per_file = 20
 # Default: true
 schemata = true
 
-# Optional LCOV file. When set, togi only keeps mutations on covered lines.
+# Optional LCOV file. When set, togi runs only mutations on covered lines;
+# mutations on lines with known zero coverage are reported as "uncovered"
+# (not executed, not counted as survivors).
 # Type: string path
 # Default: unset
 coverage_file = "coverage/lcov.info"

@@ -136,6 +136,137 @@ fn check_dry_run_lists_mutations() {
         .stdout(predicate::str::contains("mutations would be generated"));
 }
 
+/// Extend the fixture so mutants land on two lines: line 4 (the added `if`)
+/// and line 7 (`return a - b`).
+fn setup_two_line_mutation_repo() -> TempDir {
+    let dir = setup_git_repo();
+    fs::write(
+        dir.path().join("main.go"),
+        "package main\n\nfunc add(a, b int) int {\n\tif a > b {\n\t\treturn a\n\t}\n\treturn a - b\n}\n",
+    )
+    .unwrap();
+    dir
+}
+
+#[test]
+fn check_classifies_zero_coverage_mutants_as_uncovered() {
+    let dir = setup_two_line_mutation_repo();
+    // Line 4 covered; line 7 tracked but never executed.
+    fs::write(
+        dir.path().join("lcov.info"),
+        "SF:main.go\nDA:4,1\nDA:7,0\nend_of_record\n",
+    )
+    .unwrap();
+
+    let output = togi()
+        .args([
+            "check",
+            "--base",
+            "HEAD",
+            "--format",
+            "json",
+            "--test-cmd",
+            "false",
+            "--coverage-file",
+            "lcov.info",
+            "--fail-under",
+            "100",
+        ])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    // `false` kills every executed mutant. The zero-coverage mutant must not
+    // count as a survivor, so the run passes even with --fail-under 100.
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("reported as uncovered"),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|e| {
+        panic!(
+            "invalid JSON output: {e}\nstdout: {}",
+            String::from_utf8_lossy(&output.stdout)
+        )
+    });
+    assert_eq!(value["killed"], 3);
+    assert_eq!(value["survived"], 0);
+    assert_eq!(value["uncovered"], 1);
+    assert_eq!(value["mutation_score"], 100.0);
+
+    let mutations = value["mutations"].as_array().unwrap();
+    let uncovered: Vec<_> = mutations
+        .iter()
+        .filter(|m| m["result"] == "uncovered")
+        .collect();
+    assert_eq!(uncovered.len(), 1);
+    assert_eq!(uncovered[0]["line"], 7);
+    assert_eq!(uncovered[0]["file"], "main.go");
+}
+
+#[test]
+fn check_all_mutants_uncovered_skips_execution() {
+    let dir = setup_two_line_mutation_repo();
+    // Both mutated lines have zero coverage: nothing should execute.
+    fs::write(
+        dir.path().join("lcov.info"),
+        "SF:main.go\nDA:4,0\nDA:7,0\nend_of_record\n",
+    )
+    .unwrap();
+
+    let output = togi()
+        .args([
+            "check",
+            "--base",
+            "HEAD",
+            "--format",
+            "json",
+            "--test-cmd",
+            "false",
+            "--coverage-file",
+            "lcov.info",
+        ])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("Running"),
+        "no mutations should execute: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|e| {
+        panic!(
+            "invalid JSON output: {e}\nstdout: {}",
+            String::from_utf8_lossy(&output.stdout)
+        )
+    });
+    assert_eq!(value["total"], 4);
+    assert_eq!(value["killed"], 0);
+    assert_eq!(value["survived"], 0);
+    assert_eq!(value["uncovered"], 4);
+    assert_eq!(value["mutation_score"], 100.0);
+    assert!(
+        value["mutations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|m| m["result"] == "uncovered")
+    );
+}
+
 #[test]
 fn check_warns_when_fail_fast_is_ignored_for_custom_test_cmd() {
     let dir = setup_git_repo();
