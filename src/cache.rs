@@ -171,6 +171,33 @@ impl IncrementalHistoryStore {
             .cloned()
     }
 
+    /// Killer test from the latest `Killed` history entry for this mutation
+    /// whose source and command hashes still match the current run — the
+    /// evidence learned selection clusters on. Returns `None` when there is
+    /// no such entry, the verdict was not `Killed`, or no killer test was
+    /// recorded.
+    pub fn learned_killer_test(
+        &self,
+        mutation_identity: &str,
+        mutation_description: &str,
+        source_hash: u64,
+        command_hash: u64,
+    ) -> Option<String> {
+        let history = self.state.lock().ok()?;
+        history
+            .entries
+            .iter()
+            .rev()
+            .find(|entry| {
+                entry.mutation_identity == mutation_identity
+                    && entry.mutation_description == mutation_description
+                    && entry.source_hash == source_hash
+                    && entry.command_hash == command_hash
+                    && entry.result == MutationResult::Killed
+            })
+            .and_then(|entry| entry.killer_test.clone())
+    }
+
     pub fn record(&self, entry: IncrementalHistoryEntry) {
         let Ok(mut history) = self.state.lock() else {
             eprintln!("warning: incremental history mutex poisoned");
@@ -557,6 +584,78 @@ mod tests {
                 &["test_add".into(), "test_max".into()]
             ),
             Some("test_max".into())
+        );
+        Ok(())
+    }
+
+    fn killed_entry(killer_test: Option<&str>) -> IncrementalHistoryEntry {
+        IncrementalHistoryEntry {
+            mutation_identity: "src/lib.rs:0..1:op".into(),
+            mutation_description: "desc".into(),
+            result: MutationResult::Killed,
+            source_hash: 1,
+            command_hash: 2,
+            relevant_test_hash: 3,
+            covering_tests: vec!["test_add".into()],
+            killer_test: killer_test.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn learned_killer_test_matches_killed_entry_with_current_hashes() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let store = IncrementalHistoryStore::load(tmp.path());
+        store.record(killed_entry(Some("test_add")));
+
+        let reloaded = IncrementalHistoryStore::load(tmp.path());
+        assert_eq!(
+            reloaded.learned_killer_test("src/lib.rs:0..1:op", "desc", 1, 2),
+            Some("test_add".into())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn learned_killer_test_rejects_mismatched_hashes() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let store = IncrementalHistoryStore::load(tmp.path());
+        store.record(killed_entry(Some("test_add")));
+
+        assert_eq!(
+            store.learned_killer_test("src/lib.rs:0..1:op", "desc", 9, 2),
+            None
+        );
+        assert_eq!(
+            store.learned_killer_test("src/lib.rs:0..1:op", "desc", 1, 9),
+            None
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn learned_killer_test_rejects_non_killed_verdict() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let store = IncrementalHistoryStore::load(tmp.path());
+        let mut entry = killed_entry(Some("test_add"));
+        entry.result = MutationResult::Survived;
+        store.record(entry);
+
+        assert_eq!(
+            store.learned_killer_test("src/lib.rs:0..1:op", "desc", 1, 2),
+            None
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn learned_killer_test_rejects_missing_killer() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let store = IncrementalHistoryStore::load(tmp.path());
+        store.record(killed_entry(None));
+
+        assert_eq!(
+            store.learned_killer_test("src/lib.rs:0..1:op", "desc", 1, 2),
+            None
         );
         Ok(())
     }

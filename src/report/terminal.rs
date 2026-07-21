@@ -76,8 +76,7 @@ fn format_report(report: &MutationReport, color: bool) -> String {
                     if color {
                         dim("Same recorded killer test as an earlier mutant; not executed.")
                     } else {
-                        "Same recorded killer test as an earlier mutant; not executed."
-                            .to_string()
+                        "Same recorded killer test as an earlier mutant; not executed.".to_string()
                     }
                 )
                 .unwrap();
@@ -528,8 +527,7 @@ mod tests {
         );
         assert!(output.contains("Same recorded killer test as an earlier mutant; not executed."));
         assert!(
-            output
-                .contains("Results: 1 killed, 0 survived, 0 timeout, 0 build errors, 1 subsumed")
+            output.contains("Results: 1 killed, 0 survived, 0 timeout, 0 build errors, 1 subsumed")
         );
         // Subsumed mutants are excluded from the tested denominator.
         assert!(output.contains("Mutation score (test kills only): 100.0%"));

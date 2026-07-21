@@ -19,6 +19,7 @@ struct ExecuteOptions {
     early_stop: togi::runner::EarlyStopConfig,
     env: HashMap<String, String>,
     force_rerun: bool,
+    learned_selection: bool,
     cancelled: Arc<AtomicBool>,
 }
 
@@ -239,6 +240,7 @@ fn run_check(cfg: togi::cli::CheckArgs, cancelled: Arc<AtomicBool>) -> anyhow::R
     let check_baseline = cfg.check_baseline;
     let pr_comment = cfg.pr_comment.clone();
     let force_rerun = cfg.force_rerun;
+    let learned_selection = cfg.learned_selection;
 
     let resolved = resolve_config(cfg)?;
     let ResolvedCheckConfig {
@@ -385,6 +387,7 @@ fn run_check(cfg: togi::cli::CheckArgs, cancelled: Arc<AtomicBool>) -> anyhow::R
                 early_stop,
                 env: profile_env,
                 force_rerun,
+                learned_selection,
                 cancelled,
             },
         );
@@ -1249,6 +1252,7 @@ fn execute(
         env: options.env,
         incremental_history: config.mutations.incremental_history,
         force_rerun: options.force_rerun,
+        learned_selection: options.learned_selection,
         cancelled: options.cancelled,
     };
 
@@ -1666,6 +1670,7 @@ mod tests {
             fail_on_uncovered_diff: false,
             test_selection_file: None,
             no_incremental_history: false,
+            learned_selection: false,
             force_rerun: false,
             build_cmd: None,
             fail_fast: false,

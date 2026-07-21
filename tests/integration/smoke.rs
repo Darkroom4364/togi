@@ -88,6 +88,7 @@ fn run_fixture(case: FixtureCase) {
         env: HashMap::new(),
         incremental_history: false,
         force_rerun: true,
+        learned_selection: false,
         cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
 

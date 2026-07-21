@@ -91,6 +91,7 @@ fn verify_mutation_outcomes_match_independent_replay() {
         env: go_env.clone(),
         incremental_history: true,
         force_rerun: false,
+        learned_selection: false,
         cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
 

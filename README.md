@@ -205,6 +205,10 @@ togi check --force-rerun
 # Disable structured incremental history for one run
 togi check --no-incremental-history
 
+# Skip mutants that share a recorded killer test with an earlier mutant
+# (learned subsumption clusters; opt-in, requires incremental history)
+togi check --learned-selection
+
 # Generate a config file
 togi init
 ```

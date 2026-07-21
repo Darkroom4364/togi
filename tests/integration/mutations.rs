@@ -132,6 +132,7 @@ fn end_to_end_go_fixture_reports_expected_outcomes_with_fresh_tests() {
         env: go_env,
         incremental_history: true,
         force_rerun: false,
+        learned_selection: false,
         cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
 

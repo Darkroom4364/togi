@@ -135,6 +135,12 @@ pub struct CheckArgs {
     #[arg(long)]
     pub no_incremental_history: bool,
 
+    /// Skip mutants that share a recorded killer test with an earlier mutant
+    /// of the same run and file (learned subsumption clusters; requires
+    /// incremental history, ignored under --force-rerun)
+    #[arg(long)]
+    pub learned_selection: bool,
+
     /// Re-run mutations even when cache or history has a matching result
     #[arg(long)]
     pub force_rerun: bool,
@@ -276,6 +282,22 @@ mod tests {
                 assert!(args.no_incremental_history);
                 assert!(args.force_rerun);
             }
+            _ => panic!("expected Check command"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn learned_selection_is_opt_in() -> anyhow::Result<()> {
+        let default = Cli::try_parse_from(["togi", "check"])?;
+        match default.command {
+            Commands::Check(args) => assert!(!args.learned_selection),
+            _ => panic!("expected Check command"),
+        }
+
+        let enabled = Cli::try_parse_from(["togi", "check", "--learned-selection"])?;
+        match enabled.command {
+            Commands::Check(args) => assert!(args.learned_selection),
             _ => panic!("expected Check command"),
         }
         Ok(())

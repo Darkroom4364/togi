@@ -5,6 +5,7 @@ pub mod config;
 pub mod coverage;
 pub mod diff;
 pub mod languages;
+pub mod learned;
 pub mod lock;
 pub mod mapper;
 pub mod mutator;
