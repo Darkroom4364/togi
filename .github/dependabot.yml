@@ -8,6 +8,10 @@ updates:
       all-cargo:
         patterns:
           - "*"
+    ignore:
+      # ignore 0.4.30+ needs rustc >= 1.88 (let-chains); hold while rust-version is 1.87
+      - dependency-name: "ignore"
+        versions: [">=0.4.30"]
   - package-ecosystem: github-actions
     directory: /
     schedule:
