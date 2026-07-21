@@ -63,6 +63,8 @@ struct SarifInvocationProperties {
     build_errors: usize,
     #[serde(skip_serializing_if = "super::is_zero")]
     uncovered: usize,
+    #[serde(skip_serializing_if = "super::is_zero")]
+    subsumed: usize,
     mutation_score: f64,
 }
 
@@ -152,10 +154,12 @@ pub fn print_report(report: &MutationReport) -> Result<()> {
 
 /// Serialize report to a SARIF 2.1.0 string (for testing and programmatic use).
 ///
-/// Emits one result per surviving mutant; killed, timeout, build-error, and
-/// uncovered mutants are not findings. Uncovered mutants are deliberately not
-/// code-scanning results (a zero-coverage line is not an actionable surviving
-/// mutant); they only appear in the invocation totals.
+/// Emits one result per surviving mutant; killed, timeout, build-error,
+/// uncovered, and subsumed mutants are not findings. Uncovered mutants are
+/// deliberately not code-scanning results (a zero-coverage line is not an
+/// actionable surviving mutant), and subsumed mutants were never executed
+/// (their cluster canonical carries the signal); both only appear in the
+/// invocation totals.
 pub fn to_sarif_string(report: &MutationReport) -> Result<String> {
     let registry = registry_descriptions();
     let surviving: Vec<&Mutation> = report
@@ -200,6 +204,7 @@ pub fn to_sarif_string(report: &MutationReport) -> Result<String> {
                     timeout: report.timeout,
                     build_errors: report.build_errors,
                     uncovered: report.uncovered_count(),
+                    subsumed: report.subsumed_count(),
                     mutation_score: super::mutation_score(report),
                 },
             }],
@@ -423,6 +428,34 @@ mod tests {
         let value = parse(&sample_report());
         let properties = &value["runs"][0]["invocations"][0]["properties"];
         assert!(properties.get("uncovered").is_none());
+    }
+
+    #[test]
+    fn sarif_subsumed_mutants_produce_no_results_but_appear_in_totals() {
+        let report = report_with(vec![
+            (
+                mutation(0, "src/a.rs", 1, "op_a", "canonical kill"),
+                MutationResult::Killed,
+            ),
+            (
+                mutation(1, "src/a.rs", 5, "op_b", "same killer test"),
+                MutationResult::Subsumed,
+            ),
+        ]);
+        let value = parse(&report);
+        // Subsumed mutants are not code-scanning findings.
+        assert_eq!(value["runs"][0]["results"], serde_json::json!([]));
+        let properties = &value["runs"][0]["invocations"][0]["properties"];
+        assert_eq!(properties["subsumed"], 1);
+        // Score excludes subsumed mutants: 1 killed of 1 tested → 100%.
+        assert_eq!(properties["mutation_score"], 100.0);
+    }
+
+    #[test]
+    fn sarif_omits_subsumed_property_when_zero() {
+        let value = parse(&sample_report());
+        let properties = &value["runs"][0]["invocations"][0]["properties"];
+        assert!(properties.get("subsumed").is_none());
     }
 
     #[test]

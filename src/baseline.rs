@@ -23,8 +23,9 @@ pub struct Baseline {
 
 /// Build a baseline from a mutation report.
 ///
-/// Only executed mutants count: build errors and coverage-suppressed
-/// (uncovered) mutants are excluded from per-file and overall totals.
+/// Only executed mutants count: build errors, coverage-suppressed
+/// (uncovered), and learned-selection (subsumed) mutants are excluded from
+/// per-file and overall totals.
 pub fn from_report(report: &crate::MutationReport, project_root: &Path) -> Baseline {
     let mut files: HashMap<String, FileScore> = HashMap::new();
     for (mutation, result) in &report.results {
@@ -40,6 +41,7 @@ pub fn from_report(report: &crate::MutationReport, project_root: &Path) -> Basel
         });
         if *result != crate::MutationResult::BuildError
             && *result != crate::MutationResult::Uncovered
+            && *result != crate::MutationResult::Subsumed
         {
             entry.total += 1;
             if *result == crate::MutationResult::Killed {

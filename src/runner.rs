@@ -1216,7 +1216,9 @@ fn measure_baseline_command(
     }
 
     match outcome.result {
-        MutationResult::Survived | MutationResult::Uncovered => Ok(duration),
+        MutationResult::Survived | MutationResult::Uncovered | MutationResult::Subsumed => {
+            Ok(duration)
+        }
         MutationResult::Killed => {
             let output = baseline_failure_output(outcome.test_output.as_deref());
             bail!(
@@ -1826,7 +1828,7 @@ impl EarlyStopState {
         match result {
             MutationResult::Killed => counts.killed += 1,
             MutationResult::Survived => counts.survived += 1,
-            MutationResult::Timeout | MutationResult::Uncovered => {}
+            MutationResult::Timeout | MutationResult::Uncovered | MutationResult::Subsumed => {}
             MutationResult::BuildError => counts.build_errors += 1,
         }
 
@@ -2253,6 +2255,7 @@ fn record_progress(
                 MutationResult::Timeout => "⧖ timeout",
                 MutationResult::BuildError => "⚠ build error",
                 MutationResult::Uncovered => "◌ uncovered",
+                MutationResult::Subsumed => "◌ subsumed",
             };
             eprintln!(
                 "  [{}/{}] {}  {}:{} \u{2014} {}",
@@ -2768,6 +2771,7 @@ impl TestRunner {
                     MutationResult::Timeout => "⧖ timeout",
                     MutationResult::BuildError => "⚠ build error",
                     MutationResult::Uncovered => "◌ uncovered",
+                MutationResult::Subsumed => "◌ subsumed",
                 };
                 eprintln!(
                     "  [schema] {}  {}:{} — {}",
@@ -2853,7 +2857,9 @@ impl TestRunner {
                 MutationResult::BuildError => build_errors += 1,
                 // Uncovered mutants never reach the runner; they are merged
                 // into the report by the caller and derived from `results`.
-                MutationResult::Uncovered => {}
+                // Subsumed mutants are merged the same way by `merge_subsumed`
+                // after the run; neither counts toward any tally here.
+                MutationResult::Uncovered | MutationResult::Subsumed => {}
             }
             if let Some(diagnostic) = record.build_error_diagnostic {
                 build_error_diagnostics.push(diagnostic);

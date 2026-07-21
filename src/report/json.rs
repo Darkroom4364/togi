@@ -14,6 +14,8 @@ struct JsonReport {
     build_errors: usize,
     #[serde(skip_serializing_if = "super::is_zero")]
     uncovered: usize,
+    #[serde(skip_serializing_if = "super::is_zero")]
+    subsumed: usize,
     partial: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     early_stop_reason: Option<String>,
@@ -128,6 +130,7 @@ pub fn to_json_string(report: &MutationReport) -> Result<String> {
                 MutationResult::Timeout => "timeout".to_string(),
                 MutationResult::BuildError => "build_error".to_string(),
                 MutationResult::Uncovered => "uncovered".to_string(),
+                MutationResult::Subsumed => "subsumed".to_string(),
             },
             column: Some(m.column),
             original: Some(m.original.clone()),
@@ -179,6 +182,7 @@ pub fn to_json_string(report: &MutationReport) -> Result<String> {
         timeout: report.timeout,
         build_errors: report.build_errors,
         uncovered: report.uncovered_count(),
+        subsumed: report.subsumed_count(),
         partial: report.total < report.planned_total,
         early_stop_reason: report.early_stop_reason.clone(),
         mutation_score: super::mutation_score(report),
@@ -273,6 +277,47 @@ mod tests {
         let json_str = to_json_string(&report).unwrap();
         let value: serde_json::Value = serde_json::from_str(&json_str).unwrap();
         assert!(value.get("uncovered").is_none());
+    }
+
+    #[test]
+    fn json_output_lists_subsumed_mutants() {
+        let mut report = sample_report();
+        report.results.push((
+            Mutation {
+                id: 2,
+                file: PathBuf::from("src/dup.rs"),
+                language: String::new(),
+                line: 4,
+                column: 1,
+                operator: "op".to_string(),
+                description: "d".to_string(),
+                original: "x".to_string(),
+                replacement: "y".to_string(),
+                byte_range: 0..1,
+            },
+            MutationResult::Subsumed,
+        ));
+        report.total = 3;
+        report.planned_total = 3;
+
+        let json_str = to_json_string(&report).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+
+        assert_eq!(value["subsumed"], 1);
+        // Subsumed mutants are excluded from the tested denominator:
+        // 1 killed of 2 tested (killed + survived) → 50%.
+        assert_eq!(value["tested"], 2);
+        assert_eq!(value["mutation_score"], 50.0);
+        let mutations = value["mutations"].as_array().unwrap();
+        assert_eq!(mutations[2]["result"], "subsumed");
+    }
+
+    #[test]
+    fn json_output_omits_subsumed_key_when_zero() {
+        let report = sample_report();
+        let json_str = to_json_string(&report).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        assert!(value.get("subsumed").is_none());
     }
 
     #[test]

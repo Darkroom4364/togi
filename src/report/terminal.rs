@@ -68,6 +68,21 @@ fn format_report(report: &MutationReport, color: bool) -> String {
                 .unwrap();
                 ("○ UNCOVERED", Some(detail))
             }
+            MutationResult::Subsumed => {
+                let mut detail = String::new();
+                writeln!(
+                    detail,
+                    "              {}",
+                    if color {
+                        dim("Same recorded killer test as an earlier mutant; not executed.")
+                    } else {
+                        "Same recorded killer test as an earlier mutant; not executed."
+                            .to_string()
+                    }
+                )
+                .unwrap();
+                ("◌ SUBSUMED", Some(detail))
+            }
         };
 
         if color {
@@ -75,7 +90,7 @@ fn format_report(report: &MutationReport, color: bool) -> String {
                 MutationResult::Killed => green(tag),
                 MutationResult::Survived => red(tag),
                 MutationResult::Timeout | MutationResult::BuildError => yellow(tag),
-                MutationResult::Uncovered => dim(tag),
+                MutationResult::Uncovered | MutationResult::Subsumed => dim(tag),
             };
             writeln!(
                 out,
@@ -110,9 +125,15 @@ fn format_report(report: &MutationReport, color: bool) -> String {
     } else {
         String::new()
     };
+    let subsumed = report.subsumed_count();
+    let subsumed_str = if subsumed > 0 {
+        format!(", {subsumed} subsumed")
+    } else {
+        String::new()
+    };
     writeln!(
         out,
-        "Results: {} killed, {} survived, {} timeout, {} build errors{uncovered_str}",
+        "Results: {} killed, {} survived, {} timeout, {} build errors{uncovered_str}{subsumed_str}",
         report.killed, report.survived, report.timeout, report.build_errors
     )
     .unwrap();
@@ -490,6 +511,36 @@ mod tests {
         let output = format_report_plain(&report);
         assert!(output.contains("Results: 1 killed, 0 survived, 0 timeout, 0 build errors\n"));
         assert!(!output.contains("uncovered"));
+    }
+
+    #[test]
+    fn terminal_output_lists_subsumed_mutants_distinctly() {
+        let report = report(vec![
+            (mutation(1, "src/a.rs", 1), MutationResult::Killed),
+            (mutation(2, "src/b.rs", 2), MutationResult::Subsumed),
+        ]);
+        let output = format_report_plain(&report);
+        assert!(
+            output
+                .lines()
+                .any(|line| line.contains("SUBSUMED") && line.contains("src/b.rs:2")),
+            "got: {output}"
+        );
+        assert!(output.contains("Same recorded killer test as an earlier mutant; not executed."));
+        assert!(
+            output
+                .contains("Results: 1 killed, 0 survived, 0 timeout, 0 build errors, 1 subsumed")
+        );
+        // Subsumed mutants are excluded from the tested denominator.
+        assert!(output.contains("Mutation score (test kills only): 100.0%"));
+    }
+
+    #[test]
+    fn terminal_output_omits_subsumed_count_when_zero() {
+        let report = report(vec![(mutation(1, "src/a.rs", 1), MutationResult::Killed)]);
+        let output = format_report_plain(&report);
+        assert!(output.contains("Results: 1 killed, 0 survived, 0 timeout, 0 build errors\n"));
+        assert!(!output.contains("subsumed"));
     }
 
     #[test]

@@ -182,6 +182,13 @@ fn explain_mutation(mutant_id: u32, report_path: &Path) -> anyhow::Result<()> {
             println!("  Coverage data shows this line is never executed by the test suite.");
             println!("  Add a test that reaches this line to make the mutant meaningful.");
         }
+        "subsumed" => {
+            println!("Why it was not executed:");
+            println!(
+                "  Learned selection clustered it with an earlier mutant that shares its recorded killer test."
+            );
+            println!("  Re-run without --learned-selection to execute every mutant.");
+        }
         other => {
             println!("Result: {other}");
         }

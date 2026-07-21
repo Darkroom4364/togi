@@ -51,8 +51,14 @@ pub fn print_report(report: &MutationReport) {
     } else {
         String::new()
     };
+    let subsumed = report.subsumed_count();
+    let subsumed_str = if subsumed > 0 {
+        format!(", {subsumed} subsumed")
+    } else {
+        String::new()
+    };
     eprintln!(
-        "Mutation score: {:.1}% ({} killed, {} survived, {} timeout, {} build errors{uncovered_str})",
+        "Mutation score: {:.1}% ({} killed, {} survived, {} timeout, {} build errors{uncovered_str}{subsumed_str})",
         score, report.killed, report.survived, report.timeout, report.build_errors
     );
     if report.total < report.planned_total {
