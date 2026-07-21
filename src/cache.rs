@@ -16,10 +16,10 @@ use std::sync::Mutex;
 const CACHE_DIR: &str = ".togi-cache";
 
 /// Bump when mutation/operator/cache semantics change without a package version bump.
-const CACHE_SCHEMA_VERSION: &str = "2";
+const CACHE_SCHEMA_VERSION: &str = "3";
 
 const HISTORY_FILE: &str = "history.json";
-const HISTORY_SCHEMA_VERSION: u32 = 1;
+const HISTORY_SCHEMA_VERSION: u32 = 2;
 
 const TOGI_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -380,6 +380,41 @@ mod tests {
         .unwrap();
 
         assert_eq!(lookup(tmp.path(), &key), None);
+    }
+
+    #[test]
+    fn history_with_older_schema_version_loads_empty() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let entry = IncrementalHistoryEntry {
+            mutation_identity: "src/lib.rs:0..1:op".into(),
+            mutation_description: "desc".into(),
+            result: MutationResult::Survived,
+            source_hash: 1,
+            command_hash: 2,
+            relevant_test_hash: 3,
+            covering_tests: vec![],
+            killer_test: None,
+        };
+        let stale = IncrementalHistoryFile {
+            schema_version: HISTORY_SCHEMA_VERSION - 1,
+            entries: vec![entry],
+        };
+        fs::create_dir_all(cache_dir(tmp.path())).unwrap();
+        fs::write(
+            history_path(tmp.path()),
+            serde_json::to_vec(&stale).unwrap(),
+        )
+        .unwrap();
+
+        let store = IncrementalHistoryStore::load(tmp.path());
+        let query = IncrementalHistoryQuery {
+            mutation_identity: "src/lib.rs:0..1:op".into(),
+            mutation_description: "desc".into(),
+            source_hash: 1,
+            command_hash: 2,
+            relevant_test_hash: 3,
+        };
+        assert_eq!(store.lookup(&query), None);
     }
 
     #[test]
