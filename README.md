@@ -206,7 +206,9 @@ togi check --force-rerun
 togi check --no-incremental-history
 
 # Skip mutants that share a recorded killer test with an earlier mutant
-# (learned subsumption clusters; opt-in, requires incremental history)
+# (learned subsumption clusters; opt-in, requires incremental history).
+# Killer tests are attributed automatically from test output on kills —
+# no test map needed.
 togi check --learned-selection
 
 # Generate a config file
