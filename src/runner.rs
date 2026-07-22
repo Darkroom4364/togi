@@ -182,7 +182,7 @@ pub struct TestRunner {
     /// Re-run mutations instead of trusting cache or incremental history hits.
     pub force_rerun: bool,
     /// Skip mutants subsumed by a shared recorded killer test (opt-in;
-    /// requires `incremental_history`, ignored under `force_rerun`).
+    /// requires `incremental_history`).
     pub learned_selection: bool,
     /// Set to true externally (e.g. Ctrl+C handler) to stop spawning new mutations.
     pub cancelled: Arc<AtomicBool>,
@@ -2332,10 +2332,11 @@ impl TestRunner {
 
     /// Partition mutations into those to execute and those subsumed by a
     /// shared recorded killer test (opt-in learned selection). Conservative:
-    /// without the flag, without incremental history, or under --force-rerun
-    /// every mutation executes, exactly as before.
+    /// without the flag or without incremental history every mutation
+    /// executes, exactly as before. `--force-rerun` still bypasses verdict
+    /// restore for the canonical mutants but does not disable clustering.
     fn split_subsumed(&self, mutations: Vec<Mutation>) -> (Vec<Mutation>, Vec<Mutation>) {
-        if !self.learned_selection || !self.incremental_history || self.force_rerun {
+        if !self.learned_selection || !self.incremental_history {
             return (mutations, Vec::new());
         }
         let history = cache::IncrementalHistoryStore::load(&self.project_root);

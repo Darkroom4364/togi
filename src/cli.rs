@@ -137,7 +137,7 @@ pub struct CheckArgs {
 
     /// Skip mutants that share a recorded killer test with an earlier mutant
     /// of the same run and file (learned subsumption clusters; requires
-    /// incremental history, ignored under --force-rerun)
+    /// incremental history)
     #[arg(long)]
     pub learned_selection: bool,
 
