@@ -181,6 +181,9 @@ pub struct TestRunner {
     pub incremental_history: bool,
     /// Re-run mutations instead of trusting cache or incremental history hits.
     pub force_rerun: bool,
+    /// Skip mutants subsumed by a shared recorded killer test (opt-in;
+    /// requires `incremental_history`).
+    pub learned_selection: bool,
     /// Set to true externally (e.g. Ctrl+C handler) to stop spawning new mutations.
     pub cancelled: Arc<AtomicBool>,
 }
@@ -1216,7 +1219,9 @@ fn measure_baseline_command(
     }
 
     match outcome.result {
-        MutationResult::Survived | MutationResult::Uncovered => Ok(duration),
+        MutationResult::Survived | MutationResult::Uncovered | MutationResult::Subsumed => {
+            Ok(duration)
+        }
         MutationResult::Killed => {
             let output = baseline_failure_output(outcome.test_output.as_deref());
             bail!(
@@ -1826,7 +1831,7 @@ impl EarlyStopState {
         match result {
             MutationResult::Killed => counts.killed += 1,
             MutationResult::Survived => counts.survived += 1,
-            MutationResult::Timeout | MutationResult::Uncovered => {}
+            MutationResult::Timeout | MutationResult::Uncovered | MutationResult::Subsumed => {}
             MutationResult::BuildError => counts.build_errors += 1,
         }
 
@@ -2253,6 +2258,7 @@ fn record_progress(
                 MutationResult::Timeout => "⧖ timeout",
                 MutationResult::BuildError => "⚠ build error",
                 MutationResult::Uncovered => "◌ uncovered",
+                MutationResult::Subsumed => "◌ subsumed",
             };
             eprintln!(
                 "  [{}/{}] {}  {}:{} \u{2014} {}",
@@ -2287,15 +2293,86 @@ fn record_progress(
     }
 }
 
+/// Merge history-subsumed mutants into the report as `Subsumed`.
+///
+/// Mirrors `merge_uncovered` in main.rs: they count toward
+/// `total`/`planned_total` (they were part of the scheduled work) but stay
+/// out of the tested denominator; see `MutationReport::tested_count`.
+fn merge_subsumed(report: &mut MutationReport, subsumed: Vec<Mutation>) {
+    let n = subsumed.len();
+    if n == 0 {
+        return;
+    }
+    report
+        .results
+        .extend(subsumed.into_iter().map(|m| (m, MutationResult::Subsumed)));
+    report.total += n;
+    report.planned_total += n;
+}
+
 impl TestRunner {
     #[allow(clippy::manual_is_multiple_of)]
     pub fn run(&self, mutations: Vec<Mutation>) -> RunOutcome {
+        let (mutations, subsumed) = self.split_subsumed(mutations);
         let planned_total = mutations.len();
         let early_stop = EarlyStopState::for_config(self.early_stop.clone(), planned_total);
-        self.run_regular_with_state(mutations, early_stop, planned_total)
+        let mut outcome = self.run_regular_with_state(mutations, early_stop, planned_total);
+        merge_subsumed(&mut outcome.report, subsumed);
+        outcome
     }
 
     pub fn run_with_schemata(&self, mutations: Vec<Mutation>) -> RunOutcome {
+        // Learned selection runs before schemata planning so subsumed
+        // mutants never end up in schema rewrites.
+        let (mutations, subsumed) = self.split_subsumed(mutations);
+        let mut outcome = self.run_with_schemata_planned(mutations);
+        merge_subsumed(&mut outcome.report, subsumed);
+        outcome
+    }
+
+    /// Partition mutations into those to execute and those subsumed by a
+    /// shared recorded killer test (opt-in learned selection). Conservative:
+    /// without the flag or without incremental history every mutation
+    /// executes, exactly as before. `--force-rerun` still bypasses verdict
+    /// restore for the canonical mutants but does not disable clustering.
+    fn split_subsumed(&self, mutations: Vec<Mutation>) -> (Vec<Mutation>, Vec<Mutation>) {
+        if !self.learned_selection || !self.incremental_history {
+            return (mutations, Vec::new());
+        }
+        let history = cache::IncrementalHistoryStore::load(&self.project_root);
+        let source_contents = SourceContentCache::default();
+        let partition = crate::learned::partition_subsumed(mutations, |mutation| {
+            let source = source_contents.content_for(&self.project_root, &mutation.file)?;
+            let selected = select_test_command_with_history(
+                &self.project_root,
+                &self.commands,
+                mutation,
+                Some(&history),
+            );
+            let command_ctx = selected.cache_context(
+                &self.commands.build_command,
+                self.commands.build_command_explicit,
+                &self.commands.sandbox_command,
+                &self.env,
+            );
+            history.learned_killer_test(
+                &cache_identity(&self.project_root, mutation),
+                &mutation.description,
+                cache::hash_bytes(&source),
+                cache::hash_str(&command_ctx),
+            )
+        });
+        if !partition.subsumed.is_empty() {
+            eprintln!(
+                "learned selection: {} mutants subsumed into {} canonical mutants",
+                partition.subsumed.len(),
+                partition.clusters
+            );
+        }
+        (partition.to_run, partition.subsumed)
+    }
+
+    fn run_with_schemata_planned(&self, mutations: Vec<Mutation>) -> RunOutcome {
         let start = Instant::now();
         if mutations.is_empty() {
             return self.outcome_from_records(Vec::new(), start.elapsed());
@@ -2768,6 +2845,7 @@ impl TestRunner {
                     MutationResult::Timeout => "⧖ timeout",
                     MutationResult::BuildError => "⚠ build error",
                     MutationResult::Uncovered => "◌ uncovered",
+                    MutationResult::Subsumed => "◌ subsumed",
                 };
                 eprintln!(
                     "  [schema] {}  {}:{} — {}",
@@ -2853,7 +2931,9 @@ impl TestRunner {
                 MutationResult::BuildError => build_errors += 1,
                 // Uncovered mutants never reach the runner; they are merged
                 // into the report by the caller and derived from `results`.
-                MutationResult::Uncovered => {}
+                // Subsumed mutants are merged the same way by `merge_subsumed`
+                // after the run; neither counts toward any tally here.
+                MutationResult::Uncovered | MutationResult::Subsumed => {}
             }
             if let Some(diagnostic) = record.build_error_diagnostic {
                 build_error_diagnostics.push(diagnostic);
@@ -5070,6 +5150,7 @@ mod tests {
             env: HashMap::new(),
             incremental_history: true,
             force_rerun: false,
+            learned_selection: false,
             cancelled: Arc::new(AtomicBool::new(false)),
         };
         let cached = cached_runner.run(vec![mutation.clone()]).report;
@@ -5087,6 +5168,7 @@ mod tests {
             env: HashMap::new(),
             incremental_history: true,
             force_rerun: true,
+            learned_selection: false,
             cancelled: Arc::new(AtomicBool::new(false)),
         };
         let forced = forced_runner.run(vec![mutation]).report;
@@ -5163,10 +5245,153 @@ mod tests {
             env: HashMap::new(),
             incremental_history: true,
             force_rerun: false,
+            learned_selection: false,
             cancelled: Arc::new(AtomicBool::new(false)),
         };
         let report = runner.run(vec![mutation]).report;
         assert_eq!(report.results[0].1, MutationResult::Killed);
+        Ok(())
+    }
+
+    /// Three applicable mutations in one file with distinct identities.
+    fn make_killer_cluster_setup() -> (tempfile::TempDir, PathBuf, Vec<Mutation>) {
+        let (dir, file, base) = make_test_setup();
+        let mut second = base.clone();
+        second.id = 2;
+        second.byte_range = 6..11;
+        second.original = "world".into();
+        second.replacement = "hello".into();
+        second.operator = "test_b".into();
+        second.description = "mutation b".into();
+        let mut third = base.clone();
+        third.id = 3;
+        third.replacement = "WORLD".into();
+        third.operator = "test_c".into();
+        third.description = "mutation c".into();
+        (dir, file, vec![base, second, third])
+    }
+
+    /// Seed a Killed entry with a shared killer test for each mutation.
+    ///
+    /// `relevant_test_hash` is deliberately stale so verdict restore misses:
+    /// the canonical mutant really executes, making the subsumed siblings'
+    /// skipped execution observable in the report.
+    fn seed_killer_cluster_history(dir: &Path, file: &Path, mutations: &[Mutation]) {
+        let commands = CommandConfig {
+            command: failing_command(),
+            force_default_command: false,
+            force_default_timeout: false,
+            project_commands: vec![],
+            language_commands: HashMap::new(),
+            build_command: vec![],
+            sandbox_command: vec![],
+            build_command_explicit: false,
+            timeout: Duration::from_secs(5),
+            language_timeouts: HashMap::new(),
+            test_selection: None,
+        };
+        let store = cache::IncrementalHistoryStore::load(dir);
+        let source = std::fs::read(file).expect("source file should exist");
+        for mutation in mutations {
+            let selected = select_test_command(dir, &commands, mutation);
+            let command_ctx = selected.cache_context(
+                &commands.build_command,
+                false,
+                &commands.sandbox_command,
+                &HashMap::new(),
+            );
+            store.record(cache::IncrementalHistoryEntry {
+                mutation_identity: cache_identity(dir, mutation),
+                mutation_description: mutation.description.clone(),
+                result: MutationResult::Killed,
+                source_hash: cache::hash_bytes(&source),
+                command_hash: cache::hash_str(&command_ctx),
+                relevant_test_hash: 3,
+                covering_tests: vec!["test_shared".into()],
+                killer_test: Some("test_shared".into()),
+            });
+        }
+    }
+
+    fn killer_cluster_runner(dir: &Path, learned_selection: bool) -> TestRunner {
+        TestRunner {
+            commands: CommandConfig {
+                command: failing_command(),
+                force_default_command: false,
+                force_default_timeout: false,
+                project_commands: vec![],
+                language_commands: HashMap::new(),
+                build_command: vec![],
+                sandbox_command: vec![],
+                build_command_explicit: false,
+                timeout: Duration::from_secs(5),
+                language_timeouts: HashMap::new(),
+                test_selection: None,
+            },
+            parallelism: 1,
+            project_root: dir.to_path_buf(),
+            verbose: false,
+            show_output: false,
+            max_tested: None,
+            early_stop: Default::default(),
+            respect_workspace_ignores: true,
+            env: HashMap::new(),
+            incremental_history: true,
+            force_rerun: false,
+            learned_selection,
+            cancelled: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    #[test]
+    fn learned_selection_subsumes_shared_killer_cluster() -> anyhow::Result<()> {
+        let (dir, file, mutations) = make_killer_cluster_setup();
+        seed_killer_cluster_history(dir.path(), &file, &mutations);
+
+        let report = killer_cluster_runner(dir.path(), true)
+            .run(mutations)
+            .report;
+
+        // Only the canonical mutant (first in run order) executed; its two
+        // cluster siblings were classified Subsumed without execution.
+        assert_eq!(report.total, 3);
+        assert_eq!(report.killed, 1);
+        assert_eq!(report.subsumed_count(), 2);
+        assert_eq!(report.tested_count(), 1);
+        let result_for = |id: u32| {
+            report
+                .results
+                .iter()
+                .find(|(mutation, _)| mutation.id == id)
+                .map(|(_, result)| *result)
+        };
+        assert_eq!(result_for(1), Some(MutationResult::Killed));
+        assert_eq!(result_for(2), Some(MutationResult::Subsumed));
+        assert_eq!(result_for(3), Some(MutationResult::Subsumed));
+        // Subsumed mutants stay out of the score denominator: 1/1 → 100%.
+        assert_eq!(crate::report::mutation_score(&report), 100.0);
+        Ok(())
+    }
+
+    #[test]
+    fn learned_selection_disabled_by_default_executes_everything() -> anyhow::Result<()> {
+        let (dir, file, mutations) = make_killer_cluster_setup();
+        seed_killer_cluster_history(dir.path(), &file, &mutations);
+
+        let report = killer_cluster_runner(dir.path(), false)
+            .run(mutations)
+            .report;
+
+        assert_eq!(report.total, 3);
+        assert_eq!(report.tested_count(), 3);
+        assert_eq!(report.killed, 3);
+        assert_eq!(report.subsumed_count(), 0);
+        assert!(
+            report
+                .results
+                .iter()
+                .all(|(_, result)| *result == MutationResult::Killed)
+        );
         Ok(())
     }
 
@@ -6053,6 +6278,7 @@ sleep 10"#
             env: HashMap::new(),
             incremental_history: true,
             force_rerun: false,
+            learned_selection: false,
             cancelled,
         };
 
@@ -6118,6 +6344,7 @@ sleep 10"#
             env: HashMap::new(),
             incremental_history: true,
             force_rerun: false,
+            learned_selection: false,
             cancelled: Arc::new(AtomicBool::new(false)),
         };
 
@@ -6188,6 +6415,7 @@ int main(void) {
             env: HashMap::new(),
             incremental_history: true,
             force_rerun: false,
+            learned_selection: false,
             cancelled: Arc::new(AtomicBool::new(false)),
         };
 
@@ -6258,6 +6486,7 @@ int main() {
             env: HashMap::new(),
             incremental_history: true,
             force_rerun: false,
+            learned_selection: false,
             cancelled: Arc::new(AtomicBool::new(false)),
         };
 
@@ -6315,6 +6544,7 @@ esac
             env: HashMap::new(),
             incremental_history: true,
             force_rerun: false,
+            learned_selection: false,
             cancelled: Arc::new(AtomicBool::new(false)),
         };
 
@@ -6370,6 +6600,7 @@ touch side_effect
             env: HashMap::new(),
             incremental_history: true,
             force_rerun: false,
+            learned_selection: false,
             cancelled: Arc::new(AtomicBool::new(false)),
         };
 
@@ -6457,6 +6688,7 @@ esac
             env,
             incremental_history: true,
             force_rerun: false,
+            learned_selection: false,
             cancelled: Arc::new(AtomicBool::new(false)),
         };
 
@@ -6514,6 +6746,7 @@ func second(c, d int) bool { return c == d }
             env: HashMap::new(),
             incremental_history: false,
             force_rerun: true,
+            learned_selection: false,
             cancelled: Arc::new(AtomicBool::new(false)),
         };
 
@@ -6594,6 +6827,7 @@ class Calc {
             env: HashMap::new(),
             incremental_history: true,
             force_rerun: false,
+            learned_selection: false,
             cancelled: Arc::new(AtomicBool::new(false)),
         };
 
@@ -6660,6 +6894,7 @@ mod tests {
             },
             incremental_history: true,
             force_rerun: false,
+            learned_selection: false,
             cancelled: Arc::new(AtomicBool::new(false)),
         };
 
@@ -6706,6 +6941,7 @@ mod tests {
             env: HashMap::new(),
             incremental_history: true,
             force_rerun: false,
+            learned_selection: false,
             cancelled: Arc::new(AtomicBool::new(false)),
         };
 
@@ -6754,6 +6990,7 @@ mod tests {
             env: HashMap::new(),
             incremental_history: true,
             force_rerun: false,
+            learned_selection: false,
             cancelled: Arc::new(AtomicBool::new(false)),
         };
 
@@ -6811,6 +7048,7 @@ mod tests {
             env: HashMap::new(),
             incremental_history: true,
             force_rerun: false,
+            learned_selection: false,
             cancelled: Arc::new(AtomicBool::new(false)),
         };
 
@@ -6881,6 +7119,7 @@ sleep 0.2
             env,
             incremental_history: true,
             force_rerun: false,
+            learned_selection: false,
             cancelled: Arc::new(AtomicBool::new(false)),
         };
 
@@ -6956,6 +7195,7 @@ sleep 0.2
             env: HashMap::new(),
             incremental_history: true,
             force_rerun: false,
+            learned_selection: false,
             cancelled: Arc::new(AtomicBool::new(false)),
         };
 
@@ -7045,6 +7285,7 @@ rmdir "$lock"
                 env,
                 incremental_history: true,
                 force_rerun: false,
+                learned_selection: false,
                 cancelled: Arc::new(AtomicBool::new(false)),
             };
 
@@ -7119,6 +7360,7 @@ rmdir "$lock"
             env: HashMap::new(),
             incremental_history: true,
             force_rerun: false,
+            learned_selection: false,
             cancelled: Arc::new(AtomicBool::new(false)),
         };
 
@@ -7192,6 +7434,7 @@ rmdir "$lock"
             env,
             incremental_history: true,
             force_rerun: false,
+            learned_selection: false,
             cancelled: Arc::new(AtomicBool::new(false)),
         };
 
@@ -7259,6 +7502,7 @@ rmdir "$lock"
             env: HashMap::new(),
             incremental_history: true,
             force_rerun: false,
+            learned_selection: false,
             cancelled: Arc::new(AtomicBool::new(false)),
         };
 
@@ -7306,6 +7550,7 @@ rmdir "$lock"
             env: HashMap::new(),
             incremental_history: true,
             force_rerun: false,
+            learned_selection: false,
             cancelled: Arc::new(AtomicBool::new(false)),
         };
 
@@ -7378,6 +7623,7 @@ while [ "$(find "{barrier}" -type f | wc -l)" -lt 4 ]; do sleep 0.1; done"#,
             env: HashMap::new(),
             incremental_history: true,
             force_rerun: false,
+            learned_selection: false,
             cancelled: Arc::new(AtomicBool::new(false)),
         };
 
@@ -7458,6 +7704,7 @@ exit 1"#
             env: HashMap::new(),
             incremental_history: true,
             force_rerun: false,
+            learned_selection: false,
             cancelled: Arc::new(AtomicBool::new(false)),
         };
 
@@ -7514,6 +7761,7 @@ exit 1"#
             env: HashMap::new(),
             incremental_history: true,
             force_rerun: false,
+            learned_selection: false,
             cancelled: Arc::new(AtomicBool::new(false)),
         };
 
@@ -7570,6 +7818,7 @@ exit 1"#
             env: HashMap::new(),
             incremental_history: true,
             force_rerun: false,
+            learned_selection: false,
             cancelled: Arc::new(AtomicBool::new(false)),
         };
 

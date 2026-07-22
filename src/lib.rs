@@ -5,6 +5,7 @@ pub mod config;
 pub mod coverage;
 pub mod diff;
 pub mod languages;
+pub mod learned;
 pub mod lock;
 pub mod mapper;
 pub mod mutator;
@@ -85,6 +86,12 @@ pub enum MutationResult {
     /// guaranteed survivors and carry no signal. Only produced when line
     /// coverage data is available for the mutated file and line.
     Uncovered,
+    /// The mutation shares a recorded killer test with an earlier mutant of
+    /// the same run and file (a learned subsumption cluster). It is not
+    /// executed: the canonical cluster member's verdict carries the signal.
+    /// Only produced when `--learned-selection` is enabled and incremental
+    /// history holds a matching `Killed` entry with a killer test.
+    Subsumed,
 }
 
 impl fmt::Display for MutationResult {
@@ -95,6 +102,7 @@ impl fmt::Display for MutationResult {
             MutationResult::Timeout => write!(f, "timeout"),
             MutationResult::BuildError => write!(f, "build error"),
             MutationResult::Uncovered => write!(f, "uncovered"),
+            MutationResult::Subsumed => write!(f, "subsumed"),
         }
     }
 }
@@ -170,12 +178,23 @@ impl MutationReport {
             .count()
     }
 
+    /// Mutants classified as [`MutationResult::Subsumed`] (learned selection).
+    /// Derived from `results` so it can never drift out of sync.
+    pub fn subsumed_count(&self) -> usize {
+        self.results
+            .iter()
+            .filter(|(_, result)| *result == MutationResult::Subsumed)
+            .count()
+    }
+
     /// Mutants actually executed against the test suite: everything except
-    /// build errors and coverage-suppressed (uncovered) mutants.
+    /// build errors, coverage-suppressed (uncovered), and learned-selection
+    /// (subsumed) mutants.
     pub fn tested_count(&self) -> usize {
         self.total
             .saturating_sub(self.build_errors)
             .saturating_sub(self.uncovered_count())
+            .saturating_sub(self.subsumed_count())
     }
 }
 
@@ -413,6 +432,7 @@ mod tests {
         assert_eq!(MutationResult::Timeout.to_string(), "timeout");
         assert_eq!(MutationResult::BuildError.to_string(), "build error");
         assert_eq!(MutationResult::Uncovered.to_string(), "uncovered");
+        assert_eq!(MutationResult::Subsumed.to_string(), "subsumed");
     }
 
     #[test]

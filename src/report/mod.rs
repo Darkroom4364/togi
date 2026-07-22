@@ -10,15 +10,17 @@ use std::collections::BTreeMap;
 use std::fmt::Write;
 use std::fs;
 
-/// Compute mutation score as a percentage, excluding build errors and
-/// coverage-suppressed (uncovered) mutants from the denominator.
+/// Compute mutation score as a percentage, excluding build errors,
+/// coverage-suppressed (uncovered), and learned-selection (subsumed) mutants
+/// from the denominator.
 pub fn mutation_score(report: &MutationReport) -> f64 {
     let tested = report.tested_count();
     if tested > 0 {
         (report.killed as f64 / tested as f64) * 100.0
-    } else if report.total == report.uncovered_count() {
+    } else if report.total == report.uncovered_count() + report.subsumed_count() {
         // Nothing was executed: either the report is empty or every mutant
-        // sat on a zero-coverage line. Vacuous pass, same as an empty report.
+        // sat on a zero-coverage line or was subsumed by a cluster sibling.
+        // Vacuous pass, same as an empty report.
         100.0
     } else {
         0.0
@@ -168,7 +170,8 @@ fn label_or_unknown(value: &str) -> String {
 }
 
 /// serde `skip_serializing_if` helper: omit zero counts so reports without
-/// coverage-suppressed mutants keep their previous shape byte-for-byte.
+/// coverage-suppressed or subsumed mutants keep their previous shape
+/// byte-for-byte.
 pub(crate) fn is_zero(value: &usize) -> bool {
     *value == 0
 }
@@ -223,6 +226,7 @@ pub fn format_pr_comment(report: &MutationReport, baseline_score: Option<f64>) -
     let score = mutation_score(report);
     let tested = report.tested_count();
     let uncovered = report.uncovered_count();
+    let subsumed = report.subsumed_count();
     let emoji = if report.survived == 0 && report.timeout == 0 && report.build_errors == 0 {
         "✓"
     } else if score >= 80.0 {
@@ -247,9 +251,14 @@ pub fn format_pr_comment(report: &MutationReport, baseline_score: Option<f64>) -
     } else {
         String::new()
     };
+    let subsumed_str = if subsumed > 0 {
+        format!(", {subsumed} subsumed")
+    } else {
+        String::new()
+    };
     writeln!(
         md,
-        "**{score:.1}%** mutation score{delta_str} — {}/{tested} killed, {} survived, {} timeout, {} build errors{uncovered_str} — {:.2}s",
+        "**{score:.1}%** mutation score{delta_str} — {}/{tested} killed, {} survived, {} timeout, {} build errors{uncovered_str}{subsumed_str} — {:.2}s",
         report.killed, report.survived, report.timeout, report.build_errors, report.duration.as_secs_f64()
     ).unwrap();
     if report.total < report.planned_total {
@@ -843,5 +852,37 @@ mod tests {
         let report = crate::test_helpers::sample_report();
         let md = format_pr_comment(&report, None);
         assert!(!md.contains("uncovered"), "got: {md}");
+    }
+
+    #[test]
+    fn mutation_score_excludes_subsumed_mutants() {
+        // 1 of 1 executed mutants killed + 2 subsumed → 100%, not 33%.
+        let report = uncovered_report(vec![
+            report_mutation(0, "src/a.rs", MutationResult::Killed),
+            report_mutation(1, "src/b.rs", MutationResult::Subsumed),
+            report_mutation(2, "src/b.rs", MutationResult::Subsumed),
+        ]);
+        assert_eq!(report.subsumed_count(), 2);
+        assert_eq!(report.tested_count(), 1);
+        assert_eq!(mutation_score(&report), 100.0);
+    }
+
+    #[test]
+    fn pr_comment_includes_subsumed_count_when_present() {
+        let report = uncovered_report(vec![
+            report_mutation(0, "src/a.rs", MutationResult::Killed),
+            report_mutation(1, "src/b.rs", MutationResult::Subsumed),
+        ]);
+        let md = format_pr_comment(&report, None);
+        assert!(md.contains("1 subsumed"), "got: {md}");
+        // Subsumed mutants are not failures and do not block the checkmark.
+        assert!(md.contains("✓"), "got: {md}");
+    }
+
+    #[test]
+    fn pr_comment_omits_subsumed_count_when_zero() {
+        let report = crate::test_helpers::sample_report();
+        let md = format_pr_comment(&report, None);
+        assert!(!md.contains("subsumed"), "got: {md}");
     }
 }
