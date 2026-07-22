@@ -1936,14 +1936,23 @@ fn record_incremental_history(
     selected_tests: &[String],
     result: MutationResult,
     previous_killer: Option<String>,
+    failing_tests: &[String],
 ) {
     let (Some(history), Some(query)) = (history, query) else {
         return;
     };
+    // Full-suite runs have no narrowed test list; fall back to failing tests
+    // attributed from the captured output so later runs learn a killer (#428).
+    let covering_tests: Vec<String> = if selected_tests.is_empty() {
+        failing_tests.to_vec()
+    } else {
+        selected_tests.to_vec()
+    };
     let killer_test = if result == MutationResult::Killed {
         previous_killer
-            .filter(|killer| selected_tests.iter().any(|test| test == killer))
+            .filter(|killer| covering_tests.iter().any(|test| test == killer))
             .or_else(|| (selected_tests.len() == 1).then(|| selected_tests[0].clone()))
+            .or_else(|| failing_tests.first().cloned())
     } else {
         None
     };
@@ -1954,9 +1963,45 @@ fn record_incremental_history(
         source_hash: query.source_hash,
         command_hash: query.command_hash,
         relevant_test_hash: query.relevant_test_hash,
-        covering_tests: selected_tests.to_vec(),
+        covering_tests,
         killer_test,
     });
+}
+
+/// Attribute failing test names from captured full-suite test output (#428).
+///
+/// Narrowed runs know their tests up front; full-suite runs only learn which
+/// test killed a mutant from the output. Supports the common formats:
+/// cargo test (`test path::to::test ... FAILED`), go test (`--- FAIL: Name`),
+/// pytest (`FAILED path::test - reason`), and unittest (`FAIL`/`ERROR:` lines).
+fn attribute_failing_tests(test_output: &str) -> Vec<String> {
+    let mut tests = Vec::new();
+    let mut push = |name: &str| {
+        if !name.is_empty() && !tests.iter().any(|test| test == name) {
+            tests.push(name.to_string());
+        }
+    };
+    for line in test_output.lines() {
+        if let Some(name) = line
+            .strip_prefix("test ")
+            .and_then(|rest| rest.strip_suffix(" ... FAILED"))
+        {
+            push(name);
+        } else if let Some(rest) = line.strip_prefix("--- FAIL: ") {
+            if let Some(name) = rest.split_whitespace().next() {
+                push(name);
+            }
+        } else if let Some(rest) = line
+            .strip_prefix("FAILED ")
+            .or_else(|| line.strip_prefix("FAIL: "))
+            .or_else(|| line.strip_prefix("ERROR: "))
+        {
+            if let Some(name) = rest.split_whitespace().next() {
+                push(name);
+            }
+        }
+    }
+    tests
 }
 
 struct PreparedMutationRun {
@@ -2045,7 +2090,7 @@ impl PreparedMutationRun {
         }
         if let Some(ref key) = self.cache_key {
             if let Some(result) = cache::lookup(project_root, key) {
-                self.record_history(history, result);
+                self.record_history(history, result, None);
                 return Some(result);
             }
         }
@@ -2054,7 +2099,7 @@ impl PreparedMutationRun {
                 if let Some(ref key) = self.cache_key {
                     cache::store(project_root, key, result);
                 }
-                self.record_history(Some(history), result);
+                self.record_history(Some(history), result, None);
                 return Some(result);
             }
         }
@@ -2071,13 +2116,20 @@ impl PreparedMutationRun {
         &self,
         history: Option<&cache::IncrementalHistoryStore>,
         result: MutationResult,
+        test_output: Option<&str>,
     ) {
+        let failing_tests = if result == MutationResult::Killed {
+            test_output.map(attribute_failing_tests).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         record_incremental_history(
             history,
             self.history_query.as_ref(),
             &self.selected_test.selected_tests,
             result,
             self.previous_killer.clone(),
+            &failing_tests,
         );
     }
 }
@@ -2160,7 +2212,7 @@ fn run_queued_mutation(
             prepared.selected_test.timeout,
             &workspace_root,
             workspace_target,
-            shared.show_output,
+            shared.show_output || shared.history.is_some(),
             shared.env,
             shared.cancelled,
         )
@@ -2176,7 +2228,11 @@ fn run_queued_mutation(
     }
 
     prepared.store_cache(shared.project_root, outcome.result);
-    prepared.record_history(shared.history, outcome.result);
+    prepared.record_history(
+        shared.history,
+        outcome.result,
+        outcome.test_output.as_deref(),
+    );
 
     let result = outcome.result;
     record_progress(
@@ -2837,7 +2893,11 @@ impl TestRunner {
             if cacheable {
                 prepared.store_cache(&self.project_root, outcome.result);
             }
-            prepared.record_history(history.as_ref(), outcome.result);
+            prepared.record_history(
+                history.as_ref(),
+                outcome.result,
+                outcome.test_output.as_deref(),
+            );
             if self.verbose {
                 let symbol = match outcome.result {
                     MutationResult::Killed => "✓ killed",
@@ -3055,7 +3115,7 @@ fn run_schema_workspace_mutation(
         &runner.commands.sandbox_command,
         workspace_root,
         timeout,
-        runner.show_output,
+        runner.show_output || runner.incremental_history,
         env,
         &runner.cancelled,
     )
@@ -5250,6 +5310,120 @@ mod tests {
         };
         let report = runner.run(vec![mutation]).report;
         assert_eq!(report.results[0].1, MutationResult::Killed);
+        Ok(())
+    }
+
+    #[test]
+    fn attribute_failing_tests_parses_cargo_output() {
+        let output = "running 3 tests\n\
+                      test my::passing::test ... ok\n\
+                      test my::failing::test ... FAILED\n\
+                      \n\
+                      failures:\n\
+                      \n\
+                      ---- my::failing::test stdout ----\n\
+                      boom\n\
+                      \n\
+                      failures:\n\
+                      \x20   my::failing::test\n\
+                      \n\
+                      test result: FAILED. 2 passed; 1 failed; 0 ignored;\n";
+        assert_eq!(
+            attribute_failing_tests(output),
+            vec!["my::failing::test".to_string()]
+        );
+    }
+
+    #[test]
+    fn attribute_failing_tests_parses_go_output() {
+        let output = "=== RUN   TestAdd\n\
+                      --- FAIL: TestAdd (0.00s)\n\
+                      \x20   calc_test.go:12: want 5, got 4\n\
+                      --- FAIL: TestSub/fast (0.00s)\n\
+                      FAIL\n\
+                      FAIL\texample.com/calc\t0.01s\n";
+        assert_eq!(
+            attribute_failing_tests(output),
+            vec!["TestAdd".to_string(), "TestSub/fast".to_string()]
+        );
+    }
+
+    #[test]
+    fn attribute_failing_tests_parses_pytest_and_unittest_output() {
+        let pytest = "tests/test_calc.py::test_add FAILED [ 50%]\n\
+                      FAILED tests/test_calc.py::test_sub - assert 1 == 2\n";
+        assert_eq!(
+            attribute_failing_tests(pytest),
+            vec!["tests/test_calc.py::test_sub".to_string()]
+        );
+
+        let unittest = "FAIL: test_discount (test_calc.TestCalc)\n\
+                        ERROR: test_parse (test_calc.TestCalc)\n";
+        assert_eq!(
+            attribute_failing_tests(unittest),
+            vec!["test_discount".to_string(), "test_parse".to_string()]
+        );
+    }
+
+    #[test]
+    fn attribute_failing_tests_ignores_noise_and_empty_output() {
+        assert!(attribute_failing_tests("").is_empty());
+        assert!(attribute_failing_tests("all tests passed\nok  \texample.com/calc\n").is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn full_suite_kill_records_killer_test_from_output() -> anyhow::Result<()> {
+        let (dir, _file, mutation) = make_test_setup();
+        let script = "echo 'running 2 tests'\n\
+                      echo 'test my::passing::test ... ok'\n\
+                      echo 'test my::failing::test ... FAILED'\n\
+                      echo 'failures:'\n\
+                      echo '    my::failing::test'\n\
+                      echo 'test result: FAILED. 1 passed; 1 failed;'\n\
+                      exit 1\n";
+        let commands = CommandConfig {
+            command: vec!["sh".into(), "-c".into(), script.into()],
+            force_default_command: false,
+            force_default_timeout: false,
+            project_commands: vec![],
+            language_commands: HashMap::new(),
+            build_command: vec![],
+            sandbox_command: vec![],
+            build_command_explicit: false,
+            timeout: Duration::from_secs(5),
+            language_timeouts: HashMap::new(),
+            test_selection: None,
+        };
+        let runner = TestRunner {
+            commands,
+            parallelism: 1,
+            project_root: dir.path().to_path_buf(),
+            verbose: false,
+            show_output: false,
+            max_tested: None,
+            early_stop: Default::default(),
+            respect_workspace_ignores: true,
+            env: HashMap::new(),
+            incremental_history: true,
+            force_rerun: true,
+            learned_selection: false,
+            cancelled: Arc::new(AtomicBool::new(false)),
+        };
+
+        let report = runner.run(vec![mutation]).report;
+        assert_eq!(report.results[0].1, MutationResult::Killed);
+
+        // Even without --show-output, history is active, so the failing test
+        // was captured from output and recorded as the killer (#428).
+        let data = std::fs::read_to_string(dir.path().join(".togi-cache/history.json"))?;
+        let history: serde_json::Value = serde_json::from_str(&data)?;
+        let entry = &history["entries"][0];
+        assert_eq!(entry["killer_test"], "my::failing::test");
+        assert_eq!(
+            entry["covering_tests"],
+            serde_json::json!(["my::failing::test"])
+        );
         Ok(())
     }
 
