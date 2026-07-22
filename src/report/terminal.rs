@@ -118,18 +118,8 @@ fn format_report(report: &MutationReport, color: bool) -> String {
 
     let separator = "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━";
     writeln!(out, "{separator}").unwrap();
-    let uncovered = report.uncovered_count();
-    let uncovered_str = if uncovered > 0 {
-        format!(", {uncovered} uncovered")
-    } else {
-        String::new()
-    };
-    let subsumed = report.subsumed_count();
-    let subsumed_str = if subsumed > 0 {
-        format!(", {subsumed} subsumed")
-    } else {
-        String::new()
-    };
+    let uncovered_str = count_suffix(report.uncovered_count(), "uncovered");
+    let subsumed_str = count_suffix(report.subsumed_count(), "subsumed");
     writeln!(
         out,
         "Results: {} killed, {} survived, {} timeout, {} build errors{uncovered_str}{subsumed_str}",
@@ -196,6 +186,15 @@ fn format_report(report: &MutationReport, color: bool) -> String {
     }
 
     out
+}
+
+/// ", N label" suffix for summary lines, empty when the count is zero.
+fn count_suffix(count: usize, label: &str) -> String {
+    if count > 0 {
+        format!(", {count} {label}")
+    } else {
+        String::new()
+    }
 }
 
 fn format_build_error_groups(report: &MutationReport) -> String {
