@@ -225,8 +225,11 @@ fn polyglot_demo_routes_mutations_to_each_language_test_suite() {
         .lines()
         .find(|line| line.starts_with("Results: "))
         .expect("polyglot demo should print a result summary");
+    let has_clean_results = ["0 timeout", "0 build errors"]
+        .into_iter()
+        .all(|expected| results_line.split(", ").any(|field| field == expected));
     assert!(
-        results_line.ends_with(", 0 timeout, 0 build errors"),
+        has_clean_results,
         "polyglot demo reported a timeout or build error\nstdout:\n{stdout}"
     );
 }
