@@ -221,8 +221,12 @@ fn polyglot_demo_routes_mutations_to_each_language_test_suite() {
             "polyglot demo did not route {expected} to its language test suite\nstdout:\n{stdout}"
         );
     }
+    let results_line = stdout
+        .lines()
+        .find(|line| line.starts_with("Results: "))
+        .expect("polyglot demo should print a result summary");
     assert!(
-        stdout.contains("0 timeout, 0 build errors"),
+        results_line.ends_with(", 0 timeout, 0 build errors"),
         "polyglot demo reported a timeout or build error\nstdout:\n{stdout}"
     );
 }
