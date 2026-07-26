@@ -1,0 +1,10 @@
+[test]
+command = ["cargo", "test"]
+timeout = 30
+jobs = 1
+
+[test.languages.go]
+command = ["go", "test", "./..."]
+
+[test.languages.python]
+command = ["python3", "-m", "unittest"]

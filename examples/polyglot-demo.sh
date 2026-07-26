@@ -28,6 +28,8 @@ cp -r "$FIXTURE"/* "$WORK/"
 cd "$WORK"
 
 git init -q
+git config user.email "togi-demo@example.invalid"
+git config user.name "togi demo"
 git commit --allow-empty -q -m "empty"
 git add -A
 git commit -q -m "add calc helpers in go, rust, and python"
