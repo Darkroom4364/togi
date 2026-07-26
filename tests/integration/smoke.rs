@@ -214,10 +214,15 @@ fn polyglot_demo_routes_mutations_to_each_language_test_suite() {
     for expected in [
         "✓ KILLED      calc.go:5 — zero_to_one",
         "✓ KILLED      calc.py:2 — increment_numeric",
+        "✓ KILLED      src/lib.rs:2 — negate_condition",
     ] {
         assert!(
             stdout.contains(expected),
             "polyglot demo did not route {expected} to its language test suite\nstdout:\n{stdout}"
         );
     }
+    assert!(
+        stdout.contains("0 timeout, 0 build errors"),
+        "polyglot demo reported a timeout or build error\nstdout:\n{stdout}"
+    );
 }
