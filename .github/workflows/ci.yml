@@ -125,6 +125,12 @@ jobs:
       - uses: actions/setup-go@v7
         with:
           go-version: stable
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24.14.1
+      - uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: 8.0.x
       - name: Integration tests
         run: cargo test --locked -- --ignored
 
