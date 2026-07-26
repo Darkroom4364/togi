@@ -2372,7 +2372,12 @@ impl TestRunner {
         let (mutations, subsumed) = self.split_subsumed(mutations);
         let planned_total = mutations.len();
         let early_stop = EarlyStopState::for_config(self.early_stop.clone(), planned_total);
-        let mut outcome = self.run_regular_with_state(mutations, early_stop, planned_total);
+        let mut outcome = self.run_regular_with_state(
+            mutations,
+            early_stop,
+            planned_total,
+            Arc::new(AtomicUsize::new(0)),
+        );
         merge_subsumed(&mut outcome.report, subsumed);
         outcome
     }
@@ -2435,6 +2440,7 @@ impl TestRunner {
         }
         let planned_total = mutations.len();
         let early_stop = EarlyStopState::for_config(self.early_stop.clone(), planned_total);
+        let tested_counter = Arc::new(AtomicUsize::new(0));
 
         let index_by_id: HashMap<u32, usize> = mutations
             .iter()
@@ -2466,8 +2472,12 @@ impl TestRunner {
         }
 
         if schema_by_language.is_empty() {
-            let mut outcome =
-                self.run_regular_with_state(fallback_mutations, early_stop, planned_total);
+            let mut outcome = self.run_regular_with_state(
+                fallback_mutations,
+                early_stop,
+                planned_total,
+                tested_counter,
+            );
             outcome.report.schemata = Some(schemata_summary.into_report());
             return outcome;
         }
@@ -2478,7 +2488,12 @@ impl TestRunner {
                 break;
             }
             let mutation_count = schema_mutations.len();
-            match self.run_schema_mutations(&language, &schema_mutations, early_stop.clone()) {
+            match self.run_schema_mutations(
+                &language,
+                &schema_mutations,
+                early_stop.clone(),
+                tested_counter.clone(),
+            ) {
                 Ok((records, demoted)) => {
                     schemata_summary.fast_path += records.len();
                     all_records.extend(records);
@@ -2503,8 +2518,12 @@ impl TestRunner {
             && !fallback_mutations.is_empty()
             && !should_stop_early(&early_stop)
         {
-            let fallback =
-                self.run_regular_with_state(fallback_mutations, early_stop.clone(), planned_total);
+            let fallback = self.run_regular_with_state(
+                fallback_mutations,
+                early_stop.clone(),
+                planned_total,
+                tested_counter,
+            );
             all_records.extend(records_from_report(fallback.report));
         }
 
@@ -2530,6 +2549,7 @@ impl TestRunner {
         mutations: Vec<Mutation>,
         early_stop: Option<Arc<EarlyStopState>>,
         planned_total: usize,
+        tested_counter: Arc<AtomicUsize>,
     ) -> RunOutcome {
         let start = Instant::now();
         let total = mutations.len();
@@ -2551,7 +2571,6 @@ impl TestRunner {
         }
 
         let counter = Arc::new(AtomicUsize::new(0));
-        let tested_counter = Arc::new(AtomicUsize::new(0));
         let verbose = self.verbose;
         let is_tty = std::io::stderr().is_terminal();
         let workspace_slots = workspace_pool_slot_count(self.parallelism, total);
@@ -2720,19 +2739,27 @@ impl TestRunner {
         language: &str,
         schema_mutations: &[crate::schemata::SchemaMutation],
         early_stop: Option<Arc<EarlyStopState>>,
+        tested_counter: Arc<AtomicUsize>,
     ) -> Result<(Vec<MutationRunRecord>, Vec<Mutation>), crate::schemata::SchemaRewriteError> {
-        let rewrites = match language {
-            "c" => crate::schemata::rewrite_c_files(&self.project_root, schema_mutations)?,
-            "cpp" => crate::schemata::rewrite_cpp_files(&self.project_root, schema_mutations)?,
-            "go" => crate::schemata::rewrite_go_files(&self.project_root, schema_mutations)?,
-            "java" => crate::schemata::rewrite_java_files(&self.project_root, schema_mutations)?,
-            "rust" => crate::schemata::rewrite_rust_files(&self.project_root, schema_mutations)?,
-            _ => {
-                return Err(crate::schemata::SchemaRewriteError::new(format!(
-                    "{language} schemata execution is not available"
-                )));
-            }
-        };
+        self.run_schema_mutations_inner(
+            language,
+            schema_mutations,
+            early_stop,
+            tested_counter,
+            true,
+        )
+    }
+
+    fn run_schema_mutations_inner(
+        &self,
+        language: &str,
+        schema_mutations: &[crate::schemata::SchemaMutation],
+        early_stop: Option<Arc<EarlyStopState>>,
+        tested_counter: Arc<AtomicUsize>,
+        allow_build_bisection: bool,
+    ) -> Result<(Vec<MutationRunRecord>, Vec<Mutation>), crate::schemata::SchemaRewriteError> {
+        let rewrites =
+            schema_rewrites_for_language(&self.project_root, language, schema_mutations)?;
         let workspace =
             copy_workspace_with_options(&self.project_root, self.respect_workspace_ignores)
                 .map_err(|e| {
@@ -2742,7 +2769,6 @@ impl TestRunner {
                 })?;
 
         let mut results = Vec::with_capacity(schema_mutations.len());
-        let tested_counter = Arc::new(AtomicUsize::new(0));
         let source_contents = SourceContentCache::default();
         let cache_context_hash = cache_context_fingerprint(&self.project_root);
         let test_context_index = TestContextIndex::build(&self.project_root);
@@ -2752,9 +2778,6 @@ impl TestRunner {
         let mut workspace_needs_reset = false;
         let mut demoted = Vec::new();
         for (position, schema_mutation) in schema_mutations.iter().enumerate() {
-            if self.cancelled.load(Ordering::Acquire) || should_stop_early(&early_stop) {
-                break;
-            }
             if self.cancelled.load(Ordering::Acquire) || should_stop_early(&early_stop) {
                 break;
             }
@@ -2856,11 +2879,8 @@ impl TestRunner {
                     .as_ref()
                     .is_some_and(|detail| detail.phase == "schema_build")
             {
-                // The shared schema rewrite no longer compiles: every remaining
-                // mutant would fail the same build. Demote the rest to regular
-                // individual runs so they still get real verdicts (#412).
                 reservation.release();
-                let remaining = schema_mutations.len() - position;
+                let remaining = &schema_mutations[position..];
                 let error_line = outcome
                     .build_error_detail
                     .as_ref()
@@ -2872,14 +2892,71 @@ impl TestRunner {
                             .map(str::to_owned)
                     })
                     .unwrap_or_else(|| "no compiler diagnostic captured".into());
-                eprintln!(
-                    "warning: schema build failed ({error_line}) — demoting {remaining} {language} mutants to regular runs"
-                );
-                demoted.extend(
-                    schema_mutations[position..]
-                        .iter()
-                        .map(|schema_mutation| schema_mutation.mutation.clone()),
-                );
+
+                if allow_build_bisection {
+                    match self.bisect_schema_build_batch(language, remaining) {
+                        Ok((salvaged_batches, newly_demoted)) => {
+                            let salvaged_count: usize =
+                                salvaged_batches.iter().map(|batch| batch.len()).sum();
+                            let demoted_count = newly_demoted.len();
+                            eprintln!(
+                                "warning: schema build failed ({error_line}) — salvaging {salvaged_count} {language} mutants in smaller schema batches and demoting {demoted_count} to regular runs"
+                            );
+
+                            for batch in salvaged_batches {
+                                if self.cancelled.load(Ordering::Acquire)
+                                    || should_stop_early(&early_stop)
+                                {
+                                    break;
+                                }
+                                match self.run_schema_mutations_inner(
+                                    language,
+                                    &batch,
+                                    early_stop.clone(),
+                                    tested_counter.clone(),
+                                    false,
+                                ) {
+                                    Ok((batch_records, batch_demoted)) => {
+                                        results.extend(batch_records);
+                                        demoted.extend(batch_demoted);
+                                    }
+                                    Err(err) => {
+                                        eprintln!(
+                                            "warning: could not run salvaged {language} schema batch: {err} — falling back"
+                                        );
+                                        demoted.extend(
+                                            batch
+                                                .into_iter()
+                                                .map(|schema_mutation| schema_mutation.mutation),
+                                        );
+                                    }
+                                }
+                            }
+                            demoted.extend(newly_demoted);
+                        }
+                        Err(err) => {
+                            eprintln!(
+                                "warning: schema build failed ({error_line}) — could not bisect {language} schema batch: {err}; demoting {} mutants to regular runs",
+                                remaining.len()
+                            );
+                            demoted.extend(
+                                remaining
+                                    .iter()
+                                    .map(|schema_mutation| schema_mutation.mutation.clone()),
+                            );
+                        }
+                    }
+                } else {
+                    eprintln!(
+                        "warning: schema build failed ({error_line}) — demoting {} {language} mutants to regular runs",
+                        remaining.len()
+                    );
+                    demoted.extend(
+                        remaining
+                            .iter()
+                            .map(|schema_mutation| schema_mutation.mutation.clone()),
+                    );
+                }
                 break;
             }
             if outcome.result == MutationResult::BuildError {
@@ -2938,6 +3015,102 @@ impl TestRunner {
         }
 
         Ok((results, demoted))
+    }
+
+    fn bisect_schema_build_batch(
+        &self,
+        language: &str,
+        schema_mutations: &[crate::schemata::SchemaMutation],
+    ) -> Result<
+        (Vec<Vec<crate::schemata::SchemaMutation>>, Vec<Mutation>),
+        crate::schemata::SchemaRewriteError,
+    > {
+        let workspace =
+            copy_workspace_with_options(&self.project_root, self.respect_workspace_ignores)
+                .map_err(|e| {
+                    crate::schemata::SchemaRewriteError::new(format!(
+                        "could not create schema bisection workspace: {e}"
+                    ))
+                })?;
+        let mut salvaged_batches = Vec::new();
+        let mut demoted = Vec::new();
+        self.partition_schema_build_batch(
+            language,
+            schema_mutations,
+            &workspace,
+            &mut salvaged_batches,
+            &mut demoted,
+        )?;
+        Ok((salvaged_batches, demoted))
+    }
+
+    fn partition_schema_build_batch(
+        &self,
+        language: &str,
+        schema_mutations: &[crate::schemata::SchemaMutation],
+        workspace: &WorkspaceCopy,
+        salvaged_batches: &mut Vec<Vec<crate::schemata::SchemaMutation>>,
+        demoted: &mut Vec<Mutation>,
+    ) -> Result<(), crate::schemata::SchemaRewriteError> {
+        if self.cancelled.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        if schema_mutations.len() == 1 {
+            demoted.push(schema_mutations[0].mutation.clone());
+            return Ok(());
+        }
+
+        let (left, right) = schema_mutations.split_at(schema_mutations.len() / 2);
+        for batch in [left, right] {
+            if self.cancelled.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            match self.schema_batch_builds(language, batch, workspace)? {
+                Some(true) => salvaged_batches.push(batch.to_vec()),
+                Some(false) => self.partition_schema_build_batch(
+                    language,
+                    batch,
+                    workspace,
+                    salvaged_batches,
+                    demoted,
+                )?,
+                None => return Ok(()),
+            }
+        }
+        Ok(())
+    }
+
+    fn schema_batch_builds(
+        &self,
+        language: &str,
+        schema_mutations: &[crate::schemata::SchemaMutation],
+        workspace: &WorkspaceCopy,
+    ) -> Result<Option<bool>, crate::schemata::SchemaRewriteError> {
+        workspace
+            .reset(&self.project_root, self.respect_workspace_ignores)
+            .map_err(|e| {
+                crate::schemata::SchemaRewriteError::new(format!(
+                    "could not reset schema bisection workspace {}: {e}",
+                    workspace.root().display()
+                ))
+            })?;
+        let rewrites =
+            schema_rewrites_for_language(&self.project_root, language, schema_mutations)?;
+        apply_schema_rewrites_to_workspace(&self.project_root, workspace.root(), &rewrites)?;
+
+        let build = run_command(
+            &self.commands.build_command,
+            &self.commands.sandbox_command,
+            workspace.root(),
+            self.commands.timeout,
+            true,
+            &self.env,
+            &self.cancelled,
+        );
+        if build.cancelled {
+            return Ok(None);
+        }
+        Ok(Some(build.result == MutationResult::Survived))
     }
 
     fn outcome_from_records(
@@ -3030,6 +3203,23 @@ impl TestRunner {
             timeout: timeout_count,
             build_errors,
         }
+    }
+}
+
+fn schema_rewrites_for_language(
+    project_root: &Path,
+    language: &str,
+    schema_mutations: &[crate::schemata::SchemaMutation],
+) -> Result<Vec<crate::schemata::SchemaFileRewrite>, crate::schemata::SchemaRewriteError> {
+    match language {
+        "c" => crate::schemata::rewrite_c_files(project_root, schema_mutations),
+        "cpp" => crate::schemata::rewrite_cpp_files(project_root, schema_mutations),
+        "go" => crate::schemata::rewrite_go_files(project_root, schema_mutations),
+        "java" => crate::schemata::rewrite_java_files(project_root, schema_mutations),
+        "rust" => crate::schemata::rewrite_rust_files(project_root, schema_mutations),
+        _ => Err(crate::schemata::SchemaRewriteError::new(format!(
+            "{language} schemata execution is not available"
+        ))),
     }
 }
 
@@ -6938,6 +7128,67 @@ func second(c, d int) bool { return c == d }
                 .fallback_reasons
                 .iter()
                 .any(|reason| reason.reason == "schema_build_failure" && reason.count == 2)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_with_schemata_salvages_compatible_batches_after_schema_build_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = "\
+package calc
+func first(a, b int) bool { return a == b }
+func second(c, d int) bool { return c == d }
+";
+        std::fs::write(dir.path().join("calc.go"), source).unwrap();
+        let first = go_operator_mutation(0, "calc.go", source, 0);
+        let second = go_operator_mutation(1, "calc.go", source, 1);
+        // The wrapper for mutation 1 is incompatible with this build, but the
+        // first mutation's schema batch compiles and should keep the fast path.
+        let build = r#"if grep -rq '__togi_active("1")' .; then exit 1; fi"#;
+        let commands = CommandConfig {
+            command: vec!["sh".into(), "-c".into(), "exit 1".into()],
+            force_default_command: false,
+            force_default_timeout: false,
+            project_commands: vec![],
+            language_commands: HashMap::new(),
+            build_command: vec!["sh".into(), "-c".into(), build.into()],
+            sandbox_command: vec![],
+            build_command_explicit: true,
+            timeout: Duration::from_secs(5),
+            language_timeouts: HashMap::new(),
+            test_selection: None,
+        };
+        let runner = TestRunner {
+            commands,
+            parallelism: 1,
+            project_root: dir.path().to_path_buf(),
+            verbose: false,
+            show_output: false,
+            max_tested: Some(1),
+            early_stop: Default::default(),
+            respect_workspace_ignores: true,
+            env: HashMap::new(),
+            incremental_history: false,
+            force_rerun: true,
+            learned_selection: false,
+            cancelled: Arc::new(AtomicBool::new(false)),
+        };
+
+        let report = runner.run_with_schemata(vec![first, second]).report;
+
+        // The salvaged schema run consumes the shared cap, so the demoted
+        // mutation must not enter a separate regular-run budget.
+        assert_eq!(report.total, 1);
+        assert_eq!(report.killed, 1);
+        assert_eq!(report.build_errors, 0);
+        let schemata = report.schemata.expect("schemata summary");
+        assert_eq!(schemata.fast_path, 1);
+        assert!(
+            schemata
+                .fallback_reasons
+                .iter()
+                .any(|reason| reason.reason == "schema_build_failure" && reason.count == 1)
         );
     }
 
