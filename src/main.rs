@@ -13,9 +13,6 @@ use togi::{BaselineTiming, ChangedFile, Mutation};
 struct ExecuteOptions {
     verbose: bool,
     show_output: bool,
-    build_command_explicit: bool,
-    force_default_command: bool,
-    force_default_timeout: bool,
     early_stop: togi::runner::EarlyStopConfig,
     env: HashMap<String, String>,
     force_rerun: bool,
@@ -329,44 +326,82 @@ fn run_check(cfg: togi::cli::CheckArgs, cancelled: Arc<AtomicBool>) -> anyhow::R
         return Ok(());
     }
 
-    let baseline_timing = if config.test.calibrate_timeout && !classified.to_run.is_empty() {
-        eprintln!("Measuring baseline test runtime...");
-        let measurement = togi::runner::measure_baseline_timing(
+    let baseline_mutations = classified
+        .to_run
+        .iter()
+        .chain(&classified.uncovered)
+        .cloned()
+        .collect::<Vec<_>>();
+    let (baseline_timing, commands) = if baseline_mutations.is_empty() {
+        (None, None)
+    } else {
+        let mut commands = command_config(
+            &config,
             &project_root,
-            togi::runner::BaselineTimingConfig {
-                test_command: &config.test.command,
-                build_command: &config.test.build_command,
-                sandbox_command: &config.test.sandbox_command,
-                build_command_explicit: has_explicit_build_cmd,
-                timeout: baseline_measurement_timeout(config.test.timeout),
+            has_explicit_build_cmd,
+            has_custom_test_cmd,
+            has_cli_timeout,
+        );
+        if config.test.calibrate_timeout {
+            eprintln!("Measuring baseline test runtime...");
+        } else {
+            eprintln!("Checking baseline test suites...");
+        }
+        let measurement = match togi::runner::check_baseline_health(
+            &project_root,
+            &baseline_mutations,
+            togi::runner::BaselineHealthConfig {
+                commands: &commands,
+                default_measurement_timeout: config
+                    .test
+                    .calibrate_timeout
+                    .then(|| baseline_measurement_timeout(config.test.timeout)),
+                schemata_enabled: config.mutations.schemata,
                 env: &profile_env,
                 cancelled: &cancelled,
                 respect_workspace_ignores: config.mutations.respect_workspace_ignores,
             },
-        )?;
-        let timeout_secs = calibrated_timeout_seconds(
-            measurement.build_duration,
-            measurement.test_duration,
-            config.test.timeout_multiplier,
-            config.test.timeout_slack,
-        );
-        config.test.timeout = timeout_secs;
-        let timing = BaselineTiming {
-            build_command: if has_explicit_build_cmd {
-                config.test.build_command.clone()
-            } else {
-                vec![]
-            },
-            build_duration: measurement.build_duration,
-            test_command: config.test.command.clone(),
-            test_duration: measurement.test_duration,
-            calibrated_timeout: Duration::from_secs(timeout_secs),
+        ) {
+            Ok(measurement) => measurement,
+            Err(_) if cancelled.load(Ordering::Acquire) => exit_with(_lock, 130),
+            Err(error) => return Err(error),
         };
-        eprintln!("{}", baseline_timing_summary(&timing));
-        Some(timing)
-    } else {
-        None
+        let baseline_timing = if config.test.calibrate_timeout {
+            if let Some(measurement) = calibration_measurement(&measurement) {
+                let timeout_secs = calibrated_timeout_seconds(
+                    measurement.build_duration,
+                    measurement.test_duration,
+                    config.test.timeout_multiplier,
+                    config.test.timeout_slack,
+                );
+                config.test.timeout = timeout_secs;
+                commands.timeout = Duration::from_secs(timeout_secs);
+                let timing = BaselineTiming {
+                    build_command: if has_explicit_build_cmd {
+                        config.test.build_command.clone()
+                    } else {
+                        vec![]
+                    },
+                    build_duration: measurement.build_duration,
+                    test_command: measurement.test_command.clone(),
+                    test_duration: measurement.test_duration,
+                    calibrated_timeout: Duration::from_secs(timeout_secs),
+                };
+                eprintln!("{}", baseline_timing_summary(&timing));
+                Some(timing)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        (baseline_timing, Some(commands))
     };
+
+    if cancelled.load(Ordering::Acquire) {
+        eprintln!("Interrupted; skipping mutation report and side effects.");
+        exit_with(_lock, 130);
+    }
 
     let project_root_ref = project_root.clone();
     let (mut report, run_cancelled) = if classified.to_run.is_empty() {
@@ -377,30 +412,28 @@ fn run_check(cfg: togi::cli::CheckArgs, cancelled: Arc<AtomicBool>) -> anyhow::R
         let outcome = execute(
             classified.to_run,
             config,
+            commands.expect("baseline commands should exist for scheduled mutations"),
             project_root,
             ExecuteOptions {
                 verbose,
                 show_output,
-                build_command_explicit: has_explicit_build_cmd,
-                force_default_command: has_custom_test_cmd,
-                force_default_timeout: has_cli_timeout,
                 early_stop,
                 env: profile_env,
                 force_rerun,
                 learned_selection,
-                cancelled,
+                cancelled: cancelled.clone(),
             },
         );
         (outcome.report, outcome.cancelled)
     };
+    if run_cancelled || cancelled.load(Ordering::Acquire) {
+        eprintln!("Interrupted; skipping mutation report and side effects.");
+        exit_with(_lock, 130);
+    }
+
     report.baseline_timing = baseline_timing;
     merge_uncovered(&mut report, classified.uncovered);
     togi::report::print_report(&report, output_format)?;
-
-    if run_cancelled {
-        eprintln!("Interrupted; skipping baseline and PR comment updates.");
-        exit_with(_lock, 130);
-    }
 
     let current = togi::baseline::from_report(&report, &project_root_ref);
     let mut should_fail = false;
@@ -855,6 +888,21 @@ fn validate_timeout_calibration(multiplier: f64) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn calibration_measurement(
+    measurement: &togi::runner::BaselineHealthMeasurement,
+) -> Option<&togi::runner::BaselineSuiteMeasurement> {
+    measurement
+        .suites
+        .iter()
+        .filter(|suite| suite.uses_default_timeout)
+        .max_by_key(|suite| {
+            suite
+                .build_duration
+                .filter(|duration| *duration > suite.test_duration)
+                .unwrap_or(suite.test_duration)
+        })
+}
+
 fn calibrated_timeout_seconds(
     build_duration: Option<Duration>,
     test_duration: Duration,
@@ -1183,61 +1231,79 @@ fn print_dry_run(mutations: &[Mutation]) {
     }
 }
 
-fn execute(
-    mutations: Vec<Mutation>,
-    config: togi::config::Config,
-    project_root: PathBuf,
-    options: ExecuteOptions,
-) -> togi::runner::RunOutcome {
-    let mut language_commands: std::collections::HashMap<String, Vec<String>> =
-        std::collections::HashMap::new();
-    let mut language_timeouts: std::collections::HashMap<String, Duration> =
-        std::collections::HashMap::new();
-    for (lang, lang_config) in config.test.languages {
-        language_commands.insert(lang.clone(), lang_config.command);
-        if let Some(t) = lang_config.timeout {
-            language_timeouts.insert(lang, Duration::from_secs(t));
-        }
-    }
+fn command_config(
+    config: &togi::config::Config,
+    project_root: &Path,
+    build_command_explicit: bool,
+    force_default_command: bool,
+    force_default_timeout: bool,
+) -> togi::runner::CommandConfig {
+    let language_commands = config
+        .test
+        .languages
+        .iter()
+        .map(|(language, language_config)| (language.clone(), language_config.command.clone()))
+        .collect();
+    let language_timeouts = config
+        .test
+        .languages
+        .iter()
+        .filter_map(|(language, language_config)| {
+            language_config
+                .timeout
+                .map(|timeout| (language.clone(), Duration::from_secs(timeout)))
+        })
+        .collect();
     let project_commands = config
         .projects
-        .into_values()
+        .values()
         .map(|project| {
             let (command, timeout) = project
                 .test
-                .map(|test| (test.command, test.timeout))
+                .as_ref()
+                .map(|test| (test.command.clone(), test.timeout))
                 .unwrap_or((None, None));
             togi::runner::ProjectCommandConfig {
-                path: project.path,
+                path: project.path.clone(),
                 command,
                 timeout: timeout.map(Duration::from_secs),
             }
         })
         .collect();
-    let test_selection = load_test_selection(
-        config.mutations.test_selection_file.as_deref(),
-        &project_root,
-    );
+
+    togi::runner::CommandConfig {
+        command: config.test.command.clone(),
+        sandbox_command: config.test.sandbox_command.clone(),
+        force_default_command,
+        force_default_timeout,
+        project_commands,
+        language_commands,
+        build_command: if build_command_explicit {
+            config.test.build_command.clone()
+        } else {
+            vec![]
+        },
+        build_command_explicit,
+        timeout: Duration::from_secs(config.test.timeout),
+        language_timeouts,
+        test_selection: load_test_selection(
+            config.mutations.test_selection_file.as_deref(),
+            project_root,
+        ),
+    }
+}
+
+fn execute(
+    mutations: Vec<Mutation>,
+    config: togi::config::Config,
+    commands: togi::runner::CommandConfig,
+    project_root: PathBuf,
+    options: ExecuteOptions,
+) -> togi::runner::RunOutcome {
     let use_schemata = config.mutations.schemata;
 
     let runner = togi::runner::TestRunner {
-        commands: togi::runner::CommandConfig {
-            command: config.test.command,
-            sandbox_command: config.test.sandbox_command,
-            force_default_command: options.force_default_command,
-            force_default_timeout: options.force_default_timeout,
-            project_commands,
-            language_commands,
-            build_command: if options.build_command_explicit {
-                config.test.build_command
-            } else {
-                vec![]
-            },
-            build_command_explicit: options.build_command_explicit,
-            timeout: Duration::from_secs(config.test.timeout),
-            language_timeouts,
-            test_selection,
-        },
+        commands,
         parallelism: config.test.jobs,
         project_root,
         verbose: options.verbose,
@@ -1851,6 +1917,36 @@ jobs = 4
         );
 
         assert_eq!(timeout, 5);
+    }
+
+    #[test]
+    fn calibration_uses_the_slowest_default_timeout_route() {
+        let measurement = togi::runner::BaselineHealthMeasurement {
+            suites: vec![
+                togi::runner::BaselineSuiteMeasurement {
+                    build_duration: None,
+                    test_command: vec!["fast".into()],
+                    test_duration: Duration::from_secs(1),
+                    uses_default_timeout: true,
+                },
+                togi::runner::BaselineSuiteMeasurement {
+                    build_duration: None,
+                    test_command: vec!["slow".into()],
+                    test_duration: Duration::from_secs(4),
+                    uses_default_timeout: true,
+                },
+                togi::runner::BaselineSuiteMeasurement {
+                    build_duration: Some(Duration::from_secs(10)),
+                    test_command: vec!["explicit".into()],
+                    test_duration: Duration::from_secs(10),
+                    uses_default_timeout: false,
+                },
+            ],
+        };
+
+        let selected = calibration_measurement(&measurement).unwrap();
+
+        assert_eq!(selected.test_command, vec!["slow"]);
     }
 
     #[test]
