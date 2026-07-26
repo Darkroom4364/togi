@@ -186,3 +186,50 @@ fn ruby_fixture_runs_end_to_end() {
         file: "calc.rb",
     });
 }
+
+/// Proves the documented polyglot demo routes mutations to each language's
+/// configured test suite, rather than applying the Rust default everywhere.
+#[test]
+#[ignore]
+fn polyglot_demo_routes_mutations_to_each_language_test_suite() {
+    // The demo creates commits, so it must not rely on a CI runner's identity.
+    let clean_home = tempfile::tempdir().unwrap();
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let output = Command::new("bash")
+        .arg("examples/polyglot-demo.sh")
+        .current_dir(&root)
+        .env("HOME", clean_home.path())
+        .env("XDG_CONFIG_HOME", clean_home.path().join("config"))
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .expect("failed to run polyglot demo");
+    assert!(
+        output.status.success(),
+        "polyglot demo failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for expected in [
+        "✓ KILLED      calc.go:5 — zero_to_one",
+        "✓ KILLED      calc.py:2 — increment_numeric",
+        "✓ KILLED      src/lib.rs:2 — negate_condition",
+    ] {
+        assert!(
+            stdout.contains(expected),
+            "polyglot demo did not route {expected} to its language test suite\nstdout:\n{stdout}"
+        );
+    }
+    let results_line = stdout
+        .lines()
+        .find(|line| line.starts_with("Results: "))
+        .expect("polyglot demo should print a result summary");
+    let has_clean_results = ["0 timeout", "0 build errors"]
+        .into_iter()
+        .all(|expected| results_line.split(", ").any(|field| field == expected));
+    assert!(
+        has_clean_results,
+        "polyglot demo reported a timeout or build error\nstdout:\n{stdout}"
+    );
+}

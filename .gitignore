@@ -7,5 +7,6 @@
 .codex/
 .claude/
 togi.toml
+!tests/fixtures/polyglot/togi.toml
 editors/vscode/node_modules/
 editors/vscode/*.vsix
