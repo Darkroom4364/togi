@@ -2,8 +2,6 @@
 //! image. These prove more than mutation generation by running the full
 //! mutation -> test-command -> outcome pipeline across several languages.
 //!
-//! TypeScript and C# still rely on parser/unit coverage today and need
-//! dedicated runtime fixtures separately.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -31,7 +29,7 @@ fn source_line_count(path: &Path) -> usize {
         .max(1)
 }
 
-fn run_fixture(case: FixtureCase) {
+fn run_fixture(case: FixtureCase) -> togi::MutationReport {
     let root = fixture_path(case.dir);
     togi::cache::clear(&root).expect("failed to clear togi cache");
 
@@ -119,6 +117,7 @@ fn run_fixture(case: FixtureCase) {
         "{} fixture: {} total, {} killed, {} survived",
         case.name, report.total, report.killed, report.survived
     );
+    report
 }
 
 /// Requires `bash` plus the language toolchains bundled on the Ubuntu CI image.
@@ -185,6 +184,36 @@ fn ruby_fixture_runs_end_to_end() {
         dir: "ruby",
         file: "calc.rb",
     });
+}
+
+/// Requires bash plus Node.js 24.14.1 for native TypeScript type stripping.
+#[test]
+#[ignore]
+fn typescript_fixture_runs_end_to_end() {
+    let report = run_fixture(FixtureCase {
+        name: "typescript",
+        dir: "typescript",
+        file: "calc.ts",
+    });
+    assert!(
+        report.killed > 0,
+        "typescript fixture should kill at least one mutation"
+    );
+}
+
+/// Requires bash plus the .NET 8 SDK.
+#[test]
+#[ignore]
+fn csharp_fixture_runs_end_to_end() {
+    let report = run_fixture(FixtureCase {
+        name: "csharp",
+        dir: "csharp",
+        file: "Calc.cs",
+    });
+    assert!(
+        report.killed > 0,
+        "csharp fixture should kill at least one mutation"
+    );
 }
 
 /// Proves the documented polyglot demo routes mutations to each language's
