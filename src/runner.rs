@@ -2372,7 +2372,12 @@ impl TestRunner {
         let (mutations, subsumed) = self.split_subsumed(mutations);
         let planned_total = mutations.len();
         let early_stop = EarlyStopState::for_config(self.early_stop.clone(), planned_total);
-        let mut outcome = self.run_regular_with_state(mutations, early_stop, planned_total);
+        let mut outcome = self.run_regular_with_state(
+            mutations,
+            early_stop,
+            planned_total,
+            Arc::new(AtomicUsize::new(0)),
+        );
         merge_subsumed(&mut outcome.report, subsumed);
         outcome
     }
@@ -2435,6 +2440,7 @@ impl TestRunner {
         }
         let planned_total = mutations.len();
         let early_stop = EarlyStopState::for_config(self.early_stop.clone(), planned_total);
+        let tested_counter = Arc::new(AtomicUsize::new(0));
 
         let index_by_id: HashMap<u32, usize> = mutations
             .iter()
@@ -2466,8 +2472,12 @@ impl TestRunner {
         }
 
         if schema_by_language.is_empty() {
-            let mut outcome =
-                self.run_regular_with_state(fallback_mutations, early_stop, planned_total);
+            let mut outcome = self.run_regular_with_state(
+                fallback_mutations,
+                early_stop,
+                planned_total,
+                tested_counter,
+            );
             outcome.report.schemata = Some(schemata_summary.into_report());
             return outcome;
         }
@@ -2478,7 +2488,12 @@ impl TestRunner {
                 break;
             }
             let mutation_count = schema_mutations.len();
-            match self.run_schema_mutations(&language, &schema_mutations, early_stop.clone()) {
+            match self.run_schema_mutations(
+                &language,
+                &schema_mutations,
+                early_stop.clone(),
+                tested_counter.clone(),
+            ) {
                 Ok((records, demoted)) => {
                     schemata_summary.fast_path += records.len();
                     all_records.extend(records);
@@ -2503,8 +2518,12 @@ impl TestRunner {
             && !fallback_mutations.is_empty()
             && !should_stop_early(&early_stop)
         {
-            let fallback =
-                self.run_regular_with_state(fallback_mutations, early_stop.clone(), planned_total);
+            let fallback = self.run_regular_with_state(
+                fallback_mutations,
+                early_stop.clone(),
+                planned_total,
+                tested_counter,
+            );
             all_records.extend(records_from_report(fallback.report));
         }
 
@@ -2530,6 +2549,7 @@ impl TestRunner {
         mutations: Vec<Mutation>,
         early_stop: Option<Arc<EarlyStopState>>,
         planned_total: usize,
+        tested_counter: Arc<AtomicUsize>,
     ) -> RunOutcome {
         let start = Instant::now();
         let total = mutations.len();
@@ -2551,7 +2571,6 @@ impl TestRunner {
         }
 
         let counter = Arc::new(AtomicUsize::new(0));
-        let tested_counter = Arc::new(AtomicUsize::new(0));
         let verbose = self.verbose;
         let is_tty = std::io::stderr().is_terminal();
         let workspace_slots = workspace_pool_slot_count(self.parallelism, total);
@@ -2720,12 +2739,13 @@ impl TestRunner {
         language: &str,
         schema_mutations: &[crate::schemata::SchemaMutation],
         early_stop: Option<Arc<EarlyStopState>>,
+        tested_counter: Arc<AtomicUsize>,
     ) -> Result<(Vec<MutationRunRecord>, Vec<Mutation>), crate::schemata::SchemaRewriteError> {
         self.run_schema_mutations_inner(
             language,
             schema_mutations,
             early_stop,
-            Arc::new(AtomicUsize::new(0)),
+            tested_counter,
             true,
         )
     }
@@ -7145,7 +7165,7 @@ func second(c, d int) bool { return c == d }
             project_root: dir.path().to_path_buf(),
             verbose: false,
             show_output: false,
-            max_tested: None,
+            max_tested: Some(1),
             early_stop: Default::default(),
             respect_workspace_ignores: true,
             env: HashMap::new(),
@@ -7157,8 +7177,10 @@ func second(c, d int) bool { return c == d }
 
         let report = runner.run_with_schemata(vec![first, second]).report;
 
-        assert_eq!(report.total, 2);
-        assert_eq!(report.killed, 2);
+        // The salvaged schema run consumes the shared cap, so the demoted
+        // mutation must not enter a separate regular-run budget.
+        assert_eq!(report.total, 1);
+        assert_eq!(report.killed, 1);
         assert_eq!(report.build_errors, 0);
         let schemata = report.schemata.expect("schemata summary");
         assert_eq!(schemata.fast_path, 1);
