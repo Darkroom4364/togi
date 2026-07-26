@@ -2,7 +2,7 @@ use assert_cmd::Command;
 use predicates::prelude::*;
 use std::fs;
 #[cfg(unix)]
-use std::os::unix::process::CommandExt;
+use std::os::unix::{fs::PermissionsExt, process::CommandExt};
 use std::path::Path;
 #[cfg(unix)]
 use std::time::{Duration, Instant};
@@ -148,6 +148,7 @@ fn setup_two_line_mutation_repo() -> TempDir {
     dir
 }
 
+#[cfg(unix)]
 #[test]
 fn check_classifies_zero_coverage_mutants_as_uncovered() {
     let dir = setup_two_line_mutation_repo();
@@ -157,6 +158,16 @@ fn check_classifies_zero_coverage_mutants_as_uncovered() {
         "SF:main.go\nDA:4,1\nDA:7,0\nend_of_record\n",
     )
     .unwrap();
+    let expected = tempfile::NamedTempFile::new().unwrap();
+    fs::write(
+        expected.path(),
+        fs::read(dir.path().join("main.go")).unwrap(),
+    )
+    .unwrap();
+    let test_cmd = format!(
+        "sh -c {}",
+        shell_quote_text(&format!("cmp -s main.go {}", shell_quote(expected.path())))
+    );
 
     let output = togi()
         .args([
@@ -166,7 +177,7 @@ fn check_classifies_zero_coverage_mutants_as_uncovered() {
             "--format",
             "json",
             "--test-cmd",
-            "false",
+            &test_cmd,
             "--coverage-file",
             "lcov.info",
             "--fail-under",
@@ -176,8 +187,9 @@ fn check_classifies_zero_coverage_mutants_as_uncovered() {
         .output()
         .unwrap();
 
-    // `false` kills every executed mutant. The zero-coverage mutant must not
-    // count as a survivor, so the run passes even with --fail-under 100.
+    // The command passes for the unmutated file and kills each executed
+    // mutant. The zero-coverage mutant must not count as a survivor, so the
+    // run passes even with --fail-under 100.
     assert!(
         output.status.success(),
         "stderr: {}",
@@ -228,7 +240,7 @@ fn check_all_mutants_uncovered_skips_execution() {
             "--format",
             "json",
             "--test-cmd",
-            "false",
+            "true",
             "--coverage-file",
             "lcov.info",
         ])
@@ -268,6 +280,78 @@ fn check_all_mutants_uncovered_skips_execution() {
 }
 
 #[test]
+fn check_all_mutants_uncovered_aborts_when_baseline_test_fails() {
+    let dir = setup_two_line_mutation_repo();
+    fs::write(
+        dir.path().join("lcov.info"),
+        "SF:main.go\nDA:4,0\nDA:7,0\nend_of_record\n",
+    )
+    .unwrap();
+
+    let output = togi()
+        .args([
+            "check",
+            "--base",
+            "HEAD",
+            "--format",
+            "json",
+            "--test-cmd",
+            "false",
+            "--coverage-file",
+            "lcov.info",
+        ])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("baseline test command failed (`false`)")
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.contains("\"killed\""));
+    assert!(!stdout.contains("mutation_score"));
+    assert!(!dir.path().join(".togi-cache").exists());
+}
+
+#[test]
+fn check_all_mutants_uncovered_aborts_when_baseline_build_fails() {
+    let dir = setup_two_line_mutation_repo();
+    fs::write(
+        dir.path().join("lcov.info"),
+        "SF:main.go\nDA:4,0\nDA:7,0\nend_of_record\n",
+    )
+    .unwrap();
+
+    let output = togi()
+        .args([
+            "check",
+            "--base",
+            "HEAD",
+            "--format",
+            "json",
+            "--test-cmd",
+            "true",
+            "--build-cmd",
+            "false",
+            "--coverage-file",
+            "lcov.info",
+        ])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("baseline build command failed (`false`)")
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.contains("\"killed\""));
+    assert!(!stdout.contains("mutation_score"));
+    assert!(!dir.path().join(".togi-cache").exists());
+}
+
+#[test]
 fn check_warns_when_fail_fast_is_ignored_for_custom_test_cmd() {
     let dir = setup_git_repo();
 
@@ -301,7 +385,7 @@ fn check_format_json_outputs_valid_json() {
             "--format",
             "json",
             "--test-cmd",
-            "false",
+            "true",
         ])
         .current_dir(dir.path())
         .output()
@@ -315,6 +399,784 @@ fn check_format_json_outputs_valid_json() {
     });
     assert!(value.get("total").is_some());
     assert!(value.get("mutations").is_some());
+}
+
+#[test]
+fn check_aborts_before_mutations_when_baseline_test_fails() {
+    let dir = setup_git_repo();
+
+    let output = togi()
+        .args([
+            "check",
+            "--all",
+            "--path",
+            "main.go",
+            "--max-per-run",
+            "1",
+            "--no-schemata",
+            "--test-cmd",
+            "false",
+            "--force-rerun",
+            "--no-incremental-history",
+            "--fail-under",
+            "0",
+            "--format",
+            "json",
+        ])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("baseline test command failed (`false`)"));
+    assert!(!stderr.contains("Running 1 mutations"));
+    assert!(!stdout.contains("\"killed\""));
+    assert!(!stdout.contains("mutation_score"));
+    assert!(
+        !dir.path().join(".togi-cache").exists(),
+        "baseline failure must not create mutation cache entries"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn check_schemata_cannot_bypass_a_source_sensitive_baseline_failure() {
+    let dir = setup_git_repo();
+    let test_cmd = format!(
+        "sh -c {}",
+        shell_quote_text("if grep -Fq 'if a > b' main.go; then exit 1; fi")
+    );
+
+    let output = togi()
+        .args([
+            "check",
+            "--all",
+            "--path",
+            "main.go",
+            "--max-per-run",
+            "1",
+            "--operators",
+            "gt_to_gte",
+            "--test-cmd",
+            &test_cmd,
+            "--force-rerun",
+            "--no-incremental-history",
+            "--fail-under",
+            "0",
+            "--format",
+            "json",
+        ])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("baseline test command failed"));
+    assert!(!stderr.contains("Running 1 mutations"));
+    assert!(!stdout.contains("\"killed\""));
+    assert!(!stdout.contains("mutation_score"));
+    assert!(!dir.path().join(".togi-cache").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn check_failing_baseline_does_not_accept_a_preseeded_exact_cache_verdict() {
+    let dir = setup_git_repo();
+    let log = dir.path().join("cache-baseline.log");
+    let test_cmd = format!(
+        "sh -c {}",
+        shell_quote_text(
+            "if [ \"$TOGI_BASELINE_MODE\" = fail ] && grep -Fq 'if a > b' main.go; then echo baseline-failed >> \"$TOGI_TEST_LOG\"; exit 1; fi; if grep -Fq 'if a > b' main.go; then echo baseline-pass >> \"$TOGI_TEST_LOG\"; else echo mutant >> \"$TOGI_TEST_LOG\"; fi"
+        )
+    );
+
+    let seeded = togi()
+        .args([
+            "check",
+            "--all",
+            "--path",
+            "main.go",
+            "--max-per-run",
+            "1",
+            "--no-schemata",
+            "--operators",
+            "gt_to_gte",
+            "--test-cmd",
+            &test_cmd,
+            "--force-rerun",
+            "--no-incremental-history",
+            "--fail-under",
+            "0",
+            "--format",
+            "json",
+        ])
+        .env("TOGI_BASELINE_MODE", "pass")
+        .env("TOGI_TEST_LOG", &log)
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(
+        seeded.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&seeded.stdout),
+        String::from_utf8_lossy(&seeded.stderr)
+    );
+    assert!(
+        dir.path().join(".togi-cache").exists(),
+        "the first run must seed an exact cache verdict"
+    );
+
+    let output = togi()
+        .args([
+            "check",
+            "--all",
+            "--path",
+            "main.go",
+            "--max-per-run",
+            "1",
+            "--no-schemata",
+            "--operators",
+            "gt_to_gte",
+            "--test-cmd",
+            &test_cmd,
+            "--no-incremental-history",
+            "--fail-under",
+            "0",
+            "--format",
+            "json",
+        ])
+        .env("TOGI_BASELINE_MODE", "fail")
+        .env("TOGI_TEST_LOG", &log)
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("baseline test command failed"));
+    assert!(!stderr.contains("Running 1 mutations"));
+    assert!(!stdout.contains("\"killed\""));
+    assert!(!stdout.contains("mutation_score"));
+    assert_eq!(
+        fs::read_to_string(log).unwrap().lines().collect::<Vec<_>>(),
+        vec!["baseline-pass", "mutant", "baseline-failed"]
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn check_schemata_baselines_go_with_the_no_cache_argv() {
+    let dir = setup_git_repo();
+    let fake_bin = dir.path().join("fake-go-bin");
+    let log = dir.path().join("fake-go.log");
+    fs::write(
+        dir.path().join("togi.toml"),
+        r#"
+[test]
+command = ["go", "test", "./..."]
+timeout = 5
+
+[mutations]
+schemata = true
+"#,
+    )
+    .unwrap();
+
+    let output = togi()
+        .args([
+            "check",
+            "--all",
+            "--path",
+            "main.go",
+            "--max-per-run",
+            "1",
+            "--operators",
+            "gt_to_gte",
+            "--force-rerun",
+            "--no-incremental-history",
+            "--fail-under",
+            "0",
+            "--format",
+            "json",
+        ])
+        .env("PATH", fake_go_path_env(&fake_bin))
+        .env("TOGI_GO_LOG", &log)
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("baseline test command failed"));
+    assert!(stderr.contains("-count=1"));
+    assert_eq!(fs::read_to_string(log).unwrap(), "no-cache");
+    assert!(!stderr.contains("Running 1 mutations"));
+    assert!(!stdout.contains("\"killed\""));
+    assert!(!stdout.contains("mutation_score"));
+    assert!(!dir.path().join(".togi-cache").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn check_no_schemata_keeps_the_raw_go_test_argv() {
+    let dir = setup_git_repo();
+    let fake_bin = dir.path().join("fake-go-bin");
+    let log = dir.path().join("fake-go.log");
+    fs::write(
+        dir.path().join("togi.toml"),
+        r#"
+[test]
+command = ["go", "test", "./..."]
+timeout = 5
+"#,
+    )
+    .unwrap();
+
+    let output = togi()
+        .args([
+            "check",
+            "--base",
+            "HEAD",
+            "--max-per-run",
+            "1",
+            "--no-schemata",
+            "--operators",
+            "gt_to_gte",
+            "--force-rerun",
+            "--no-incremental-history",
+            "--fail-under",
+            "0",
+            "--format",
+            "json",
+        ])
+        .env("PATH", fake_go_path_env(&fake_bin))
+        .env("TOGI_GO_LOG", &log)
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["survived"], 1);
+    assert_eq!(fs::read_to_string(log).unwrap(), "rawraw");
+}
+
+#[test]
+fn check_runs_mutations_after_a_passing_baseline() {
+    let dir = setup_git_repo();
+
+    let output = togi()
+        .args([
+            "check",
+            "--base",
+            "HEAD",
+            "--max-per-run",
+            "1",
+            "--no-schemata",
+            "--test-cmd",
+            "true",
+            "--force-rerun",
+            "--no-incremental-history",
+            "--fail-under",
+            "0",
+            "--format",
+            "json",
+        ])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("Checking baseline test suites..."));
+    assert!(stderr.contains("Running 1 mutations..."));
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["total"], 1);
+    assert_eq!(value["survived"], 1);
+    assert!(dir.path().join(".togi-cache").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn check_calibration_reuses_the_passing_baseline_run() {
+    let dir = setup_git_repo();
+    let log = dir.path().join("baseline-runs.log");
+    let test_cmd = format!(
+        "sh -c {}",
+        shell_quote_text(
+            "if grep -q 'if a > b' main.go; then echo baseline >> \"$TOGI_TEST_LOG\"; else echo mutant >> \"$TOGI_TEST_LOG\"; fi"
+        )
+    );
+
+    let output = togi()
+        .args([
+            "check",
+            "--all",
+            "--path",
+            "main.go",
+            "--max-per-run",
+            "1",
+            "--no-schemata",
+            "--operators",
+            "gt_to_gte",
+            "--test-cmd",
+            &test_cmd,
+            "--calibrate-timeout",
+            "--force-rerun",
+            "--no-incremental-history",
+            "--fail-under",
+            "0",
+        ])
+        .env("TOGI_TEST_LOG", &log)
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(log).unwrap().lines().collect::<Vec<_>>(),
+        vec!["baseline", "mutant"]
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn check_calibration_extends_a_slow_global_default_route() {
+    let dir = setup_git_repo();
+    fs::write(
+        dir.path().join("togi.toml"),
+        r#"
+[test]
+command = ["sh", "-c", "sleep 2"]
+timeout = 1
+calibrate_timeout = true
+timeout_multiplier = 1.0
+timeout_slack = 1
+"#,
+    )
+    .unwrap();
+
+    let output = togi()
+        .args([
+            "check",
+            "--base",
+            "HEAD",
+            "--format",
+            "json",
+            "--max-per-run",
+            "1",
+            "--no-schemata",
+            "--operators",
+            "gt_to_gte",
+            "--force-rerun",
+            "--no-incremental-history",
+            "--fail-under",
+            "0",
+        ])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["timeout"], 0);
+    assert!(
+        value["baseline_timing"]["calibrated_timeout_ms"]
+            .as_u64()
+            .is_some_and(|timeout| timeout >= 3_000)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn check_calibration_uses_the_slowest_default_route() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    for args in [
+        &["init"][..],
+        &["config", "user.email", "test@example.com"],
+        &["config", "user.name", "Test"],
+    ] {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .unwrap();
+    }
+    fs::write(
+        root.join("a.rs"),
+        "pub fn compare(a: i32, b: i32) -> bool { a >= b }\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("z.go"),
+        "package sample\n\nfunc compare(a, b int) bool { return a >= b }\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("togi.toml"),
+        r#"
+[test]
+command = ["true"]
+timeout = 1
+calibrate_timeout = true
+timeout_multiplier = 1.0
+timeout_slack = 1
+
+[test.languages.go]
+command = ["sh", "-c", "sleep 2"]
+"#,
+    )
+    .unwrap();
+    std::process::Command::new("git")
+        .args(["add", "."])
+        .current_dir(root)
+        .output()
+        .unwrap();
+    std::process::Command::new("git")
+        .args(["commit", "-m", "initial"])
+        .current_dir(root)
+        .output()
+        .unwrap();
+    fs::write(
+        root.join("a.rs"),
+        "pub fn compare(a: i32, b: i32) -> bool { a > b }\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("z.go"),
+        "package sample\n\nfunc compare(a, b int) bool { return a > b }\n",
+    )
+    .unwrap();
+
+    let output = togi()
+        .args([
+            "check",
+            "--base",
+            "HEAD",
+            "--format",
+            "json",
+            "--max-per-run",
+            "2",
+            "--no-schemata",
+            "--operators",
+            "gt_to_gte",
+            "--force-rerun",
+            "--no-incremental-history",
+            "--fail-under",
+            "0",
+        ])
+        .current_dir(root)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["timeout"], 0);
+    assert!(
+        value["baseline_timing"]["calibrated_timeout_ms"]
+            .as_u64()
+            .is_some_and(|timeout| timeout >= 3_000)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn check_calibration_uses_a_slow_project_route_without_an_explicit_timeout() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    for args in [
+        &["init"][..],
+        &["config", "user.email", "test@example.com"],
+        &["config", "user.name", "Test"],
+    ] {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .unwrap();
+    }
+    fs::create_dir_all(root.join("zproject")).unwrap();
+    fs::write(
+        root.join("a.rs"),
+        "pub fn compare(a: i32, b: i32) -> bool { a >= b }\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("zproject/main.go"),
+        "package sample\n\nfunc compare(a, b int) bool { return a >= b }\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("togi.toml"),
+        r#"
+[test]
+command = ["true"]
+timeout = 1
+calibrate_timeout = true
+timeout_multiplier = 1.0
+timeout_slack = 1
+
+[projects.api]
+path = "zproject"
+
+[projects.api.test]
+command = ["sh", "-c", "sleep 2"]
+"#,
+    )
+    .unwrap();
+    std::process::Command::new("git")
+        .args(["add", "."])
+        .current_dir(root)
+        .output()
+        .unwrap();
+    std::process::Command::new("git")
+        .args(["commit", "-m", "initial"])
+        .current_dir(root)
+        .output()
+        .unwrap();
+    fs::write(
+        root.join("a.rs"),
+        "pub fn compare(a: i32, b: i32) -> bool { return a > b }\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("zproject/main.go"),
+        "package sample\n\nfunc compare(a, b int) bool { return a > b }\n",
+    )
+    .unwrap();
+
+    let output = togi()
+        .args([
+            "check",
+            "--base",
+            "HEAD",
+            "--format",
+            "json",
+            "--max-per-run",
+            "2",
+            "--no-schemata",
+            "--operators",
+            "gt_to_gte",
+            "--force-rerun",
+            "--no-incremental-history",
+            "--fail-under",
+            "0",
+        ])
+        .current_dir(root)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["timeout"], 0);
+    assert!(
+        value["baseline_timing"]["calibrated_timeout_ms"]
+            .as_u64()
+            .is_some_and(|timeout| timeout >= 3_000)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn check_baselines_global_language_and_project_routes() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    std::process::Command::new("git")
+        .arg("init")
+        .current_dir(root)
+        .output()
+        .unwrap();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::create_dir_all(root.join("services/api")).unwrap();
+    fs::write(
+        root.join("src/lib.rs"),
+        "pub fn compare(a: i32, b: i32) -> bool { a > b }\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("worker.go"),
+        "package worker\n\nfunc compare(a, b int) bool { return a > b }\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("services/api/main.go"),
+        "package api\n\nfunc compare(a, b int) bool { return a > b }\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("togi.toml"),
+        r#"
+[test]
+command = ["sh", "-c", 'if grep -Fq "a > b" src/lib.rs; then echo global >> "$TOGI_TEST_LOG"; fi; exit 0']
+
+[test.languages.go]
+command = ["sh", "-c", 'if grep -Fq "a > b" worker.go; then echo language >> "$TOGI_TEST_LOG"; fi; exit 0']
+
+[projects.api]
+path = "services/api"
+
+[projects.api.test]
+command = ["sh", "-c", 'if grep -Fq "a > b" services/api/main.go; then echo project >> "$TOGI_TEST_LOG"; fi; exit 0']
+"#,
+    )
+    .unwrap();
+    let log = root.join("baseline-routes.log");
+
+    let output = togi()
+        .args([
+            "check",
+            "--all",
+            "--max-per-run",
+            "3",
+            "--no-schemata",
+            "--operators",
+            "gt_to_gte",
+            "--force-rerun",
+            "--no-incremental-history",
+            "--fail-under",
+            "0",
+        ])
+        .env("TOGI_TEST_LOG", &log)
+        .current_dir(root)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let mut baseline_routes = fs::read_to_string(log)
+        .unwrap()
+        .lines()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    baseline_routes.sort();
+    assert_eq!(baseline_routes, vec!["global", "language", "project"]);
+}
+
+#[cfg(unix)]
+#[test]
+fn check_aborts_before_mutation_work_when_a_later_project_baseline_fails() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    std::process::Command::new("git")
+        .arg("init")
+        .current_dir(root)
+        .output()
+        .unwrap();
+    fs::create_dir_all(root.join("zproject")).unwrap();
+    fs::write(
+        root.join("a.rs"),
+        "pub fn compare(a: i32, b: i32) -> bool { a > b }\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("m.go"),
+        "package worker\n\nfunc compare(a, b int) bool { return a > b }\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("zproject/main.go"),
+        "package api\n\nfunc compare(a, b int) bool { return a > b }\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("togi.toml"),
+        r#"
+[test]
+command = ["sh", "-c", 'if grep -Fq "a > b" a.rs; then echo global >> "$TOGI_TEST_LOG"; fi; exit 0']
+
+[test.languages.go]
+command = ["sh", "-c", 'if grep -Fq "a > b" m.go; then echo language >> "$TOGI_TEST_LOG"; fi; exit 0']
+
+[projects.api]
+path = "zproject"
+
+[projects.api.test]
+command = ["sh", "-c", 'if grep -Fq "a > b" zproject/main.go; then echo project-failed >> "$TOGI_TEST_LOG"; exit 1; fi; exit 0']
+"#,
+    )
+    .unwrap();
+    let log = root.join("baseline-routes.log");
+
+    let output = togi()
+        .args([
+            "check",
+            "--all",
+            "--max-per-run",
+            "3",
+            "--no-schemata",
+            "--operators",
+            "gt_to_gte",
+            "--force-rerun",
+            "--no-incremental-history",
+            "--fail-under",
+            "0",
+            "--format",
+            "json",
+        ])
+        .env("TOGI_TEST_LOG", &log)
+        .current_dir(root)
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("baseline test command failed"), "{stderr}");
+    assert!(!stderr.contains("Running 3 mutations"));
+    assert!(!stdout.contains("\"killed\""));
+    assert!(!stdout.contains("mutation_score"));
+    assert!(!root.join(".togi-cache").exists());
+    assert_eq!(
+        fs::read_to_string(log).unwrap().lines().collect::<Vec<_>>(),
+        vec!["global", "language", "project-failed"]
+    );
 }
 
 #[test]
@@ -358,12 +1220,8 @@ fn check_format_sarif_outputs_valid_sarif() {
 
 #[cfg(unix)]
 #[test]
-fn check_format_json_includes_build_error_diagnostics() {
+fn check_aborts_before_report_when_baseline_build_fails() {
     let dir = setup_git_repo();
-    let build_cmd = format!(
-        "{} not-a-togi-command",
-        shell_quote(&assert_cmd::cargo::cargo_bin("togi"))
-    );
 
     let output = togi()
         .args([
@@ -375,58 +1233,53 @@ fn check_format_json_includes_build_error_diagnostics() {
             "--test-cmd",
             "true",
             "--build-cmd",
-            &build_cmd,
+            "false",
             "--no-schemata",
             "--operators",
             "gt_to_gte",
             "--max-per-run",
-            "1",
-            "--jobs",
             "1",
         ])
         .current_dir(dir.path())
         .output()
         .unwrap();
 
-    assert!(
-        output.status.success(),
-        "check failed\nstdout:\n{}\nstderr:\n{}",
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "stdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|e| {
-        panic!(
-            "invalid JSON output: {e}\nstdout: {}",
-            String::from_utf8_lossy(&output.stdout)
-        )
-    });
-
-    assert_eq!(value["build_errors"], 1);
-    assert_eq!(value["mutations"][0]["result"], "build_error");
-    assert!(value["mutations"][0]["build_error_fingerprint"].is_string());
-    assert_eq!(value["build_error_groups"][0]["phase"], "build_command");
-    assert_eq!(value["build_error_groups"][0]["runner"], "regular");
-    assert!(
-        value["build_error_groups"][0]["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("not-a-togi-command"))
-    );
-    assert!(
-        value["build_error_groups"][0]["command"]
-            .as_array()
-            .is_some_and(|command| command
-                .iter()
-                .any(|arg| arg.as_str() == Some("not-a-togi-command")))
-    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("baseline build command failed (`false`)"));
+    assert!(!stderr.contains("Running 1 mutations"));
+    assert!(!stdout.contains("\"killed\""));
+    assert!(!stdout.contains("mutation_score"));
+    assert!(!dir.path().join(".togi-cache").exists());
 }
 
 #[cfg(unix)]
 #[test]
 fn check_terminal_includes_build_error_diagnostics() {
     let dir = setup_git_repo();
-    let build_cmd = format!(
+    let expected = tempfile::NamedTempFile::new().unwrap();
+    fs::write(
+        expected.path(),
+        fs::read(dir.path().join("main.go")).unwrap(),
+    )
+    .unwrap();
+    let failing_command = format!(
         "{} not-a-togi-command",
         shell_quote(&assert_cmd::cargo::cargo_bin("togi"))
+    );
+    let build_cmd = format!(
+        "sh -c {}",
+        shell_quote_text(&format!(
+            "if cmp -s main.go {}; then exit 0; else exec {failing_command}; fi",
+            shell_quote(expected.path())
+        ))
     );
 
     togi()
@@ -554,6 +1407,126 @@ fn check_baseline_still_honors_fail_under() {
 
 #[cfg(unix)]
 #[test]
+fn interrupted_mutation_exits_130_without_a_report_or_side_effects() {
+    let dir = setup_git_repo();
+    let baseline_marker = dir.path().join("baseline-marker");
+    let mutation_marker = dir.path().join("mutation-marker");
+    let release = dir.path().join("mutation-release");
+    let stdout_path = dir.path().join("togi-stdout.log");
+    let stderr_path = dir.path().join("togi-stderr.log");
+    let pr_comment_path = dir.path().join("togi-pr-comment.md");
+    let baseline_path = dir.path().join(".togi-baseline");
+    let cache_path = dir.path().join(".togi-cache");
+    let test_script = dir.path().join("block-mutant.sh");
+    fs::write(
+        &test_script,
+        format!(
+            "#!/bin/sh\n\
+             baseline={}\n\
+             mutation={}\n\
+             release={}\n\
+             if grep -Fq 'if a > b' main.go; then\n\
+             \tprintf baseline > \"$baseline\"\n\
+             \texit 0\n\
+             fi\n\
+             printf mutation > \"$mutation\"\n\
+             while [ ! -f \"$release\" ]; do\n\
+             \tsleep 0.05\n\
+             done\n",
+            shell_quote(&baseline_marker),
+            shell_quote(&mutation_marker),
+            shell_quote(&release),
+        ),
+    )
+    .unwrap();
+
+    let stdout = fs::File::create(&stdout_path).unwrap();
+    let stderr = fs::File::create(&stderr_path).unwrap();
+    let test_command = format!("sh {}", shell_quote(&test_script));
+    // foxguard: ignore[rs/no-command-injection]
+    // The test launches the just-built `togi` binary from Cargo metadata.
+    let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("togi"))
+        .args([
+            "check",
+            "--all",
+            "--path",
+            "main.go",
+            "--max-per-run",
+            "1",
+            "--no-schemata",
+            "--operators",
+            "gt_to_gte",
+            "--test-cmd",
+            &test_command,
+            "--timeout",
+            "5",
+            "--force-rerun",
+            "--no-incremental-history",
+            "--fail-under",
+            "0",
+            "--format",
+            "json",
+            "--save-baseline",
+            "--pr-comment",
+            pr_comment_path
+                .to_str()
+                .expect("PR comment path should be utf-8"),
+        ])
+        .current_dir(dir.path())
+        .process_group(0)
+        .stdout(stdout)
+        .stderr(stderr)
+        .spawn()
+        .unwrap();
+
+    if !wait_for_path(&baseline_marker, Duration::from_secs(10))
+        || !wait_for_path(&mutation_marker, Duration::from_secs(10))
+    {
+        send_signal_to_process_group(child.id(), libc::SIGKILL);
+        let _ = child.wait();
+        panic!(
+            "baseline or mutation command did not start\nstdout:\n{}\nstderr:\n{}",
+            read_log(&stdout_path),
+            read_log(&stderr_path)
+        );
+    }
+
+    send_signal_to_process_group(child.id(), libc::SIGINT);
+    fs::write(&release, "").unwrap();
+    let status = wait_for_child(&mut child, Duration::from_secs(10)).unwrap_or_else(|message| {
+        send_signal_to_process_group(child.id(), libc::SIGKILL);
+        let _ = child.wait();
+        panic!(
+            "{message}\nstdout:\n{}\nstderr:\n{}",
+            read_log(&stdout_path),
+            read_log(&stderr_path)
+        );
+    });
+
+    assert_eq!(
+        status.code(),
+        Some(130),
+        "interrupted mutation should exit 130\nstatus: {status:?}\nstdout:\n{}\nstderr:\n{}",
+        read_log(&stdout_path),
+        read_log(&stderr_path)
+    );
+    let stdout = read_log(&stdout_path);
+    assert!(!stdout.contains("mutation_score"));
+    assert!(!stdout.contains("\"total\""));
+    assert!(!stdout.contains("\"killed\""));
+    assert!(!cache_path.exists(), "interrupted mutation wrote a cache");
+    assert!(
+        !baseline_path.exists(),
+        "interrupted mutation wrote a baseline"
+    );
+    assert!(
+        !pr_comment_path.exists(),
+        "interrupted mutation wrote a PR comment"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn interrupted_check_exits_130_without_writing_side_effects() {
     let dir = setup_git_repo();
     let marker = dir.path().join("test-command-started");
@@ -562,6 +1535,7 @@ fn interrupted_check_exits_130_without_writing_side_effects() {
     let stderr_path = dir.path().join("togi-stderr.log");
     let pr_comment_path = dir.path().join("togi-pr-comment.md");
     let baseline_path = dir.path().join(".togi-baseline");
+    let cache_path = dir.path().join(".togi-cache");
     let slow_test = dir.path().join("slow-test.sh");
 
     fs::write(
@@ -649,12 +1623,50 @@ fn interrupted_check_exits_130_without_writing_side_effects() {
         "interrupted check wrote {}",
         pr_comment_path.display()
     );
+    assert!(
+        !cache_path.exists(),
+        "interrupted check wrote {}",
+        cache_path.display()
+    );
+    let stdout = read_log(&stdout_path);
+    assert!(!stdout.contains("mutation_score"));
+    assert!(!stdout.contains("\"killed\""));
 }
 
 #[cfg(unix)]
 fn shell_quote(path: &Path) -> String {
     let value = path.to_str().expect("test path should be utf-8");
     format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+#[cfg(unix)]
+fn shell_quote_text(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+#[cfg(unix)]
+fn fake_go_path_env(fake_bin: &Path) -> std::ffi::OsString {
+    fs::create_dir_all(fake_bin).unwrap();
+    let fake_go = fake_bin.join("go");
+    fs::write(
+        &fake_go,
+        r#"#!/bin/sh
+if [ "$1" = "test" ] && [ "$2" = "-count=1" ]; then
+    printf no-cache >> "$TOGI_GO_LOG"
+    exit 1
+fi
+printf raw >> "$TOGI_GO_LOG"
+"#,
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&fake_go).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&fake_go, permissions).unwrap();
+
+    let inherited = std::env::var_os("PATH").unwrap_or_default();
+    let mut paths = vec![fake_bin.to_path_buf()];
+    paths.extend(std::env::split_paths(&inherited));
+    std::env::join_paths(paths).unwrap()
 }
 
 #[cfg(unix)]

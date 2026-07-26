@@ -214,11 +214,44 @@ pub struct BaselineTimingConfig<'a> {
     pub cancelled: &'a AtomicBool,
     pub respect_workspace_ignores: bool,
 }
+/// Configuration for validating unmutated test suites before mutation execution.
+pub struct BaselineHealthConfig<'a> {
+    /// Commands and routing used for the pending mutations.
+    pub commands: &'a CommandConfig,
+    /// More generous deadline used only while measuring routes that inherit the
+    /// global timeout for calibration.
+    pub default_measurement_timeout: Option<Duration>,
+    /// Whether Go mutations may run through schemata, which requires an
+    /// uncached `go test` command.
+    pub schemata_enabled: bool,
+    /// Extra environment variables passed to every spawned command.
+    pub env: &'a HashMap<String, String>,
+    /// Stops baseline execution when cancellation is requested.
+    pub cancelled: &'a AtomicBool,
+    /// Whether the isolated baseline workspace honors ignore files.
+    pub respect_workspace_ignores: bool,
+}
+
+/// One passing unmutated test suite.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BaselineSuiteMeasurement {
+    pub build_duration: Option<Duration>,
+    pub test_command: Vec<String>,
+    pub test_duration: Duration,
+    pub uses_default_timeout: bool,
+}
+
+/// Passing baselines suitable for timeout calibration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BaselineHealthMeasurement {
+    pub suites: Vec<BaselineSuiteMeasurement>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SelectedTestCommand {
     argv: Vec<String>,
     timeout: Duration,
+    uses_default_timeout: bool,
     selected_tests: Vec<String>,
 }
 
@@ -268,19 +301,7 @@ fn select_test_command_with_history(
     mutation: &Mutation,
     history: Option<&cache::IncrementalHistoryStore>,
 ) -> SelectedTestCommand {
-    let project_info = matching_project_command(project_root, commands, mutation);
-
-    let mut argv = project_info
-        .filter(|_| !commands.force_default_command)
-        .and_then(|project| project.command.as_ref())
-        .or_else(|| {
-            (!commands.force_default_command)
-                .then(|| commands.language_commands.get(mutation.language.as_str()))
-                .flatten()
-        })
-        .unwrap_or(&commands.command)
-        .clone();
-    let mut selected_tests = Vec::new();
+    let mut selected = select_unnarrowed_test_command(project_root, commands, mutation);
 
     if let Some(test_selection) = &commands.test_selection {
         if let Some(mut tests) = test_selection.tests_for(project_root, mutation) {
@@ -293,27 +314,50 @@ fn select_test_command_with_history(
             }) {
                 tests.sort_by_key(|test| if *test == preferred { 0 } else { 1 });
             }
-            argv = narrow_test_command(argv, &tests);
-            selected_tests = tests;
+            selected.argv = narrow_test_command(selected.argv, &tests);
+            selected.selected_tests = tests;
         }
     }
 
+    selected
+}
+
+fn select_unnarrowed_test_command(
+    project_root: &Path,
+    commands: &CommandConfig,
+    mutation: &Mutation,
+) -> SelectedTestCommand {
+    let project_info = matching_project_command(project_root, commands, mutation);
+    let argv = project_info
+        .filter(|_| !commands.force_default_command)
+        .and_then(|project| project.command.as_ref())
+        .or_else(|| {
+            (!commands.force_default_command)
+                .then(|| commands.language_commands.get(mutation.language.as_str()))
+                .flatten()
+        })
+        .unwrap_or(&commands.command)
+        .clone();
+
+    let (timeout, uses_default_timeout) = if commands.force_default_timeout {
+        (commands.timeout, true)
+    } else if let Some(timeout) = project_info.and_then(|project| project.timeout) {
+        (timeout, false)
+    } else if let Some(timeout) = commands
+        .language_timeouts
+        .get(mutation.language.as_str())
+        .copied()
+    {
+        (timeout, false)
+    } else {
+        (commands.timeout, true)
+    };
+
     SelectedTestCommand {
         argv,
-        timeout: if commands.force_default_timeout {
-            commands.timeout
-        } else {
-            project_info
-                .and_then(|project| project.timeout)
-                .or_else(|| {
-                    commands
-                        .language_timeouts
-                        .get(mutation.language.as_str())
-                        .copied()
-                })
-                .unwrap_or(commands.timeout)
-        },
-        selected_tests,
+        timeout,
+        uses_default_timeout,
+        selected_tests: Vec::new(),
     }
 }
 
@@ -1200,6 +1244,123 @@ pub fn measure_baseline_timing(
         build_duration,
         test_duration,
     })
+}
+/// Run every unmutated test suite that the pending mutations would use.
+///
+/// Test selection is intentionally not applied: a narrowed command cannot
+/// establish that the full effective suite is healthy. Each suite runs in a
+/// fresh isolated workspace, with the opt-in build command immediately
+/// preceding its test command.
+pub fn check_baseline_health(
+    project_root: &Path,
+    mutations: &[Mutation],
+    config: BaselineHealthConfig<'_>,
+) -> anyhow::Result<BaselineHealthMeasurement> {
+    let suites = resolve_baseline_suites(
+        project_root,
+        config.commands,
+        mutations,
+        config.schemata_enabled,
+    );
+    if suites.is_empty() {
+        bail!("no baseline test suites were selected");
+    }
+
+    let mut measurements = Vec::with_capacity(suites.len());
+    for suite in suites {
+        let workspace = copy_workspace_with_options(project_root, config.respect_workspace_ignores)
+            .with_context(|| "could not create baseline health workspace")?;
+        let root = workspace.root();
+        let timeout = baseline_suite_timeout(&suite, config.default_measurement_timeout);
+        let build_duration = if config.commands.build_command_explicit
+            && !config.commands.build_command.is_empty()
+        {
+            Some(measure_baseline_command(
+                "baseline build command",
+                &config.commands.build_command,
+                &config.commands.sandbox_command,
+                root,
+                timeout,
+                config.env,
+                config.cancelled,
+            )?)
+        } else {
+            None
+        };
+        let test_duration = measure_baseline_command(
+            "baseline test command",
+            &suite.argv,
+            &config.commands.sandbox_command,
+            root,
+            timeout,
+            config.env,
+            config.cancelled,
+        )?;
+        measurements.push(BaselineSuiteMeasurement {
+            build_duration,
+            test_command: suite.argv,
+            test_duration,
+            uses_default_timeout: suite.default_timeout.is_some(),
+        });
+    }
+
+    Ok(BaselineHealthMeasurement {
+        suites: measurements,
+    })
+}
+
+struct ResolvedBaselineSuite {
+    argv: Vec<String>,
+    default_timeout: Option<Duration>,
+    explicit_timeout: Option<Duration>,
+}
+
+fn baseline_suite_timeout(
+    suite: &ResolvedBaselineSuite,
+    default_measurement_timeout: Option<Duration>,
+) -> Duration {
+    let default_timeout = suite
+        .default_timeout
+        .map(|timeout| default_measurement_timeout.unwrap_or(timeout));
+    match (default_timeout, suite.explicit_timeout) {
+        (Some(default), Some(explicit)) => default.min(explicit),
+        (Some(timeout), None) | (None, Some(timeout)) => timeout,
+        (None, None) => unreachable!("baseline suite has a timeout"),
+    }
+}
+
+fn resolve_baseline_suites(
+    project_root: &Path,
+    commands: &CommandConfig,
+    mutations: &[Mutation],
+    schemata_enabled: bool,
+) -> Vec<ResolvedBaselineSuite> {
+    let mut suites = Vec::new();
+    for mutation in mutations {
+        let mut selected = select_unnarrowed_test_command(project_root, commands, mutation);
+        if schemata_enabled && mutation.language == "go" {
+            selected.argv = force_go_no_test_cache(selected.argv);
+        }
+        if let Some(existing) = suites
+            .iter_mut()
+            .find(|suite: &&mut ResolvedBaselineSuite| suite.argv == selected.argv)
+        {
+            let timeout = if selected.uses_default_timeout {
+                &mut existing.default_timeout
+            } else {
+                &mut existing.explicit_timeout
+            };
+            *timeout =
+                Some(timeout.map_or(selected.timeout, |current| current.min(selected.timeout)));
+        } else {
+            suites.push(ResolvedBaselineSuite {
+                argv: selected.argv,
+                default_timeout: selected.uses_default_timeout.then_some(selected.timeout),
+                explicit_timeout: (!selected.uses_default_timeout).then_some(selected.timeout),
+            });
+        }
+    }
+    suites
 }
 
 fn measure_baseline_command(
@@ -3098,11 +3259,23 @@ impl TestRunner {
             schema_rewrites_for_language(&self.project_root, language, schema_mutations)?;
         apply_schema_rewrites_to_workspace(&self.project_root, workspace.root(), &rewrites)?;
 
+        let timeout = schema_mutations
+            .iter()
+            .map(|schema_mutation| {
+                select_unnarrowed_test_command(
+                    &self.project_root,
+                    &self.commands,
+                    &schema_mutation.mutation,
+                )
+                .timeout
+            })
+            .max()
+            .unwrap_or(self.commands.timeout);
         let build = run_command(
             &self.commands.build_command,
             &self.commands.sandbox_command,
             workspace.root(),
-            self.commands.timeout,
+            timeout,
             true,
             &self.env,
             &self.cancelled,
@@ -3278,7 +3451,7 @@ fn run_schema_workspace_mutation(
             &runner.commands.build_command,
             &runner.commands.sandbox_command,
             workspace_root,
-            runner.commands.timeout,
+            timeout,
             true,
             &runner.env,
             &runner.cancelled,
@@ -4874,11 +5047,13 @@ mod tests {
         let selected = SelectedTestCommand {
             argv: vec!["cargo test".into()],
             timeout: Duration::from_secs(2),
+            uses_default_timeout: false,
             selected_tests: Vec::new(),
         };
         let ambiguous = SelectedTestCommand {
             argv: vec!["cargo".into(), "test".into()],
             timeout: Duration::from_secs(2),
+            uses_default_timeout: false,
             selected_tests: Vec::new(),
         };
 
@@ -6052,6 +6227,245 @@ mod tests {
         assert!(measurement.test_duration <= Duration::from_secs(5));
         Ok(())
     }
+    #[test]
+    fn baseline_suites_ignore_line_to_test_narrowing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut commands = test_command_config();
+        let mut selection = TestSelectionConfig::new();
+        selection.insert(
+            dir.path(),
+            Path::new("src/lib.rs"),
+            1,
+            vec!["only_this_test".into()],
+        );
+        commands.test_selection = Some(selection);
+        let mutation = make_test_mutation(Path::new("src/lib.rs"));
+
+        let suites = resolve_baseline_suites(dir.path(), &commands, &[mutation], false);
+
+        assert_eq!(suites.len(), 1);
+        assert_eq!(suites[0].argv, vec!["cargo", "test"]);
+        assert!(suites[0].default_timeout.is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn baseline_health_isolates_source_and_target_between_routes() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path().join("project");
+        let log = dir.path().join("baseline.log");
+        std::fs::create_dir_all(root.join("services/api"))?;
+        std::fs::create_dir_all(root.join("src"))?;
+        std::fs::write(root.join("src/lib.rs"), "clean")?;
+        std::fs::write(root.join("worker.go"), "package worker")?;
+        std::fs::write(root.join("services/api/main.go"), "package api")?;
+
+        let global_command = vec![
+            "sh".into(),
+            "-c".into(),
+            "test \"$(cat target/build-state)\" = generated || exit 1; echo global >> \"$BASELINE_LOG\"; printf changed > src/lib.rs; printf leaked > target/from-global".into(),
+        ];
+        let language_command = vec![
+            "sh".into(),
+            "-c".into(),
+            "test \"$(cat src/lib.rs)\" = clean && test \"$(cat target/build-state)\" = generated && test ! -e target/from-global || exit 1; echo language >> \"$BASELINE_LOG\"; printf leaked > target/from-language".into(),
+        ];
+        let project_command = vec![
+            "sh".into(),
+            "-c".into(),
+            "test \"$(cat src/lib.rs)\" = clean && test \"$(cat target/build-state)\" = generated && test ! -e target/from-global && test ! -e target/from-language || exit 1; echo project >> \"$BASELINE_LOG\"".into(),
+        ];
+        let build_command = vec![
+            "sh".into(),
+            "-c".into(),
+            "mkdir -p target; printf generated > target/build-state; echo build >> \"$BASELINE_LOG\"".into(),
+        ];
+        let mut commands = test_command_config();
+        commands.command = global_command.clone();
+        commands
+            .language_commands
+            .insert("go".into(), language_command);
+        commands.project_commands.push(ProjectCommandConfig {
+            path: PathBuf::from("services/api"),
+            command: Some(project_command),
+            timeout: None,
+        });
+        commands.build_command = build_command;
+        commands.build_command_explicit = true;
+
+        let mut env = HashMap::new();
+        env.insert(
+            "BASELINE_LOG".to_string(),
+            log.to_string_lossy().into_owned(),
+        );
+        let mut language_mutation = make_test_mutation(Path::new("worker.go"));
+        language_mutation.language = "go".into();
+        let mut project_mutation = make_test_mutation(Path::new("services/api/main.go"));
+        project_mutation.language = "go".into();
+        let mutations = vec![
+            make_test_mutation(Path::new("src/lib.rs")),
+            language_mutation.clone(),
+            project_mutation,
+            language_mutation,
+        ];
+
+        let measurement = check_baseline_health(
+            &root,
+            &mutations,
+            BaselineHealthConfig {
+                commands: &commands,
+                default_measurement_timeout: None,
+                schemata_enabled: false,
+                env: &env,
+                cancelled: &AtomicBool::new(false),
+                respect_workspace_ignores: false,
+            },
+        )?;
+
+        assert_eq!(measurement.suites.len(), 3);
+        assert_eq!(measurement.suites[0].test_command, global_command);
+        assert_eq!(
+            std::fs::read_to_string(log)?.lines().collect::<Vec<_>>(),
+            vec!["build", "global", "build", "language", "build", "project"]
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn baseline_health_uses_explicit_route_timeout_while_calibrating() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("worker.go"), "package worker").unwrap();
+        let mut commands = test_command_config();
+        commands.language_commands.insert(
+            "go".into(),
+            vec!["sh".into(), "-c".into(), "sleep 1".into()],
+        );
+        commands
+            .language_timeouts
+            .insert("go".into(), Duration::from_millis(50));
+        let mut mutation = make_test_mutation(Path::new("worker.go"));
+        mutation.language = "go".into();
+
+        let err = check_baseline_health(
+            dir.path(),
+            &[mutation],
+            BaselineHealthConfig {
+                commands: &commands,
+                default_measurement_timeout: Some(Duration::from_secs(60)),
+                schemata_enabled: false,
+                env: &HashMap::new(),
+                cancelled: &AtomicBool::new(false),
+                respect_workspace_ignores: false,
+            },
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("timed out after 0.05s"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn baseline_health_checks_identical_commands_at_each_effective_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("default.rs"), "fn main() {}").unwrap();
+        std::fs::write(dir.path().join("worker.go"), "package worker").unwrap();
+        let command = vec!["sh".into(), "-c".into(), "sleep 2".into()];
+        let mut commands = test_command_config();
+        commands.command = command.clone();
+        commands.timeout = Duration::from_secs(1);
+        commands.language_commands.insert("go".into(), command);
+        commands
+            .language_timeouts
+            .insert("go".into(), Duration::from_secs(5));
+        let mut language_mutation = make_test_mutation(Path::new("worker.go"));
+        language_mutation.language = "go".into();
+
+        let err = check_baseline_health(
+            dir.path(),
+            &[
+                make_test_mutation(Path::new("default.rs")),
+                language_mutation,
+            ],
+            BaselineHealthConfig {
+                commands: &commands,
+                default_measurement_timeout: None,
+                schemata_enabled: false,
+                env: &HashMap::new(),
+                cancelled: &AtomicBool::new(false),
+                respect_workspace_ignores: false,
+            },
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("timed out after 1.00s"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn baseline_health_keeps_explicit_identical_deadline_while_calibrating_in_reverse_order() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("default.rs"), "fn main() {}").unwrap();
+        std::fs::write(dir.path().join("worker.go"), "package worker").unwrap();
+        let command = vec!["sh".into(), "-c".into(), "sleep 1".into()];
+        let mut commands = test_command_config();
+        commands.command = command.clone();
+        commands.language_commands.insert("go".into(), command);
+        commands
+            .language_timeouts
+            .insert("go".into(), Duration::from_millis(50));
+        let mut language_mutation = make_test_mutation(Path::new("worker.go"));
+        language_mutation.language = "go".into();
+
+        let err = check_baseline_health(
+            dir.path(),
+            &[
+                language_mutation,
+                make_test_mutation(Path::new("default.rs")),
+            ],
+            BaselineHealthConfig {
+                commands: &commands,
+                default_measurement_timeout: Some(Duration::from_secs(60)),
+                schemata_enabled: false,
+                env: &HashMap::new(),
+                cancelled: &AtomicBool::new(false),
+                respect_workspace_ignores: false,
+            },
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("timed out after 0.05s"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn baseline_health_uses_explicit_project_timeout_while_calibrating() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("services/api")).unwrap();
+        std::fs::write(dir.path().join("services/api/main.go"), "package api").unwrap();
+        let mut commands = test_command_config();
+        commands.project_commands.push(ProjectCommandConfig {
+            path: PathBuf::from("services/api"),
+            command: Some(vec!["sh".into(), "-c".into(), "sleep 1".into()]),
+            timeout: Some(Duration::from_millis(50)),
+        });
+
+        let err = check_baseline_health(
+            dir.path(),
+            &[make_test_mutation(Path::new("services/api/main.go"))],
+            BaselineHealthConfig {
+                commands: &commands,
+                default_measurement_timeout: Some(Duration::from_secs(60)),
+                schemata_enabled: false,
+                env: &HashMap::new(),
+                cancelled: &AtomicBool::new(false),
+                respect_workspace_ignores: false,
+            },
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("timed out after 0.05s"));
+    }
 
     #[test]
     fn workspace_pool_creates_slots_and_reuses_after_drop() {
@@ -6921,6 +7335,65 @@ esac
 
     #[cfg(unix)]
     #[test]
+    fn schemata_build_uses_project_route_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("services/api")).unwrap();
+        let source = "package api\nfunc same(a, b int) bool { return a == b }\n";
+        std::fs::write(dir.path().join("services/api/calc.go"), source).unwrap();
+        let mutation = go_operator_mutation(0, "services/api/calc.go", source, 0);
+        let test_command = vec![
+            "sh".into(),
+            "-c".into(),
+            "case \"$(cat services/api/calc.go)\" in *__togi_active*) exit 1 ;; *) exit 2 ;; esac"
+                .into(),
+        ];
+        let runner = TestRunner {
+            commands: CommandConfig {
+                command: successful_command(),
+                force_default_command: false,
+                force_default_timeout: false,
+                project_commands: vec![ProjectCommandConfig {
+                    path: PathBuf::from("services/api"),
+                    command: Some(test_command),
+                    timeout: Some(Duration::from_secs(2)),
+                }],
+                language_commands: HashMap::new(),
+                build_command: vec!["sh".into(), "-c".into(), "sleep 1".into()],
+                sandbox_command: vec![],
+                build_command_explicit: true,
+                timeout: Duration::from_millis(50),
+                language_timeouts: HashMap::new(),
+                test_selection: None,
+            },
+            parallelism: 1,
+            project_root: dir.path().to_path_buf(),
+            verbose: false,
+            show_output: false,
+            max_tested: None,
+            early_stop: Default::default(),
+            respect_workspace_ignores: true,
+            env: HashMap::new(),
+            incremental_history: true,
+            force_rerun: false,
+            learned_selection: false,
+            cancelled: Arc::new(AtomicBool::new(false)),
+        };
+
+        let report = runner.run_with_schemata(vec![mutation]).report;
+
+        assert_eq!(report.results[0].1, MutationResult::Killed);
+        assert!(
+            report
+                .schemata
+                .expect("schemata report")
+                .fallback_reasons
+                .iter()
+                .all(|reason| reason.reason != "schema_build_failure")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn run_with_schemata_resets_workspace_between_schema_mutants() {
         let dir = tempfile::tempdir().unwrap();
         let source = "\
@@ -7020,6 +7493,7 @@ esac
         let cache_selected = SelectedTestCommand {
             argv: selected.argv,
             timeout: selected.timeout,
+            uses_default_timeout: selected.uses_default_timeout,
             selected_tests: selected.selected_tests,
         };
         let cache_ctx = cache_selected.cache_context(
