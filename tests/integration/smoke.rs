@@ -192,10 +192,15 @@ fn ruby_fixture_runs_end_to_end() {
 #[test]
 #[ignore]
 fn polyglot_demo_routes_mutations_to_each_language_test_suite() {
+    // The demo creates commits, so it must not rely on a CI runner's identity.
+    let clean_home = tempfile::tempdir().unwrap();
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let output = Command::new("bash")
         .arg("examples/polyglot-demo.sh")
         .current_dir(&root)
+        .env("HOME", clean_home.path())
+        .env("XDG_CONFIG_HOME", clean_home.path().join("config"))
+        .env("GIT_CONFIG_NOSYSTEM", "1")
         .output()
         .expect("failed to run polyglot demo");
     assert!(
