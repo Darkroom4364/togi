@@ -186,3 +186,33 @@ fn ruby_fixture_runs_end_to_end() {
         file: "calc.rb",
     });
 }
+
+/// Proves the documented polyglot demo routes mutations to each language's
+/// configured test suite, rather than applying the Rust default everywhere.
+#[test]
+#[ignore]
+fn polyglot_demo_routes_mutations_to_each_language_test_suite() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let output = Command::new("bash")
+        .arg("examples/polyglot-demo.sh")
+        .current_dir(&root)
+        .output()
+        .expect("failed to run polyglot demo");
+    assert!(
+        output.status.success(),
+        "polyglot demo failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for expected in [
+        "✓ KILLED      calc.go:5 — zero_to_one",
+        "✓ KILLED      calc.py:2 — increment_numeric",
+    ] {
+        assert!(
+            stdout.contains(expected),
+            "polyglot demo did not route {expected} to its language test suite\nstdout:\n{stdout}"
+        );
+    }
+}
