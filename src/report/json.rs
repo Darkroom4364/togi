@@ -1,3 +1,7 @@
+use crate::replay::{
+    REPORT_KIND, REPORT_SCHEMA_VERSION, RegularDirectRecipe, ReplayReportCapture,
+    replay_unavailable_reason,
+};
 use crate::runner::{RunSuiteFailure, RunSuiteFailureOutcome, SuiteFailurePhase};
 use crate::{Mutation, MutationReport, MutationResult};
 use anyhow::Result;
@@ -6,6 +10,14 @@ use std::collections::BTreeMap;
 
 #[derive(Serialize)]
 struct JsonReport {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kind: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    schema_version: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    generator: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_revision: Option<String>,
     total: usize,
     planned_total: usize,
     tested: usize,
@@ -110,6 +122,18 @@ struct JsonMutation {
     build_error_fingerprint: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     baseline_status: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    language: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    byte_start: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    byte_end: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_fingerprint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    replay: Option<JsonMutationReplay>,
 }
 
 #[derive(Serialize)]
@@ -117,6 +141,82 @@ struct JsonMutationExecution {
     state: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     reason: Option<&'static str>,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum JsonMutationReplay {
+    RegularDirect {
+        test_command: Vec<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        build_command: Option<Vec<String>>,
+        timeout_ms: u64,
+        env: BTreeMap<String, String>,
+        respect_workspace_ignores: bool,
+        origin: crate::replay::DirectRecipeOrigin,
+    },
+    Unavailable {
+        reason: &'static str,
+    },
+}
+
+struct JsonReplayMutationFields {
+    language: String,
+    source_path: String,
+    byte_start: usize,
+    byte_end: usize,
+    source_fingerprint: String,
+    replay: JsonMutationReplay,
+}
+
+fn json_replay_mutation_fields(
+    capture: &ReplayReportCapture,
+    direct_recipe: Option<&RegularDirectRecipe>,
+    mutation: &Mutation,
+    result: MutationResult,
+    execution: crate::MutationExecution,
+    schemata_enabled: bool,
+) -> JsonReplayMutationFields {
+    let source = capture.source_for(mutation.id);
+    let replay = match replay_unavailable_reason(
+        capture,
+        mutation.id,
+        result,
+        direct_recipe,
+        execution,
+        schemata_enabled,
+    ) {
+        Some(reason) => JsonMutationReplay::Unavailable {
+            reason: reason.as_str(),
+        },
+        None => {
+            let recipe = direct_recipe.expect("validated direct replay recipe must be present");
+            JsonMutationReplay::RegularDirect {
+                test_command: recipe.test_command.clone(),
+                build_command: recipe.build_command.clone(),
+                timeout_ms: recipe.timeout_ms,
+                env: recipe.env.clone(),
+                respect_workspace_ignores: recipe.respect_workspace_ignores,
+                origin: recipe.origin.clone(),
+            }
+        }
+    };
+    JsonReplayMutationFields {
+        language: source
+            .map(|source| source.language.clone())
+            .unwrap_or_else(|| mutation.language.clone()),
+        source_path: source.map(|source| source.path.clone()).unwrap_or_default(),
+        byte_start: source
+            .map(|source| source.byte_start)
+            .unwrap_or(mutation.byte_range.start),
+        byte_end: source
+            .map(|source| source.byte_end)
+            .unwrap_or(mutation.byte_range.end),
+        source_fingerprint: source
+            .map(|source| source.source_fingerprint.clone())
+            .unwrap_or_default(),
+        replay,
+    }
 }
 
 #[derive(Serialize)]
@@ -162,6 +262,22 @@ pub fn print_report_with_baseline(
     comparison: Option<&crate::baseline::SurvivorBaselineComparison>,
 ) -> Result<()> {
     println!("{}", to_json_string_with_baseline(report, comparison)?);
+    Ok(())
+}
+
+/// Print a versioned replay-aware mutation report. Only normal JSON reports
+/// receive this additive metadata; dry-run and suite-failure documents retain
+/// their distinct schemas.
+pub fn print_report_with_baseline_and_replay(
+    report: &MutationReport,
+    comparison: Option<&crate::baseline::SurvivorBaselineComparison>,
+    capture: &ReplayReportCapture,
+    direct_recipes: &BTreeMap<u32, RegularDirectRecipe>,
+) -> Result<()> {
+    println!(
+        "{}",
+        to_json_string_with_baseline_and_replay(report, comparison, capture, direct_recipes)?
+    );
     Ok(())
 }
 
@@ -238,6 +354,27 @@ pub fn to_json_string_with_baseline(
     report: &MutationReport,
     comparison: Option<&crate::baseline::SurvivorBaselineComparison>,
 ) -> Result<String> {
+    to_json_string_with_baseline_and_replay_optional(report, comparison, None)
+}
+/// Serialize a versioned replay-aware mutation report.
+pub fn to_json_string_with_baseline_and_replay(
+    report: &MutationReport,
+    comparison: Option<&crate::baseline::SurvivorBaselineComparison>,
+    capture: &ReplayReportCapture,
+    direct_recipes: &BTreeMap<u32, RegularDirectRecipe>,
+) -> Result<String> {
+    to_json_string_with_baseline_and_replay_optional(
+        report,
+        comparison,
+        Some((capture, direct_recipes)),
+    )
+}
+
+fn to_json_string_with_baseline_and_replay_optional(
+    report: &MutationReport,
+    comparison: Option<&crate::baseline::SurvivorBaselineComparison>,
+    replay_capture: Option<(&ReplayReportCapture, &BTreeMap<u32, RegularDirectRecipe>)>,
+) -> Result<String> {
     let diagnostic_by_id: BTreeMap<_, _> = report
         .build_error_diagnostics
         .iter()
@@ -248,6 +385,16 @@ pub fn to_json_string_with_baseline(
         .iter()
         .map(|(m, r)| {
             let execution = report.execution_for(m.id, *r);
+            let replay_fields = replay_capture.map(|(capture, recipes)| {
+                json_replay_mutation_fields(
+                    capture,
+                    recipes.get(&m.id),
+                    m,
+                    *r,
+                    execution,
+                    report.schemata.is_some(),
+                )
+            });
             JsonMutation {
                 id: m.id + 1,
                 file: m.file.display().to_string(),
@@ -281,6 +428,16 @@ pub fn to_json_string_with_baseline(
                     .then(|| comparison.and_then(|comparison| comparison.status_for(m.id)))
                     .flatten()
                     .map(|status| status.as_str()),
+                language: replay_fields.as_ref().map(|fields| fields.language.clone()),
+                source_path: replay_fields
+                    .as_ref()
+                    .map(|fields| fields.source_path.clone()),
+                byte_start: replay_fields.as_ref().map(|fields| fields.byte_start),
+                byte_end: replay_fields.as_ref().map(|fields| fields.byte_end),
+                source_fingerprint: replay_fields
+                    .as_ref()
+                    .map(|fields| fields.source_fingerprint.clone()),
+                replay: replay_fields.map(|fields| fields.replay),
             }
         })
         .collect();
@@ -316,7 +473,21 @@ pub fn to_json_string_with_baseline(
         .collect();
 
     let execution_counts = report.execution_counts();
+    let (kind, schema_version, generator, source_revision) = replay_capture
+        .map(|(capture, _)| {
+            (
+                Some(REPORT_KIND),
+                Some(REPORT_SCHEMA_VERSION),
+                Some(format!("togi/{}", env!("CARGO_PKG_VERSION"))),
+                capture.source_revision().map(str::to_owned),
+            )
+        })
+        .unwrap_or((None, None, None, None));
     let json_report = JsonReport {
+        kind,
+        schema_version,
+        generator,
+        source_revision,
         total: report.total,
         planned_total: report.planned_total,
         tested: execution_counts.executed,
@@ -371,11 +542,13 @@ mod tests {
     use crate::runner::{RunSuiteFailure, RunSuiteFailureOutcome, SuiteFailurePhase};
     use crate::test_helpers::sample_report;
     use crate::{
-        BaselineTiming, BuildErrorDiagnostic, Mutation, SchemataFallbackReasonCount, SchemataReport,
+        BaselineTiming, BuildErrorDiagnostic, Mutation, MutationExecution,
+        SchemataFallbackReasonCount, SchemataReport,
     };
     use serde_json::Value;
     use std::collections::BTreeMap;
     use std::path::PathBuf;
+    use std::process::Command;
     use std::time::Duration;
 
     fn assert_object_keys(value: &Value, expected: &[&str]) {
@@ -844,6 +1017,157 @@ mod tests {
         assert_eq!(mutations[1]["replacement"], "!=");
         // diff is None because the test file doesn't exist on disk
         assert!(mutations[1]["diff"].is_null());
+    }
+
+    #[test]
+    fn replay_json_keeps_baseline_status_and_marks_unavailable_records() {
+        let project = tempfile::tempdir().unwrap();
+        let source_dir = project.path().join("src");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        std::fs::write(source_dir.join("lib.rs"), "fn f() { a < b; }\n").unwrap();
+        for args in [
+            vec!["init"],
+            vec!["config", "user.email", "test@example.com"],
+            vec!["config", "user.name", "Togi Test"],
+            vec!["add", "."],
+            vec!["commit", "-m", "initial"],
+        ] {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(project.path())
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        let mutation = Mutation {
+            id: 0,
+            file: PathBuf::from("src/lib.rs"),
+            language: "rust".into(),
+            line: 1,
+            column: 12,
+            operator: "lt_to_lte".into(),
+            description: "replace < with <=".into(),
+            original: "<".into(),
+            replacement: "<=".into(),
+            byte_range: 11..12,
+        };
+        let capture = ReplayReportCapture::capture(project.path(), std::slice::from_ref(&mutation));
+        let mut report = MutationReport {
+            results: vec![(mutation.clone(), MutationResult::Survived)],
+            execution_provenance: BTreeMap::from([(0, MutationExecution::Executed)]),
+            build_error_diagnostics: vec![],
+            schemata: Some(SchemataReport {
+                fast_path: 0,
+                fallback: 1,
+                fallback_reasons: vec![],
+            }),
+            baseline_timing: None,
+            duration: Duration::ZERO,
+            test_command: Some(vec!["cargo".into(), "test".into()]),
+            build_command: vec![],
+            planned_total: 1,
+            early_stop_reason: None,
+            total: 1,
+            killed: 0,
+            survived: 1,
+            timeout: 0,
+            build_errors: 0,
+        };
+        let recipe = RegularDirectRecipe {
+            test_command: vec!["cargo".into(), "test".into()],
+            build_command: None,
+            timeout_ms: 1_000,
+            env: BTreeMap::new(),
+            respect_workspace_ignores: true,
+            origin: crate::replay::DirectRecipeOrigin::Executed,
+        };
+        let comparison = crate::baseline::SurvivorBaselineComparison::from_statuses(
+            BTreeMap::from([(0, crate::baseline::SurvivorBaselineStatus::New)]),
+        );
+        let replayable: Value = serde_json::from_str(
+            &to_json_string_with_baseline_and_replay(
+                &report,
+                Some(&comparison),
+                &capture,
+                &BTreeMap::from([(0, recipe)]),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(replayable["kind"], REPORT_KIND);
+        assert_eq!(replayable["schema_version"], REPORT_SCHEMA_VERSION);
+        assert_eq!(replayable["mutations"][0]["baseline_status"], "new");
+        assert_eq!(replayable["mutations"][0]["source_path"], "src/lib.rs");
+        assert_eq!(
+            replayable["mutations"][0]["replay"]["kind"],
+            "regular_direct"
+        );
+
+        let schema: Value = serde_json::from_str(
+            &to_json_string_with_baseline_and_replay(&report, None, &capture, &BTreeMap::new())
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(schema["mutations"][0]["replay"]["reason"], "schemata");
+
+        report.results[0].1 = MutationResult::BuildError;
+        report.execution_provenance.clear();
+        report.survived = 0;
+        report.build_errors = 1;
+        let not_executed: Value = serde_json::from_str(
+            &to_json_string_with_baseline_and_replay(&report, None, &capture, &BTreeMap::new())
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            not_executed["mutations"][0]["replay"]["reason"],
+            "not_executed"
+        );
+
+        let mut missing = mutation;
+        missing.file = PathBuf::from("src/missing.rs");
+        let failed_capture =
+            ReplayReportCapture::capture(project.path(), std::slice::from_ref(&missing));
+        report.results[0].0 = missing;
+        let capture_failed: Value = serde_json::from_str(
+            &to_json_string_with_baseline_and_replay(
+                &report,
+                None,
+                &failed_capture,
+                &BTreeMap::new(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(capture_failed["mutations"][0]["file"], "src/missing.rs");
+        assert_eq!(
+            capture_failed["mutations"][0]["replay"]["reason"],
+            "capture_failed"
+        );
+    }
+
+    #[test]
+    fn replay_json_omits_source_revision_without_git_head() {
+        let project = tempfile::tempdir().unwrap();
+        let capture = ReplayReportCapture::capture(project.path(), &[]);
+        assert!(capture.source_revision().is_none());
+
+        let value: Value = serde_json::from_str(
+            &to_json_string_with_baseline_and_replay(
+                &sample_report(),
+                None,
+                &capture,
+                &BTreeMap::new(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(value["kind"], REPORT_KIND);
+        assert_eq!(value["schema_version"], REPORT_SCHEMA_VERSION);
+        assert!(value.get("source_revision").is_none());
     }
 
     #[test]

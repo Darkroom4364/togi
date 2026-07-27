@@ -11,9 +11,11 @@ pub mod mapper;
 pub mod mutator;
 pub mod operators;
 pub mod parser;
+pub mod replay;
 pub mod report;
 pub mod runner;
 pub mod schemata;
+pub mod source_identity;
 
 #[cfg(test)]
 pub mod test_helpers;

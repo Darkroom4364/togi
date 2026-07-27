@@ -38,6 +38,9 @@ sha2 = "0.10"
 tempfile = "3"
 globset = "0.4"
 ignore = "0.4"
+cap-std = "4.0.2"
+cap-tempfile = "4.0.2"
+cap-fs-ext = "4.0.2"
 
 # Shell parsing
 shell-words = "1"

@@ -116,6 +116,9 @@ togi check --format json
 togi check --format json > togi-report.json
 togi explain 1 --report togi-report.json
 
+# Force a fresh replay from a trusted versioned JSON report
+togi replay 1 --report togi-report.json
+
 # GitHub annotations or HTML report
 togi check --format github
 togi check --format html
@@ -542,6 +545,15 @@ test command genuinely needs ignored files copied into the mutation workspace.
 
 togi executes repository-defined build and test commands with the permissions of
 the current user or CI runner.
+
+`togi replay` intentionally executes the report's stored argv and Togi-owned
+environment overrides to reproduce its recorded command context. Replay only
+trusted reports: report commands are not sandboxed by togi. Its no-residue
+guarantee applies only to Togi-owned workspace, cache, history, and lock
+operations; report commands remain responsible for their own behavior.
+
+Replay is unavailable on Windows until its disposable-workspace setup can
+guarantee race-free directory removal.
 
 Workspace copies, timeouts, descendant-process cleanup, and the optional
 `[test] sandbox_command` wrapper improve correctness and reduce exposure, but

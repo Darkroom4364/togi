@@ -79,6 +79,18 @@ fn main() {
                 process::exit(2);
             }
         }
+        togi::cli::Commands::Replay {
+            mutant_id,
+            report,
+            show_output,
+        } => {
+            if let Err(e) =
+                togi::replay::replay_mutation(mutant_id, &report, show_output, cancelled.as_ref())
+            {
+                eprintln!("Error: {e:#}");
+                process::exit(2);
+            }
+        }
         togi::cli::Commands::ListOperators => {
             print_operators();
         }
@@ -346,7 +358,7 @@ fn run_check(cfg: togi::cli::CheckArgs, cancelled: Arc<AtomicBool>) -> anyhow::R
     )?;
     if changed_files.is_empty() {
         if output_format == togi::cli::OutputFormat::Json {
-            print_empty_json_check_output(&config, has_explicit_build_cmd, dry_run)?;
+            print_empty_json_check_output(&config, has_explicit_build_cmd, dry_run, &project_root)?;
         }
         return Ok(());
     }
@@ -420,7 +432,7 @@ fn run_check(cfg: togi::cli::CheckArgs, cancelled: Arc<AtomicBool>) -> anyhow::R
             eprintln!("  - Changed files are in an unsupported language");
             eprintln!("  - All mutable nodes were filtered out (test files, noisy patterns)");
             eprintln!("  - max_per_run or max_per_file is set to 0 in togi.toml");
-            print_empty_json_check_output(&config, has_explicit_build_cmd, dry_run)?;
+            print_empty_json_check_output(&config, has_explicit_build_cmd, dry_run, &project_root)?;
         } else {
             println!("No mutations generated. Possible causes:");
             println!("  - Changed files are in an unsupported language");
@@ -445,6 +457,10 @@ fn run_check(cfg: togi::cli::CheckArgs, cancelled: Arc<AtomicBool>) -> anyhow::R
         .chain(&classified.uncovered)
         .cloned()
         .collect::<Vec<_>>();
+    // Snapshot exact source evidence before baseline or mutation commands can
+    // run; JSON serialization revalidates it after the run.
+    let mut replay_capture =
+        togi::replay::ReplayReportCapture::capture(&project_root, &baseline_mutations);
     let (baseline_timing, commands) = if baseline_mutations.is_empty() {
         (None, None)
     } else {
@@ -522,9 +538,13 @@ fn run_check(cfg: togi::cli::CheckArgs, cancelled: Arc<AtomicBool>) -> anyhow::R
     }
 
     let project_root_ref = project_root.clone();
-    let (mut report, run_cancelled) = if classified.to_run.is_empty() {
+    let (mut report, run_cancelled, direct_recipes) = if classified.to_run.is_empty() {
         // Every generated mutant sits on a zero-coverage line: nothing to run.
-        (coverage_only_report(&config, has_explicit_build_cmd), false)
+        (
+            coverage_only_report(&config, has_explicit_build_cmd),
+            false,
+            BTreeMap::new(),
+        )
     } else {
         eprintln!("Running {} mutations...", classified.to_run.len());
         let outcome = execute(
@@ -542,7 +562,7 @@ fn run_check(cfg: togi::cli::CheckArgs, cancelled: Arc<AtomicBool>) -> anyhow::R
                 cancelled: cancelled.clone(),
             },
         );
-        (outcome.report, outcome.cancelled)
+        (outcome.report, outcome.cancelled, outcome.replay_recipes)
     };
     if run_cancelled || cancelled.load(Ordering::Acquire) {
         eprintln!("Interrupted; skipping mutation report and side effects.");
@@ -585,7 +605,21 @@ fn run_check(cfg: togi::cli::CheckArgs, cancelled: Arc<AtomicBool>) -> anyhow::R
         }
     }
 
-    togi::report::print_report_with_baseline(&report, output_format, survivor_comparison.as_ref())?;
+    if output_format == togi::cli::OutputFormat::Json {
+        replay_capture.revalidate(&project_root_ref);
+        togi::report::print_report_with_baseline_and_replay(
+            &report,
+            output_format,
+            survivor_comparison.as_ref(),
+            Some((&replay_capture, &direct_recipes)),
+        )?;
+    } else {
+        togi::report::print_report_with_baseline(
+            &report,
+            output_format,
+            survivor_comparison.as_ref(),
+        )?;
+    }
 
     if let Some(error) = baseline_load_error {
         return Err(error);
@@ -1393,12 +1427,20 @@ fn print_empty_json_check_output(
     config: &togi::config::Config,
     build_command_explicit: bool,
     dry_run: bool,
+    project_root: &Path,
 ) -> anyhow::Result<()> {
     if dry_run {
         togi::report::json::print_dry_run(&[])?;
     } else {
         let report = coverage_only_report(config, build_command_explicit);
-        togi::report::json::print_report(&report)?;
+        let mut capture = togi::replay::ReplayReportCapture::capture(project_root, &[]);
+        capture.revalidate(project_root);
+        togi::report::json::print_report_with_baseline_and_replay(
+            &report,
+            None,
+            &capture,
+            &BTreeMap::new(),
+        )?;
     }
     Ok(())
 }
