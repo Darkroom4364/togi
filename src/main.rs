@@ -551,13 +551,55 @@ fn run_check(cfg: togi::cli::CheckArgs, cancelled: Arc<AtomicBool>) -> anyhow::R
 
     report.baseline_timing = baseline_timing;
     merge_uncovered(&mut report, classified.uncovered);
-    togi::report::print_report(&report, output_format)?;
 
     let baseline_eligible = togi::baseline::is_baseline_eligible(&report);
-    let mut current = None;
     let mut should_fail = false;
     let partial_report = report.total < report.planned_total;
     let baseline_actions_allowed = baseline_eligible;
+    let mut baseline_score: Option<f64> = None;
+    let mut loaded_baseline = false;
+    let mut survivor_comparison = None;
+    let mut baseline_regressions = None;
+    let mut baseline_load_error = None;
+
+    if check_baseline && baseline_actions_allowed {
+        match togi::baseline::load_baseline(&project_root_ref) {
+            Ok(Some(baseline)) => {
+                loaded_baseline = true;
+                baseline_score =
+                    Some(baseline.killed as f64 / baseline.total.max(1) as f64 * 100.0);
+                survivor_comparison = Some(togi::baseline::compare_survivors(
+                    &report,
+                    &baseline,
+                    &project_root_ref,
+                ));
+                let current = togi::baseline::from_report(&report, &project_root_ref);
+                if togi::baseline::check_regression(&current, &baseline) {
+                    should_fail = true;
+                    baseline_regressions =
+                        Some(togi::baseline::per_file_regressions(&current, &baseline));
+                }
+            }
+            Ok(None) => {}
+            Err(error) => baseline_load_error = Some(error),
+        }
+    }
+
+    togi::report::print_report_with_baseline(&report, output_format, survivor_comparison.as_ref())?;
+
+    if let Some(error) = baseline_load_error {
+        return Err(error);
+    }
+
+    if let Some(regressions) = baseline_regressions {
+        eprintln!("Mutation score regression detected!");
+        for r in regressions {
+            eprintln!(
+                "  {} — {:.1}% → {:.1}%",
+                r.file, r.baseline_pct, r.current_pct
+            );
+        }
+    }
 
     if (save_baseline || check_baseline) && !baseline_actions_allowed {
         if partial_report {
@@ -568,37 +610,19 @@ fn run_check(cfg: togi::cli::CheckArgs, cancelled: Arc<AtomicBool>) -> anyhow::R
             );
         }
     } else if save_baseline {
-        current = togi::baseline::save_baseline_from_report(&report, &project_root_ref)?;
-        debug_assert!(current.is_some(), "eligible report must save a baseline");
+        let saved = togi::baseline::save_baseline_from_report(&report, &project_root_ref)?;
+        debug_assert!(saved.is_some(), "eligible report must save a baseline");
         eprintln!("Baseline saved to .togi-baseline");
+    } else if check_baseline && !loaded_baseline {
+        eprintln!("warning: no baseline found — use --save-baseline first");
     }
-
-    let mut baseline_score: Option<f64> = None;
-    let mut loaded_baseline = false;
-    if check_baseline && baseline_actions_allowed {
-        if let Some(baseline) = togi::baseline::load_baseline(&project_root_ref)? {
-            loaded_baseline = true;
-            baseline_score = Some(baseline.killed as f64 / baseline.total.max(1) as f64 * 100.0);
-            let current = current
-                .get_or_insert_with(|| togi::baseline::from_report(&report, &project_root_ref));
-            if togi::baseline::check_regression(current, &baseline) {
-                let regressions = togi::baseline::per_file_regressions(current, &baseline);
-                eprintln!("Mutation score regression detected!");
-                for r in &regressions {
-                    eprintln!(
-                        "  {} — {:.1}% → {:.1}%",
-                        r.file, r.baseline_pct, r.current_pct
-                    );
-                }
-                should_fail = true;
-            }
-        } else {
-            eprintln!("warning: no baseline found — use --save-baseline first");
-        }
-    }
-
-    if let Some(ref path) = pr_comment {
-        togi::report::write_pr_comment(&report, path, baseline_score)?;
+    if let Some(path) = &pr_comment {
+        togi::report::write_pr_comment_with_baseline(
+            &report,
+            path,
+            baseline_score,
+            survivor_comparison.as_ref(),
+        )?;
         eprintln!("PR comment written to {}", path.display());
     }
 

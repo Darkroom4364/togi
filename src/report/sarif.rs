@@ -90,6 +90,8 @@ struct SarifResultProperties {
     execution: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     nonexecution_reason: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    baseline_status: Option<&'static str>,
 }
 
 #[derive(Serialize)]
@@ -127,7 +129,11 @@ fn artifact_uri(mutation: &Mutation) -> String {
     mutation.file.display().to_string().replace('\\', "/")
 }
 
-fn result_for(mutation: &Mutation, execution: MutationExecution) -> SarifResult {
+fn result_for_with_baseline(
+    mutation: &Mutation,
+    execution: MutationExecution,
+    status: Option<crate::baseline::SurvivorBaselineStatus>,
+) -> SarifResult {
     SarifResult {
         rule_id: mutation.operator.clone(),
         level: "warning",
@@ -150,9 +156,10 @@ fn result_for(mutation: &Mutation, execution: MutationExecution) -> SarifResult 
                 },
             },
         }],
-        properties: (!execution.is_tested()).then(|| SarifResultProperties {
+        properties: (!execution.is_tested() || status.is_some()).then(|| SarifResultProperties {
             execution: execution.state_name(),
             nonexecution_reason: execution.reason().map(|reason| reason.name()),
+            baseline_status: status.map(|status| status.as_str()),
         }),
     }
 }
@@ -166,8 +173,14 @@ fn registry_descriptions() -> BTreeMap<String, String> {
 }
 
 pub fn print_report(report: &MutationReport) -> Result<()> {
-    let sarif = to_sarif_string(report)?;
-    println!("{}", sarif);
+    print_report_with_baseline(report, None)
+}
+
+pub fn print_report_with_baseline(
+    report: &MutationReport,
+    comparison: Option<&crate::baseline::SurvivorBaselineComparison>,
+) -> Result<()> {
+    println!("{}", to_sarif_string_with_baseline(report, comparison)?);
     Ok(())
 }
 
@@ -180,6 +193,14 @@ pub fn print_report(report: &MutationReport) -> Result<()> {
 /// (their cluster canonical carries the signal); both only appear in the
 /// invocation totals.
 pub fn to_sarif_string(report: &MutationReport) -> Result<String> {
+    to_sarif_string_with_baseline(report, None)
+}
+
+/// Serialize report with optional per-survivor baseline comparison data.
+pub fn to_sarif_string_with_baseline(
+    report: &MutationReport,
+    comparison: Option<&crate::baseline::SurvivorBaselineComparison>,
+) -> Result<String> {
     let registry = registry_descriptions();
     let surviving: Vec<(&Mutation, MutationExecution)> = report
         .results
@@ -234,7 +255,13 @@ pub fn to_sarif_string(report: &MutationReport) -> Result<String> {
             }],
             results: surviving
                 .iter()
-                .map(|(mutation, execution)| result_for(mutation, *execution))
+                .map(|(mutation, execution)| {
+                    result_for_with_baseline(
+                        mutation,
+                        *execution,
+                        comparison.and_then(|comparison| comparison.status_for(mutation.id)),
+                    )
+                })
                 .collect(),
         }],
     };
@@ -361,6 +388,60 @@ mod tests {
         let results = value["runs"][0]["results"].as_array().unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0]["ruleId"], "op_b");
+    }
+
+    #[test]
+    fn sarif_adds_active_baseline_statuses_only_to_survivor_results() {
+        let mut report = report_with(vec![
+            (
+                mutation(0, "src/killed.rs", 1, "op", "killed"),
+                MutationResult::Killed,
+            ),
+            (
+                mutation(1, "src/fresh.rs", 2, "op", "fresh"),
+                MutationResult::Survived,
+            ),
+            (
+                mutation(2, "src/exact.rs", 3, "op", "exact"),
+                MutationResult::Survived,
+            ),
+        ]);
+        report
+            .execution_provenance
+            .insert(2, MutationExecution::ExactCache);
+        let comparison =
+            crate::baseline::SurvivorBaselineComparison::from_statuses(BTreeMap::from([
+                (0, crate::baseline::SurvivorBaselineStatus::New),
+                (1, crate::baseline::SurvivorBaselineStatus::Historic),
+                (2, crate::baseline::SurvivorBaselineStatus::NonComparable),
+            ]));
+
+        let inactive = to_sarif_string(&report).unwrap();
+        assert_eq!(
+            inactive,
+            to_sarif_string_with_baseline(&report, None).unwrap()
+        );
+        let inactive: Value = serde_json::from_str(&inactive).unwrap();
+        assert!(
+            inactive["runs"][0]["results"][0]
+                .get("properties")
+                .is_none()
+        );
+
+        let active: Value = serde_json::from_str(
+            &to_sarif_string_with_baseline(&report, Some(&comparison)).unwrap(),
+        )
+        .unwrap();
+        let results = active["runs"][0]["results"].as_array().unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0]["properties"]["baseline_status"], "historic");
+        assert_eq!(
+            results[1]["properties"],
+            serde_json::json!({
+                "execution": "exact_cache",
+                "baseline_status": "non_comparable"
+            })
+        );
     }
 
     #[test]

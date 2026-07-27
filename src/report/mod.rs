@@ -183,17 +183,26 @@ pub fn print_report(
     report: &crate::MutationReport,
     format: crate::cli::OutputFormat,
 ) -> anyhow::Result<()> {
+    print_report_with_baseline(report, format, None)
+}
+
+/// Render a report with optional per-survivor baseline comparison data.
+pub fn print_report_with_baseline(
+    report: &crate::MutationReport,
+    format: crate::cli::OutputFormat,
+    comparison: Option<&crate::baseline::SurvivorBaselineComparison>,
+) -> anyhow::Result<()> {
     use crate::cli::OutputFormat;
     match format {
-        OutputFormat::Json => json::print_report(report)?,
-        OutputFormat::Github => github::print_report(report),
+        OutputFormat::Json => json::print_report_with_baseline(report, comparison)?,
+        OutputFormat::Github => github::print_report_with_baseline(report, comparison),
         OutputFormat::Html => {
             let path = std::path::Path::new("togi-report.html");
-            html::write_report(report, path)?;
+            html::write_report_with_baseline(report, path, comparison)?;
             eprintln!("HTML report written to {}", path.display());
         }
-        OutputFormat::Sarif => sarif::print_report(report)?,
-        OutputFormat::Terminal => terminal::print_report(report),
+        OutputFormat::Sarif => sarif::print_report_with_baseline(report, comparison)?,
+        OutputFormat::Terminal => terminal::print_report_with_baseline(report, comparison),
     }
     Ok(())
 }
@@ -235,6 +244,15 @@ pub fn print_coverage_gate_report(
 /// Includes a hidden marker comment so CI pipelines can find/replace
 /// existing togi comments on subsequent runs.
 pub fn format_pr_comment(report: &MutationReport, baseline_score: Option<f64>) -> String {
+    format_pr_comment_with_baseline(report, baseline_score, None)
+}
+
+/// Generate a markdown PR comment with optional survivor baseline annotations.
+pub fn format_pr_comment_with_baseline(
+    report: &MutationReport,
+    baseline_score: Option<f64>,
+    comparison: Option<&crate::baseline::SurvivorBaselineComparison>,
+) -> String {
     use crate::{MutationExecution, MutationResult};
     use std::fmt::Write;
 
@@ -320,8 +338,13 @@ pub fn format_pr_comment(report: &MutationReport, baseline_score: Option<f64>) -
         )
         .unwrap();
         writeln!(md).unwrap();
-        writeln!(md, "| File | Line | Operator | Description |").unwrap();
-        writeln!(md, "|------|------|----------|-------------|").unwrap();
+        if comparison.is_some() {
+            let _ = writeln!(md, "| File | Line | Operator | Description | Baseline |");
+            let _ = writeln!(md, "|------|------|----------|-------------|----------|");
+        } else {
+            let _ = writeln!(md, "| File | Line | Operator | Description |");
+            let _ = writeln!(md, "|------|------|----------|-------------|");
+        }
         for (mutation, result) in survived {
             let provenance = match report.execution_for(mutation.id, *result) {
                 MutationExecution::Executed => String::new(),
@@ -331,16 +354,32 @@ pub fn format_pr_comment(report: &MutationReport, baseline_score: Option<f64>) -
                 }
                 MutationExecution::NotExecuted(reason) => format!(" (not executed: {reason})"),
             };
-            writeln!(
-                md,
-                "| `{}` | {} | `{}` | {}{} |",
-                escape_md_cell(&mutation.file.display().to_string()),
-                mutation.line,
-                escape_md_cell(&mutation.operator),
-                escape_md_cell(&mutation.description),
-                provenance,
-            )
-            .unwrap();
+            if let Some(comparison) = comparison {
+                let baseline_status = comparison
+                    .status_for(mutation.id)
+                    .map(|status| escape_md_cell(status.as_str()))
+                    .unwrap_or_default();
+                let _ = writeln!(
+                    md,
+                    "| `{}` | {} | `{}` | {}{} | {} |",
+                    escape_md_cell(&mutation.file.display().to_string()),
+                    mutation.line,
+                    escape_md_cell(&mutation.operator),
+                    escape_md_cell(&mutation.description),
+                    provenance,
+                    baseline_status,
+                );
+            } else {
+                let _ = writeln!(
+                    md,
+                    "| `{}` | {} | `{}` | {}{} |",
+                    escape_md_cell(&mutation.file.display().to_string()),
+                    mutation.line,
+                    escape_md_cell(&mutation.operator),
+                    escape_md_cell(&mutation.description),
+                    provenance,
+                );
+            }
         }
         writeln!(md).unwrap();
         writeln!(md, "</details>").unwrap();
@@ -360,10 +399,20 @@ pub fn write_pr_comment(
     path: &std::path::Path,
     baseline_score: Option<f64>,
 ) -> anyhow::Result<()> {
+    write_pr_comment_with_baseline(report, path, baseline_score, None)
+}
+
+/// Write a PR comment with optional survivor baseline annotations.
+pub fn write_pr_comment_with_baseline(
+    report: &MutationReport,
+    path: &std::path::Path,
+    baseline_score: Option<f64>,
+    comparison: Option<&crate::baseline::SurvivorBaselineComparison>,
+) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let md = format_pr_comment(report, baseline_score);
+    let md = format_pr_comment_with_baseline(report, baseline_score, comparison);
     fs::write(path, md)?;
     Ok(())
 }
@@ -648,6 +697,28 @@ mod tests {
         let md = format_pr_comment(&report, None);
         assert!(md.contains("survived mutation"));
         assert!(md.contains("src/handler.rs"));
+    }
+
+    #[test]
+    fn pr_comment_adds_baseline_column_for_active_survivor_comparison_only() {
+        let report = crate::test_helpers::sample_report();
+        let comparison =
+            crate::baseline::SurvivorBaselineComparison::from_statuses(BTreeMap::from([
+                (0, crate::baseline::SurvivorBaselineStatus::New),
+                (1, crate::baseline::SurvivorBaselineStatus::Historic),
+            ]));
+
+        let inactive = format_pr_comment(&report, None);
+        assert_eq!(
+            inactive,
+            format_pr_comment_with_baseline(&report, None, None)
+        );
+        assert!(!inactive.contains("| Baseline |"));
+
+        let active = format_pr_comment_with_baseline(&report, None, Some(&comparison));
+        assert!(active.contains("| File | Line | Operator | Description | Baseline |"));
+        assert!(active.contains(" | historic |"));
+        assert!(!active.contains(" | new |"));
     }
 
     #[test]
