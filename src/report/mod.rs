@@ -192,9 +192,34 @@ pub fn print_report_with_baseline(
     format: crate::cli::OutputFormat,
     comparison: Option<&crate::baseline::SurvivorBaselineComparison>,
 ) -> anyhow::Result<()> {
+    print_report_with_baseline_and_replay(report, format, comparison, None)
+}
+
+/// Render a report, adding replay metadata only to JSON when source evidence
+/// and regular direct recipes were captured.
+pub fn print_report_with_baseline_and_replay(
+    report: &crate::MutationReport,
+    format: crate::cli::OutputFormat,
+    comparison: Option<&crate::baseline::SurvivorBaselineComparison>,
+    replay: Option<(
+        &crate::replay::ReplayReportCapture,
+        &std::collections::BTreeMap<u32, crate::replay::RegularDirectRecipe>,
+    )>,
+) -> anyhow::Result<()> {
     use crate::cli::OutputFormat;
     match format {
-        OutputFormat::Json => json::print_report_with_baseline(report, comparison)?,
+        OutputFormat::Json => {
+            if let Some((capture, direct_recipes)) = replay {
+                json::print_report_with_baseline_and_replay(
+                    report,
+                    comparison,
+                    capture,
+                    direct_recipes,
+                )?;
+            } else {
+                json::print_report_with_baseline(report, comparison)?;
+            }
+        }
         OutputFormat::Github => github::print_report_with_baseline(report, comparison),
         OutputFormat::Html => {
             let path = std::path::Path::new("togi-report.html");

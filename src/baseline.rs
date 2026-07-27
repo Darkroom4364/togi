@@ -1,10 +1,13 @@
+use crate::source_identity::{
+    is_normalized_project_relative_path, normalized_project_relative_path, range_matches,
+    source_fingerprint,
+};
 use crate::{Mutation, MutationReport, MutationResult};
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::ErrorKind;
-use std::path::{Component, Path};
+use std::path::Path;
 
 const BASELINE_FILE: &str = ".togi-baseline";
 const MUTANT_SNAPSHOT_VERSION: u32 = 1;
@@ -327,44 +330,6 @@ fn current_identity(mutation: &Mutation, source: &SourceIdentity) -> CurrentMuta
     }
 }
 
-fn normalized_project_relative_path(project_root: &Path, file: &Path) -> Option<String> {
-    let relative = if file.is_absolute() {
-        file.strip_prefix(project_root).ok()?
-    } else {
-        file
-    };
-    let mut parts = Vec::new();
-    for component in relative.components() {
-        match component {
-            Component::Normal(part) => {
-                let part = part.to_str()?;
-                if part.contains('\\') {
-                    return None;
-                }
-                parts.push(part);
-            }
-            Component::CurDir => {}
-            Component::ParentDir => {
-                parts.pop()?;
-            }
-            Component::RootDir | Component::Prefix(_) => return None,
-        }
-    }
-    (!parts.is_empty()).then(|| parts.join("/"))
-}
-
-fn range_matches(source: &[u8], start: usize, end: usize, original: &str) -> bool {
-    start <= end
-        && end <= source.len()
-        && source
-            .get(start..end)
-            .is_some_and(|bytes| bytes == original.as_bytes())
-}
-
-fn source_fingerprint(source: &[u8]) -> String {
-    format!("sha256:{:x}", Sha256::digest(source))
-}
-
 /// Compare freshly executed current survivors with a loaded per-mutant baseline.
 ///
 /// Any missing, malformed, renamed, changed, incomplete, or ambiguous source
@@ -488,14 +453,6 @@ fn baseline_entry_is_valid(entry: &BaselineMutant, source: &SourceIdentity) -> b
             entry.byte_end,
             &entry.original,
         )
-}
-
-fn is_normalized_project_relative_path(path: &str) -> bool {
-    !path.is_empty()
-        && !path.contains('\\')
-        && path
-            .split('/')
-            .all(|part| !part.is_empty() && part != "." && part != "..")
 }
 
 fn has_duplicate_identity(entries: &[&BaselineMutant]) -> bool {

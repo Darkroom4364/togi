@@ -212,6 +212,19 @@ pub enum Commands {
         #[arg(short, long, default_value = "togi-report.json")]
         report: PathBuf,
     },
+    /// Reapply a mutation from a trusted versioned JSON report; its stored argv/env are executed
+    Replay {
+        /// 1-based mutation id from `togi check --format json`
+        mutant_id: u32,
+
+        /// JSON report file produced by `togi check --format json`
+        #[arg(short, long, default_value = "togi-report.json")]
+        report: PathBuf,
+
+        /// Show captured test output from the fresh replay
+        #[arg(long)]
+        show_output: bool,
+    },
     /// List all available mutation operators
     ListOperators,
 }

@@ -1,12 +1,24 @@
 // Parallel test execution with timeouts
 
 use crate::cache::{self, CacheKey};
+use crate::replay::{DirectRecipeOrigin, RegularDirectRecipe};
+use crate::source_identity::{
+    normalized_project_relative_path, range_matches, resolve_normalized_project_relative_path,
+    source_fingerprint,
+};
 use crate::{
     BuildErrorDiagnostic, Mutation, MutationExecution, MutationReport, MutationResult,
     SchemataFallbackReasonCount, SchemataReport,
 };
 use anyhow::{Context, bail};
+#[cfg(not(windows))]
+use cap_fs_ext::MetadataExt as CapMetadataExt;
+use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
+use cap_std::ambient_authority;
+use cap_std::fs::{Dir as CapDir, OpenOptions as CapOpenOptions};
+use cap_tempfile::TempFile;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::ffi::OsString;
 use std::fs;
 use std::hash::Hasher;
 use std::io::{IsTerminal, Read, Write};
@@ -195,6 +207,10 @@ pub struct TestRunner {
 #[derive(Debug)]
 pub struct RunOutcome {
     pub report: MutationReport,
+    /// Captured direct recipes for regular one-mutation paths only. These are
+    /// kept separate from the general report so non-JSON renderers never grow
+    /// replay-specific data.
+    pub replay_recipes: BTreeMap<u32, RegularDirectRecipe>,
     pub cancelled: bool,
 }
 
@@ -213,6 +229,27 @@ pub struct BaselineTimingConfig<'a> {
     pub env: &'a HashMap<String, String>,
     pub cancelled: &'a AtomicBool,
     pub respect_workspace_ignores: bool,
+}
+
+/// A deliberately narrow replay invocation. It never reaches normal runner
+/// cache/history/selection/schemata paths.
+pub struct ReplayRunConfig<'a> {
+    pub test_command: Vec<String>,
+    pub build_command: Option<Vec<String>>,
+    pub timeout: Duration,
+    pub env: HashMap<String, String>,
+    pub respect_workspace_ignores: bool,
+    pub source_revision: &'a str,
+    pub source_fingerprint: &'a str,
+    pub show_output: bool,
+    pub cancelled: &'a AtomicBool,
+}
+
+#[derive(Debug)]
+pub struct ReplayRunOutcome {
+    pub result: MutationResult,
+    pub test_output: Option<String>,
+    pub cancelled: bool,
 }
 /// Configuration for validating unmutated test suites before mutation execution.
 pub struct BaselineHealthConfig<'a> {
@@ -694,6 +731,24 @@ impl GitWorktreeOverlay {
         }
         Ok(())
     }
+
+    fn apply_replay(
+        &self,
+        source_root: &CapDir,
+        workspace: &ReplayWorkspace,
+    ) -> std::io::Result<()> {
+        for relative in &self.remove_paths {
+            workspace.remove_relative(relative)?;
+        }
+        for relative in &self.copy_paths {
+            if cap_relative_file_is_regular(source_root, relative)? {
+                workspace.copy_regular_source(source_root, relative)?;
+            } else {
+                workspace.remove_relative(relative)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 impl WorkspaceCopy {
@@ -714,6 +769,280 @@ impl WorkspaceCopy {
     }
 }
 
+/// Replay's capability-bounded view of its disposable clone.
+///
+/// `root` deliberately precedes `workspace` so its capability handle is
+/// dropped before the `WorkspaceCopy` closes its TempDir, which matters on
+/// Windows.
+struct ReplayWorkspace {
+    root: CapDir,
+    workspace: WorkspaceCopy,
+}
+
+impl ReplayWorkspace {
+    fn open(workspace: WorkspaceCopy) -> std::io::Result<Self> {
+        let root = CapDir::open_ambient_dir(workspace.root(), ambient_authority())?;
+        Ok(Self { root, workspace })
+    }
+
+    /// This path is only for external Git and user-command working directories.
+    fn root(&self) -> &Path {
+        self.workspace.root()
+    }
+
+    fn ensure_directory(&self, relative: &Path) -> std::io::Result<()> {
+        let (parents, leaf) = split_replay_relative_path(relative)?;
+        let mut current = self.root.try_clone()?;
+        for component in parents.into_iter().chain(std::iter::once(leaf)) {
+            current = ensure_cap_directory_child(&current, &component)?;
+        }
+        Ok(())
+    }
+
+    fn remove_relative(&self, relative: &Path) -> std::io::Result<()> {
+        let (parents, leaf) = split_replay_relative_path(relative)?;
+        let mut current = self.root.try_clone()?;
+        for component in parents {
+            match current.symlink_metadata(&component) {
+                Ok(metadata) if metadata.file_type().is_dir() => {
+                    current = current.open_dir_nofollow(&component)?;
+                }
+                Ok(_) => {
+                    remove_cap_entry(&current, &component)?;
+                    return Ok(());
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(error) => return Err(error),
+            }
+        }
+        remove_cap_entry(&current, &leaf)
+    }
+
+    fn read_regular(&self, relative: &Path) -> std::io::Result<Vec<u8>> {
+        let (parent, leaf) = open_cap_existing_parent(&self.root, relative)?;
+        let metadata = parent.symlink_metadata(&leaf)?;
+        if !metadata.file_type().is_file() {
+            return Err(std::io::Error::other(format!(
+                "replay workspace entry {} is not a regular file",
+                relative.display()
+            )));
+        }
+        let mut options = CapOpenOptions::new();
+        options.read(true).follow(FollowSymlinks::No);
+        let mut file = parent.open_with(&leaf, &options)?;
+        if !file.metadata()?.file_type().is_file() {
+            return Err(std::io::Error::other(format!(
+                "replay workspace entry {} changed from a regular file",
+                relative.display()
+            )));
+        }
+        let mut contents = Vec::new();
+        file.read_to_end(&mut contents)?;
+        Ok(contents)
+    }
+
+    fn copy_regular_source(&self, source_root: &CapDir, relative: &Path) -> std::io::Result<()> {
+        let (source_parent, source_leaf) = open_cap_existing_parent(source_root, relative)?;
+        let source_metadata = source_parent.symlink_metadata(&source_leaf)?;
+        if !source_metadata.file_type().is_file() {
+            return Err(std::io::Error::other(format!(
+                "replay source entry {} is not a regular file",
+                relative.display()
+            )));
+        }
+        let mut options = CapOpenOptions::new();
+        options.read(true).follow(FollowSymlinks::No);
+        let mut source_file = source_parent.open_with(&source_leaf, &options)?;
+        // Permissions and bytes come from this same held capability file.
+        let source_metadata = source_file.metadata()?;
+        if !source_metadata.file_type().is_file() {
+            return Err(std::io::Error::other(format!(
+                "replay source entry {} changed from a regular file",
+                relative.display()
+            )));
+        }
+        let permissions = source_metadata.permissions();
+        #[cfg(not(windows))]
+        if CapMetadataExt::nlink(&source_metadata) > 1 {
+            // Recheck the opened inode before copying it into the replay clone.
+            return Err(std::io::Error::other(format!(
+                "replay source entry {} has multiple hard links",
+                relative.display()
+            )));
+        }
+
+        let (destination_parent, destination_leaf) = ensure_cap_parent(&self.root, relative)?;
+        let mut staged = TempFile::new(&destination_parent)?;
+        std::io::copy(&mut source_file, staged.as_file_mut())?;
+        staged.as_file_mut().flush()?;
+        staged.as_file().set_permissions(permissions)?;
+        staged.replace(destination_leaf)
+    }
+
+    fn replace_regular(&self, relative: &Path, contents: &[u8]) -> std::io::Result<()> {
+        let (parent, leaf) = ensure_cap_parent(&self.root, relative)?;
+        let permissions = parent
+            .symlink_metadata(&leaf)
+            .ok()
+            .filter(|metadata| metadata.file_type().is_file())
+            .map(|metadata| metadata.permissions());
+        let mut staged = TempFile::new(&parent)?;
+        staged.as_file_mut().write_all(contents)?;
+        staged.as_file_mut().flush()?;
+        if let Some(permissions) = permissions {
+            staged.as_file().set_permissions(permissions)?;
+        }
+        run_replay_publish_hook();
+        staged.replace(leaf)
+    }
+}
+
+fn split_replay_relative_path(relative: &Path) -> std::io::Result<(Vec<OsString>, OsString)> {
+    if !is_safe_relative_path(relative) {
+        return Err(invalid_workspace_relative_path(relative));
+    }
+    let mut components = relative
+        .components()
+        .map(|component| match component {
+            std::path::Component::Normal(component) => Ok(component.to_os_string()),
+            _ => Err(invalid_workspace_relative_path(relative)),
+        })
+        .collect::<std::io::Result<Vec<_>>>()?;
+    let leaf = components
+        .pop()
+        .ok_or_else(|| invalid_workspace_relative_path(relative))?;
+    Ok((components, leaf))
+}
+
+fn remove_cap_entry(parent: &CapDir, name: &OsString) -> std::io::Result<()> {
+    match parent.symlink_metadata(name) {
+        Ok(metadata) if metadata.file_type().is_dir() => {
+            #[cfg(windows)]
+            {
+                Err(std::io::Error::other(
+                    "replay cannot safely remove a directory on Windows",
+                ))
+            }
+            #[cfg(not(windows))]
+            {
+                // Unix removal remains rooted in the held parent capability.
+                parent.remove_dir_all(name)
+            }
+        }
+        Ok(_) => parent.remove_file_or_symlink(name),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn ensure_cap_directory_child(parent: &CapDir, name: &OsString) -> std::io::Result<CapDir> {
+    loop {
+        match parent.symlink_metadata(name) {
+            Ok(metadata) if metadata.file_type().is_dir() => {
+                return parent.open_dir_nofollow(name);
+            }
+            Ok(_) => remove_cap_entry(parent, name)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        match parent.create_dir(name) {
+            Ok(()) => return parent.open_dir_nofollow(name),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn ensure_cap_parent(root: &CapDir, relative: &Path) -> std::io::Result<(CapDir, OsString)> {
+    let (parents, leaf) = split_replay_relative_path(relative)?;
+    let mut current = root.try_clone()?;
+    for component in parents {
+        current = ensure_cap_directory_child(&current, &component)?;
+    }
+    Ok((current, leaf))
+}
+
+fn open_cap_existing_parent(root: &CapDir, relative: &Path) -> std::io::Result<(CapDir, OsString)> {
+    let (parents, leaf) = split_replay_relative_path(relative)?;
+    let mut current = root.try_clone()?;
+    for component in parents {
+        let metadata = current.symlink_metadata(&component)?;
+        if !metadata.file_type().is_dir() {
+            return Err(std::io::Error::other(format!(
+                "capability path parent {} is not a directory",
+                component.to_string_lossy()
+            )));
+        }
+        current = current.open_dir_nofollow(&component)?;
+    }
+    Ok((current, leaf))
+}
+
+fn cap_relative_file_is_regular(root: &CapDir, relative: &Path) -> std::io::Result<bool> {
+    let (parents, leaf) = match split_replay_relative_path(relative) {
+        Ok(parts) => parts,
+        Err(_) => return Ok(false),
+    };
+    let mut current = root.try_clone()?;
+    for component in parents {
+        let metadata = match current.symlink_metadata(&component) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        if !metadata.file_type().is_dir() {
+            return Ok(false);
+        }
+        current = current.open_dir_nofollow(&component)?;
+    }
+    match current.symlink_metadata(&leaf) {
+        Ok(metadata) => Ok(metadata.file_type().is_file()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static REPLAY_PUBLISH_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn set_replay_publish_hook(hook: Option<Box<dyn FnOnce()>>) {
+    REPLAY_PUBLISH_HOOK.with(|slot| *slot.borrow_mut() = hook);
+}
+
+fn run_replay_publish_hook() {
+    #[cfg(test)]
+    REPLAY_PUBLISH_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook();
+        }
+    });
+}
+
+/// Replay-only RAII restoration through the capability writer.
+struct ReplayFileGuard<'a> {
+    workspace: &'a ReplayWorkspace,
+    relative: PathBuf,
+    original: Vec<u8>,
+}
+
+impl Drop for ReplayFileGuard<'_> {
+    fn drop(&mut self) {
+        if let Err(error) = self
+            .workspace
+            .replace_regular(&self.relative, &self.original)
+        {
+            eprintln!(
+                "error: failed to restore replay workspace {}: {error}",
+                self.relative.display()
+            );
+        }
+    }
+}
+
 impl Drop for WorkspaceCopy {
     fn drop(&mut self) {
         let WorkspaceResetStrategy::GitWorktree { project_root, .. } = &self.reset_strategy else {
@@ -728,6 +1057,8 @@ impl Drop for WorkspaceCopy {
     }
 }
 
+/// Normal workspace-copy exclusions. Keep this compatible with ordinary
+/// `togi check` workspace behavior.
 pub(crate) fn should_skip_workspace_entry(relative: &Path) -> bool {
     relative.components().any(|component| {
         component.as_os_str().to_str().is_some_and(|name| {
@@ -754,6 +1085,38 @@ fn should_copy_workspace_entry(project_root: &Path, path: &Path) -> bool {
         || path
             .strip_prefix(project_root)
             .is_ok_and(|relative| !should_skip_workspace_entry(relative))
+}
+
+/// Replay excludes control aliases case-insensitively in addition to normal
+/// disposable-workspace artifacts.
+fn should_skip_replay_workspace_entry(relative: &Path) -> bool {
+    relative.components().any(|component| {
+        component.as_os_str().to_str().is_some_and(|name| {
+            let name = name.to_ascii_lowercase();
+            matches!(
+                name.as_str(),
+                ".git"
+                    | ".togi"
+                    | ".togi-cache"
+                    | ".togi.lock"
+                    | ".togi-baseline"
+                    | ".codex"
+                    | ".claude"
+                    | "target"
+                    | "node_modules"
+                    | ".venv"
+                    | "dist"
+                    | "build"
+            ) || name.starts_with(".togi-")
+        })
+    })
+}
+
+fn should_copy_replay_workspace_entry(project_root: &Path, path: &Path) -> bool {
+    path == project_root
+        || path
+            .strip_prefix(project_root)
+            .is_ok_and(|relative| !should_skip_replay_workspace_entry(relative))
 }
 
 /// Workspace directories kept across resets.
@@ -1262,9 +1625,147 @@ fn copy_workspace_with_options(
         }
     }
 
+    finish_copy_workspace(project_root, tempdir, root, respect_ignores)
+}
+
+/// Create an independent Git snapshot for replay without registering a
+/// worktree in the source repository. The source working tree is then overlaid
+/// so dirty, untracked, and deleted paths retain normal workspace semantics.
+fn copy_workspace_for_replay(
+    project_root: &Path,
+    expected_source_revision: &str,
+    respect_ignores: bool,
+) -> std::io::Result<ReplayWorkspace> {
+    ensure_replay_snapshot_revision(project_root, expected_source_revision)?;
+    let tempdir = tempfile::tempdir()?;
+    let root = tempdir.path().join("workspace");
+    clone_replay_snapshot(project_root, &root, expected_source_revision)?;
+
+    let workspace = ReplayWorkspace::open(WorkspaceCopy {
+        _tempdir: tempdir,
+        root,
+        reset_strategy: WorkspaceResetStrategy::Copy,
+    })?;
+    let source_root = CapDir::open_ambient_dir(project_root, ambient_authority())?;
+    ensure_replay_snapshot_revision(project_root, expected_source_revision)?;
+    let overlay = collect_replay_git_worktree_overlay(project_root)?;
+    remove_replay_snapshot_exclusions(&workspace)?;
+    populate_replay_workspace(project_root, &source_root, &workspace, respect_ignores)?;
+    overlay.apply_replay(&source_root, &workspace)?;
+    ensure_replay_snapshot_revision(project_root, expected_source_revision)?;
+    Ok(workspace)
+}
+
+fn git_snapshot_revision(project_root: &Path) -> std::io::Result<String> {
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "--verify", "HEAD"])
+        .current_dir(project_root)
+        .output()?;
+    if !output.status.success() {
+        return Err(std::io::Error::other(format!(
+            "could not resolve Git HEAD for replay snapshot in {}\nstderr:\n{}",
+            project_root.display(),
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+    let revision = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if revision.is_empty() {
+        return Err(std::io::Error::other(
+            "could not resolve a non-empty Git HEAD for replay snapshot",
+        ));
+    }
+    Ok(revision)
+}
+
+fn ensure_replay_snapshot_revision(
+    project_root: &Path,
+    expected_source_revision: &str,
+) -> std::io::Result<()> {
+    let current = git_snapshot_revision(project_root)?;
+    if current != expected_source_revision {
+        return Err(std::io::Error::other(format!(
+            "replay source Git HEAD changed: expected {expected_source_revision}, found {current}"
+        )));
+    }
+    Ok(())
+}
+
+fn clone_replay_snapshot(
+    project_root: &Path,
+    root: &Path,
+    source_revision: &str,
+) -> std::io::Result<()> {
+    let clone = std::process::Command::new("git")
+        .args(["clone", "--no-local", "--quiet", "--no-checkout"])
+        .arg(project_root)
+        .arg(root)
+        .output()?;
+    if !clone.status.success() {
+        return Err(std::io::Error::other(format!(
+            "could not create isolated Git replay snapshot from {}\nstderr:\n{}",
+            project_root.display(),
+            String::from_utf8_lossy(&clone.stderr)
+        )));
+    }
+
+    let checkout = std::process::Command::new("git")
+        .args(["checkout", "--detach", "--quiet", source_revision])
+        .current_dir(root)
+        .output()?;
+    if !checkout.status.success() {
+        return Err(std::io::Error::other(format!(
+            "could not check out replay snapshot revision {source_revision}\nstderr:\n{}",
+            String::from_utf8_lossy(&checkout.stderr)
+        )));
+    }
+
+    let git_dir = root.join(".git");
+    let metadata = fs::symlink_metadata(&git_dir)?;
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        return Err(std::io::Error::other(
+            "isolated replay snapshot has a non-directory .git entry",
+        ));
+    }
+    Ok(())
+}
+
+fn remove_replay_snapshot_exclusions(workspace: &ReplayWorkspace) -> std::io::Result<()> {
+    fn remove_entries(
+        workspace: &ReplayWorkspace,
+        current: &CapDir,
+        current_relative: &Path,
+    ) -> std::io::Result<()> {
+        for entry in current.entries()? {
+            let entry = entry?;
+            let relative = current_relative.join(entry.file_name());
+            // The clone's own independent Git directory is the one excluded
+            // entry that must remain for Git-dependent replay commands.
+            if relative == Path::new(".git") {
+                continue;
+            }
+            if should_skip_replay_workspace_entry(&relative) {
+                workspace.remove_relative(&relative)?;
+                continue;
+            }
+            if entry.file_type()?.is_dir() {
+                let child = current.open_dir_nofollow(entry.file_name())?;
+                remove_entries(workspace, &child, &relative)?;
+            }
+        }
+        Ok(())
+    }
+
+    remove_entries(workspace, &workspace.root, Path::new(""))
+}
+
+fn finish_copy_workspace(
+    project_root: &Path,
+    tempdir: tempfile::TempDir,
+    root: PathBuf,
+    respect_ignores: bool,
+) -> std::io::Result<WorkspaceCopy> {
     fs::create_dir(&root)?;
     populate_workspace(project_root, &root, respect_ignores)?;
-
     Ok(WorkspaceCopy {
         _tempdir: tempdir,
         root,
@@ -1578,8 +2079,7 @@ fn collect_git_worktree_overlay(project_root: &Path) -> std::io::Result<GitWorkt
         if !should_overlay_workspace_entry(&relative) {
             continue;
         }
-        let source = project_root.join(&relative);
-        if source.is_file() {
+        if project_root.join(&relative).is_file() {
             copy_paths.insert(relative);
         } else {
             remove_paths.insert(relative);
@@ -1603,6 +2103,80 @@ fn collect_git_worktree_overlay(project_root: &Path) -> std::io::Result<GitWorkt
         copy_paths: copy_paths.into_iter().collect(),
         remove_paths: remove_paths.into_iter().collect(),
     })
+}
+
+fn collect_replay_git_worktree_overlay(project_root: &Path) -> std::io::Result<GitWorktreeOverlay> {
+    let changed_paths = git_z_output_paths(
+        project_root,
+        &["diff", "--name-only", "-z", "--no-renames", "HEAD", "--"],
+    )?;
+    let untracked_paths = git_z_output_paths(
+        project_root,
+        &["ls-files", "-z", "--others", "--exclude-standard", "--"],
+    )?;
+
+    let mut copy_paths = BTreeSet::new();
+    let mut remove_paths = BTreeSet::new();
+
+    for relative in changed_paths {
+        if !should_overlay_replay_workspace_entry(&relative) {
+            continue;
+        }
+        if replay_source_relative_file_is_regular(project_root, &relative)? {
+            copy_paths.insert(relative);
+        } else {
+            remove_paths.insert(relative);
+        }
+    }
+
+    for relative in untracked_paths {
+        if !should_overlay_replay_workspace_entry(&relative) {
+            continue;
+        }
+        if replay_source_relative_file_is_regular(project_root, &relative)? {
+            copy_paths.insert(relative);
+        }
+    }
+
+    for copied in &copy_paths {
+        remove_paths.remove(copied);
+    }
+
+    Ok(GitWorktreeOverlay {
+        copy_paths: copy_paths.into_iter().collect(),
+        remove_paths: remove_paths.into_iter().collect(),
+    })
+}
+
+/// Replay-only source classification without following symlinked parents into
+/// source-root control state.
+fn replay_source_relative_file_is_regular(
+    project_root: &Path,
+    relative: &Path,
+) -> std::io::Result<bool> {
+    if !is_safe_relative_path(relative) {
+        return Ok(false);
+    }
+    let mut current = project_root.to_path_buf();
+    let mut components = relative.components().peekable();
+    while let Some(component) = components.next() {
+        let std::path::Component::Normal(component) = component else {
+            return Ok(false);
+        };
+        current.push(component);
+        let metadata = match fs::symlink_metadata(&current) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        if components.peek().is_none() {
+            return Ok(metadata.file_type().is_file());
+        }
+        if !metadata.file_type().is_dir() {
+            return Ok(false);
+        }
+    }
+    Ok(false)
 }
 
 fn git_z_output_paths(project_root: &Path, args: &[&str]) -> std::io::Result<Vec<PathBuf>> {
@@ -1629,6 +2203,10 @@ fn git_z_output_paths(project_root: &Path, args: &[&str]) -> std::io::Result<Vec
 
 fn should_overlay_workspace_entry(relative: &Path) -> bool {
     is_safe_relative_path(relative) && !should_skip_workspace_entry(relative)
+}
+
+fn should_overlay_replay_workspace_entry(relative: &Path) -> bool {
+    is_safe_relative_path(relative) && !should_skip_replay_workspace_entry(relative)
 }
 
 fn safe_git_relative_path(raw: &[u8]) -> Option<PathBuf> {
@@ -1737,20 +2315,170 @@ fn remove_workspace_path(path: &Path) -> std::io::Result<()> {
     }
 }
 
+fn ensure_workspace_root(workspace_root: &Path) -> std::io::Result<()> {
+    let metadata = fs::symlink_metadata(workspace_root)?;
+    if metadata.file_type().is_dir() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!(
+            "workspace root {} is not a directory",
+            workspace_root.display()
+        )))
+    }
+}
+
+fn invalid_workspace_relative_path(relative: &Path) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!(
+            "workspace destination path {} is not a safe relative path",
+            relative.display()
+        ),
+    )
+}
+
+/// Create one directory after replacing any non-directory entry at its leaf.
+/// Callers first materialize all ancestor directories, so this never follows a
+/// symlink while preparing a workspace destination.
+fn materialize_workspace_directory(path: &Path) -> std::io::Result<()> {
+    loop {
+        match fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.file_type().is_dir() => return Ok(()),
+            Ok(_) => remove_workspace_path(path)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        match fs::create_dir(path) {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn materialize_workspace_directory_at(
+    workspace_root: &Path,
+    relative: &Path,
+) -> std::io::Result<()> {
+    if !is_safe_relative_path(relative) {
+        return Err(invalid_workspace_relative_path(relative));
+    }
+    ensure_workspace_root(workspace_root)?;
+    let mut current = workspace_root.to_path_buf();
+    for component in relative.components() {
+        let std::path::Component::Normal(component) = component else {
+            return Err(invalid_workspace_relative_path(relative));
+        };
+        current.push(component);
+        materialize_workspace_directory(&current)?;
+    }
+    Ok(())
+}
+
+fn materialize_workspace_parent(workspace_root: &Path, relative: &Path) -> std::io::Result<()> {
+    if !is_safe_relative_path(relative) {
+        return Err(invalid_workspace_relative_path(relative));
+    }
+    ensure_workspace_root(workspace_root)?;
+    if let Some(parent) = relative
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        materialize_workspace_directory_at(workspace_root, parent)?;
+    }
+    Ok(())
+}
+
+/// Prepare a destination below a workspace without retaining a leaf symlink.
+fn prepare_workspace_destination(
+    workspace_root: &Path,
+    relative: &Path,
+) -> std::io::Result<PathBuf> {
+    materialize_workspace_parent(workspace_root, relative)?;
+    let destination = workspace_root.join(relative);
+    remove_workspace_path(&destination)?;
+    Ok(destination)
+}
+
+fn copy_regular_source_file_to_workspace(
+    source: &Path,
+    workspace_root: &Path,
+    relative: &Path,
+) -> std::io::Result<()> {
+    let metadata = fs::symlink_metadata(source)?;
+    if !metadata.file_type().is_file() {
+        return Err(std::io::Error::other(format!(
+            "source entry {} is not a regular file",
+            source.display()
+        )));
+    }
+    let destination = prepare_workspace_destination(workspace_root, relative)?;
+    fs::copy(source, destination)?;
+    Ok(())
+}
+
+fn normal_overlay_source_is_control_path(relative: &Path) -> bool {
+    relative.components().any(|component| {
+        component.as_os_str().to_str().is_some_and(|name| {
+            let name = name.to_ascii_lowercase();
+            name == ".git" || name == ".togi" || name == ".togi.lock" || name.starts_with(".togi-")
+        })
+    })
+}
+
+fn resolve_normal_overlay_source(
+    project_root: &Path,
+    relative: &Path,
+) -> std::io::Result<Option<PathBuf>> {
+    if !is_safe_relative_path(relative) {
+        return Err(invalid_workspace_relative_path(relative));
+    }
+    let source = project_root.join(relative);
+    if !source.is_file() {
+        return Ok(None);
+    }
+    let normalized = normalized_project_relative_path(project_root, relative).ok_or_else(|| {
+        std::io::Error::other(format!(
+            "workspace overlay source {} is not project-relative",
+            source.display()
+        ))
+    })?;
+    let resolved =
+        resolve_normalized_project_relative_path(project_root, &normalized).ok_or_else(|| {
+            std::io::Error::other(format!(
+                "workspace overlay source {} does not resolve within the project root",
+                source.display()
+            ))
+        })?;
+    let root = project_root.canonicalize()?;
+    let resolved_relative = resolved.strip_prefix(root).map_err(|_| {
+        std::io::Error::other(format!(
+            "workspace overlay source {} does not resolve within the project root",
+            source.display()
+        ))
+    })?;
+    if normal_overlay_source_is_control_path(resolved_relative) {
+        return Err(std::io::Error::other(format!(
+            "workspace overlay source {} resolves into Togi or Git control state",
+            source.display()
+        )));
+    }
+    if !fs::metadata(&resolved)?.is_file() {
+        return Ok(None);
+    }
+    Ok(Some(resolved))
+}
+
 fn copy_overlay_file(
     project_root: &Path,
     workspace_root: &Path,
     relative: &Path,
 ) -> std::io::Result<()> {
-    let source = project_root.join(relative);
-    let destination = workspace_root.join(relative);
-    if !source.is_file() {
-        remove_workspace_path(&destination)?;
+    let Some(source) = resolve_normal_overlay_source(project_root, relative)? else {
+        remove_workspace_path(&workspace_root.join(relative))?;
         return Ok(());
-    }
-    if let Some(parent) = destination.parent() {
-        fs::create_dir_all(parent)?;
-    }
+    };
+    let destination = prepare_workspace_destination(workspace_root, relative)?;
     fs::copy(source, destination)?;
     Ok(())
 }
@@ -1786,10 +2514,7 @@ fn restore_workspace_dirs(
     preserved_dirs: Vec<(PathBuf, PathBuf)>,
 ) -> std::io::Result<()> {
     for (relative, stash) in preserved_dirs {
-        let destination = workspace_root.join(relative);
-        if let Some(parent) = destination.parent() {
-            fs::create_dir_all(parent)?;
-        }
+        let destination = prepare_workspace_destination(workspace_root, &relative)?;
         fs::rename(stash, destination)?;
     }
     Ok(())
@@ -1830,17 +2555,62 @@ fn populate_workspace(
             Err(_) => continue,
         };
 
-        let dest = root.join(relative);
         if entry.file_type().is_some_and(|ft| ft.is_dir()) {
-            fs::create_dir_all(&dest)?;
+            materialize_workspace_directory_at(root, relative)?;
         } else if entry.file_type().is_some_and(|ft| ft.is_file()) {
-            if let Some(parent) = dest.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            fs::copy(path, dest)?;
+            copy_regular_source_file_to_workspace(path, root, relative)?;
         }
     }
 
+    Ok(())
+}
+
+/// Populate a replay clone through capabilities rather than destination paths.
+fn populate_replay_workspace(
+    project_root: &Path,
+    source_root: &CapDir,
+    workspace: &ReplayWorkspace,
+    respect_ignores: bool,
+) -> std::io::Result<()> {
+    let project_root_for_filter = project_root.to_path_buf();
+    let mut builder = ignore::WalkBuilder::new(project_root);
+    builder
+        .hidden(false)
+        .ignore(respect_ignores)
+        .git_ignore(respect_ignores)
+        .git_exclude(respect_ignores)
+        .git_global(respect_ignores)
+        .parents(respect_ignores)
+        .filter_entry(move |entry| {
+            should_copy_replay_workspace_entry(&project_root_for_filter, entry.path())
+        });
+
+    for entry in builder.build() {
+        let entry = entry.map_err(std::io::Error::other)?;
+        let path = entry.path();
+        if path == project_root {
+            continue;
+        }
+        let relative = match path.strip_prefix(project_root) {
+            Ok(relative) if is_safe_relative_path(relative) => relative,
+            _ => continue,
+        };
+        if entry
+            .file_type()
+            .is_some_and(|file_type| file_type.is_dir())
+        {
+            workspace.ensure_directory(relative)?;
+        } else if entry
+            .file_type()
+            .is_some_and(|file_type| file_type.is_file())
+        {
+            if cap_relative_file_is_regular(source_root, relative)? {
+                workspace.copy_regular_source(source_root, relative)?;
+            } else {
+                workspace.remove_relative(relative)?;
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1958,6 +2728,7 @@ struct MutationRunRecord {
     result: MutationResult,
     execution: MutationExecution,
     build_error_diagnostic: Option<BuildErrorDiagnostic>,
+    replay_recipe: Option<RegularDirectRecipe>,
 }
 
 impl MutationRunRecord {
@@ -1971,11 +2742,17 @@ impl MutationRunRecord {
             result,
             execution: MutationExecution::for_result(result),
             build_error_diagnostic,
+            replay_recipe: None,
         }
     }
 
     fn with_execution(mut self, execution: MutationExecution) -> Self {
         self.execution = execution;
+        self
+    }
+
+    fn with_replay_recipe(mut self, replay_recipe: RegularDirectRecipe) -> Self {
+        self.replay_recipe = Some(replay_recipe);
         self
     }
 }
@@ -2357,6 +3134,30 @@ impl PreparedMutationRun {
         }
     }
 
+    /// Capture the final direct argv before cache/history lookup. The recipe
+    /// deliberately contains no configuration lookup inputs: replay must not
+    /// resolve current routes, selection, or sandbox settings again.
+    fn direct_recipe(
+        &self,
+        commands: &CommandConfig,
+        env: &HashMap<String, String>,
+        respect_workspace_ignores: bool,
+        origin: DirectRecipeOrigin,
+    ) -> RegularDirectRecipe {
+        RegularDirectRecipe {
+            test_command: sandboxed_command(&commands.sandbox_command, &self.selected_test.argv),
+            build_command: (commands.build_command_explicit && !commands.build_command.is_empty())
+                .then(|| sandboxed_command(&commands.sandbox_command, &commands.build_command)),
+            timeout_ms: u64::try_from(self.selected_test.timeout.as_millis()).unwrap_or(u64::MAX),
+            env: env
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+            respect_workspace_ignores,
+            origin,
+        }
+    }
+
     fn restore_result(
         &self,
         project_root: &Path,
@@ -2446,6 +3247,13 @@ fn run_queued_mutation(
             env: shared.env,
         },
     );
+    // Capture the exact direct recipe before any cache/history lookup.
+    let direct_recipe = prepared.direct_recipe(
+        shared.commands,
+        shared.env,
+        shared.respect_workspace_ignores,
+        DirectRecipeOrigin::Executed,
+    );
 
     // Normal runs retain lazy cache lookup; early-stop runs preclassify every
     // candidate before scheduling and mark fresh entries as already checked.
@@ -2456,11 +3264,19 @@ fn run_queued_mutation(
             reservation.release();
             exclude_restored_from_early_stop(shared.early_stop, restored.execution);
             record_progress(&shared, &mutation, restored.result, None, true);
-            return Some((
-                index,
-                MutationRunRecord::new(mutation, restored.result, None)
-                    .with_execution(restored.execution),
-            ));
+            let mut record = MutationRunRecord::new(mutation, restored.result, None)
+                .with_execution(restored.execution);
+            if matches!(
+                restored.result,
+                MutationResult::Killed | MutationResult::Survived | MutationResult::Timeout
+            ) {
+                if let Some(origin) = DirectRecipeOrigin::from_execution(restored.execution) {
+                    let mut recipe = direct_recipe.clone();
+                    recipe.origin = origin;
+                    record = record.with_replay_recipe(recipe);
+                }
+            }
+            return Some((index, record));
         }
     }
 
@@ -2538,7 +3354,14 @@ fn run_queued_mutation(
     );
     record_early_stop(&shared, result);
     let diagnostic = build_error_diagnostic_from_outcome(&mutation, "regular", &outcome);
-    Some((index, MutationRunRecord::new(mutation, result, diagnostic)))
+    let mut record = MutationRunRecord::new(mutation, result, diagnostic);
+    if matches!(
+        result,
+        MutationResult::Killed | MutationResult::Survived | MutationResult::Timeout
+    ) {
+        record = record.with_replay_recipe(direct_recipe);
+    }
+    Some((index, record))
 }
 
 struct TestSlotReservation {
@@ -2714,14 +3537,33 @@ impl TestRunner {
                     env: &self.env,
                 },
             );
+            // Capture before cache/history lookup even when early-stop
+            // preclassification restores the verdict.
+            let direct_recipe = prepared.direct_recipe(
+                &self.commands,
+                &self.env,
+                self.respect_workspace_ignores,
+                DirectRecipeOrigin::Executed,
+            );
             if let Some(restored_result) =
                 prepared.restore_result(&self.project_root, history.as_ref(), self.force_rerun)
             {
-                restored.push((
-                    index,
+                let mut record =
                     MutationRunRecord::new(mutation.clone(), restored_result.result, None)
-                        .with_execution(restored_result.execution),
-                ));
+                        .with_execution(restored_result.execution);
+                if matches!(
+                    restored_result.result,
+                    MutationResult::Killed | MutationResult::Survived | MutationResult::Timeout
+                ) {
+                    if let Some(origin) =
+                        DirectRecipeOrigin::from_execution(restored_result.execution)
+                    {
+                        let mut recipe = direct_recipe;
+                        recipe.origin = origin;
+                        record = record.with_replay_recipe(recipe);
+                    }
+                }
+                restored.push((index, record));
             } else {
                 fresh.push(QueuedMutation {
                     index,
@@ -2826,6 +3668,17 @@ impl TestRunner {
             .map(|(index, mutation)| (mutation.id, index))
             .collect();
         let plan = crate::schemata::plan(&self.project_root, mutations);
+        let schema_candidate_ids: HashSet<u32> = plan
+            .selected
+            .iter()
+            .filter(|schema_mutation| {
+                matches!(
+                    schema_mutation.mutation.language.as_str(),
+                    "c" | "cpp" | "go" | "java" | "rust"
+                )
+            })
+            .map(|schema_mutation| schema_mutation.mutation.id)
+            .collect();
         let mut schema_by_language = HashMap::<String, Vec<crate::schemata::SchemaMutation>>::new();
         let mut fallback_mutations = Vec::new();
         let mut schemata_summary = SchemataRunSummary::default();
@@ -2834,6 +3687,14 @@ impl TestRunner {
             .into_iter()
             .map(|(_, record)| record)
             .collect::<Vec<_>>();
+        // Cache/history restoration before schema planning is not enough
+        // evidence to publish a direct replay recipe for a schema candidate.
+        // Known regular fallbacks keep their captured direct recipe.
+        for record in &mut all_records {
+            if schema_candidate_ids.contains(&record.mutation.id) {
+                record.replay_recipe = None;
+            }
+        }
 
         for schema_mutation in plan.selected {
             match schema_mutation.mutation.language.as_str() {
@@ -2913,7 +3774,10 @@ impl TestRunner {
                 planned_total,
                 tested_counter,
             );
-            all_records.extend(records_from_report(fallback.report));
+            all_records.extend(records_from_report(
+                fallback.report,
+                fallback.replay_recipes,
+            ));
         }
 
         all_records.sort_by_key(|record| {
@@ -3535,13 +4399,11 @@ impl TestRunner {
         planned_total: usize,
         early_stop_reason: Option<String>,
     ) -> RunOutcome {
+        let (report, replay_recipes) =
+            self.report_from_records(all_records, duration, planned_total, early_stop_reason);
         RunOutcome {
-            report: self.report_from_records(
-                all_records,
-                duration,
-                planned_total,
-                early_stop_reason,
-            ),
+            report,
+            replay_recipes,
             cancelled: self.cancelled.load(Ordering::Acquire),
         }
     }
@@ -3552,10 +4414,11 @@ impl TestRunner {
         duration: Duration,
         planned_total: usize,
         early_stop_reason: Option<String>,
-    ) -> MutationReport {
+    ) -> (MutationReport, BTreeMap<u32, RegularDirectRecipe>) {
         let mut results = Vec::with_capacity(all_records.len());
         let mut build_error_diagnostics = Vec::new();
         let mut execution_provenance = BTreeMap::new();
+        let mut replay_recipes = BTreeMap::new();
         let mut total = 0;
         let mut killed = 0;
         let mut survived = 0;
@@ -3568,6 +4431,7 @@ impl TestRunner {
                 result,
                 execution,
                 build_error_diagnostic,
+                replay_recipe,
             } = record;
             total += 1;
             match result {
@@ -3588,39 +4452,50 @@ impl TestRunner {
                 debug_assert_eq!(result, MutationResult::BuildError);
                 build_error_diagnostics.push(diagnostic);
             }
+            if let Some(recipe) = replay_recipe {
+                if matches!(
+                    result,
+                    MutationResult::Killed | MutationResult::Survived | MutationResult::Timeout
+                ) {
+                    replay_recipes.insert(mutation.id, recipe);
+                }
+            }
             results.push((mutation, result));
         }
 
-        MutationReport {
-            results,
-            execution_provenance,
-            build_error_diagnostics,
-            schemata: None,
-            baseline_timing: None,
-            duration,
-            test_command: if self.commands.language_commands.is_empty()
-                && self.commands.project_commands.is_empty()
-            {
-                Some(sandboxed_command(
-                    &self.commands.sandbox_command,
-                    &self.commands.command,
-                ))
-            } else {
-                None
+        (
+            MutationReport {
+                results,
+                execution_provenance,
+                build_error_diagnostics,
+                schemata: None,
+                baseline_timing: None,
+                duration,
+                test_command: if self.commands.language_commands.is_empty()
+                    && self.commands.project_commands.is_empty()
+                {
+                    Some(sandboxed_command(
+                        &self.commands.sandbox_command,
+                        &self.commands.command,
+                    ))
+                } else {
+                    None
+                },
+                build_command: if self.commands.build_command_explicit {
+                    sandboxed_command(&self.commands.sandbox_command, &self.commands.build_command)
+                } else {
+                    vec![]
+                },
+                planned_total,
+                early_stop_reason,
+                total,
+                killed,
+                survived,
+                timeout: timeout_count,
+                build_errors,
             },
-            build_command: if self.commands.build_command_explicit {
-                sandboxed_command(&self.commands.sandbox_command, &self.commands.build_command)
-            } else {
-                vec![]
-            },
-            planned_total,
-            early_stop_reason,
-            total,
-            killed,
-            survived,
-            timeout: timeout_count,
-            build_errors,
-        }
+            replay_recipes,
+        )
     }
 }
 
@@ -3729,7 +4604,10 @@ fn run_schema_workspace_mutation(
     )
 }
 
-fn records_from_report(report: MutationReport) -> Vec<MutationRunRecord> {
+fn records_from_report(
+    report: MutationReport,
+    mut replay_recipes: BTreeMap<u32, RegularDirectRecipe>,
+) -> Vec<MutationRunRecord> {
     let MutationReport {
         results,
         execution_provenance,
@@ -3748,7 +4626,12 @@ fn records_from_report(report: MutationReport) -> Vec<MutationRunRecord> {
                 .copied()
                 .unwrap_or_else(|| MutationExecution::for_result(result));
             let diagnostic = diagnostics.remove(&mutation.id);
-            MutationRunRecord::new(mutation, result, diagnostic).with_execution(execution)
+            let mut record =
+                MutationRunRecord::new(mutation, result, diagnostic).with_execution(execution);
+            if let Some(recipe) = replay_recipes.remove(&record.mutation.id) {
+                record = record.with_replay_recipe(recipe);
+            }
+            record
         })
         .collect()
 }
@@ -3984,6 +4867,7 @@ fn validate_and_resolve_mutation_path(
 struct ResolvedMutation<'a> {
     mutation: &'a Mutation,
     file_path: Result<PathBuf, ()>,
+    relative_path: Result<PathBuf, ()>,
 }
 
 impl<'a> ResolvedMutation<'a> {
@@ -3992,6 +4876,13 @@ impl<'a> ResolvedMutation<'a> {
         Self {
             mutation,
             file_path: validate_and_resolve_mutation_path(project_root, &mutation.file),
+            relative_path: project_relative_path(project_root, &mutation.file).and_then(
+                |relative| {
+                    is_safe_relative_path(&relative)
+                        .then_some(relative)
+                        .ok_or(())
+                },
+            ),
         }
     }
 
@@ -4000,30 +4891,124 @@ impl<'a> ResolvedMutation<'a> {
         execution_root: &Path,
         mutation: &'a Mutation,
     ) -> Self {
-        let file_path = if mutation.file.is_absolute() {
-            mutation
-                .file
-                .canonicalize()
-                .ok()
-                .and_then(|canonical| {
-                    original_root
-                        .canonicalize()
-                        .ok()
-                        .and_then(|root| canonical.strip_prefix(root).ok().map(PathBuf::from))
-                })
-                .and_then(|relative| {
-                    validate_and_resolve_mutation_path(execution_root, &relative).ok()
-                })
-                .ok_or(())
+        let relative_path = if mutation.file.is_absolute() {
+            mutation.file.canonicalize().ok().and_then(|canonical| {
+                original_root
+                    .canonicalize()
+                    .ok()
+                    .and_then(|root| canonical.strip_prefix(root).ok().map(PathBuf::from))
+            })
         } else {
-            validate_and_resolve_mutation_path(execution_root, &mutation.file)
-        };
+            Some(mutation.file.clone())
+        }
+        .filter(|relative| is_safe_relative_path(relative))
+        .ok_or(());
+        let file_path = relative_path
+            .as_ref()
+            .map_err(|_| ())
+            .and_then(|relative| validate_and_resolve_mutation_path(execution_root, relative));
 
         Self {
             mutation,
             file_path,
+            relative_path,
         }
     }
+
+    fn new_for_replay(source_root: &Path, workspace_root: &Path, mutation: &'a Mutation) -> Self {
+        let relative_path =
+            project_relative_path(source_root, &mutation.file).and_then(|relative| {
+                is_safe_relative_path(&relative)
+                    .then_some(relative)
+                    .ok_or(())
+            });
+        let file_path = relative_path
+            .as_ref()
+            .map(|relative| workspace_root.join(relative))
+            .map_err(|_| ());
+        Self {
+            mutation,
+            file_path,
+            relative_path,
+        }
+    }
+}
+
+fn validate_replay_snapshot_target(
+    workspace: &ReplayWorkspace,
+    target: &ResolvedMutation<'_>,
+    expected_source_fingerprint: &str,
+) -> anyhow::Result<()> {
+    let relative = target.relative_path.as_ref().map_err(|()| {
+        anyhow::anyhow!(
+            "could not derive a safe replay source path for {}",
+            target.mutation.file.display()
+        )
+    })?;
+    let source = workspace.read_regular(relative).with_context(|| {
+        format!(
+            "could not read replay source {} in isolated snapshot",
+            target.mutation.file.display()
+        )
+    })?;
+    if source_fingerprint(&source) != expected_source_fingerprint {
+        anyhow::bail!("replay snapshot source fingerprint does not match the report");
+    }
+    if !range_matches(
+        &source,
+        target.mutation.byte_range.start,
+        target.mutation.byte_range.end,
+        &target.mutation.original,
+    ) {
+        anyhow::bail!("replay snapshot mutation byte range and original bytes do not match");
+    }
+    Ok(())
+}
+
+/// Execute one validated replay in a disposable workspace without consulting
+/// or updating any normal-run cache/history state.
+pub fn run_replay_mutation(
+    project_root: &Path,
+    mutation: &Mutation,
+    config: ReplayRunConfig<'_>,
+) -> anyhow::Result<ReplayRunOutcome> {
+    // cap-primitives 4.0.2 cannot atomically remove an opened directory on
+    // Windows. Reject before clone setup rather than risk a path-based
+    // directory-replacement window in replay's mutable workspace.
+    #[cfg(windows)]
+    anyhow::bail!(
+        "replay is unavailable on Windows: safe disposable workspace setup requires race-free directory removal"
+    );
+
+    let workspace = copy_workspace_for_replay(
+        project_root,
+        config.source_revision,
+        config.respect_workspace_ignores,
+    )
+    .with_context(|| "could not create replay workspace")?;
+    let target = ResolvedMutation::new_for_replay(project_root, workspace.root(), mutation);
+    validate_replay_snapshot_target(&workspace, &target, config.source_fingerprint)?;
+    let build_command = config.build_command.as_deref().unwrap_or(&[]);
+    let outcome = run_single_mutation_with_replay_access(
+        &config.test_command,
+        &[],
+        BuildCommand {
+            argv: build_command,
+            explicit: config.build_command.is_some(),
+        },
+        config.timeout,
+        workspace.root(),
+        target,
+        config.show_output,
+        &config.env,
+        config.cancelled,
+        Some(&workspace),
+    );
+    Ok(ReplayRunOutcome {
+        result: outcome.result,
+        test_output: outcome.test_output,
+        cancelled: outcome.cancelled,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4038,11 +5023,49 @@ fn run_single_mutation(
     env: &HashMap<String, String>,
     cancelled: &AtomicBool,
 ) -> MutationOutcome {
+    run_single_mutation_with_replay_access(
+        command,
+        sandbox_command,
+        build_command,
+        timeout,
+        project_root,
+        target,
+        capture_output,
+        env,
+        cancelled,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_single_mutation_with_replay_access(
+    command: &[String],
+    sandbox_command: &[String],
+    build_command: BuildCommand<'_>,
+    timeout: Duration,
+    project_root: &Path,
+    target: ResolvedMutation<'_>,
+    capture_output: bool,
+    env: &HashMap<String, String>,
+    cancelled: &AtomicBool,
+    replay_workspace: Option<&ReplayWorkspace>,
+) -> MutationOutcome {
     if cancelled.load(Ordering::Acquire) {
         return MutationOutcome::cancelled();
     }
 
     let mutation = target.mutation;
+    let replay_relative = target.relative_path.as_ref().ok().cloned();
+    if replay_workspace.is_some() && replay_relative.is_none() {
+        return MutationOutcome::build_error_with(
+            "resolve_mutation_path",
+            vec![],
+            format!(
+                "could not derive a safe mutation path {} in replay workspace",
+                mutation.file.display()
+            ),
+        );
+    }
     let file_path = match target.file_path {
         Ok(path) => path,
         Err(()) => {
@@ -4058,23 +5081,49 @@ fn run_single_mutation(
         }
     };
 
-    // Read original content
-    let original = match std::fs::read(&file_path) {
-        Ok(content) => content,
-        Err(e) => {
-            eprintln!("warning: could not read {}: {e}", file_path.display());
-            return MutationOutcome::build_error_with(
-                "read_source",
-                vec![],
-                format!("could not read {}: {e}", file_path.display()),
-            );
+    // Replay reads and restores through its clone capability; normal runs keep
+    // their established ambient-path behavior.
+    let (original, _normal_guard, _replay_guard): (
+        Vec<u8>,
+        Option<FileGuard>,
+        Option<ReplayFileGuard<'_>>,
+    ) = if let (Some(workspace), Some(relative)) = (replay_workspace, replay_relative.as_deref()) {
+        match workspace.read_regular(relative) {
+            Ok(content) => {
+                let guard = ReplayFileGuard {
+                    workspace,
+                    relative: relative.to_path_buf(),
+                    original: content.clone(),
+                };
+                (content, None, Some(guard))
+            }
+            Err(error) => {
+                eprintln!("warning: could not read {}: {error}", file_path.display());
+                return MutationOutcome::build_error_with(
+                    "read_source",
+                    vec![],
+                    format!("could not read {}: {error}", file_path.display()),
+                );
+            }
         }
-    };
-
-    // Set up file guard for guaranteed restoration
-    let _guard = FileGuard {
-        path: file_path.clone(),
-        original: original.clone(),
+    } else {
+        match std::fs::read(&file_path) {
+            Ok(content) => {
+                let guard = FileGuard {
+                    path: file_path.clone(),
+                    original: content.clone(),
+                };
+                (content, Some(guard), None)
+            }
+            Err(error) => {
+                eprintln!("warning: could not read {}: {error}", file_path.display());
+                return MutationOutcome::build_error_with(
+                    "read_source",
+                    vec![],
+                    format!("could not read {}: {error}", file_path.display()),
+                );
+            }
+        }
     };
 
     // Apply mutation
@@ -4093,14 +5142,34 @@ fn run_single_mutation(
             ),
         );
     }
+    if !crate::source_identity::range_matches(&original, range.start, range.end, &mutation.original)
+    {
+        return MutationOutcome::build_error_with(
+            "apply_mutation",
+            vec![],
+            format!(
+                "mutation original bytes do not match {}..{} in {}",
+                range.start,
+                range.end,
+                file_path.display()
+            ),
+        );
+    }
     mutated.splice(range, mutation.replacement.as_bytes().iter().copied());
 
-    if let Err(e) = write_workspace_file(&file_path, &mutated) {
-        eprintln!("warning: could not write {}: {e}", file_path.display());
+    let write_result = match (replay_workspace, replay_relative.as_deref()) {
+        (Some(workspace), Some(relative)) => workspace.replace_regular(relative, &mutated),
+        (Some(_), None) => Err(std::io::Error::other(
+            "missing replay mutation path after validation",
+        )),
+        (None, _) => write_workspace_file(&file_path, &mutated),
+    };
+    if let Err(error) = write_result {
+        eprintln!("warning: could not write {}: {error}", file_path.display());
         return MutationOutcome::build_error_with(
             "write_source",
             vec![],
-            format!("could not write {}: {e}", file_path.display()),
+            format!("could not write {}: {error}", file_path.display()),
         );
     }
 
@@ -4832,6 +5901,608 @@ mod tests {
         std::fs::write(&file, b"hello world").unwrap();
         let mutation = make_test_mutation(Path::new("test.txt"));
         (dir, file, mutation)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replay_snapshot_target_rejects_fifo_before_reading() -> anyhow::Result<()> {
+        let tempdir = tempfile::tempdir()?;
+        let root = tempdir.path().to_path_buf();
+        let fifo = root.join("target");
+        let status = std::process::Command::new("mkfifo").arg(&fifo).status()?;
+        assert!(status.success());
+
+        let mutation = make_test_mutation(&fifo);
+        let target = ResolvedMutation::new(&root, &mutation);
+        let workspace = ReplayWorkspace::open(WorkspaceCopy {
+            _tempdir: tempdir,
+            root,
+            reset_strategy: WorkspaceResetStrategy::Copy,
+        })?;
+        let error =
+            validate_replay_snapshot_target(&workspace, &target, "sha256:expected").unwrap_err();
+        assert!(format!("{error:#}").contains("not a regular file"));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replay_workspace_publish_does_not_follow_replaced_leaf_symlink() -> anyhow::Result<()> {
+        let tempdir = tempfile::tempdir()?;
+        let root = tempdir.path().to_path_buf();
+        let target = root.join("target");
+        std::fs::write(&target, b"original")?;
+        let sentinel_dir = tempfile::tempdir()?;
+        let sentinel = sentinel_dir.path().join("sentinel");
+        std::fs::write(&sentinel, b"outside")?;
+        let replacement_target = target.clone();
+        let replacement_sentinel = sentinel.clone();
+        let workspace = ReplayWorkspace::open(WorkspaceCopy {
+            _tempdir: tempdir,
+            root,
+            reset_strategy: WorkspaceResetStrategy::Copy,
+        })?;
+
+        set_replay_publish_hook(Some(Box::new(move || {
+            std::fs::remove_file(&replacement_target).unwrap();
+            std::os::unix::fs::symlink(&replacement_sentinel, &replacement_target).unwrap();
+        })));
+        workspace.replace_regular(Path::new("target"), b"mutated")?;
+
+        assert_eq!(std::fs::read(&sentinel)?, b"outside");
+        assert_eq!(workspace.read_regular(Path::new("target"))?, b"mutated");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replay_workspace_publish_does_not_write_hardlink_target() -> anyhow::Result<()> {
+        let tempdir = tempfile::tempdir()?;
+        let root = tempdir.path().to_path_buf();
+        let sentinel_dir = tempfile::tempdir()?;
+        let sentinel = sentinel_dir.path().join("sentinel");
+        std::fs::write(&sentinel, b"outside")?;
+        std::fs::hard_link(&sentinel, root.join("target"))?;
+        let workspace = ReplayWorkspace::open(WorkspaceCopy {
+            _tempdir: tempdir,
+            root,
+            reset_strategy: WorkspaceResetStrategy::Copy,
+        })?;
+
+        workspace.replace_regular(Path::new("target"), b"mutated")?;
+
+        assert_eq!(std::fs::read(&sentinel)?, b"outside");
+        assert_eq!(workspace.read_regular(Path::new("target"))?, b"mutated");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replay_workspace_copies_only_regular_sources_and_preserves_permissions() -> anyhow::Result<()>
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let source_tempdir = tempfile::tempdir()?;
+        let source_root = CapDir::open_ambient_dir(source_tempdir.path(), ambient_authority())?;
+        let source = source_tempdir.path().join("source");
+        std::fs::write(&source, b"source bytes")?;
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o640))?;
+        let workspace_tempdir = tempfile::tempdir()?;
+        let root = workspace_tempdir.path().to_path_buf();
+        let workspace = ReplayWorkspace::open(WorkspaceCopy {
+            _tempdir: workspace_tempdir,
+            root,
+            reset_strategy: WorkspaceResetStrategy::Copy,
+        })?;
+
+        workspace.copy_regular_source(&source_root, Path::new("source"))?;
+        let copied = workspace.read_regular(Path::new("source"))?;
+        assert_eq!(copied, b"source bytes");
+        let copied_mode = std::fs::metadata(workspace.root().join("source"))?
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(copied_mode, 0o640);
+
+        let sentinel = source_tempdir.path().join("sentinel");
+        std::fs::write(&sentinel, b"outside")?;
+        let source_link = source_tempdir.path().join("link");
+        std::os::unix::fs::symlink(&sentinel, &source_link)?;
+        assert!(
+            workspace
+                .copy_regular_source(&source_root, Path::new("link"))
+                .is_err()
+        );
+        let source_hardlink = source_tempdir.path().join("hardlink");
+        std::fs::hard_link(&sentinel, &source_hardlink)?;
+        assert!(
+            workspace
+                .copy_regular_source(&source_root, Path::new("hardlink"))
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&sentinel)?, b"outside");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replay_workspace_replaces_parent_symlink_inside_clone() -> anyhow::Result<()> {
+        let tempdir = tempfile::tempdir()?;
+        let root = tempdir.path().to_path_buf();
+        let sentinel_dir = tempfile::tempdir()?;
+        let sentinel = sentinel_dir.path().join("sentinel");
+        std::fs::write(&sentinel, b"outside")?;
+        std::os::unix::fs::symlink(sentinel_dir.path(), root.join("alias"))?;
+        let workspace = ReplayWorkspace::open(WorkspaceCopy {
+            _tempdir: tempdir,
+            root,
+            reset_strategy: WorkspaceResetStrategy::Copy,
+        })?;
+
+        workspace.replace_regular(Path::new("alias/sentinel"), b"mutated")?;
+
+        assert_eq!(std::fs::read(&sentinel)?, b"outside");
+        assert_eq!(
+            workspace.read_regular(Path::new("alias/sentinel"))?,
+            b"mutated"
+        );
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn replay_is_rejected_on_windows_before_workspace_setup() {
+        let (dir, file, mutation) = make_relative_test_setup();
+        let cancelled = AtomicBool::new(false);
+        let error = run_replay_mutation(
+            dir.path(),
+            &mutation,
+            ReplayRunConfig {
+                test_command: successful_command(),
+                build_command: None,
+                timeout: Duration::from_secs(1),
+                env: HashMap::new(),
+                respect_workspace_ignores: true,
+                source_revision: "expected",
+                source_fingerprint: "sha256:expected",
+                show_output: false,
+                cancelled: &cancelled,
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("unavailable on Windows"));
+        assert_eq!(std::fs::read(file).unwrap(), b"hello world");
+    }
+    #[cfg(not(windows))]
+    #[test]
+    fn replay_runner_uses_only_workspace_and_validates_original_bytes() -> anyhow::Result<()> {
+        let (dir, file, mutation) = make_relative_test_setup();
+        if !git_available() {
+            return Ok(());
+        }
+        run_git(dir.path(), &["init"]);
+        run_git(dir.path(), &["config", "user.email", "test@example.com"]);
+        run_git(dir.path(), &["config", "user.name", "Togi Test"]);
+        run_git(dir.path(), &["add", "."]);
+        run_git(dir.path(), &["commit", "-m", "initial"]);
+        let source_revision = git_snapshot_revision(dir.path())?;
+        let expected_source_fingerprint = source_fingerprint(&std::fs::read(&file)?);
+        let cache_dir = dir.path().join(".togi-cache");
+        std::fs::create_dir_all(&cache_dir)?;
+        let history_path = cache_dir.join("history.json");
+        std::fs::write(&history_path, "sentinel history")?;
+        let cache_before = std::fs::read(&history_path)?;
+        let log_dir = tempfile::tempdir()?;
+        let log_path = log_dir.path().join("replay.log");
+        let cancelled = AtomicBool::new(false);
+        let config = ReplayRunConfig {
+            test_command: vec![
+                "sh".into(),
+                "-c".into(),
+                "printf invoked >> \"$1\"".into(),
+                "replay".into(),
+                log_path.display().to_string(),
+            ],
+            build_command: None,
+            timeout: Duration::from_secs(1),
+            env: HashMap::new(),
+            respect_workspace_ignores: true,
+            source_revision: &source_revision,
+            source_fingerprint: &expected_source_fingerprint,
+            show_output: false,
+            cancelled: &cancelled,
+        };
+
+        let outcome = run_replay_mutation(dir.path(), &mutation, config)?;
+        assert_eq!(outcome.result, MutationResult::Survived);
+        assert_eq!(std::fs::read(&log_path)?, b"invoked");
+        assert_eq!(std::fs::read(&file)?, b"hello world");
+        assert_eq!(std::fs::read(&history_path)?, cache_before);
+        assert!(!dir.path().join(".togi.lock").exists());
+
+        let mut mismatched = mutation;
+        mismatched.original = "nope".into();
+        let rejected_log = log_dir.path().join("rejected.log");
+        let rejected = run_replay_mutation(
+            dir.path(),
+            &mismatched,
+            ReplayRunConfig {
+                test_command: vec![
+                    "sh".into(),
+                    "-c".into(),
+                    "printf invoked >> \"$1\"".into(),
+                    "replay".into(),
+                    rejected_log.display().to_string(),
+                ],
+                build_command: None,
+                timeout: Duration::from_secs(1),
+                env: HashMap::new(),
+                respect_workspace_ignores: true,
+                source_revision: &source_revision,
+                source_fingerprint: &expected_source_fingerprint,
+                show_output: false,
+                cancelled: &cancelled,
+            },
+        );
+        assert!(rejected.is_err());
+        assert!(!rejected_log.exists());
+        assert_eq!(std::fs::read(&file)?, b"hello world");
+        assert_eq!(std::fs::read(&history_path)?, cache_before);
+        Ok(())
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn replay_runner_requires_git_snapshot_before_spawning_commands() -> anyhow::Result<()> {
+        let (dir, _file, mutation) = make_relative_test_setup();
+        let log_dir = tempfile::tempdir()?;
+        let log_path = log_dir.path().join("replay.log");
+        let cancelled = AtomicBool::new(false);
+
+        let result = run_replay_mutation(
+            dir.path(),
+            &mutation,
+            ReplayRunConfig {
+                test_command: vec![
+                    "sh".into(),
+                    "-c".into(),
+                    "printf invoked >> \"$1\"".into(),
+                    "replay".into(),
+                    log_path.display().to_string(),
+                ],
+                build_command: None,
+                timeout: Duration::from_secs(1),
+                env: HashMap::new(),
+                respect_workspace_ignores: true,
+                source_revision: "expected",
+                source_fingerprint: "expected",
+                show_output: false,
+                cancelled: &cancelled,
+            },
+        );
+        assert!(result.is_err());
+        assert!(!log_path.exists());
+        Ok(())
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn replay_runner_rejects_snapshot_fingerprint_mismatch_before_spawning_commands()
+    -> anyhow::Result<()> {
+        if !git_available() {
+            return Ok(());
+        }
+
+        let (dir, file, mutation) = make_relative_test_setup();
+        run_git(dir.path(), &["init"]);
+        run_git(dir.path(), &["config", "user.email", "test@example.com"]);
+        run_git(dir.path(), &["config", "user.name", "Togi Test"]);
+        run_git(dir.path(), &["add", "."]);
+        run_git(dir.path(), &["commit", "-m", "initial"]);
+        let source_revision = git_snapshot_revision(dir.path())?;
+        let expected_source_fingerprint = source_fingerprint(&std::fs::read(&file)?);
+        std::fs::write(&file, b"changed source")?;
+
+        let log_dir = tempfile::tempdir()?;
+        let log_path = log_dir.path().join("replay.log");
+        let cancelled = AtomicBool::new(false);
+        let result = run_replay_mutation(
+            dir.path(),
+            &mutation,
+            ReplayRunConfig {
+                test_command: vec![
+                    "sh".into(),
+                    "-c".into(),
+                    "printf invoked >> \"$1\"".into(),
+                    "replay".into(),
+                    log_path.display().to_string(),
+                ],
+                build_command: None,
+                timeout: Duration::from_secs(1),
+                env: HashMap::new(),
+                respect_workspace_ignores: true,
+                source_revision: &source_revision,
+                source_fingerprint: &expected_source_fingerprint,
+                show_output: false,
+                cancelled: &cancelled,
+            },
+        );
+        assert!(result.is_err());
+        assert!(!log_path.exists());
+        assert_eq!(std::fs::read(&file)?, b"changed source");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replay_overlay_replaces_tracked_symlink_without_touching_source_target() -> anyhow::Result<()>
+    {
+        if !git_available() {
+            return Ok(());
+        }
+
+        let (dir, file, mutation) = make_relative_test_setup();
+        run_git(dir.path(), &["init"]);
+        run_git(dir.path(), &["config", "user.email", "test@example.com"]);
+        run_git(dir.path(), &["config", "user.name", "Togi Test"]);
+        let victim = dir.path().join(".togi-cache/history.json");
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&victim, &link)?;
+        let nested = dir.path().join("nested");
+        std::os::unix::fs::symlink(victim.parent().unwrap(), &nested)?;
+        run_git(dir.path(), &["add", "."]);
+        run_git(dir.path(), &["commit", "-m", "initial"]);
+        let source_revision = git_snapshot_revision(dir.path())?;
+        let expected_source_fingerprint = source_fingerprint(&std::fs::read(&file)?);
+
+        std::fs::create_dir_all(victim.parent().unwrap())?;
+        std::fs::write(&victim, b"source cache sentinel")?;
+        std::fs::remove_file(&link)?;
+        std::fs::write(&link, b"dirty payload")?;
+        std::fs::remove_file(&nested)?;
+        std::fs::create_dir(&nested)?;
+        std::fs::write(nested.join("payload"), b"nested dirty payload")?;
+
+        let log_dir = tempfile::tempdir()?;
+        let log_path = log_dir.path().join("replay.log");
+        let cancelled = AtomicBool::new(false);
+        let outcome = run_replay_mutation(
+            dir.path(),
+            &mutation,
+            ReplayRunConfig {
+                test_command: vec![
+                    "sh".into(),
+                    "-c".into(),
+                    "printf invoked >> \"$1\"".into(),
+                    "replay".into(),
+                    log_path.display().to_string(),
+                ],
+                build_command: None,
+                timeout: Duration::from_secs(1),
+                env: HashMap::new(),
+                respect_workspace_ignores: true,
+                source_revision: &source_revision,
+                source_fingerprint: &expected_source_fingerprint,
+                show_output: false,
+                cancelled: &cancelled,
+            },
+        )?;
+        assert_eq!(outcome.result, MutationResult::Survived);
+        assert_eq!(std::fs::read(&log_path)?, b"invoked");
+        assert_eq!(std::fs::read(&victim)?, b"source cache sentinel");
+        assert_eq!(std::fs::read(&link)?, b"dirty payload");
+        assert_eq!(
+            std::fs::read(nested.join("payload"))?,
+            b"nested dirty payload"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replay_overlay_skips_untracked_source_symlink_to_cache() -> anyhow::Result<()> {
+        if !git_available() {
+            return Ok(());
+        }
+
+        let (dir, file, mutation) = make_relative_test_setup();
+        run_git(dir.path(), &["init"]);
+        run_git(dir.path(), &["config", "user.email", "test@example.com"]);
+        run_git(dir.path(), &["config", "user.name", "Togi Test"]);
+        run_git(dir.path(), &["add", "."]);
+        run_git(dir.path(), &["commit", "-m", "initial"]);
+        let source_revision = git_snapshot_revision(dir.path())?;
+        let expected_source_fingerprint = source_fingerprint(&std::fs::read(&file)?);
+
+        let cached_source = dir.path().join(".togi-cache/history.json");
+        std::fs::create_dir_all(cached_source.parent().unwrap())?;
+        std::fs::write(&cached_source, b"source cache sentinel")?;
+        let alias = dir.path().join("alias");
+        std::os::unix::fs::symlink(&cached_source, &alias)?;
+        let replay_overlay = collect_replay_git_worktree_overlay(dir.path())?;
+        assert!(
+            replay_overlay
+                .copy_paths
+                .iter()
+                .all(|relative| relative != Path::new("alias"))
+        );
+
+        let log_dir = tempfile::tempdir()?;
+        let log_path = log_dir.path().join("replay.log");
+        let cancelled = AtomicBool::new(false);
+        let outcome = run_replay_mutation(
+            dir.path(),
+            &mutation,
+            ReplayRunConfig {
+                test_command: vec![
+                    "sh".into(),
+                    "-c".into(),
+                    "test ! -e alias && printf invoked >> \"$1\"".into(),
+                    "replay".into(),
+                    log_path.display().to_string(),
+                ],
+                build_command: None,
+                timeout: Duration::from_secs(1),
+                env: HashMap::new(),
+                respect_workspace_ignores: true,
+                source_revision: &source_revision,
+                source_fingerprint: &expected_source_fingerprint,
+                show_output: false,
+                cancelled: &cancelled,
+            },
+        )?;
+        assert_eq!(outcome.result, MutationResult::Survived);
+        assert_eq!(std::fs::read(&log_path)?, b"invoked");
+        assert_eq!(std::fs::read(&cached_source)?, b"source cache sentinel");
+        assert!(std::fs::symlink_metadata(&alias)?.file_type().is_symlink());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replay_overlay_skips_source_parent_symlink_to_cache() -> anyhow::Result<()> {
+        if !git_available() {
+            return Ok(());
+        }
+
+        let (dir, file, mutation) = make_relative_test_setup();
+        let replaced_dir = dir.path().join("dir");
+        std::fs::create_dir(&replaced_dir)?;
+        std::fs::write(replaced_dir.join("file"), b"tracked source")?;
+        run_git(dir.path(), &["init"]);
+        run_git(dir.path(), &["config", "user.email", "test@example.com"]);
+        run_git(dir.path(), &["config", "user.name", "Togi Test"]);
+        run_git(dir.path(), &["add", "."]);
+        run_git(dir.path(), &["commit", "-m", "initial"]);
+        let source_revision = git_snapshot_revision(dir.path())?;
+        let expected_source_fingerprint = source_fingerprint(&std::fs::read(&file)?);
+
+        let cached_source = dir.path().join(".togi-cache/file");
+        std::fs::create_dir_all(cached_source.parent().unwrap())?;
+        std::fs::write(&cached_source, b"source cache sentinel")?;
+        std::fs::remove_dir_all(&replaced_dir)?;
+        std::os::unix::fs::symlink(".togi-cache", &replaced_dir)?;
+        assert!(!replay_source_relative_file_is_regular(
+            dir.path(),
+            Path::new("dir/file")
+        )?);
+        let overlay = collect_replay_git_worktree_overlay(dir.path())?;
+        assert!(
+            overlay
+                .copy_paths
+                .iter()
+                .all(|relative| !relative.starts_with("dir"))
+        );
+
+        let log_dir = tempfile::tempdir()?;
+        let log_path = log_dir.path().join("replay.log");
+        let cancelled = AtomicBool::new(false);
+        let outcome = run_replay_mutation(
+            dir.path(),
+            &mutation,
+            ReplayRunConfig {
+                test_command: vec![
+                    "sh".into(),
+                    "-c".into(),
+                    "test ! -e dir/file && printf invoked >> \"$1\"".into(),
+                    "replay".into(),
+                    log_path.display().to_string(),
+                ],
+                build_command: None,
+                timeout: Duration::from_secs(1),
+                env: HashMap::new(),
+                respect_workspace_ignores: true,
+                source_revision: &source_revision,
+                source_fingerprint: &expected_source_fingerprint,
+                show_output: false,
+                cancelled: &cancelled,
+            },
+        )?;
+        assert_eq!(outcome.result, MutationResult::Survived);
+        assert_eq!(std::fs::read(&log_path)?, b"invoked");
+        assert_eq!(std::fs::read(&cached_source)?, b"source cache sentinel");
+        assert!(
+            std::fs::symlink_metadata(&replaced_dir)?
+                .file_type()
+                .is_symlink()
+        );
+        Ok(())
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn regular_direct_recipes_cover_fresh_cache_history_and_schema_fallback() -> anyhow::Result<()>
+    {
+        for (reuse, expected_origin) in [
+            (None, DirectRecipeOrigin::Executed),
+            (
+                Some(ReuseSource::ExactCache),
+                DirectRecipeOrigin::ExactCache,
+            ),
+            (
+                Some(ReuseSource::IncrementalHistory),
+                DirectRecipeOrigin::IncrementalHistory,
+            ),
+        ] {
+            let (dir, _file, mutation) = make_relative_test_setup();
+            let mut commands = test_command_config();
+            commands.command = successful_command();
+            if let Some(reuse) = reuse {
+                seed_reused_survivor(dir.path(), &commands, &mutation, reuse)?;
+            }
+            let runner = TestRunner {
+                commands,
+                parallelism: 1,
+                project_root: dir.path().to_path_buf(),
+                verbose: false,
+                show_output: false,
+                max_tested: None,
+                early_stop: EarlyStopConfig::default(),
+                respect_workspace_ignores: true,
+                env: HashMap::new(),
+                incremental_history: true,
+                force_rerun: false,
+                learned_selection: false,
+                cancelled: Arc::new(AtomicBool::new(false)),
+            };
+            let outcome = runner.run(vec![mutation.clone()]);
+            let recipe = outcome
+                .replay_recipes
+                .get(&mutation.id)
+                .expect("regular result should capture a direct replay recipe");
+            assert_eq!(recipe.origin, expected_origin);
+            assert_eq!(recipe.test_command, successful_command());
+        }
+
+        let (dir, _file, mut mutation) = make_relative_test_setup();
+        mutation.language = "unsupported".into();
+        let mut commands = test_command_config();
+        commands.command = successful_command();
+        let runner = TestRunner {
+            commands,
+            parallelism: 1,
+            project_root: dir.path().to_path_buf(),
+            verbose: false,
+            show_output: false,
+            max_tested: None,
+            early_stop: EarlyStopConfig::default(),
+            respect_workspace_ignores: true,
+            env: HashMap::new(),
+            incremental_history: false,
+            force_rerun: true,
+            learned_selection: false,
+            cancelled: Arc::new(AtomicBool::new(false)),
+        };
+        let outcome = runner.run_with_schemata(vec![mutation.clone()]);
+        assert!(outcome.report.schemata.is_some());
+        assert_eq!(
+            outcome
+                .replay_recipes
+                .get(&mutation.id)
+                .map(|recipe| &recipe.origin),
+            Some(&DirectRecipeOrigin::Executed)
+        );
+        Ok(())
     }
 
     fn go_operator_mutation(id: u32, file: &str, source: &str, nth: usize) -> Mutation {
@@ -6433,6 +8104,30 @@ test "$runs" -eq 1
     }
 
     #[test]
+    fn replay_workspace_control_exclusions_are_ascii_case_insensitive() {
+        for path in [
+            ".GIT/config",
+            ".TOGI/state",
+            ".TOGI-CACHE/history.json",
+            ".TOGI.LOCK",
+            ".TOGI-BASELINE",
+            ".TOGI-OTHER/state",
+        ] {
+            assert!(
+                should_skip_replay_workspace_entry(Path::new(path)),
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn normal_workspace_exclusions_remain_case_sensitive() {
+        for path in ["Target/cache", "Build/artifact", ".Togi-Custom/state"] {
+            assert!(!should_skip_workspace_entry(Path::new(path)), "{path}");
+        }
+    }
+
+    #[test]
     fn copy_workspace_copies_regular_files_and_skips_internal_dirs() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
@@ -6498,6 +8193,36 @@ test "$runs" -eq 1
         assert!(!copy.root().join(".togi.lock").exists());
         assert!(!copy.root().join(".codex").exists());
         assert!(!copy.root().join(".claude").exists());
+    }
+
+    #[test]
+    fn normal_workspace_copy_retains_mixed_case_unrelated_directories() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        for (relative, contents) in [
+            ("Target/cache", b"target" as &[u8]),
+            ("Build/artifact", b"build"),
+            (".Togi-Custom/state", b"custom"),
+        ] {
+            let path = root.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, contents).unwrap();
+        }
+
+        let copy = copy_workspace_with_options(root, false).unwrap();
+
+        assert_eq!(
+            std::fs::read(copy.root().join("Target/cache")).unwrap(),
+            b"target"
+        );
+        assert_eq!(
+            std::fs::read(copy.root().join("Build/artifact")).unwrap(),
+            b"build"
+        );
+        assert_eq!(
+            std::fs::read(copy.root().join(".Togi-Custom/state")).unwrap(),
+            b"custom"
+        );
     }
 
     #[test]
@@ -6597,6 +8322,64 @@ test "$runs" -eq 1
     }
 
     #[test]
+    fn replay_workspace_is_independent_git_snapshot_without_source_admin_residue() {
+        if !git_available() {
+            return;
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        init_clean_git_fixture(root);
+        std::fs::write(root.join(".TOGI-BASELINE"), b"control").unwrap();
+        std::fs::write(root.join("src/deleted.rs"), b"stale").unwrap();
+        run_git(root, &["add", ".TOGI-BASELINE", "src/deleted.rs"]);
+        run_git(root, &["commit", "-m", "add snapshot controls"]);
+        let source_revision = git_snapshot_revision(root).unwrap();
+        std::fs::remove_file(root.join("src/deleted.rs")).unwrap();
+        std::fs::create_dir_all(root.join(".TOGI-CACHE")).unwrap();
+        std::fs::write(root.join(".TOGI-CACHE/cache"), b"control").unwrap();
+        let worktrees = root.join(".git/worktrees");
+        assert!(!worktrees.exists());
+
+        let workspace_root;
+        {
+            let copy = copy_workspace_for_replay(root, &source_revision, true).unwrap();
+            workspace_root = copy.root().to_path_buf();
+            let git_dir = copy.root().join(".git");
+            let metadata = std::fs::symlink_metadata(&git_dir).unwrap();
+            assert!(metadata.file_type().is_dir());
+            assert!(!metadata.file_type().is_symlink());
+            assert_eq!(
+                std::fs::read(copy.root().join("src/lib.rs")).unwrap(),
+                b"pub fn f() {}\n"
+            );
+            assert!(!copy.root().join(".TOGI-BASELINE").exists());
+            assert!(!copy.root().join(".TOGI-CACHE").exists());
+            assert!(!copy.root().join("src/deleted.rs").exists());
+            assert!(!worktrees.exists());
+        }
+
+        assert!(!workspace_root.exists());
+        assert!(!worktrees.exists());
+    }
+
+    #[test]
+    fn replay_snapshot_rejects_mismatched_expected_revision() {
+        if !git_available() {
+            return;
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        init_clean_git_fixture(root);
+        let actual = git_snapshot_revision(root).unwrap();
+        let expected = "0".repeat(actual.len());
+        assert_ne!(actual, expected);
+        assert!(copy_workspace_for_replay(root, &expected, true).is_err());
+        assert!(!root.join(".git/worktrees").exists());
+    }
+
+    #[test]
     fn copy_workspace_uses_git_worktree_with_dirty_overlay() -> std::io::Result<()> {
         if !git_available() {
             return Ok(());
@@ -6648,6 +8431,7 @@ test "$runs" -eq 1
         );
         assert_eq!(std::fs::read(copy.root().join("local.txt"))?, b"copy me");
         assert!(!copy.root().join("src/old.rs").exists());
+
         assert_eq!(
             std::fs::read(copy.root().join("src/replaced/nested.rs"))?,
             b"pub fn nested() {}\n"
@@ -6657,6 +8441,139 @@ test "$runs" -eq 1
             std::fs::read(copy.root().join("target/debug/cache"))?,
             b"keep"
         );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn normal_git_worktree_overlay_follows_dirty_and_untracked_regular_source_symlinks()
+    -> std::io::Result<()> {
+        use std::os::unix::fs::symlink;
+
+        if !git_available() {
+            return Ok(());
+        }
+
+        let tmp = tempfile::tempdir()?;
+        let root = tmp.path();
+        init_clean_git_fixture(root);
+        std::fs::write(root.join("target.txt"), b"linked contents")?;
+        std::fs::write(root.join("tracked.txt"), b"original contents")?;
+        run_git(root, &["add", "target.txt", "tracked.txt"]);
+        run_git(root, &["commit", "-m", "add overlay files"]);
+
+        std::fs::remove_file(root.join("tracked.txt"))?;
+        symlink("target.txt", root.join("tracked.txt"))?;
+        symlink("target.txt", root.join("untracked-link.txt"))?;
+
+        let copy = copy_workspace(root)?;
+
+        for relative in ["tracked.txt", "untracked-link.txt"] {
+            let destination = copy.root().join(relative);
+            assert_eq!(std::fs::read(&destination)?, b"linked contents");
+            assert!(
+                !std::fs::symlink_metadata(destination)?
+                    .file_type()
+                    .is_symlink(),
+                "{relative} should retain normal overlay copy semantics"
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_workspace_falls_back_for_escaping_untracked_symlink() -> std::io::Result<()> {
+        use std::os::unix::fs::symlink;
+
+        if !git_available() {
+            return Ok(());
+        }
+
+        let tmp = tempfile::tempdir()?;
+        let root = tmp.path().join("repo");
+        std::fs::create_dir(&root)?;
+        init_clean_git_fixture(&root);
+        let outside = tmp.path().join("outside.rs");
+        let link = root.join("untracked-link.rs");
+        std::fs::write(&outside, b"outside")?;
+        symlink(&outside, &link)?;
+
+        let copy = copy_workspace(&root)?;
+
+        assert!(matches!(&copy.reset_strategy, WorkspaceResetStrategy::Copy));
+        assert!(!copy.root().join("untracked-link.rs").exists());
+        assert_eq!(std::fs::read(&outside)?, b"outside");
+        assert!(std::fs::symlink_metadata(&link)?.file_type().is_symlink());
+        assert!(!root.join(".git/worktrees").exists());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn normal_git_worktree_overlay_replaces_destination_symlink() -> std::io::Result<()> {
+        use std::os::unix::fs::symlink;
+
+        if !git_available() {
+            return Ok(());
+        }
+
+        let tmp = tempfile::tempdir()?;
+        let root = tmp.path().join("repo");
+        std::fs::create_dir(&root)?;
+        init_clean_git_fixture(&root);
+        let sentinel = tmp.path().join("outside");
+        std::fs::write(&sentinel, b"outside sentinel")?;
+        let link = root.join("link.txt");
+        symlink(&sentinel, &link)?;
+        run_git(&root, &["add", "link.txt"]);
+        run_git(&root, &["commit", "-m", "add linked file"]);
+
+        std::fs::remove_file(&link)?;
+        std::fs::write(&link, b"overlay contents")?;
+
+        let copy = copy_workspace(&root)?;
+        let destination = copy.root().join("link.txt");
+        assert_eq!(std::fs::read(&sentinel)?, b"outside sentinel");
+        assert!(
+            std::fs::symlink_metadata(&destination)?
+                .file_type()
+                .is_file()
+        );
+        assert_eq!(std::fs::read(destination)?, b"overlay contents");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn normal_overlay_rejects_escaping_and_control_symlink_sources() -> std::io::Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir()?;
+        let root = tmp.path().join("project");
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir(&root)?;
+        std::fs::create_dir(&workspace)?;
+        let outside = tmp.path().join("outside");
+        std::fs::write(&outside, b"outside sentinel")?;
+        symlink(&outside, root.join("outside-link"))?;
+
+        let error = copy_overlay_file(&root, &workspace, Path::new("outside-link")).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("does not resolve within the project root")
+        );
+        assert_eq!(std::fs::read(&outside)?, b"outside sentinel");
+
+        let control = root.join(".TOGI-CACHE/cache");
+        std::fs::create_dir_all(control.parent().unwrap())?;
+        std::fs::write(&control, b"control sentinel")?;
+        symlink(".TOGI-CACHE/cache", root.join("control-link"))?;
+
+        let error = copy_overlay_file(&root, &workspace, Path::new("control-link")).unwrap_err();
+        assert!(error.to_string().contains("Togi or Git control state"));
+        assert_eq!(std::fs::read(control)?, b"control sentinel");
         Ok(())
     }
 
