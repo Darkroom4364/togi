@@ -5,7 +5,7 @@ use std::fmt::Write;
 
 struct FileStats {
     total: usize,
-    build_errors: usize,
+    tested: usize,
     uncovered: usize,
     subsumed: usize,
     killed: usize,
@@ -14,9 +14,8 @@ struct FileStats {
 
 impl FileStats {
     fn score_pct(&self) -> f64 {
-        let tested = self.tested();
-        if tested > 0 {
-            (self.killed as f64 / tested as f64) * 100.0
+        if self.tested > 0 {
+            (self.killed as f64 / self.tested as f64) * 100.0
         } else if self.total == self.uncovered + self.subsumed {
             100.0
         } else {
@@ -25,10 +24,7 @@ impl FileStats {
     }
 
     fn tested(&self) -> usize {
-        self.total
-            .saturating_sub(self.build_errors)
-            .saturating_sub(self.uncovered)
-            .saturating_sub(self.subsumed)
+        self.tested
     }
 }
 
@@ -39,6 +35,7 @@ struct MutationEntry {
     original: String,
     replacement: String,
     result: &'static str,
+    execution: String,
 }
 
 pub fn generate_report(report: &MutationReport) -> Result<String> {
@@ -46,6 +43,7 @@ pub fn generate_report(report: &MutationReport) -> Result<String> {
 
     for (mutation, result) in &report.results {
         let file_path = mutation.file.display().to_string();
+        let execution = report.execution_for(mutation.id, *result);
         let result_str = match result {
             MutationResult::Killed => "killed",
             MutationResult::Survived => "survived",
@@ -54,25 +52,24 @@ pub fn generate_report(report: &MutationReport) -> Result<String> {
             MutationResult::Uncovered => "uncovered",
             MutationResult::Subsumed => "subsumed",
         };
-        let killed = matches!(result, MutationResult::Killed);
-        let build_error = matches!(result, MutationResult::BuildError);
-        let uncovered = matches!(result, MutationResult::Uncovered);
-        let subsumed = matches!(result, MutationResult::Subsumed);
+        let killed = execution.is_tested() && *result == MutationResult::Killed;
+        let uncovered = *result == MutationResult::Uncovered;
+        let subsumed = *result == MutationResult::Subsumed;
 
         let stats = files.entry(file_path).or_insert(FileStats {
             total: 0,
-            build_errors: 0,
+            tested: 0,
             uncovered: 0,
             subsumed: 0,
             killed: 0,
             mutations: Vec::new(),
         });
         stats.total += 1;
+        if execution.is_tested() {
+            stats.tested += 1;
+        }
         if killed {
             stats.killed += 1;
-        }
-        if build_error {
-            stats.build_errors += 1;
         }
         if uncovered {
             stats.uncovered += 1;
@@ -87,10 +84,12 @@ pub fn generate_report(report: &MutationReport) -> Result<String> {
             original: mutation.original.clone(),
             replacement: mutation.replacement.clone(),
             result: result_str,
+            execution: execution.to_string(),
         });
     }
 
-    let tested = report.tested_count();
+    let execution_counts = report.execution_counts();
+    let tested = execution_counts.executed;
     let score_pct = super::mutation_score(report);
     let uncovered = report.uncovered_count();
     let uncovered_str = if uncovered > 0 {
@@ -101,6 +100,14 @@ pub fn generate_report(report: &MutationReport) -> Result<String> {
     let subsumed = report.subsumed_count();
     let subsumed_str = if subsumed > 0 {
         format!(", {subsumed} subsumed")
+    } else {
+        String::new()
+    };
+    let reused_str = if execution_counts.reused() > 0 {
+        format!(
+            ", {} exact-cache reused, {} incremental-history reused",
+            execution_counts.exact_cache_reused, execution_counts.incremental_history_reused
+        )
     } else {
         String::new()
     };
@@ -123,16 +130,17 @@ pub fn generate_report(report: &MutationReport) -> Result<String> {
     write!(
         html,
         "<div class=\"summary\"><span class=\"score\">{:.1}%</span> mutation score \
-         &mdash; {}/{} killed, {} survived, {} timeout, {} build errors{}{} \
+         &mdash; {}/{} freshly executed killed, {} survived, {} timeout, {} build errors{}{}{} \
          &mdash; {:.2}s</div>",
         score_pct,
-        report.killed,
+        execution_counts.executed_killed,
         tested,
         report.survived,
         report.timeout,
         report.build_errors,
         uncovered_str,
         subsumed_str,
+        reused_str,
         report.duration.as_secs_f64()
     )?;
     if report.total < report.planned_total {
@@ -247,7 +255,7 @@ pub fn generate_report(report: &MutationReport) -> Result<String> {
             html,
             "<table><thead><tr>\
             <th>Line</th><th>Operator</th><th>Description</th>\
-            <th>Original</th><th>Replacement</th><th>Result</th>\
+            <th>Original</th><th>Replacement</th><th>Result</th><th>Execution</th>\
             </tr></thead><tbody>"
         )?;
 
@@ -265,14 +273,15 @@ pub fn generate_report(report: &MutationReport) -> Result<String> {
                 "<tr class=\"{}\"><td>{}</td><td><code>{}</code></td><td>{}</td>\
                  <td><code class=\"orig\">{}</code></td>\
                  <td><code class=\"repl\">{}</code></td>\
-                 <td>{}</td></tr>",
+                 <td>{}</td><td>{}</td></tr>",
                 result_class,
                 m.line,
                 html_escape(&m.operator),
                 html_escape(&m.description),
                 html_escape(&m.original),
                 html_escape(&m.replacement),
-                m.result
+                m.result,
+                html_escape(&m.execution)
             )?;
         }
 
@@ -447,7 +456,7 @@ mod tests {
     fn html_contains_score() {
         let html = generate_report(&sample_report()).unwrap();
         assert!(html.contains("50.0%"));
-        assert!(html.contains("1/2 killed"));
+        assert!(html.contains("1/2 freshly executed killed"));
     }
 
     #[test]
@@ -468,6 +477,7 @@ mod tests {
                 },
                 MutationResult::BuildError,
             )],
+            execution_provenance: BTreeMap::new(),
             build_error_diagnostics: vec![BuildErrorDiagnostic::new(
                 1,
                 "regular",
@@ -527,6 +537,7 @@ mod tests {
         }
         let report = MutationReport {
             results,
+            execution_provenance: BTreeMap::new(),
             build_error_diagnostics,
             schemata: None,
             baseline_timing: None,
@@ -564,6 +575,7 @@ mod tests {
                 },
                 MutationResult::Killed,
             )],
+            execution_provenance: BTreeMap::new(),
             build_error_diagnostics: vec![],
             schemata: None,
             baseline_timing: None,
@@ -605,6 +617,7 @@ mod tests {
 
         let report = MutationReport {
             results,
+            execution_provenance: BTreeMap::new(),
             build_error_diagnostics: vec![],
             schemata: None,
             baseline_timing: None,

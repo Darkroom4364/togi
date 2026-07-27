@@ -1,4 +1,4 @@
-use crate::{Mutation, MutationReport, MutationResult};
+use crate::{Mutation, MutationExecution, MutationReport, MutationResult};
 use anyhow::Result;
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -61,6 +61,12 @@ struct SarifInvocationProperties {
     survived: usize,
     timeout: usize,
     build_errors: usize,
+    tested: usize,
+    executed_killed: usize,
+    #[serde(skip_serializing_if = "super::is_zero")]
+    exact_cache_reused: usize,
+    #[serde(skip_serializing_if = "super::is_zero")]
+    incremental_history_reused: usize,
     #[serde(skip_serializing_if = "super::is_zero")]
     uncovered: usize,
     #[serde(skip_serializing_if = "super::is_zero")]
@@ -75,6 +81,15 @@ struct SarifResult {
     level: &'static str,
     message: SarifMessage,
     locations: Vec<SarifLocation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    properties: Option<SarifResultProperties>,
+}
+
+#[derive(Serialize)]
+struct SarifResultProperties {
+    execution: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    nonexecution_reason: Option<&'static str>,
 }
 
 #[derive(Serialize)]
@@ -112,7 +127,7 @@ fn artifact_uri(mutation: &Mutation) -> String {
     mutation.file.display().to_string().replace('\\', "/")
 }
 
-fn result_for(mutation: &Mutation) -> SarifResult {
+fn result_for(mutation: &Mutation, execution: MutationExecution) -> SarifResult {
     SarifResult {
         rule_id: mutation.operator.clone(),
         level: "warning",
@@ -135,6 +150,10 @@ fn result_for(mutation: &Mutation) -> SarifResult {
                 },
             },
         }],
+        properties: (!execution.is_tested()).then(|| SarifResultProperties {
+            execution: execution.state_name(),
+            nonexecution_reason: execution.reason().map(|reason| reason.name()),
+        }),
     }
 }
 
@@ -162,15 +181,15 @@ pub fn print_report(report: &MutationReport) -> Result<()> {
 /// invocation totals.
 pub fn to_sarif_string(report: &MutationReport) -> Result<String> {
     let registry = registry_descriptions();
-    let surviving: Vec<&Mutation> = report
+    let surviving: Vec<(&Mutation, MutationExecution)> = report
         .results
         .iter()
-        .filter(|(_, r)| *r == MutationResult::Survived)
-        .map(|(m, _)| m)
+        .filter(|(_, result)| *result == MutationResult::Survived)
+        .map(|(mutation, result)| (mutation, report.execution_for(mutation.id, *result)))
         .collect();
 
     let mut rules: Vec<SarifRule> = Vec::new();
-    for mutation in &surviving {
+    for (mutation, _) in &surviving {
         if rules.iter().any(|rule| rule.id == mutation.operator) {
             continue;
         }
@@ -184,6 +203,7 @@ pub fn to_sarif_string(report: &MutationReport) -> Result<String> {
         });
     }
 
+    let execution_counts = report.execution_counts();
     let sarif_report = SarifReport {
         schema: SARIF_SCHEMA,
         version: SARIF_VERSION,
@@ -203,6 +223,10 @@ pub fn to_sarif_string(report: &MutationReport) -> Result<String> {
                     survived: report.survived,
                     timeout: report.timeout,
                     build_errors: report.build_errors,
+                    tested: execution_counts.executed,
+                    executed_killed: execution_counts.executed_killed,
+                    exact_cache_reused: execution_counts.exact_cache_reused,
+                    incremental_history_reused: execution_counts.incremental_history_reused,
                     uncovered: report.uncovered_count(),
                     subsumed: report.subsumed_count(),
                     mutation_score: super::mutation_score(report),
@@ -210,7 +234,7 @@ pub fn to_sarif_string(report: &MutationReport) -> Result<String> {
             }],
             results: surviving
                 .iter()
-                .map(|mutation| result_for(mutation))
+                .map(|(mutation, execution)| result_for(mutation, *execution))
                 .collect(),
         }],
     };
@@ -223,6 +247,7 @@ mod tests {
     use super::*;
     use crate::test_helpers::sample_report;
     use serde_json::Value;
+    use std::collections::BTreeMap;
     use std::path::PathBuf;
     use std::time::Duration;
 
@@ -270,6 +295,7 @@ mod tests {
             test_command: None,
             build_command: vec![],
             results,
+            execution_provenance: BTreeMap::new(),
             build_error_diagnostics: vec![],
             schemata: None,
             baseline_timing: None,
@@ -338,6 +364,56 @@ mod tests {
     }
 
     #[test]
+    fn sarif_survivor_results_include_nonfresh_provenance() {
+        let mut report = report_with(vec![
+            (
+                mutation(0, "src/fresh.rs", 1, "op", "fresh"),
+                MutationResult::Survived,
+            ),
+            (
+                mutation(1, "src/exact.rs", 2, "op", "exact"),
+                MutationResult::Survived,
+            ),
+            (
+                mutation(2, "src/history.rs", 3, "op", "history"),
+                MutationResult::Survived,
+            ),
+            (
+                mutation(3, "src/skipped.rs", 4, "op", "skipped"),
+                MutationResult::Survived,
+            ),
+        ]);
+        report
+            .execution_provenance
+            .insert(1, MutationExecution::ExactCache);
+        report
+            .execution_provenance
+            .insert(2, MutationExecution::IncrementalHistory);
+        report.execution_provenance.insert(
+            3,
+            MutationExecution::NotExecuted(crate::MutationNonExecutionReason::Subsumed),
+        );
+
+        let results = parse(&report)["runs"][0]["results"].clone();
+
+        assert!(results[0].get("properties").is_none());
+        assert_eq!(
+            results[1]["properties"],
+            serde_json::json!({"execution": "exact_cache"})
+        );
+        assert_eq!(
+            results[2]["properties"],
+            serde_json::json!({"execution": "incremental_history"})
+        );
+        assert_eq!(
+            results[3]["properties"],
+            serde_json::json!({
+                "execution": "not_executed",
+                "nonexecution_reason": "subsumed"
+            })
+        );
+    }
+    #[test]
     fn sarif_result_has_level_message_and_location() {
         let value = parse(&sample_report());
         let result = &value["runs"][0]["results"][0];
@@ -364,6 +440,8 @@ mod tests {
         assert_eq!(properties["survived"], 1);
         assert_eq!(properties["timeout"], 0);
         assert_eq!(properties["build_errors"], 0);
+        assert_eq!(properties["tested"], 2);
+        assert_eq!(properties["executed_killed"], 1);
         assert_eq!(properties["mutation_score"], 50.0);
     }
 
@@ -507,6 +585,8 @@ mod tests {
                         "survived": 1,
                         "timeout": 0,
                         "build_errors": 0,
+                        "tested": 2,
+                        "executed_killed": 1,
                         "mutation_score": 50.0
                     }
                 }],

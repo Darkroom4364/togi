@@ -587,8 +587,6 @@ fn check_all_mutants_uncovered_aborts_when_baseline_test_fails() {
             "check",
             "--base",
             "HEAD",
-            "--format",
-            "json",
             "--test-cmd",
             "false",
             "--coverage-file",
@@ -599,9 +597,11 @@ fn check_all_mutants_uncovered_aborts_when_baseline_test_fails() {
         .unwrap();
 
     assert_eq!(output.status.code(), Some(2));
-    assert!(
-        String::from_utf8_lossy(&output.stderr).contains("baseline test command failed (`false`)")
-    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("Test suite failure before mutation execution."));
+    assert!(stderr.contains("Baseline phase: test"));
+    assert!(stderr.contains("Outcome: failed"));
+    assert!(stderr.contains("baseline test command failed (`false`)"));
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(!stdout.contains("\"killed\""));
     assert!(!stdout.contains("mutation_score"));
@@ -636,12 +636,17 @@ fn check_all_mutants_uncovered_aborts_when_baseline_build_fails() {
         .unwrap();
 
     assert_eq!(output.status.code(), Some(2));
-    assert!(
-        String::from_utf8_lossy(&output.stderr).contains("baseline build command failed (`false`)")
-    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("baseline build command failed (`false`)"));
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(!stdout.contains("\"killed\""));
-    assert!(!stdout.contains("mutation_score"));
+    let failure: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|error| panic!("invalid suite-failure JSON: {error}\nstdout:\n{stdout}"));
+    assert_eq!(failure["kind"], "suite_failure");
+    assert_eq!(failure["phase"], "build");
+    assert_eq!(failure["command"], serde_json::json!(["false"]));
+    assert_eq!(failure["outcome"], "failed");
+    assert!(failure.get("mutations").is_none());
+    assert!(failure.get("mutation_score").is_none());
     assert!(!dir.path().join(".togi-cache").exists());
 }
 
@@ -712,6 +717,233 @@ fn check_format_json_outputs_standalone_json_for_explain() {
 }
 
 #[test]
+fn check_format_json_outputs_valid_json() {
+    let dir = setup_git_repo();
+
+    let output = togi()
+        .args([
+            "check",
+            "--base",
+            "HEAD",
+            "--format",
+            "json",
+            "--test-cmd",
+            "true",
+            "--fail-under",
+            "0",
+        ])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|e| {
+        panic!(
+            "invalid JSON output: {e}\nstdout: {}",
+            String::from_utf8_lossy(&output.stdout)
+        )
+    });
+    assert!(value.get("total").is_some());
+    assert!(value.get("mutations").is_some());
+}
+
+#[test]
+fn check_format_json_dry_run_outputs_a_single_preview_document() {
+    let dir = setup_git_repo();
+
+    let output = togi()
+        .args([
+            "check",
+            "--all",
+            "--format",
+            "json",
+            "--dry-run",
+            "--test-cmd",
+            "true",
+        ])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|e| {
+        panic!(
+            "invalid dry-run JSON output: {e}\nstdout: {}",
+            String::from_utf8_lossy(&output.stdout)
+        )
+    });
+    assert_eq!(value["kind"], "dry_run");
+    assert_eq!(value["dry_run"], true);
+    assert_eq!(
+        value["planned_total"],
+        value["mutations"].as_array().unwrap().len()
+    );
+    assert!(value.get("mutation_score").is_none());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("Scanning all 1 supported files..."),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!dir.path().join(".togi-cache").exists());
+}
+
+#[test]
+fn check_format_json_no_mutations_outputs_an_empty_report() {
+    let dir = setup_git_repo();
+    assert_command_success(
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(dir.path())
+            .output()
+            .unwrap(),
+        "commit no-diff setup",
+    );
+    assert_command_success(
+        std::process::Command::new("git")
+            .args(["commit", "-m", "second"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap(),
+        "commit no-diff setup",
+    );
+
+    let output = togi()
+        .args([
+            "check",
+            "--base",
+            "HEAD",
+            "--format",
+            "json",
+            "--test-cmd",
+            "true",
+        ])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|e| {
+        panic!(
+            "invalid empty-report JSON output: {e}\nstdout: {}",
+            String::from_utf8_lossy(&output.stdout)
+        )
+    });
+    assert_eq!(value["total"], 0);
+    assert_eq!(value["planned_total"], 0);
+    assert_eq!(value["mutation_score"], 100.0);
+    assert_eq!(value["mutations"], serde_json::json!([]));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("No changes found"),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn check_format_json_post_generation_no_mutations_outputs_empty_report() {
+    let dir = setup_git_repo();
+    let main_go = dir.path().join("main.go");
+    fs::write(
+        &main_go,
+        "package main\n\nconst name = \"before\"\n\nfunc main() {}\n",
+    )
+    .unwrap();
+    assert_command_success(
+        std::process::Command::new("git")
+            .args(["add", "main.go"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap(),
+        "stage no-candidate baseline",
+    );
+    assert_command_success(
+        std::process::Command::new("git")
+            .args(["commit", "-m", "no-candidate baseline"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap(),
+        "commit no-candidate baseline",
+    );
+    fs::write(
+        &main_go,
+        "package main\n\nconst name = \"after\"\n\nfunc main() {}\n",
+    )
+    .unwrap();
+
+    let output = togi()
+        .args([
+            "check",
+            "--base",
+            "HEAD",
+            "--format",
+            "json",
+            "--operators",
+            "string_to_empty",
+            "--test-cmd",
+            "true",
+        ])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|e| {
+        panic!(
+            "invalid post-generation empty-report JSON output: {e}\nstdout: {}",
+            String::from_utf8_lossy(&output.stdout)
+        )
+    });
+    assert_eq!(value["total"], 0);
+    assert_eq!(value["planned_total"], 0);
+    assert_eq!(value["mutations"], serde_json::json!([]));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("No mutations generated"),
+        "stderr: {stderr}"
+    );
+    assert!(!stderr.contains("No changes found"), "stderr: {stderr}");
+}
+
+#[test]
+fn check_all_no_supported_files_json_outputs_an_empty_report() {
+    let dir = setup_git_repo();
+
+    let output = togi()
+        .args([
+            "check",
+            "--all",
+            "--path",
+            "go.mod",
+            "--format",
+            "json",
+            "--test-cmd",
+            "true",
+        ])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|e| {
+        panic!(
+            "invalid no-supported-files JSON output: {e}\nstdout: {}",
+            String::from_utf8_lossy(&output.stdout)
+        )
+    });
+    assert_eq!(value["total"], 0);
+    assert_eq!(value["mutations"], serde_json::json!([]));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("No supported source files found"),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+#[test]
 fn check_aborts_before_mutations_when_baseline_test_fails() {
     let dir = setup_git_repo();
 
@@ -746,10 +978,16 @@ fn check_aborts_before_mutations_when_baseline_test_fails() {
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
+    let failure: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|error| panic!("invalid suite-failure JSON: {error}\nstdout:\n{stdout}"));
+    assert_eq!(failure["kind"], "suite_failure");
+    assert_eq!(failure["phase"], "test");
+    assert_eq!(failure["command"], serde_json::json!(["false"]));
+    assert_eq!(failure["outcome"], "failed");
     assert!(stderr.contains("baseline test command failed (`false`)"));
     assert!(!stderr.contains("Running 1 mutations"));
-    assert!(!stdout.contains("\"killed\""));
-    assert!(!stdout.contains("mutation_score"));
+    assert!(failure.get("mutations").is_none());
+    assert!(failure.get("mutation_score").is_none());
     assert!(
         !dir.path().join(".togi-cache").exists(),
         "baseline failure must not create mutation cache entries"
@@ -1715,6 +1953,298 @@ fn check_baseline_still_honors_fail_under() {
         .stderr(predicate::str::contains("below --fail-under threshold"));
 }
 
+#[test]
+fn check_skips_baseline_actions_without_fresh_cache_or_history_evidence() {
+    for (reuse_source, expected_state) in [
+        ("exact cache", "exact_cache"),
+        ("incremental history", "incremental_history"),
+    ] {
+        let dir = setup_git_repo();
+        let baseline_path = dir.path().join(".togi-baseline");
+
+        let fresh = togi()
+            .args([
+                "check",
+                "--base",
+                "HEAD",
+                "--format",
+                "json",
+                "--test-cmd",
+                "true",
+                "--no-schemata",
+                "--operators",
+                "gt_to_gte",
+                "--max-per-run",
+                "1",
+                "--jobs",
+                "1",
+                "--fail-under",
+                "0",
+                "--save-baseline",
+            ])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        assert!(
+            fresh.status.success(),
+            "fresh baseline run failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&fresh.stdout),
+            String::from_utf8_lossy(&fresh.stderr)
+        );
+        let baseline_before = fs::read(&baseline_path).unwrap();
+        let saved: serde_json::Value = serde_json::from_slice(&baseline_before).unwrap();
+        assert_eq!(saved["total"], 1, "{reuse_source} fixture needs a baseline");
+
+        for action in ["--save-baseline", "--check-baseline"] {
+            if reuse_source == "incremental history" {
+                let cache_dir = dir.path().join(".togi-cache");
+                for entry in fs::read_dir(&cache_dir).unwrap() {
+                    let entry = entry.unwrap();
+                    if entry.file_type().unwrap().is_file()
+                        && entry.file_name().to_string_lossy() != "history.json"
+                    {
+                        fs::remove_file(entry.path()).unwrap();
+                    }
+                }
+                assert!(cache_dir.join("history.json").exists());
+            }
+            let reused = togi()
+                .args([
+                    "check",
+                    "--base",
+                    "HEAD",
+                    "--format",
+                    "json",
+                    "--test-cmd",
+                    "true",
+                    "--no-schemata",
+                    "--operators",
+                    "gt_to_gte",
+                    "--max-per-run",
+                    "1",
+                    "--jobs",
+                    "1",
+                ])
+                .arg(action)
+                .current_dir(dir.path())
+                .output()
+                .unwrap();
+            let stderr = String::from_utf8_lossy(&reused.stderr);
+            assert_eq!(
+                reused.status.code(),
+                Some(1),
+                "{reuse_source} {action} verdict must retain normal no-baseline survivor behavior\nstdout:\n{}\nstderr:\n{stderr}",
+                String::from_utf8_lossy(&reused.stdout),
+            );
+            assert_eq!(
+                stderr
+                    .matches("Report has no complete fresh execution evidence; skipping baseline save/check.")
+                    .count(),
+                1,
+                "{reuse_source} {action}: {stderr}"
+            );
+            assert!(
+                !stderr.contains("Baseline saved to .togi-baseline"),
+                "{stderr}"
+            );
+            assert!(
+                !stderr.contains("Mutation score regression detected!"),
+                "{stderr}"
+            );
+            assert_eq!(fs::read(&baseline_path).unwrap(), baseline_before);
+
+            let report: serde_json::Value = serde_json::from_slice(&reused.stdout).unwrap();
+            assert_eq!(
+                report["mutations"][0]["execution"]["state"], expected_state,
+                "{reuse_source} {action}: {report}"
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn check_skips_baseline_actions_for_mixed_fresh_and_reused_results() {
+    for action in ["--save-baseline", "--check-baseline"] {
+        let dir = setup_git_repo();
+        fs::write(
+            dir.path().join("history.go"),
+            "package main\n\nfunc history(a, b int) bool {\n\treturn a > b\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("fresh.go"),
+            "package main\n\nfunc fresh(a, b int) bool {\n\treturn a > b\n}\n",
+        )
+        .unwrap();
+        let state = tempfile::NamedTempFile::new().unwrap();
+        fs::write(state.path(), "kill").unwrap();
+        let test_cmd = format!(
+            "sh -c {}",
+            shell_quote_text(&format!(
+                "if grep -Fq '>=' main.go history.go fresh.go; then test \"$(cat {})\" = survive; else exit 0; fi",
+                shell_quote(state.path())
+            ))
+        );
+        let baseline_path = dir.path().join(".togi-baseline");
+
+        let initial = togi()
+            .args([
+                "check",
+                "--all",
+                "--format",
+                "json",
+                "--test-cmd",
+                &test_cmd,
+                "--no-schemata",
+                "--operators",
+                "gt_to_gte",
+                "--max-per-run",
+                "3",
+                "--jobs",
+                "1",
+                "--fail-under",
+                "0",
+                "--save-baseline",
+            ])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        assert!(
+            initial.status.success(),
+            "initial baseline run failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&initial.stdout),
+            String::from_utf8_lossy(&initial.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&initial.stderr).contains("Baseline saved to .togi-baseline")
+        );
+        let initial_report: serde_json::Value = serde_json::from_slice(&initial.stdout).unwrap();
+        assert_eq!(initial_report["mutation_score"].as_f64(), Some(100.0));
+        let baseline_before = fs::read(&baseline_path).unwrap();
+        let baseline: serde_json::Value = serde_json::from_slice(&baseline_before).unwrap();
+        assert_eq!(baseline["killed"], 3);
+        assert_eq!(baseline["total"], 3);
+        fs::remove_dir_all(dir.path().join(".togi-cache")).unwrap();
+
+        fs::write(state.path(), "survive").unwrap();
+        for path in ["history.go", "main.go"] {
+            let seeded = togi()
+                .args([
+                    "check",
+                    "--all",
+                    "--path",
+                    path,
+                    "--format",
+                    "json",
+                    "--test-cmd",
+                    &test_cmd,
+                    "--no-schemata",
+                    "--operators",
+                    "gt_to_gte",
+                    "--max-per-run",
+                    "1",
+                    "--jobs",
+                    "1",
+                    "--fail-under",
+                    "0",
+                ])
+                .current_dir(dir.path())
+                .output()
+                .unwrap();
+            assert!(
+                seeded.status.success(),
+                "seed {path} failed\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&seeded.stdout),
+                String::from_utf8_lossy(&seeded.stderr)
+            );
+
+            if path == "history.go" {
+                let cache_dir = dir.path().join(".togi-cache");
+                for entry in fs::read_dir(&cache_dir).unwrap() {
+                    let entry = entry.unwrap();
+                    if entry.file_type().unwrap().is_file()
+                        && entry.file_name().to_string_lossy() != "history.json"
+                    {
+                        fs::remove_file(entry.path()).unwrap();
+                    }
+                }
+                assert!(cache_dir.join("history.json").exists());
+            }
+        }
+
+        let mixed = togi()
+            .args([
+                "check",
+                "--all",
+                "--format",
+                "json",
+                "--test-cmd",
+                &test_cmd,
+                "--no-schemata",
+                "--operators",
+                "gt_to_gte",
+                "--max-per-run",
+                "3",
+                "--jobs",
+                "1",
+            ])
+            .arg(action)
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&mixed.stderr);
+        assert_eq!(
+            mixed.status.code(),
+            Some(1),
+            "mixed {action} must retain normal no-baseline survivor behavior\nstdout:\n{}\nstderr:\n{stderr}",
+            String::from_utf8_lossy(&mixed.stdout)
+        );
+        assert_eq!(
+            stderr
+                .matches(
+                    "Report has no complete fresh execution evidence; skipping baseline save/check."
+                )
+                .count(),
+            1,
+            "{action}: {stderr}"
+        );
+        assert!(
+            !stderr.contains("Baseline saved to .togi-baseline"),
+            "{stderr}"
+        );
+        assert!(
+            !stderr.contains("Mutation score regression detected!"),
+            "{stderr}"
+        );
+        assert_eq!(fs::read(&baseline_path).unwrap(), baseline_before);
+
+        let report: serde_json::Value = serde_json::from_slice(&mixed.stdout).unwrap();
+        assert_eq!(report["tested"].as_u64(), Some(1));
+        assert_eq!(report["exact_cache_reused"].as_u64(), Some(1));
+        assert_eq!(report["incremental_history_reused"].as_u64(), Some(1));
+        assert_eq!(report["killed"].as_u64(), Some(0));
+        assert_eq!(report["survived"].as_u64(), Some(3));
+        assert_eq!(report["mutation_score"].as_f64(), Some(0.0));
+        for (file, expected_state) in [
+            ("main.go", "exact_cache"),
+            ("history.go", "incremental_history"),
+            ("fresh.go", "executed"),
+        ] {
+            let mutation = report["mutations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|mutation| mutation["file"].as_str() == Some(file))
+                .unwrap_or_else(|| panic!("missing {file} mutation: {report}"));
+            assert_eq!(
+                mutation["execution"]["state"], expected_state,
+                "{action}: {report}"
+            );
+        }
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn interrupted_mutation_exits_130_without_a_report_or_side_effects() {
@@ -2409,6 +2939,141 @@ fn explain_reads_json_report() {
         .success()
         .stdout(predicate::str::contains("Change: + -> -"))
         .stdout(predicate::str::contains("Why it was killed"));
+}
+
+#[test]
+fn explain_reports_reused_cache_verdict_without_claiming_a_test_ran() {
+    let dir = TempDir::new().unwrap();
+    let report_path = dir.path().join("togi-report.json");
+    fs::write(
+        &report_path,
+        r#"{
+  "test_command": ["cargo", "test"],
+  "mutations": [{
+    "id": 1,
+    "file": "src/main.go",
+    "line": 3,
+    "operator": "plus_to_minus",
+    "description": "Replace + with -",
+    "result": "survived",
+    "execution": {"state": "exact_cache"}
+  }]
+}"#,
+    )
+    .unwrap();
+
+    let output = togi()
+        .args([
+            "explain",
+            "1",
+            "--report",
+            report_path.to_str().expect("report path should be utf-8"),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "explain cached verdict failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Execution: reused from exact cache"));
+    assert!(stdout.contains("Test command: not run."));
+    assert!(!stdout.contains(r#"Test command: ["cargo","test"]"#));
+}
+
+#[test]
+fn explain_reports_incremental_history_and_structured_nonexecution() {
+    let dir = TempDir::new().unwrap();
+
+    for (index, (label, result, state, reason, execution_text)) in [
+        (
+            "incremental history",
+            "survived",
+            "incremental_history",
+            None,
+            "reused from incremental history",
+        ),
+        (
+            "build error",
+            "build_error",
+            "not_executed",
+            Some("build_error"),
+            "not executed (build_error)",
+        ),
+        (
+            "uncovered",
+            "uncovered",
+            "not_executed",
+            Some("uncovered"),
+            "not executed (uncovered)",
+        ),
+        (
+            "subsumed",
+            "subsumed",
+            "not_executed",
+            Some("subsumed"),
+            "not executed (subsumed)",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut execution = serde_json::json!({"state": state});
+        if let Some(reason) = reason {
+            execution["reason"] = serde_json::Value::String(reason.into());
+        }
+        let report_path = dir.path().join(format!("report-{index}.json"));
+        fs::write(
+            &report_path,
+            serde_json::to_string(&serde_json::json!({
+                "test_command": ["cargo", "test"],
+                "mutations": [{
+                    "id": 1,
+                    "file": "src/main.go",
+                    "line": 3,
+                    "operator": "plus_to_minus",
+                    "description": label,
+                    "result": result,
+                    "execution": execution,
+                }],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let output = togi()
+            .args([
+                "explain",
+                "1",
+                "--report",
+                report_path.to_str().expect("report path should be utf-8"),
+            ])
+            .output()
+            .unwrap();
+
+        assert!(
+            output.status.success(),
+            "{label} explain failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains(&format!("Execution: {execution_text}")),
+            "{label} stdout:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("Test command: not run."),
+            "{label} stdout:\n{stdout}"
+        );
+        assert!(
+            !stdout.contains(r#"Test command: ["cargo","test"]"#),
+            "{label} stdout:\n{stdout}"
+        );
+    }
 }
 
 #[test]

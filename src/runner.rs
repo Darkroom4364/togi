@@ -2,11 +2,11 @@
 
 use crate::cache::{self, CacheKey};
 use crate::{
-    BuildErrorDiagnostic, Mutation, MutationReport, MutationResult, SchemataFallbackReasonCount,
-    SchemataReport,
+    BuildErrorDiagnostic, Mutation, MutationExecution, MutationReport, MutationResult,
+    SchemataFallbackReasonCount, SchemataReport,
 };
 use anyhow::{Context, bail};
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::hash::Hasher;
 use std::io::{IsTerminal, Read, Write};
@@ -245,6 +245,72 @@ pub struct BaselineSuiteMeasurement {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BaselineHealthMeasurement {
     pub suites: Vec<BaselineSuiteMeasurement>,
+}
+
+/// Which baseline command made a mutation run unsuitable for scoring.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SuiteFailurePhase {
+    Build,
+    Test,
+}
+
+impl SuiteFailurePhase {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Build => "baseline build command",
+            Self::Test => "baseline test command",
+        }
+    }
+}
+
+/// Structured outcome for a failing unmutated baseline suite.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunSuiteFailureOutcome {
+    Failed { output: Option<String> },
+    TimedOut { timeout: Duration },
+    CannotRun { detail: String },
+}
+
+/// A run-level failure that prevents mutation verdicts from being trustworthy.
+///
+/// `src/main.rs` can downcast a `check_baseline_health` error with
+/// [`run_suite_failure`] and render this separately from mutation results.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunSuiteFailure {
+    pub phase: SuiteFailurePhase,
+    pub command: Vec<String>,
+    pub outcome: RunSuiteFailureOutcome,
+}
+
+impl std::fmt::Display for RunSuiteFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let label = self.phase.label();
+        let command = command_for_message(&self.command);
+        match &self.outcome {
+            RunSuiteFailureOutcome::Failed { output } => {
+                write!(f, "{label} failed (`{command}`)")?;
+                if let Some(output) = output {
+                    write!(f, ":\n{output}")?;
+                }
+                Ok(())
+            }
+            RunSuiteFailureOutcome::TimedOut { timeout } => write!(
+                f,
+                "{label} timed out after {:.2}s (`{command}`)",
+                timeout.as_secs_f64()
+            ),
+            RunSuiteFailureOutcome::CannotRun { detail } => {
+                write!(f, "{label} could not run (`{command}`): {detail}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for RunSuiteFailure {}
+
+/// Extract a structured run-level suite failure from baseline health checking.
+pub fn run_suite_failure(error: &anyhow::Error) -> Option<&RunSuiteFailure> {
+    error.downcast_ref::<RunSuiteFailure>()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1219,7 +1285,7 @@ pub fn measure_baseline_timing(
     let root = workspace.root();
     let build_duration = if config.build_command_explicit && !config.build_command.is_empty() {
         Some(measure_baseline_command(
-            "baseline build command",
+            SuiteFailurePhase::Build,
             config.build_command,
             config.sandbox_command,
             root,
@@ -1231,7 +1297,7 @@ pub fn measure_baseline_timing(
         None
     };
     let test_duration = measure_baseline_command(
-        "baseline test command",
+        SuiteFailurePhase::Test,
         config.test_command,
         config.sandbox_command,
         root,
@@ -1276,7 +1342,7 @@ pub fn check_baseline_health(
             && !config.commands.build_command.is_empty()
         {
             Some(measure_baseline_command(
-                "baseline build command",
+                SuiteFailurePhase::Build,
                 &config.commands.build_command,
                 &config.commands.sandbox_command,
                 root,
@@ -1288,7 +1354,7 @@ pub fn check_baseline_health(
             None
         };
         let test_duration = measure_baseline_command(
-            "baseline test command",
+            SuiteFailurePhase::Test,
             &suite.argv,
             &config.commands.sandbox_command,
             root,
@@ -1364,7 +1430,7 @@ fn resolve_baseline_suites(
 }
 
 fn measure_baseline_command(
-    label: &str,
+    phase: SuiteFailurePhase,
     command: &[String],
     sandbox_command: &[String],
     cwd: &Path,
@@ -1383,28 +1449,32 @@ fn measure_baseline_command(
         MutationResult::Survived | MutationResult::Uncovered | MutationResult::Subsumed => {
             Ok(duration)
         }
-        MutationResult::Killed => {
-            let output = baseline_failure_output(outcome.test_output.as_deref());
-            bail!(
-                "{label} failed (`{}`){output}",
-                command_for_message(command)
-            )
+        MutationResult::Killed => Err(RunSuiteFailure {
+            phase,
+            command: command.to_vec(),
+            outcome: RunSuiteFailureOutcome::Failed {
+                output: baseline_failure_output(outcome.test_output.as_deref()),
+            },
         }
-        MutationResult::Timeout => bail!(
-            "{label} timed out after {:.2}s (`{}`)",
-            timeout.as_secs_f64(),
-            command_for_message(command)
-        ),
+        .into()),
+        MutationResult::Timeout => Err(RunSuiteFailure {
+            phase,
+            command: command.to_vec(),
+            outcome: RunSuiteFailureOutcome::TimedOut { timeout },
+        }
+        .into()),
         MutationResult::BuildError => {
             let detail = outcome
                 .build_error_detail
                 .as_ref()
-                .map(|detail| detail.message.as_str())
-                .unwrap_or("command could not run");
-            bail!(
-                "{label} could not run (`{}`): {detail}",
-                command_for_message(command)
-            )
+                .map(|detail| detail.message.clone())
+                .unwrap_or_else(|| "command could not run".to_string());
+            Err(RunSuiteFailure {
+                phase,
+                command: command.to_vec(),
+                outcome: RunSuiteFailureOutcome::CannotRun { detail },
+            }
+            .into())
         }
     }
 }
@@ -1426,12 +1496,9 @@ fn sandboxed_command(sandbox_command: &[String], command: &[String]) -> Vec<Stri
     argv
 }
 
-fn baseline_failure_output(output: Option<&str>) -> String {
-    let Some(output) = output.map(str::trim).filter(|output| !output.is_empty()) else {
-        return String::new();
-    };
-    let excerpt = output.lines().take(6).collect::<Vec<_>>().join("\n");
-    format!(":\n{excerpt}")
+fn baseline_failure_output(output: Option<&str>) -> Option<String> {
+    let output = output.map(str::trim).filter(|output| !output.is_empty())?;
+    Some(output.lines().take(6).collect::<Vec<_>>().join("\n"))
 }
 
 fn create_git_worktree_workspace(
@@ -1882,12 +1949,14 @@ impl Drop for WorkspaceSlot {
 struct QueuedMutation {
     index: usize,
     mutation: Mutation,
+    restore_checked: bool,
 }
 
 #[derive(Debug)]
 struct MutationRunRecord {
     mutation: Mutation,
     result: MutationResult,
+    execution: MutationExecution,
     build_error_diagnostic: Option<BuildErrorDiagnostic>,
 }
 
@@ -1900,9 +1969,20 @@ impl MutationRunRecord {
         Self {
             mutation,
             result,
+            execution: MutationExecution::for_result(result),
             build_error_diagnostic,
         }
     }
+
+    fn with_execution(mut self, execution: MutationExecution) -> Self {
+        self.execution = execution;
+        self
+    }
+}
+
+struct PreclassifiedMutations {
+    fresh: Vec<QueuedMutation>,
+    restored: Vec<(usize, MutationRunRecord)>,
 }
 
 #[derive(Default)]
@@ -1937,6 +2017,7 @@ impl SchemataRunSummary {
 
 #[derive(Default)]
 struct EarlyStopCounts {
+    fresh_eligible_total: usize,
     completed: usize,
     killed: usize,
     survived: usize,
@@ -1945,7 +2026,6 @@ struct EarlyStopCounts {
 
 struct EarlyStopState {
     config: EarlyStopConfig,
-    planned_total: usize,
     stopped: AtomicBool,
     reason: Mutex<Option<String>>,
     counts: Mutex<EarlyStopCounts>,
@@ -1955,10 +2035,12 @@ impl EarlyStopState {
     fn new(config: EarlyStopConfig, planned_total: usize) -> Self {
         Self {
             config,
-            planned_total,
             stopped: AtomicBool::new(false),
             reason: Mutex::new(None),
-            counts: Mutex::new(EarlyStopCounts::default()),
+            counts: Mutex::new(EarlyStopCounts {
+                fresh_eligible_total: planned_total,
+                ..Default::default()
+            }),
         }
     }
 
@@ -1995,8 +2077,26 @@ impl EarlyStopState {
             MutationResult::Timeout | MutationResult::Uncovered | MutationResult::Subsumed => {}
             MutationResult::BuildError => counts.build_errors += 1,
         }
+        self.reevaluate(&counts);
+    }
 
-        let remaining = self.planned_total.saturating_sub(counts.completed);
+    /// Remove a restored cache/history verdict from the fresh-work budget
+    /// without treating its verdict as a newly observed result.
+    fn exclude_restored(&self) {
+        let mut counts = self
+            .counts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        counts.fresh_eligible_total = counts.fresh_eligible_total.saturating_sub(1);
+        self.reevaluate(&counts);
+    }
+
+    fn reevaluate(&self, counts: &EarlyStopCounts) {
+        if self.should_stop() {
+            return;
+        }
+
+        let remaining = counts.fresh_eligible_total.saturating_sub(counts.completed);
         if remaining == 0 {
             return;
         }
@@ -2018,7 +2118,7 @@ impl EarlyStopState {
             let best_killed = counts.killed + remaining;
             let best_score = if best_tested > 0 {
                 (best_killed as f64 / best_tested as f64) * 100.0
-            } else if self.planned_total == 0 {
+            } else if counts.fresh_eligible_total == 0 {
                 100.0
             } else {
                 0.0
@@ -2072,6 +2172,17 @@ fn should_stop_early(early_stop: &Option<Arc<EarlyStopState>>) -> bool {
 fn record_early_stop(shared: &RunShared<'_>, result: MutationResult) {
     if let Some(early_stop) = shared.early_stop {
         early_stop.record(result);
+    }
+}
+
+fn exclude_restored_from_early_stop(
+    early_stop: Option<&Arc<EarlyStopState>>,
+    execution: MutationExecution,
+) {
+    if execution.is_reused() {
+        if let Some(early_stop) = early_stop {
+            early_stop.exclude_restored();
+        }
     }
 }
 
@@ -2172,6 +2283,12 @@ struct PreparedMutationRun {
     cache_key: Option<CacheKey>,
 }
 
+#[derive(Clone, Copy)]
+struct RestoredMutationResult {
+    result: MutationResult,
+    execution: MutationExecution,
+}
+
 struct PreparedMutationContext<'a> {
     commands: &'a CommandConfig,
     history: Option<&'a cache::IncrementalHistoryStore>,
@@ -2245,30 +2362,36 @@ impl PreparedMutationRun {
         project_root: &Path,
         history: Option<&cache::IncrementalHistoryStore>,
         force_rerun: bool,
-    ) -> Option<MutationResult> {
+    ) -> Option<RestoredMutationResult> {
         if force_rerun {
             return None;
         }
-        if let Some(ref key) = self.cache_key {
+        if let Some(key) = &self.cache_key {
             if let Some(result) = cache::lookup(project_root, key) {
                 self.record_history(history, result, None);
-                return Some(result);
+                return Some(RestoredMutationResult {
+                    result,
+                    execution: MutationExecution::ExactCache,
+                });
             }
         }
         if let (Some(history), Some(query)) = (history, self.history_query.as_ref()) {
             if let Some(result) = history.lookup(query) {
-                if let Some(ref key) = self.cache_key {
+                if let Some(key) = &self.cache_key {
                     cache::store(project_root, key, result);
                 }
                 self.record_history(Some(history), result, None);
-                return Some(result);
+                return Some(RestoredMutationResult {
+                    result,
+                    execution: MutationExecution::IncrementalHistory,
+                });
             }
         }
         None
     }
 
     fn store_cache(&self, project_root: &Path, result: MutationResult) {
-        if let Some(ref key) = self.cache_key {
+        if let Some(key) = &self.cache_key {
             cache::store(project_root, key, result);
         }
     }
@@ -2300,7 +2423,11 @@ fn run_queued_mutation(
     reservation: TestSlotReservation,
     shared: RunShared<'_>,
 ) -> Option<(usize, MutationRunRecord)> {
-    let QueuedMutation { index, mutation } = queued;
+    let QueuedMutation {
+        index,
+        mutation,
+        restore_checked,
+    } = queued;
 
     // Stop if cancelled (Ctrl+C).
     if shared.cancelled.load(Ordering::Relaxed) {
@@ -2320,15 +2447,21 @@ fn run_queued_mutation(
         },
     );
 
-    // Check exact cache and then structured history before acquiring a workspace slot.
-    if let Some(result) =
-        prepared.restore_result(shared.project_root, shared.history, shared.force_rerun)
-    {
-        reservation.release();
-        record_progress(&shared, &mutation, result, None, true);
-        record_early_stop(&shared, result);
-        let diagnostic = cached_build_error_diagnostic(&mutation, "regular", result);
-        return Some((index, MutationRunRecord::new(mutation, result, diagnostic)));
+    // Normal runs retain lazy cache lookup; early-stop runs preclassify every
+    // candidate before scheduling and mark fresh entries as already checked.
+    if !restore_checked {
+        if let Some(restored) =
+            prepared.restore_result(shared.project_root, shared.history, shared.force_rerun)
+        {
+            reservation.release();
+            exclude_restored_from_early_stop(shared.early_stop, restored.execution);
+            record_progress(&shared, &mutation, restored.result, None, true);
+            return Some((
+                index,
+                MutationRunRecord::new(mutation, restored.result, None)
+                    .with_execution(restored.execution),
+            ));
+        }
     }
 
     let outcome = {
@@ -2528,13 +2661,89 @@ fn merge_subsumed(report: &mut MutationReport, subsumed: Vec<Mutation>) {
 }
 
 impl TestRunner {
+    /// Resolve reusable verdicts before early-stop decisions so the gate sees
+    /// the complete fresh-work denominator rather than only cache hits
+    /// encountered so far by workers.
+    fn preclassify_for_early_stop(&self, mutations: &[Mutation]) -> PreclassifiedMutations {
+        if !self.early_stop.is_enabled() {
+            return PreclassifiedMutations {
+                fresh: mutations
+                    .iter()
+                    .cloned()
+                    .enumerate()
+                    .map(|(index, mutation)| QueuedMutation {
+                        index,
+                        mutation,
+                        restore_checked: false,
+                    })
+                    .collect(),
+                restored: Vec::new(),
+            };
+        }
+
+        let source_contents = SourceContentCache::default();
+        let cache_context_hash = cache_context_fingerprint(&self.project_root);
+        let test_context_index = TestContextIndex::build(&self.project_root);
+        let history = self
+            .incremental_history
+            .then(|| cache::IncrementalHistoryStore::load(&self.project_root));
+        let mut fresh = Vec::with_capacity(mutations.len());
+        let mut restored = Vec::new();
+        let mut cancelled = false;
+
+        for (index, mutation) in mutations.iter().enumerate() {
+            if cancelled || self.cancelled.load(Ordering::Acquire) {
+                cancelled = true;
+                fresh.push(QueuedMutation {
+                    index,
+                    mutation: mutation.clone(),
+                    restore_checked: false,
+                });
+                continue;
+            }
+
+            let prepared = PreparedMutationRun::new(
+                &self.project_root,
+                mutation,
+                PreparedMutationContext {
+                    commands: &self.commands,
+                    history: history.as_ref(),
+                    source_contents: &source_contents,
+                    cache_context_fingerprint: cache_context_hash,
+                    test_context_index: &test_context_index,
+                    env: &self.env,
+                },
+            );
+            if let Some(restored_result) =
+                prepared.restore_result(&self.project_root, history.as_ref(), self.force_rerun)
+            {
+                restored.push((
+                    index,
+                    MutationRunRecord::new(mutation.clone(), restored_result.result, None)
+                        .with_execution(restored_result.execution),
+                ));
+            } else {
+                fresh.push(QueuedMutation {
+                    index,
+                    mutation: mutation.clone(),
+                    restore_checked: true,
+                });
+            }
+        }
+
+        PreclassifiedMutations { fresh, restored }
+    }
+
     #[allow(clippy::manual_is_multiple_of)]
     pub fn run(&self, mutations: Vec<Mutation>) -> RunOutcome {
         let (mutations, subsumed) = self.split_subsumed(mutations);
         let planned_total = mutations.len();
-        let early_stop = EarlyStopState::for_config(self.early_stop.clone(), planned_total);
+        let preclassified = self.preclassify_for_early_stop(&mutations);
+        let early_stop =
+            EarlyStopState::for_config(self.early_stop.clone(), preclassified.fresh.len());
         let mut outcome = self.run_regular_with_state(
-            mutations,
+            preclassified.fresh,
+            preclassified.restored,
             early_stop,
             planned_total,
             Arc::new(AtomicUsize::new(0)),
@@ -2600,7 +2809,15 @@ impl TestRunner {
             return self.outcome_from_records(Vec::new(), start.elapsed());
         }
         let planned_total = mutations.len();
-        let early_stop = EarlyStopState::for_config(self.early_stop.clone(), planned_total);
+        let preclassified = self.preclassify_for_early_stop(&mutations);
+        let restored_ids: HashSet<u32> = preclassified
+            .restored
+            .iter()
+            .map(|(_, record)| record.mutation.id)
+            .collect();
+        let restore_checked = self.early_stop.is_enabled();
+        let early_stop =
+            EarlyStopState::for_config(self.early_stop.clone(), preclassified.fresh.len());
         let tested_counter = Arc::new(AtomicUsize::new(0));
 
         let index_by_id: HashMap<u32, usize> = mutations
@@ -2612,38 +2829,36 @@ impl TestRunner {
         let mut schema_by_language = HashMap::<String, Vec<crate::schemata::SchemaMutation>>::new();
         let mut fallback_mutations = Vec::new();
         let mut schemata_summary = SchemataRunSummary::default();
+        let mut all_records = preclassified
+            .restored
+            .into_iter()
+            .map(|(_, record)| record)
+            .collect::<Vec<_>>();
 
         for schema_mutation in plan.selected {
             match schema_mutation.mutation.language.as_str() {
                 "c" | "cpp" | "go" | "java" | "rust" => {
-                    schema_by_language
-                        .entry(schema_mutation.mutation.language.clone())
-                        .or_default()
-                        .push(schema_mutation);
+                    if !restored_ids.contains(&schema_mutation.mutation.id) {
+                        schema_by_language
+                            .entry(schema_mutation.mutation.language.clone())
+                            .or_default()
+                            .push(schema_mutation);
+                    }
                 }
                 _ => {
                     schemata_summary.record_fallback("unsupported_runner");
-                    fallback_mutations.push(schema_mutation.mutation);
+                    if !restored_ids.contains(&schema_mutation.mutation.id) {
+                        fallback_mutations.push(schema_mutation.mutation);
+                    }
                 }
             }
         }
         for fallback in plan.fallback {
             schemata_summary.record_fallback(fallback.reason.as_str());
-            fallback_mutations.push(fallback.mutation);
+            if !restored_ids.contains(&fallback.mutation.id) {
+                fallback_mutations.push(fallback.mutation);
+            }
         }
-
-        if schema_by_language.is_empty() {
-            let mut outcome = self.run_regular_with_state(
-                fallback_mutations,
-                early_stop,
-                planned_total,
-                tested_counter,
-            );
-            outcome.report.schemata = Some(schemata_summary.into_report());
-            return outcome;
-        }
-
-        let mut all_records = Vec::new();
         for (language, schema_mutations) in schema_by_language {
             if should_stop_early(&early_stop) {
                 break;
@@ -2654,9 +2869,13 @@ impl TestRunner {
                 &schema_mutations,
                 early_stop.clone(),
                 tested_counter.clone(),
+                restore_checked,
             ) {
                 Ok((records, demoted)) => {
-                    schemata_summary.fast_path += records.len();
+                    schemata_summary.fast_path += records
+                        .iter()
+                        .filter(|record| record.execution.is_tested())
+                        .count();
                     all_records.extend(records);
                     if !demoted.is_empty() {
                         schemata_summary.record_fallbacks("schema_build_failure", demoted.len());
@@ -2680,7 +2899,16 @@ impl TestRunner {
             && !should_stop_early(&early_stop)
         {
             let fallback = self.run_regular_with_state(
-                fallback_mutations,
+                fallback_mutations
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, mutation)| QueuedMutation {
+                        index,
+                        mutation,
+                        restore_checked,
+                    })
+                    .collect(),
+                Vec::new(),
                 early_stop.clone(),
                 planned_total,
                 tested_counter,
@@ -2707,34 +2935,29 @@ impl TestRunner {
     #[allow(clippy::manual_is_multiple_of)]
     fn run_regular_with_state(
         &self,
-        mutations: Vec<Mutation>,
+        mutations: Vec<QueuedMutation>,
+        mut restored: Vec<(usize, MutationRunRecord)>,
         early_stop: Option<Arc<EarlyStopState>>,
         planned_total: usize,
         tested_counter: Arc<AtomicUsize>,
     ) -> RunOutcome {
         let start = Instant::now();
-        let total = mutations.len();
-        if total == 0 {
+        let fresh_total = mutations.len();
+        let total = fresh_total + restored.len();
+        if fresh_total == 0 || self.cancelled.load(Ordering::Acquire) {
+            restored.sort_by_key(|(index, _)| *index);
             return self.outcome_from_records_with_status(
-                Vec::new(),
-                start.elapsed(),
-                planned_total,
-                early_stop.as_ref().and_then(|state| state.reason()),
-            );
-        }
-        if self.cancelled.load(Ordering::Acquire) {
-            return self.outcome_from_records_with_status(
-                Vec::new(),
+                restored.into_iter().map(|(_, record)| record).collect(),
                 start.elapsed(),
                 planned_total,
                 early_stop.as_ref().and_then(|state| state.reason()),
             );
         }
 
-        let counter = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::new(AtomicUsize::new(restored.len()));
         let verbose = self.verbose;
         let is_tty = std::io::stderr().is_terminal();
-        let workspace_slots = workspace_pool_slot_count(self.parallelism, total);
+        let workspace_slots = workspace_pool_slot_count(self.parallelism, fresh_total);
 
         let workspace_pool_result = if self.respect_workspace_ignores {
             WorkspacePool::new(&self.project_root, workspace_slots)
@@ -2745,24 +2968,30 @@ impl TestRunner {
             Ok(pool) => Arc::new(pool),
             Err(e) => {
                 eprintln!("warning: could not create isolated mutation workspaces: {e}");
-                let results = mutations
-                    .into_iter()
-                    .map(|mutation| {
-                        let diagnostic = BuildErrorDiagnostic::new(
-                            mutation.id,
-                            "regular",
-                            "workspace_pool",
-                            vec![],
-                            format!("could not create isolated mutation workspaces: {e}"),
-                        );
+                restored.extend(mutations.into_iter().map(|queued| {
+                    let diagnostic = BuildErrorDiagnostic::new(
+                        queued.mutation.id,
+                        "regular",
+                        "workspace_pool",
+                        vec![],
+                        format!("could not create isolated mutation workspaces: {e}"),
+                    );
+                    (
+                        queued.index,
                         MutationRunRecord::new(
-                            mutation,
+                            queued.mutation,
                             MutationResult::BuildError,
                             Some(diagnostic),
-                        )
-                    })
-                    .collect();
-                return self.outcome_from_records(results, start.elapsed());
+                        ),
+                    )
+                }));
+                restored.sort_by_key(|(index, _)| *index);
+                return self.outcome_from_records_with_status(
+                    restored.into_iter().map(|(_, record)| record).collect(),
+                    start.elapsed(),
+                    planned_total,
+                    early_stop.as_ref().and_then(|state| state.reason()),
+                );
             }
         };
 
@@ -2770,11 +2999,9 @@ impl TestRunner {
         let project_root = Arc::new(self.project_root.clone());
         let build_command = Arc::new(self.commands.build_command.clone());
         let build_command_explicit = self.commands.build_command_explicit;
-        let queue = Arc::new(Mutex::new(
-            mutations.into_iter().enumerate().collect::<VecDeque<_>>(),
-        ));
-        let results = Arc::new(Mutex::new(Vec::new()));
-        let worker_count = workspace_pool.len().min(total).max(1);
+        let queue = Arc::new(Mutex::new(mutations.into_iter().collect::<VecDeque<_>>()));
+        let results = Arc::new(Mutex::new(restored));
+        let worker_count = workspace_pool.len().min(fresh_total).max(1);
         let cache_context_hash = cache_context_fingerprint(&self.project_root);
         let test_context_index = TestContextIndex::build(&self.project_root);
         let history = self
@@ -2823,13 +3050,13 @@ impl TestRunner {
                                 break;
                             }
                         };
-                        let Some((index, mutation)) = next else {
+                        let Some(queued) = next else {
                             break;
                         };
 
                         let outcome = catch_unwind(PanicBoundary(|| {
                             run_queued_mutation(
-                                QueuedMutation { index, mutation },
+                                queued,
                                 reservation,
                                 RunShared {
                                     workspace_pool: workspace_pool.as_ref(),
@@ -2901,12 +3128,14 @@ impl TestRunner {
         schema_mutations: &[crate::schemata::SchemaMutation],
         early_stop: Option<Arc<EarlyStopState>>,
         tested_counter: Arc<AtomicUsize>,
+        restore_checked: bool,
     ) -> Result<(Vec<MutationRunRecord>, Vec<Mutation>), crate::schemata::SchemaRewriteError> {
         self.run_schema_mutations_inner(
             language,
             schema_mutations,
             early_stop,
             tested_counter,
+            restore_checked,
             true,
         )
     }
@@ -2917,6 +3146,7 @@ impl TestRunner {
         schema_mutations: &[crate::schemata::SchemaMutation],
         early_stop: Option<Arc<EarlyStopState>>,
         tested_counter: Arc<AtomicUsize>,
+        restore_checked: bool,
         allow_build_bisection: bool,
     ) -> Result<(Vec<MutationRunRecord>, Vec<Mutation>), crate::schemata::SchemaRewriteError> {
         let rewrites =
@@ -2974,24 +3204,26 @@ impl TestRunner {
             } else {
                 prepared.selected_test.argv.clone()
             };
-            if let Some(result) =
-                prepared.restore_result(&self.project_root, history.as_ref(), self.force_rerun)
-            {
-                reservation.release();
-                if let Some(early_stop) = &early_stop {
-                    early_stop.record(result);
-                }
-                if self.verbose {
-                    eprintln!(
-                        "  [schema] ↻ cached  {}:{} — {}",
-                        mutation.file.display(),
-                        mutation.line,
-                        mutation.operator
+            if !restore_checked {
+                if let Some(restored) =
+                    prepared.restore_result(&self.project_root, history.as_ref(), self.force_rerun)
+                {
+                    reservation.release();
+                    exclude_restored_from_early_stop(early_stop.as_ref(), restored.execution);
+                    if self.verbose {
+                        eprintln!(
+                            "  [schema] ↻ cached  {}:{} — {}",
+                            mutation.file.display(),
+                            mutation.line,
+                            mutation.operator
+                        );
+                    }
+                    results.push(
+                        MutationRunRecord::new(mutation.clone(), restored.result, None)
+                            .with_execution(restored.execution),
                     );
+                    continue;
                 }
-                let diagnostic = cached_build_error_diagnostic(mutation, "schemata", result);
-                results.push(MutationRunRecord::new(mutation.clone(), result, diagnostic));
-                continue;
             }
 
             let mut cacheable = true;
@@ -3075,6 +3307,7 @@ impl TestRunner {
                                     &batch,
                                     early_stop.clone(),
                                     tested_counter.clone(),
+                                    restore_checked,
                                     false,
                                 ) {
                                     Ok((batch_records, batch_demoted)) => {
@@ -3322,6 +3555,7 @@ impl TestRunner {
     ) -> MutationReport {
         let mut results = Vec::with_capacity(all_records.len());
         let mut build_error_diagnostics = Vec::new();
+        let mut execution_provenance = BTreeMap::new();
         let mut total = 0;
         let mut killed = 0;
         let mut survived = 0;
@@ -3329,8 +3563,14 @@ impl TestRunner {
         let mut build_errors = 0;
 
         for record in all_records {
+            let MutationRunRecord {
+                mutation,
+                result,
+                execution,
+                build_error_diagnostic,
+            } = record;
             total += 1;
-            match record.result {
+            match result {
                 MutationResult::Killed => killed += 1,
                 MutationResult::Survived => survived += 1,
                 MutationResult::Timeout => timeout_count += 1,
@@ -3341,14 +3581,19 @@ impl TestRunner {
                 // after the run; neither counts toward any tally here.
                 MutationResult::Uncovered | MutationResult::Subsumed => {}
             }
-            if let Some(diagnostic) = record.build_error_diagnostic {
+            if execution != MutationExecution::for_result(result) {
+                execution_provenance.insert(mutation.id, execution);
+            }
+            if let Some(diagnostic) = build_error_diagnostic {
+                debug_assert_eq!(result, MutationResult::BuildError);
                 build_error_diagnostics.push(diagnostic);
             }
-            results.push((record.mutation, record.result));
+            results.push((mutation, result));
         }
 
         MutationReport {
             results,
+            execution_provenance,
             build_error_diagnostics,
             schemata: None,
             baseline_timing: None,
@@ -3485,17 +3730,25 @@ fn run_schema_workspace_mutation(
 }
 
 fn records_from_report(report: MutationReport) -> Vec<MutationRunRecord> {
-    let mut diagnostics: HashMap<u32, BuildErrorDiagnostic> = report
-        .build_error_diagnostics
+    let MutationReport {
+        results,
+        execution_provenance,
+        build_error_diagnostics,
+        ..
+    } = report;
+    let mut diagnostics: HashMap<u32, BuildErrorDiagnostic> = build_error_diagnostics
         .into_iter()
         .map(|diagnostic| (diagnostic.mutation_id, diagnostic))
         .collect();
-    report
-        .results
+    results
         .into_iter()
         .map(|(mutation, result)| {
+            let execution = execution_provenance
+                .get(&mutation.id)
+                .copied()
+                .unwrap_or_else(|| MutationExecution::for_result(result));
             let diagnostic = diagnostics.remove(&mutation.id);
-            MutationRunRecord::new(mutation, result, diagnostic)
+            MutationRunRecord::new(mutation, result, diagnostic).with_execution(execution)
         })
         .collect()
 }
@@ -3564,26 +3817,6 @@ impl MutationOutcome {
 struct BuildCommand<'a> {
     argv: &'a [String],
     explicit: bool,
-}
-
-/// Cache entries currently persist only [`MutationResult`], so
-/// `cached_build_error_diagnostic` intentionally groups cached build errors
-/// under one synthetic [`BuildErrorDiagnostic::new`] bucket. Persist the
-/// original phase/fingerprint with cached results to restore full fidelity.
-fn cached_build_error_diagnostic(
-    mutation: &Mutation,
-    runner: &str,
-    result: MutationResult,
-) -> Option<BuildErrorDiagnostic> {
-    (result == MutationResult::BuildError).then(|| {
-        BuildErrorDiagnostic::new(
-            mutation.id,
-            runner,
-            "cache",
-            vec![],
-            "build error result restored from cache; diagnostic output unavailable",
-        )
-    })
 }
 
 fn build_error_diagnostic_from_outcome(
@@ -4627,6 +4860,91 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy)]
+    enum ReuseSource {
+        ExactCache,
+        IncrementalHistory,
+    }
+
+    fn seed_reused_survivor(
+        project_root: &Path,
+        commands: &CommandConfig,
+        mutation: &Mutation,
+        reuse_source: ReuseSource,
+    ) -> anyhow::Result<()> {
+        let env = HashMap::new();
+        let selected = select_test_command(project_root, commands, mutation);
+        let command_context = selected.cache_context(
+            &commands.build_command,
+            commands.build_command_explicit,
+            &commands.sandbox_command,
+            &env,
+        );
+        let context_hash = cache_context_fingerprint(project_root);
+        let source_path = if mutation.file.is_absolute() {
+            mutation.file.clone()
+        } else {
+            project_root.join(&mutation.file)
+        };
+        let source = std::fs::read(source_path)?;
+
+        match reuse_source {
+            ReuseSource::ExactCache => {
+                let key = CacheKey::new(
+                    &source,
+                    &cache_identity(project_root, mutation),
+                    &mutation.description,
+                    &format!("{command_context};context={context_hash:016x}"),
+                );
+                cache::store(project_root, &key, MutationResult::Survived);
+            }
+            ReuseSource::IncrementalHistory => {
+                let test_context_index = TestContextIndex::build(project_root);
+                let query = incremental_history_query(
+                    project_root,
+                    mutation,
+                    &source,
+                    &command_context,
+                    test_context_index
+                        .fingerprint_for_tests(&selected.selected_tests, context_hash),
+                );
+                cache::IncrementalHistoryStore::load(project_root).record(
+                    cache::IncrementalHistoryEntry {
+                        mutation_identity: query.mutation_identity,
+                        mutation_description: query.mutation_description,
+                        result: MutationResult::Survived,
+                        source_hash: query.source_hash,
+                        command_hash: query.command_hash,
+                        relevant_test_hash: query.relevant_test_hash,
+                        covering_tests: vec![],
+                        killer_test: None,
+                    },
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn first_run_survives_second_kills_command(state_dir: &Path) -> Vec<String> {
+        vec![
+            "sh".into(),
+            "-c".into(),
+            r#"
+state_dir=$1
+runs=0
+if [ -f "$state_dir/runs" ]; then runs=$(cat "$state_dir/runs"); fi
+runs=$((runs + 1))
+printf '%s\n' "$runs" > "$state_dir/runs"
+test "$runs" -eq 1
+"#
+            .into(),
+            "state".into(),
+            state_dir.display().to_string(),
+        ]
+    }
+
     fn c_operator_mutation(id: u32, file: &str, source: &str, nth: usize) -> Mutation {
         let mut mutation = go_operator_mutation(id, file, source, nth);
         mutation.language = "c".into();
@@ -5580,6 +5898,12 @@ mod tests {
         };
         let cached = cached_runner.run(vec![mutation.clone()]).report;
         assert_eq!(cached.results[0].1, MutationResult::Survived);
+        assert_eq!(
+            cached.execution_for(mutation.id, MutationResult::Survived),
+            MutationExecution::IncrementalHistory
+        );
+        assert_eq!(cached.tested_count(), 0);
+        assert_eq!(cached.execution_counts().incremental_history_reused, 1);
 
         let forced_runner = TestRunner {
             commands: commands(),
@@ -5598,6 +5922,139 @@ mod tests {
         };
         let forced = forced_runner.run(vec![mutation]).report;
         assert_eq!(forced.results[0].1, MutationResult::Killed);
+        assert_eq!(
+            forced.execution_for(forced.results[0].0.id, MutationResult::Killed),
+            MutationExecution::Executed
+        );
+        assert_eq!(forced.tested_count(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn restored_cache_and_history_verdicts_keep_provenance_without_fake_diagnostics()
+    -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mutation = |id: u32, file: &str, description: &str| Mutation {
+            id,
+            file: PathBuf::from(file),
+            language: String::new(),
+            line: 1,
+            column: 1,
+            operator: "test".into(),
+            description: description.into(),
+            original: "hello".into(),
+            replacement: "world".into(),
+            byte_range: 0..5,
+        };
+        let cached = mutation(0, "cached.txt", "cached build error");
+        let historical = mutation(1, "history.txt", "historical survivor");
+        std::fs::write(dir.path().join(&cached.file), "hello")?;
+        std::fs::write(dir.path().join(&historical.file), "hello")?;
+        let commands = CommandConfig {
+            command: successful_command(),
+            force_default_command: false,
+            force_default_timeout: false,
+            project_commands: vec![],
+            language_commands: HashMap::new(),
+            build_command: vec![],
+            sandbox_command: vec![],
+            build_command_explicit: false,
+            timeout: Duration::from_secs(5),
+            language_timeouts: HashMap::new(),
+            test_selection: None,
+        };
+        let env = HashMap::new();
+        let context_hash = cache_context_fingerprint(dir.path());
+
+        let selected = select_test_command(dir.path(), &commands, &cached);
+        let context = selected.cache_context(
+            &commands.build_command,
+            commands.build_command_explicit,
+            &commands.sandbox_command,
+            &env,
+        );
+        let key = CacheKey::new(
+            &std::fs::read(dir.path().join(&cached.file))?,
+            &cache_identity(dir.path(), &cached),
+            &cached.description,
+            &format!("{context};context={context_hash:016x}"),
+        );
+        cache::store(dir.path(), &key, MutationResult::BuildError);
+
+        let selected = select_test_command(dir.path(), &commands, &historical);
+        let command_context = selected.cache_context(
+            &commands.build_command,
+            commands.build_command_explicit,
+            &commands.sandbox_command,
+            &env,
+        );
+        let test_context_index = TestContextIndex::build(dir.path());
+        let source = std::fs::read(dir.path().join(&historical.file))?;
+        let query = incremental_history_query(
+            dir.path(),
+            &historical,
+            &source,
+            &command_context,
+            test_context_index.fingerprint_for_tests(&selected.selected_tests, context_hash),
+        );
+        cache::IncrementalHistoryStore::load(dir.path()).record(cache::IncrementalHistoryEntry {
+            mutation_identity: query.mutation_identity,
+            mutation_description: query.mutation_description,
+            result: MutationResult::Survived,
+            source_hash: query.source_hash,
+            command_hash: query.command_hash,
+            relevant_test_hash: query.relevant_test_hash,
+            covering_tests: vec![],
+            killer_test: None,
+        });
+
+        let runner = TestRunner {
+            commands,
+            parallelism: 1,
+            project_root: dir.path().to_path_buf(),
+            verbose: false,
+            show_output: false,
+            max_tested: None,
+            early_stop: Default::default(),
+            respect_workspace_ignores: true,
+            env,
+            incremental_history: true,
+            force_rerun: false,
+            learned_selection: false,
+            cancelled: Arc::new(AtomicBool::new(false)),
+        };
+        let report = runner.run(vec![cached, historical]).report;
+
+        assert_eq!(
+            report
+                .results
+                .iter()
+                .map(|(_, result)| *result)
+                .collect::<Vec<_>>(),
+            vec![MutationResult::BuildError, MutationResult::Survived]
+        );
+        assert_eq!(report.tested_count(), 0);
+        assert!(report.build_error_diagnostics.is_empty());
+        assert_eq!(
+            report.execution_for(0, MutationResult::BuildError),
+            MutationExecution::ExactCache
+        );
+        assert_eq!(
+            report.execution_for(1, MutationResult::Survived),
+            MutationExecution::IncrementalHistory
+        );
+
+        let json: serde_json::Value =
+            serde_json::from_str(&crate::report::json::to_json_string(&report)?)?;
+        assert_eq!(json["tested"], 0);
+        assert_eq!(json["mutations"][0]["result"], "build_error");
+        assert_eq!(json["mutations"][0]["execution"]["state"], "exact_cache");
+        assert_eq!(json["mutations"][1]["result"], "survived");
+        assert_eq!(
+            json["mutations"][1]["execution"]["state"],
+            "incremental_history"
+        );
+        assert_eq!(json["build_error_groups"], serde_json::json!([]));
         Ok(())
     }
 
@@ -6329,6 +6786,40 @@ mod tests {
             vec!["build", "global", "build", "language", "build", "project"]
         );
         Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn baseline_health_exposes_structured_run_suite_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("subject.rs");
+        std::fs::write(&file, "fn subject() {}").unwrap();
+        let mutation = make_test_mutation(&file);
+        let mut commands = test_command_config();
+        commands.command = failing_command();
+        let cancelled = AtomicBool::new(false);
+
+        let error = check_baseline_health(
+            dir.path(),
+            &[mutation],
+            BaselineHealthConfig {
+                commands: &commands,
+                default_measurement_timeout: None,
+                schemata_enabled: false,
+                env: &HashMap::new(),
+                cancelled: &cancelled,
+                respect_workspace_ignores: true,
+            },
+        )
+        .unwrap_err();
+
+        let failure = run_suite_failure(&error).expect("baseline failure should be structured");
+        assert_eq!(failure.phase, SuiteFailurePhase::Test);
+        assert_eq!(failure.command, failing_command());
+        assert!(matches!(
+            &failure.outcome,
+            RunSuiteFailureOutcome::Failed { .. }
+        ));
     }
 
     #[cfg(unix)]
@@ -7540,7 +8031,423 @@ esac
         assert_eq!(report.total, 2);
         assert_eq!(report.results[0].1, MutationResult::Survived);
         assert_eq!(report.results[1].1, MutationResult::Survived);
+        assert_eq!(
+            report.execution_for(report.results[0].0.id, MutationResult::Survived),
+            MutationExecution::ExactCache
+        );
+        assert_eq!(
+            report.execution_for(report.results[1].0.id, MutationResult::Survived),
+            MutationExecution::Executed
+        );
+        assert_eq!(report.tested_count(), 1);
+        assert_eq!(
+            report
+                .schemata
+                .as_ref()
+                .expect("schemata summary")
+                .fast_path,
+            report.tested_count()
+        );
+        assert_eq!(report.execution_counts().exact_cache_reused, 1);
         assert_eq!(runs, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_with_schemata_marks_incremental_history_reuse() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let source = "package calc\nfunc equal(a, b int) bool { return a == b }\n";
+        std::fs::write(dir.path().join("calc.go"), source)?;
+        let mutation = go_operator_mutation(0, "calc.go", source, 0);
+        let commands = CommandConfig {
+            command: failing_command(),
+            force_default_command: false,
+            force_default_timeout: false,
+            project_commands: vec![],
+            language_commands: HashMap::new(),
+            build_command: vec![],
+            sandbox_command: vec![],
+            build_command_explicit: false,
+            timeout: Duration::from_secs(5),
+            language_timeouts: HashMap::new(),
+            test_selection: None,
+        };
+        let selected = select_test_command(dir.path(), &commands, &mutation);
+        let command_context = selected.cache_context(
+            &commands.build_command,
+            commands.build_command_explicit,
+            &commands.sandbox_command,
+            &HashMap::new(),
+        );
+        let source_content = std::fs::read(dir.path().join("calc.go"))?;
+        let context_hash = cache_context_fingerprint(dir.path());
+        let test_context_index = TestContextIndex::build(dir.path());
+        let relevant_test_hash =
+            test_context_index.fingerprint_for_tests(&selected.selected_tests, context_hash);
+        let query = incremental_history_query(
+            dir.path(),
+            &mutation,
+            &source_content,
+            &command_context,
+            relevant_test_hash,
+        );
+        cache::IncrementalHistoryStore::load(dir.path()).record(cache::IncrementalHistoryEntry {
+            mutation_identity: query.mutation_identity,
+            mutation_description: query.mutation_description,
+            result: MutationResult::Survived,
+            source_hash: query.source_hash,
+            command_hash: query.command_hash,
+            relevant_test_hash: query.relevant_test_hash,
+            covering_tests: vec![],
+            killer_test: None,
+        });
+
+        let runner = TestRunner {
+            commands,
+            parallelism: 1,
+            project_root: dir.path().to_path_buf(),
+            verbose: false,
+            show_output: false,
+            max_tested: None,
+            early_stop: Default::default(),
+            respect_workspace_ignores: true,
+            env: HashMap::new(),
+            incremental_history: true,
+            force_rerun: false,
+            learned_selection: false,
+            cancelled: Arc::new(AtomicBool::new(false)),
+        };
+
+        let report = runner.run_with_schemata(vec![mutation]).report;
+        assert_eq!(report.results[0].1, MutationResult::Survived);
+        assert_eq!(
+            report.execution_for(report.results[0].0.id, MutationResult::Survived),
+            MutationExecution::IncrementalHistory
+        );
+        assert_eq!(
+            report
+                .schemata
+                .as_ref()
+                .expect("schemata summary")
+                .fast_path,
+            report.tested_count()
+        );
+        assert_eq!(report.tested_count(), 0);
+        assert_eq!(report.execution_counts().incremental_history_reused, 1);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reused_schemata_survivor_does_not_trigger_early_stop() -> anyhow::Result<()> {
+        for reuse_source in [ReuseSource::ExactCache, ReuseSource::IncrementalHistory] {
+            for (early_stop, gate) in [
+                (
+                    EarlyStopConfig {
+                        max_survivors: Some(1),
+                        fail_under: None,
+                    },
+                    "max survivors",
+                ),
+                (
+                    EarlyStopConfig {
+                        max_survivors: None,
+                        fail_under: Some(100.0),
+                    },
+                    "fail under",
+                ),
+            ] {
+                let dir = tempfile::tempdir()?;
+                let source = "\
+package calc
+func first(a, b int) bool { return a == b }
+func second(a, b int) bool { return a == b }
+func third(a, b int) bool { return a == b }
+";
+                std::fs::write(dir.path().join("calc.go"), source)?;
+                let mutations = (0..3)
+                    .map(|id| go_operator_mutation(id, "calc.go", source, id as usize))
+                    .collect::<Vec<_>>();
+                let commands = CommandConfig {
+                    command: failing_command(),
+                    force_default_command: false,
+                    force_default_timeout: false,
+                    project_commands: vec![],
+                    language_commands: HashMap::new(),
+                    build_command: vec![],
+                    sandbox_command: vec![],
+                    build_command_explicit: false,
+                    timeout: Duration::from_secs(5),
+                    language_timeouts: HashMap::new(),
+                    test_selection: None,
+                };
+                seed_reused_survivor(dir.path(), &commands, &mutations[0], reuse_source)?;
+                let expected_execution = match reuse_source {
+                    ReuseSource::ExactCache => MutationExecution::ExactCache,
+                    ReuseSource::IncrementalHistory => MutationExecution::IncrementalHistory,
+                };
+                let runner = TestRunner {
+                    commands,
+                    parallelism: 1,
+                    project_root: dir.path().to_path_buf(),
+                    verbose: false,
+                    show_output: false,
+                    max_tested: None,
+                    early_stop,
+                    respect_workspace_ignores: true,
+                    env: HashMap::new(),
+                    incremental_history: true,
+                    force_rerun: false,
+                    learned_selection: false,
+                    cancelled: Arc::new(AtomicBool::new(false)),
+                };
+
+                let report = runner.run_with_schemata(mutations).report;
+                let schemata = report.schemata.as_ref().expect("schemata summary");
+
+                assert_eq!(report.total, 3, "{gate} should not stop fresh mutations");
+                assert_eq!(report.survived, 1);
+                assert_eq!(report.killed, 2);
+                assert_eq!(report.tested_count(), 2);
+                assert_eq!(schemata.fast_path, report.tested_count());
+                assert_eq!(
+                    report.execution_for(0, MutationResult::Survived),
+                    expected_execution
+                );
+                assert!(report.early_stop_reason.is_none(), "{gate}: {report:?}");
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn late_restored_schemata_survivor_reduces_fail_under_fresh_budget() -> anyhow::Result<()> {
+        for reuse_source in [ReuseSource::ExactCache, ReuseSource::IncrementalHistory] {
+            let dir = tempfile::tempdir()?;
+            let state = tempfile::tempdir()?;
+            let source = "\
+package calc
+func first(a, b int) bool { return a == b }
+func second(a, b int) bool { return a == b }
+func third(a, b int) bool { return a == b }
+";
+            std::fs::write(dir.path().join("calc.go"), source)?;
+            let mutations = (0..3)
+                .map(|id| go_operator_mutation(id, "calc.go", source, id as usize))
+                .collect::<Vec<_>>();
+            let commands = CommandConfig {
+                command: first_run_survives_second_kills_command(state.path()),
+                force_default_command: false,
+                force_default_timeout: false,
+                project_commands: vec![],
+                language_commands: HashMap::new(),
+                build_command: vec![],
+                sandbox_command: vec![],
+                build_command_explicit: false,
+                timeout: Duration::from_secs(5),
+                language_timeouts: HashMap::new(),
+                test_selection: None,
+            };
+            seed_reused_survivor(dir.path(), &commands, &mutations[2], reuse_source)?;
+            let expected_execution = match reuse_source {
+                ReuseSource::ExactCache => MutationExecution::ExactCache,
+                ReuseSource::IncrementalHistory => MutationExecution::IncrementalHistory,
+            };
+            let runner = TestRunner {
+                commands,
+                parallelism: 1,
+                project_root: dir.path().to_path_buf(),
+                verbose: false,
+                show_output: false,
+                max_tested: None,
+                early_stop: EarlyStopConfig {
+                    max_survivors: None,
+                    fail_under: Some(60.0),
+                },
+                respect_workspace_ignores: true,
+                env: HashMap::new(),
+                incremental_history: true,
+                force_rerun: false,
+                learned_selection: false,
+                cancelled: Arc::new(AtomicBool::new(false)),
+            };
+
+            let report = runner.run_with_schemata(mutations).report;
+            let runs = std::fs::read_to_string(state.path().join("runs"))?;
+            let schemata = report.schemata.as_ref().expect("schemata summary");
+
+            assert_eq!(report.planned_total, 3);
+            assert_eq!(report.total, 2);
+            assert_eq!(report.survived, 2);
+            assert_eq!(report.killed, 0);
+            assert_eq!(report.tested_count(), 1);
+            assert_eq!(schemata.fast_path, report.tested_count());
+            assert_eq!(
+                report.execution_for(0, MutationResult::Survived),
+                MutationExecution::Executed
+            );
+            assert_eq!(
+                report.execution_for(2, MutationResult::Survived),
+                expected_execution
+            );
+            assert!(report.results.iter().all(|(mutation, _)| mutation.id != 1));
+            assert_eq!(runs.trim(), "1");
+            assert!(
+                report
+                    .early_stop_reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("--fail-under 60.0"))
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn schemata_fallback_preserves_cache_and_history_provenance_through_records()
+    -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let go_source = "package calc\nfunc equal(a, b int) bool { return a == b }\n";
+        let python_source = "\
+def first(a, b):
+    return a == b
+
+def second(c, d):
+    return c == d
+";
+        std::fs::write(dir.path().join("calc.go"), go_source)?;
+        std::fs::write(dir.path().join("app.py"), python_source)?;
+        let go = go_operator_mutation(0, "calc.go", go_source, 0);
+        let python = |id, nth| {
+            let offset = python_source
+                .match_indices("==")
+                .nth(nth)
+                .expect("Python source should contain the operator")
+                .0;
+            Mutation {
+                id,
+                file: PathBuf::from("app.py"),
+                language: "python".into(),
+                line: 2 + nth * 3,
+                column: 14,
+                operator: "eq_to_neq".into(),
+                description: "Replace == with !=".into(),
+                original: "==".into(),
+                replacement: "!=".into(),
+                byte_range: offset..offset + 2,
+            }
+        };
+        let python_cached = python(1, 0);
+        let python_history = python(2, 1);
+        let commands = CommandConfig {
+            command: successful_command(),
+            force_default_command: false,
+            force_default_timeout: false,
+            project_commands: vec![],
+            language_commands: HashMap::new(),
+            build_command: vec![],
+            sandbox_command: vec![],
+            build_command_explicit: false,
+            timeout: Duration::from_secs(5),
+            language_timeouts: HashMap::new(),
+            test_selection: None,
+        };
+        let env = HashMap::new();
+        let context_hash = cache_context_fingerprint(dir.path());
+        let test_context_index = TestContextIndex::build(dir.path());
+        let seed_cache = |mutation: &Mutation| -> anyhow::Result<()> {
+            let selected = select_test_command(dir.path(), &commands, mutation);
+            let context = selected.cache_context(
+                &commands.build_command,
+                commands.build_command_explicit,
+                &commands.sandbox_command,
+                &env,
+            );
+            let context = format!("{context};context={context_hash:016x}");
+            let source = std::fs::read(dir.path().join(&mutation.file))?;
+            let key = CacheKey::new(
+                &source,
+                &cache_identity(dir.path(), mutation),
+                &mutation.description,
+                &context,
+            );
+            cache::store(dir.path(), &key, MutationResult::Survived);
+            Ok(())
+        };
+        seed_cache(&go)?;
+        seed_cache(&python_cached)?;
+
+        let selected = select_test_command(dir.path(), &commands, &python_history);
+        let command_context = selected.cache_context(
+            &commands.build_command,
+            commands.build_command_explicit,
+            &commands.sandbox_command,
+            &env,
+        );
+        let source = std::fs::read(dir.path().join(&python_history.file))?;
+        let query = incremental_history_query(
+            dir.path(),
+            &python_history,
+            &source,
+            &command_context,
+            test_context_index.fingerprint_for_tests(&selected.selected_tests, context_hash),
+        );
+        cache::IncrementalHistoryStore::load(dir.path()).record(cache::IncrementalHistoryEntry {
+            mutation_identity: query.mutation_identity,
+            mutation_description: query.mutation_description,
+            result: MutationResult::Survived,
+            source_hash: query.source_hash,
+            command_hash: query.command_hash,
+            relevant_test_hash: query.relevant_test_hash,
+            covering_tests: vec![],
+            killer_test: None,
+        });
+
+        let runner = TestRunner {
+            commands,
+            parallelism: 1,
+            project_root: dir.path().to_path_buf(),
+            verbose: false,
+            show_output: false,
+            max_tested: None,
+            early_stop: Default::default(),
+            respect_workspace_ignores: true,
+            env,
+            incremental_history: true,
+            force_rerun: false,
+            learned_selection: false,
+            cancelled: Arc::new(AtomicBool::new(false)),
+        };
+        let report = runner
+            .run_with_schemata(vec![go, python_cached, python_history])
+            .report;
+
+        assert_eq!(report.tested_count(), 0);
+        assert!(report.build_error_diagnostics.is_empty());
+        assert_eq!(
+            report.execution_for(0, MutationResult::Survived),
+            MutationExecution::ExactCache
+        );
+        assert_eq!(
+            report.execution_for(1, MutationResult::Survived),
+            MutationExecution::ExactCache
+        );
+        assert_eq!(
+            report.execution_for(2, MutationResult::Survived),
+            MutationExecution::IncrementalHistory
+        );
+        let schemata = report.schemata.as_ref().expect("schemata summary");
+        assert_eq!(schemata.fast_path, report.tested_count());
+        assert_eq!(schemata.fallback, 2);
+
+        let json: serde_json::Value =
+            serde_json::from_str(&crate::report::json::to_json_string(&report)?)?;
+        let mutations = json["mutations"].as_array().expect("mutation array");
+        assert_eq!(mutations[0]["execution"]["state"], "exact_cache");
+        assert_eq!(mutations[1]["execution"]["state"], "exact_cache");
+        assert_eq!(mutations[2]["execution"]["state"], "incremental_history");
+        Ok(())
     }
 
     #[cfg(unix)]
@@ -7964,6 +8871,171 @@ mod tests {
         );
     }
 
+    #[test]
+    fn reused_regular_survivor_does_not_trigger_early_stop() -> anyhow::Result<()> {
+        for reuse_source in [ReuseSource::ExactCache, ReuseSource::IncrementalHistory] {
+            for (early_stop, gate) in [
+                (
+                    EarlyStopConfig {
+                        max_survivors: Some(1),
+                        fail_under: None,
+                    },
+                    "max survivors",
+                ),
+                (
+                    EarlyStopConfig {
+                        max_survivors: None,
+                        fail_under: Some(100.0),
+                    },
+                    "fail under",
+                ),
+            ] {
+                let dir = tempfile::tempdir()?;
+                let mutations = ["cached.txt", "fresh-one.txt", "fresh-two.txt"]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(id, name)| {
+                        let file = dir.path().join(name);
+                        std::fs::write(&file, b"hello world")?;
+                        let mut mutation = make_test_mutation(&file);
+                        mutation.id = u32::try_from(id)?;
+                        mutation.description = format!("early-stop {name}");
+                        Ok::<_, anyhow::Error>(mutation)
+                    })
+                    .collect::<anyhow::Result<Vec<_>>>()?;
+                let commands = CommandConfig {
+                    command: failing_command(),
+                    force_default_command: false,
+                    force_default_timeout: false,
+                    project_commands: vec![],
+                    language_commands: HashMap::new(),
+                    build_command: vec![],
+                    sandbox_command: vec![],
+                    build_command_explicit: false,
+                    timeout: Duration::from_secs(5),
+                    language_timeouts: HashMap::new(),
+                    test_selection: None,
+                };
+                seed_reused_survivor(dir.path(), &commands, &mutations[0], reuse_source)?;
+                let expected_execution = match reuse_source {
+                    ReuseSource::ExactCache => MutationExecution::ExactCache,
+                    ReuseSource::IncrementalHistory => MutationExecution::IncrementalHistory,
+                };
+                let runner = TestRunner {
+                    commands,
+                    parallelism: 1,
+                    project_root: dir.path().to_path_buf(),
+                    verbose: false,
+                    show_output: false,
+                    max_tested: None,
+                    early_stop,
+                    respect_workspace_ignores: true,
+                    env: HashMap::new(),
+                    incremental_history: true,
+                    force_rerun: false,
+                    learned_selection: false,
+                    cancelled: Arc::new(AtomicBool::new(false)),
+                };
+
+                let report = runner.run(mutations).report;
+
+                assert_eq!(report.total, 3, "{gate} should not stop fresh mutations");
+                assert_eq!(report.survived, 1);
+                assert_eq!(report.killed, 2);
+                assert_eq!(report.tested_count(), 2);
+                assert_eq!(
+                    report.execution_for(0, MutationResult::Survived),
+                    expected_execution
+                );
+                assert!(report.early_stop_reason.is_none(), "{gate}: {report:?}");
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn late_restored_regular_survivor_reduces_fail_under_fresh_budget() -> anyhow::Result<()> {
+        for reuse_source in [ReuseSource::ExactCache, ReuseSource::IncrementalHistory] {
+            let dir = tempfile::tempdir()?;
+            let state = tempfile::tempdir()?;
+            let mutations = ["fresh-survivor.txt", "fresh-killer.txt", "cached.txt"]
+                .into_iter()
+                .enumerate()
+                .map(|(id, name)| {
+                    let file = dir.path().join(name);
+                    std::fs::write(&file, b"hello world")?;
+                    let mut mutation = make_test_mutation(&file);
+                    mutation.id = u32::try_from(id)?;
+                    mutation.description = format!("fresh-budget {name}");
+                    Ok::<_, anyhow::Error>(mutation)
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            let commands = CommandConfig {
+                command: first_run_survives_second_kills_command(state.path()),
+                force_default_command: false,
+                force_default_timeout: false,
+                project_commands: vec![],
+                language_commands: HashMap::new(),
+                build_command: vec![],
+                sandbox_command: vec![],
+                build_command_explicit: false,
+                timeout: Duration::from_secs(5),
+                language_timeouts: HashMap::new(),
+                test_selection: None,
+            };
+            seed_reused_survivor(dir.path(), &commands, &mutations[2], reuse_source)?;
+            let expected_execution = match reuse_source {
+                ReuseSource::ExactCache => MutationExecution::ExactCache,
+                ReuseSource::IncrementalHistory => MutationExecution::IncrementalHistory,
+            };
+            let runner = TestRunner {
+                commands,
+                parallelism: 1,
+                project_root: dir.path().to_path_buf(),
+                verbose: false,
+                show_output: false,
+                max_tested: None,
+                early_stop: EarlyStopConfig {
+                    max_survivors: None,
+                    fail_under: Some(60.0),
+                },
+                respect_workspace_ignores: true,
+                env: HashMap::new(),
+                incremental_history: true,
+                force_rerun: false,
+                learned_selection: false,
+                cancelled: Arc::new(AtomicBool::new(false)),
+            };
+
+            let report = runner.run(mutations).report;
+            let runs = std::fs::read_to_string(state.path().join("runs"))?;
+
+            assert_eq!(report.planned_total, 3);
+            assert_eq!(report.total, 2);
+            assert_eq!(report.survived, 2);
+            assert_eq!(report.killed, 0);
+            assert_eq!(report.tested_count(), 1);
+            assert_eq!(
+                report.execution_for(0, MutationResult::Survived),
+                MutationExecution::Executed
+            );
+            assert_eq!(
+                report.execution_for(2, MutationResult::Survived),
+                expected_execution
+            );
+            assert!(report.results.iter().all(|(mutation, _)| mutation.id != 1));
+            assert_eq!(runs.trim(), "1");
+            assert!(
+                report
+                    .early_stop_reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("--fail-under 60.0"))
+            );
+        }
+        Ok(())
+    }
+
     #[cfg(unix)]
     #[test]
     fn max_tested_reservation_caps_execution_before_commands_run() {
@@ -8198,6 +9270,16 @@ rmdir "$lock"
             assert_eq!(report.total, 2);
             assert_eq!(report.results[0].1, cached_result);
             assert_eq!(report.results[1].1, MutationResult::Survived);
+            assert_eq!(
+                report.execution_for(report.results[0].0.id, cached_result),
+                MutationExecution::ExactCache
+            );
+            assert_eq!(
+                report.execution_for(report.results[1].0.id, MutationResult::Survived),
+                MutationExecution::Executed
+            );
+            assert_eq!(report.tested_count(), 1);
+            assert_eq!(report.execution_counts().exact_cache_reused, 1);
             assert_eq!(
                 runs, 1,
                 "cache hits should not consume the max_tested execution budget"
