@@ -282,7 +282,14 @@ fn run_check(cfg: togi::cli::CheckArgs, cancelled: Arc<AtomicBool>) -> anyhow::R
     let known: Vec<&str> = all_langs.iter().map(|l| l.name()).collect();
     config.warn_unknown_languages(&known);
 
-    let changed_files = collect_files(&config, all, &paths, dry_run, &project_root)?;
+    let changed_files = collect_files(
+        &config,
+        all,
+        &paths,
+        dry_run,
+        output_format == togi::cli::OutputFormat::Json,
+        &project_root,
+    )?;
     if changed_files.is_empty() {
         return Ok(());
     }
@@ -1055,6 +1062,7 @@ fn collect_files(
     all: bool,
     paths: &[PathBuf],
     dry_run: bool,
+    json_output: bool,
     project_root: &Path,
 ) -> anyhow::Result<Vec<ChangedFile>> {
     let skip_noisy = config.mutations.skip_noisy_files;
@@ -1070,7 +1078,11 @@ fn collect_files(
             println!("No supported source files found. Nothing to mutate.");
             return Ok(vec![]);
         }
-        println!("Scanning all {} supported files...", files.len());
+        if json_output {
+            eprintln!("Scanning all {} supported files...", files.len());
+        } else {
+            println!("Scanning all {} supported files...", files.len());
+        }
         return Ok(files);
     }
 

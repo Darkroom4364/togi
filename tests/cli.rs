@@ -668,22 +668,19 @@ fn check_warns_when_fail_fast_is_ignored_for_custom_test_cmd() {
 }
 
 #[test]
-fn check_format_json_outputs_valid_json() {
+fn check_format_json_outputs_standalone_json_for_explain() {
     let dir = setup_git_repo();
 
     let output = togi()
-        .args([
-            "check",
-            "--base",
-            "HEAD",
-            "--format",
-            "json",
-            "--test-cmd",
-            "true",
-        ])
+        .args(["check", "--all", "--format", "json", "--test-cmd", "true"])
         .current_dir(dir.path())
         .output()
         .unwrap();
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("Scanning all 1 supported files..."),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|e| {
         panic!(
@@ -693,6 +690,25 @@ fn check_format_json_outputs_valid_json() {
     });
     assert!(value.get("total").is_some());
     assert!(value.get("mutations").is_some());
+
+    let report_path = dir.path().join("togi-report.json");
+    fs::write(&report_path, &output.stdout).unwrap();
+    let mutant_id = value["mutations"][0]["id"]
+        .as_u64()
+        .expect("report must contain a mutation")
+        .to_string();
+
+    togi()
+        .args([
+            "explain",
+            &mutant_id,
+            "--report",
+            report_path.to_str().unwrap(),
+        ])
+        .current_dir(dir.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(format!("Mutation #{mutant_id}")));
 }
 
 #[test]
