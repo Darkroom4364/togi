@@ -1,6 +1,7 @@
 /// Shared test utilities.
 /// Used across operator, language, and report tests to avoid duplication.
 use crate::{Mutation, MutationReport, MutationResult};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -39,6 +40,7 @@ pub fn sample_report() -> MutationReport {
                 MutationResult::Survived,
             ),
         ],
+        execution_provenance: BTreeMap::new(),
         build_error_diagnostics: vec![],
         schemata: None,
         baseline_timing: None,

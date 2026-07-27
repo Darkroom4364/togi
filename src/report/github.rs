@@ -1,9 +1,15 @@
-use crate::{Mutation, MutationReport, MutationResult};
+use crate::{Mutation, MutationExecution, MutationReport, MutationResult};
 
 /// Format a single GitHub Actions warning annotation for a survived mutation.
-fn format_annotation(mutation: &Mutation) -> String {
+fn format_annotation(mutation: &Mutation, execution: MutationExecution) -> String {
+    let provenance = match execution {
+        MutationExecution::Executed => String::new(),
+        MutationExecution::ExactCache => " [reused: exact cache]".to_string(),
+        MutationExecution::IncrementalHistory => " [reused: incremental history]".to_string(),
+        MutationExecution::NotExecuted(reason) => format!(" [not executed: {reason}]"),
+    };
     let message = format!(
-        "Survived mutation: {} ({})",
+        "Survived mutation: {} ({}){provenance}",
         mutation.operator, mutation.description
     );
     format!(
@@ -31,8 +37,10 @@ fn annotations(report: &MutationReport) -> Vec<String> {
     report
         .results
         .iter()
-        .filter(|(_, r)| *r == MutationResult::Survived)
-        .map(|(m, _)| format_annotation(m))
+        .filter(|(_, result)| *result == MutationResult::Survived)
+        .map(|(mutation, result)| {
+            format_annotation(mutation, report.execution_for(mutation.id, *result))
+        })
         .collect()
 }
 
@@ -43,7 +51,8 @@ pub fn print_report(report: &MutationReport) {
         println!("{line}");
     }
 
-    let tested = report.tested_count();
+    let execution_counts = report.execution_counts();
+    let tested = execution_counts.executed;
     let score = super::mutation_score(report);
     let uncovered = report.uncovered_count();
     let uncovered_str = if uncovered > 0 {
@@ -58,9 +67,20 @@ pub fn print_report(report: &MutationReport) {
         String::new()
     };
     eprintln!(
-        "Mutation score: {:.1}% ({} killed, {} survived, {} timeout, {} build errors{uncovered_str}{subsumed_str})",
-        score, report.killed, report.survived, report.timeout, report.build_errors
+        "Mutation score: {:.1}% ({}/{} freshly executed killed, {} survived, {} timeout, {} build errors{uncovered_str}{subsumed_str})",
+        score,
+        execution_counts.executed_killed,
+        tested,
+        report.survived,
+        report.timeout,
+        report.build_errors
     );
+    if execution_counts.reused() > 0 {
+        eprintln!(
+            "Reused verdicts: {} exact-cache, {} incremental-history",
+            execution_counts.exact_cache_reused, execution_counts.incremental_history_reused
+        );
+    }
     if report.total < report.planned_total {
         eprintln!(
             "Partial results: stopped after {}/{} scheduled mutations",
@@ -83,6 +103,7 @@ pub fn print_report(report: &MutationReport) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
     use std::path::PathBuf;
     use std::time::Duration;
 
@@ -122,6 +143,7 @@ mod tests {
             test_command: None,
             build_command: vec![],
             results,
+            execution_provenance: BTreeMap::new(),
             build_error_diagnostics: vec![],
             schemata: None,
             baseline_timing: None,
@@ -131,7 +153,7 @@ mod tests {
     #[test]
     fn annotation_format_for_survived_mutation() {
         let m = mutation("src/auth.rs", 47, "lt_to_lte", "changed < to <=");
-        let line = format_annotation(&m);
+        let line = format_annotation(&m, MutationExecution::Executed);
         assert_eq!(
             line,
             "::warning file=src/auth.rs,line=47::Survived mutation: lt_to_lte (changed < to <=)"
@@ -171,6 +193,34 @@ mod tests {
     }
 
     #[test]
+    fn annotations_label_mixed_survivor_provenance() {
+        let mut fresh = mutation("src/fresh.rs", 1, "fresh", "fresh survivor");
+        fresh.id = 1;
+        let mut exact = mutation("src/exact.rs", 2, "exact", "cached survivor");
+        exact.id = 2;
+        let mut history = mutation("src/history.rs", 3, "history", "history survivor");
+        history.id = 3;
+        let mut report = report_with(vec![
+            (fresh, MutationResult::Survived),
+            (exact, MutationResult::Survived),
+            (history, MutationResult::Survived),
+        ]);
+        report
+            .execution_provenance
+            .insert(2, MutationExecution::ExactCache);
+        report
+            .execution_provenance
+            .insert(3, MutationExecution::IncrementalHistory);
+
+        let lines = annotations(&report);
+
+        assert_eq!(lines.len(), 3);
+        assert!(!lines[0].contains("reused"));
+        assert!(lines[1].contains("[reused: exact cache]"));
+        assert!(lines[2].contains("[reused: incremental history]"));
+    }
+
+    #[test]
     fn uncovered_mutations_emit_no_annotations() {
         let report = report_with(vec![(
             mutation("src/dead.rs", 7, "op", "desc"),
@@ -182,7 +232,7 @@ mod tests {
     #[test]
     fn annotation_escapes_special_chars_in_path_and_message() {
         let m = mutation("src/odd,name:thing.rs", 10, "op", "msg with %, \r\n chars");
-        let line = format_annotation(&m);
+        let line = format_annotation(&m, MutationExecution::Executed);
         assert_eq!(
             line,
             "::warning file=src/odd%2Cname%3Athing.rs,line=10::Survived mutation: op (msg with %25, %0D%0A chars)"

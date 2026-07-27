@@ -112,9 +112,16 @@ struct ExplainMutation {
     operator: String,
     description: String,
     result: String,
+    execution: Option<ExplainMutationExecution>,
     original: Option<String>,
     replacement: Option<String>,
     diff: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ExplainMutationExecution {
+    state: String,
+    reason: Option<String>,
 }
 
 fn explain_mutation(mutant_id: u32, report_path: &Path) -> anyhow::Result<()> {
@@ -145,9 +152,38 @@ fn explain_mutation(mutant_id: u32, report_path: &Path) -> anyhow::Result<()> {
         println!("{diff}");
     }
 
+    let (execution_state, execution_reason) = mutation
+        .execution
+        .as_ref()
+        .map(|execution| (execution.state.as_str(), execution.reason.as_deref()))
+        .unwrap_or_else(|| match mutation.result.as_str() {
+            "killed" | "survived" | "timeout" => ("executed", None),
+            "build_error" => ("not_executed", Some("build_error")),
+            "uncovered" => ("not_executed", Some("uncovered")),
+            "subsumed" => ("not_executed", Some("subsumed")),
+            _ => ("not_executed", None),
+        });
+    let test_executed = execution_state == "executed";
+    let reused_verdict = matches!(execution_state, "exact_cache" | "incremental_history");
+    let execution_detail = match execution_state {
+        "executed" => "executed".to_string(),
+        "exact_cache" => "reused from exact cache".to_string(),
+        "incremental_history" => "reused from incremental history".to_string(),
+        "not_executed" => match execution_reason {
+            Some(reason) => format!("not executed ({reason})"),
+            None => "not executed".to_string(),
+        },
+        other => format!("not executed ({other})"),
+    };
+
     println!();
-    if let Some(command) = report.test_command.as_ref().filter(|cmd| !cmd.is_empty()) {
-        println!("Test command: {}", serde_json::to_string(command)?);
+    println!("Execution: {execution_detail}");
+    if test_executed {
+        if let Some(command) = report.test_command.as_ref().filter(|cmd| !cmd.is_empty()) {
+            println!("Test command: {}", serde_json::to_string(command)?);
+        }
+    } else {
+        println!("Test command: not run.");
     }
     if let Some(command) = report.build_command.as_ref().filter(|cmd| !cmd.is_empty()) {
         println!("Build check: {}", serde_json::to_string(command)?);
@@ -156,24 +192,42 @@ fn explain_mutation(mutant_id: u32, report_path: &Path) -> anyhow::Result<()> {
     match mutation.result.as_str() {
         "survived" => {
             println!("Why it survived:");
-            println!("  The configured test command completed successfully with this mutation.");
+            if test_executed {
+                println!(
+                    "  The configured test command completed successfully with this mutation."
+                );
+            } else {
+                println!("  This verdict was not freshly tested in this invocation.");
+            }
             println!(
                 "  Add an assertion that distinguishes the original behavior from the mutated one."
             );
         }
         "killed" => {
             println!("Why it was killed:");
-            println!(
-                "  The configured test command failed with this mutation, so existing tests caught it."
-            );
+            if test_executed {
+                println!(
+                    "  The configured test command failed with this mutation, so existing tests caught it."
+                );
+            } else {
+                println!("  This verdict was not freshly tested in this invocation.");
+            }
         }
         "timeout" => {
             println!("Why it timed out:");
-            println!("  The configured test command exceeded the mutation timeout.");
+            if test_executed {
+                println!("  The configured test command exceeded the mutation timeout.");
+            } else {
+                println!("  This verdict was not freshly tested in this invocation.");
+            }
         }
         "build_error" => {
             println!("Why it was not testable:");
-            println!("  The mutation made the project fail its build check.");
+            if reused_verdict {
+                println!("  This build-error verdict was not produced in this invocation.");
+            } else {
+                println!("  The mutation made the project fail its build check.");
+            }
         }
         "uncovered" => {
             println!("Why it was not executed:");
@@ -291,6 +345,9 @@ fn run_check(cfg: togi::cli::CheckArgs, cancelled: Arc<AtomicBool>) -> anyhow::R
         &project_root,
     )?;
     if changed_files.is_empty() {
+        if output_format == togi::cli::OutputFormat::Json {
+            print_empty_json_check_output(&config, has_explicit_build_cmd, dry_run)?;
+        }
         return Ok(());
     }
 
@@ -358,15 +415,27 @@ fn run_check(cfg: togi::cli::CheckArgs, cancelled: Arc<AtomicBool>) -> anyhow::R
     }
 
     if classified.to_run.is_empty() && classified.uncovered.is_empty() {
-        println!("No mutations generated. Possible causes:");
-        println!("  - Changed files are in an unsupported language");
-        println!("  - All mutable nodes were filtered out (test files, noisy patterns)");
-        println!("  - max_per_run or max_per_file is set to 0 in togi.toml");
+        if output_format == togi::cli::OutputFormat::Json {
+            eprintln!("No mutations generated. Possible causes:");
+            eprintln!("  - Changed files are in an unsupported language");
+            eprintln!("  - All mutable nodes were filtered out (test files, noisy patterns)");
+            eprintln!("  - max_per_run or max_per_file is set to 0 in togi.toml");
+            print_empty_json_check_output(&config, has_explicit_build_cmd, dry_run)?;
+        } else {
+            println!("No mutations generated. Possible causes:");
+            println!("  - Changed files are in an unsupported language");
+            println!("  - All mutable nodes were filtered out (test files, noisy patterns)");
+            println!("  - max_per_run or max_per_file is set to 0 in togi.toml");
+        }
         return Ok(());
     }
 
     if dry_run {
-        print_dry_run(&classified.to_run);
+        if output_format == togi::cli::OutputFormat::Json {
+            togi::report::json::print_dry_run(&classified.to_run)?;
+        } else {
+            print_dry_run(&classified.to_run);
+        }
         return Ok(());
     }
 
@@ -408,7 +477,12 @@ fn run_check(cfg: togi::cli::CheckArgs, cancelled: Arc<AtomicBool>) -> anyhow::R
         ) {
             Ok(measurement) => measurement,
             Err(_) if cancelled.load(Ordering::Acquire) => exit_with(_lock, 130),
-            Err(error) => return Err(error),
+            Err(error) => {
+                if let Some(failure) = togi::runner::run_suite_failure(&error) {
+                    togi::report::print_run_suite_failure(failure, output_format)?;
+                }
+                return Err(error);
+            }
         };
         let baseline_timing = if config.test.calibrate_timeout {
             if let Some(measurement) = calibration_measurement(&measurement) {
@@ -479,26 +553,36 @@ fn run_check(cfg: togi::cli::CheckArgs, cancelled: Arc<AtomicBool>) -> anyhow::R
     merge_uncovered(&mut report, classified.uncovered);
     togi::report::print_report(&report, output_format)?;
 
-    let current = togi::baseline::from_report(&report, &project_root_ref);
+    let baseline_eligible = togi::baseline::is_baseline_eligible(&report);
+    let mut current = None;
     let mut should_fail = false;
-
     let partial_report = report.total < report.planned_total;
+    let baseline_actions_allowed = baseline_eligible;
 
-    if partial_report && (save_baseline || check_baseline) {
-        eprintln!("Partial early-stop report; skipping baseline save/check.");
+    if (save_baseline || check_baseline) && !baseline_actions_allowed {
+        if partial_report {
+            eprintln!("Partial early-stop report; skipping baseline save/check.");
+        } else {
+            eprintln!(
+                "Report has no complete fresh execution evidence; skipping baseline save/check."
+            );
+        }
     } else if save_baseline {
-        togi::baseline::save_baseline(&current, &project_root_ref)?;
+        current = togi::baseline::save_baseline_from_report(&report, &project_root_ref)?;
+        debug_assert!(current.is_some(), "eligible report must save a baseline");
         eprintln!("Baseline saved to .togi-baseline");
     }
 
     let mut baseline_score: Option<f64> = None;
     let mut loaded_baseline = false;
-    if check_baseline && !partial_report {
+    if check_baseline && baseline_actions_allowed {
         if let Some(baseline) = togi::baseline::load_baseline(&project_root_ref)? {
             loaded_baseline = true;
             baseline_score = Some(baseline.killed as f64 / baseline.total.max(1) as f64 * 100.0);
-            if togi::baseline::check_regression(&current, &baseline) {
-                let regressions = togi::baseline::per_file_regressions(&current, &baseline);
+            let current = current
+                .get_or_insert_with(|| togi::baseline::from_report(&report, &project_root_ref));
+            if togi::baseline::check_regression(current, &baseline) {
+                let regressions = togi::baseline::per_file_regressions(current, &baseline);
                 eprintln!("Mutation score regression detected!");
                 for r in &regressions {
                     eprintln!(
@@ -1075,7 +1159,11 @@ fn collect_files(
             files.retain(|f| paths.iter().any(|p| f.path.starts_with(p)));
         }
         if files.is_empty() {
-            println!("No supported source files found. Nothing to mutate.");
+            if json_output {
+                eprintln!("No supported source files found. Nothing to mutate.");
+            } else {
+                println!("No supported source files found. Nothing to mutate.");
+            }
             return Ok(vec![]);
         }
         if json_output {
@@ -1088,12 +1176,22 @@ fn collect_files(
 
     let diff_output = get_git_diff(&config.diff.base)?;
     if diff_output.is_empty() {
-        println!(
-            "No changes found in diff against `{}`. Nothing to mutate.",
-            config.diff.base
-        );
-        if dry_run {
-            println!("Hint: use --all --dry-run to preview mutations across all files.");
+        if json_output {
+            eprintln!(
+                "No changes found in diff against `{}`. Nothing to mutate.",
+                config.diff.base
+            );
+            if dry_run {
+                eprintln!("Hint: use --all --dry-run to preview mutations across all files.");
+            }
+        } else {
+            println!(
+                "No changes found in diff against `{}`. Nothing to mutate.",
+                config.diff.base
+            );
+            if dry_run {
+                println!("Hint: use --all --dry-run to preview mutations across all files.");
+            }
         }
         return Ok(vec![]);
     }
@@ -1104,7 +1202,11 @@ fn collect_files(
     }
     files.retain(|f| !togi::diff::matches_user_excludes(&f.path, exclude_globs));
     if files.is_empty() {
-        println!("No added/modified lines found. Nothing to mutate.");
+        if json_output {
+            eprintln!("No added/modified lines found. Nothing to mutate.");
+        } else {
+            println!("No added/modified lines found. Nothing to mutate.");
+        }
         return Ok(vec![]);
     }
     Ok(files)
@@ -1242,6 +1344,7 @@ fn coverage_only_report(
 ) -> togi::MutationReport {
     togi::MutationReport {
         results: Vec::new(),
+        execution_provenance: BTreeMap::new(),
         build_error_diagnostics: Vec::new(),
         schemata: None,
         baseline_timing: None,
@@ -1260,6 +1363,20 @@ fn coverage_only_report(
         timeout: 0,
         build_errors: 0,
     }
+}
+
+fn print_empty_json_check_output(
+    config: &togi::config::Config,
+    build_command_explicit: bool,
+    dry_run: bool,
+) -> anyhow::Result<()> {
+    if dry_run {
+        togi::report::json::print_dry_run(&[])?;
+    } else {
+        let report = coverage_only_report(config, build_command_explicit);
+        togi::report::json::print_report(&report)?;
+    }
+    Ok(())
 }
 
 fn print_dry_run(mutations: &[Mutation]) {

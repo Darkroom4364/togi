@@ -18,6 +18,7 @@ pub mod schemata;
 #[cfg(test)]
 pub mod test_helpers;
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -107,7 +108,96 @@ impl fmt::Display for MutationResult {
     }
 }
 
-/// Diagnostic details captured when a mutation is classified as a build error.
+/// Where a mutation verdict came from during this run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum MutationExecution {
+    /// The mutated test suite ran during this invocation.
+    Executed,
+    /// The verdict was restored from an exact cache key.
+    ExactCache,
+    /// The verdict was restored from incremental history.
+    IncrementalHistory,
+    /// No mutated test suite ran for this mutation.
+    NotExecuted(MutationNonExecutionReason),
+}
+
+impl MutationExecution {
+    pub fn for_result(result: MutationResult) -> Self {
+        match result {
+            MutationResult::Killed | MutationResult::Survived | MutationResult::Timeout => {
+                Self::Executed
+            }
+            MutationResult::BuildError => Self::NotExecuted(MutationNonExecutionReason::BuildError),
+            MutationResult::Uncovered => Self::NotExecuted(MutationNonExecutionReason::Uncovered),
+            MutationResult::Subsumed => Self::NotExecuted(MutationNonExecutionReason::Subsumed),
+        }
+    }
+
+    pub fn is_tested(self) -> bool {
+        self == Self::Executed
+    }
+
+    pub fn is_reused(self) -> bool {
+        matches!(self, Self::ExactCache | Self::IncrementalHistory)
+    }
+
+    pub fn reason(self) -> Option<MutationNonExecutionReason> {
+        match self {
+            Self::NotExecuted(reason) => Some(reason),
+            Self::Executed | Self::ExactCache | Self::IncrementalHistory => None,
+        }
+    }
+
+    pub fn state_name(self) -> &'static str {
+        match self {
+            Self::Executed => "executed",
+            Self::ExactCache => "exact_cache",
+            Self::IncrementalHistory => "incremental_history",
+            Self::NotExecuted(_) => "not_executed",
+        }
+    }
+}
+
+impl fmt::Display for MutationExecution {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Executed => write!(f, "executed"),
+            Self::ExactCache => write!(f, "exact cache"),
+            Self::IncrementalHistory => write!(f, "incremental history"),
+            Self::NotExecuted(reason) => write!(f, "not executed: {reason}"),
+        }
+    }
+}
+
+/// Why a mutation did not run its mutated test suite.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum MutationNonExecutionReason {
+    BuildError,
+    Uncovered,
+    Subsumed,
+}
+
+impl MutationNonExecutionReason {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::BuildError => "build_error",
+            Self::Uncovered => "uncovered",
+            Self::Subsumed => "subsumed",
+        }
+    }
+}
+
+impl fmt::Display for MutationNonExecutionReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::BuildError => write!(f, "build error"),
+            Self::Uncovered => write!(f, "uncovered"),
+            Self::Subsumed => write!(f, "subsumed"),
+        }
+    }
+}
+
+/// Diagnostic details captured for an actual build-error mutation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BuildErrorDiagnostic {
     pub mutation_id: u32,
@@ -117,7 +207,6 @@ pub struct BuildErrorDiagnostic {
     pub message: String,
     pub fingerprint: String,
 }
-
 impl BuildErrorDiagnostic {
     pub fn new(
         mutation_id: u32,
@@ -149,10 +238,31 @@ impl BuildErrorDiagnostic {
     }
 }
 
+/// Aggregate execution provenance for the mutations present in a report.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MutationExecutionCounts {
+    pub executed: usize,
+    pub executed_killed: usize,
+    pub exact_cache_reused: usize,
+    pub incremental_history_reused: usize,
+    pub not_executed: usize,
+}
+
+impl MutationExecutionCounts {
+    pub fn reused(self) -> usize {
+        self.exact_cache_reused + self.incremental_history_reused
+    }
+}
+
 /// Aggregated results from a mutation testing run
 #[derive(Debug)]
 pub struct MutationReport {
     pub results: Vec<(Mutation, MutationResult)>,
+    /// Explicit provenance for verdicts restored from cache or history, keyed
+    /// by mutation id. Verdicts absent here derive their canonical execution
+    /// state from `MutationResult`.
+    pub execution_provenance: BTreeMap<u32, MutationExecution>,
+    /// Diagnostics for mutations classified as `BuildError`.
     pub build_error_diagnostics: Vec<BuildErrorDiagnostic>,
     pub schemata: Option<SchemataReport>,
     pub baseline_timing: Option<BaselineTiming>,
@@ -187,14 +297,53 @@ impl MutationReport {
             .count()
     }
 
-    /// Mutants actually executed against the test suite: everything except
-    /// build errors, coverage-suppressed (uncovered), and learned-selection
-    /// (subsumed) mutants.
+    /// Explicit cache/history provenance keyed by mutation id.
+    pub fn execution_provenance(&self) -> &BTreeMap<u32, MutationExecution> {
+        &self.execution_provenance
+    }
+
+    /// Return the structured execution state for one mutation verdict.
+    pub fn execution_for(&self, mutation_id: u32, result: MutationResult) -> MutationExecution {
+        self.execution_provenance
+            .get(&mutation_id)
+            .copied()
+            .unwrap_or_else(|| MutationExecution::for_result(result))
+    }
+
+    /// Count fresh executions, restored verdicts, and non-executed outcomes.
+    pub fn execution_counts(&self) -> MutationExecutionCounts {
+        let mut counts = MutationExecutionCounts::default();
+        for (mutation, result) in &self.results {
+            match self.execution_for(mutation.id, *result) {
+                MutationExecution::Executed => {
+                    counts.executed += 1;
+                    if *result == MutationResult::Killed {
+                        counts.executed_killed += 1;
+                    }
+                }
+                MutationExecution::ExactCache => counts.exact_cache_reused += 1,
+                MutationExecution::IncrementalHistory => {
+                    counts.incremental_history_reused += 1;
+                }
+                MutationExecution::NotExecuted(_) => counts.not_executed += 1,
+            }
+        }
+        counts
+    }
+
+    /// Mutants whose test suites ran during this invocation.
     pub fn tested_count(&self) -> usize {
-        self.total
-            .saturating_sub(self.build_errors)
-            .saturating_sub(self.uncovered_count())
-            .saturating_sub(self.subsumed_count())
+        self.execution_counts().executed
+    }
+
+    /// Killed mutants whose test suites ran during this invocation.
+    pub fn executed_killed_count(&self) -> usize {
+        self.execution_counts().executed_killed
+    }
+
+    /// Mutants whose verdicts were restored from cache or history.
+    pub fn reused_count(&self) -> usize {
+        self.execution_counts().reused()
     }
 }
 

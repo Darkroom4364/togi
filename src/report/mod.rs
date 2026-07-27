@@ -10,16 +10,17 @@ use std::collections::BTreeMap;
 use std::fmt::Write;
 use std::fs;
 
-/// Compute mutation score as a percentage, excluding build errors,
-/// coverage-suppressed (uncovered), and learned-selection (subsumed) mutants
-/// from the denominator.
+/// Compute mutation score from tests executed during this invocation.
+///
+/// Build errors, cache/history reuse, coverage-suppressed (uncovered), and
+/// learned-selection (subsumed) mutants do not contribute to the denominator.
 pub fn mutation_score(report: &MutationReport) -> f64 {
-    let tested = report.tested_count();
-    if tested > 0 {
-        (report.killed as f64 / tested as f64) * 100.0
+    let executions = report.execution_counts();
+    if executions.executed > 0 {
+        (executions.executed_killed as f64 / executions.executed as f64) * 100.0
     } else if report.total == report.uncovered_count() + report.subsumed_count() {
-        // Nothing was executed: either the report is empty or every mutant
-        // sat on a zero-coverage line or was subsumed by a cluster sibling.
+        // Nothing was eligible to execute: either the report is empty or every
+        // mutant sat on a zero-coverage line or was subsumed by a cluster sibling.
         // Vacuous pass, same as an empty report.
         100.0
     } else {
@@ -73,7 +74,9 @@ pub fn build_error_groups(report: &MutationReport) -> Vec<BuildErrorGroup> {
         BTreeMap::<(String, String, String, String, String), BuildErrorGroupAccumulator>::new();
 
     for (mutation, result) in &report.results {
-        if *result != MutationResult::BuildError {
+        if *result != MutationResult::BuildError
+            || report.execution_for(mutation.id, *result).is_reused()
+        {
             continue;
         }
 
@@ -195,6 +198,18 @@ pub fn print_report(
     Ok(())
 }
 
+/// Render a baseline suite failure without fabricating a mutation report.
+pub fn print_run_suite_failure(
+    failure: &crate::runner::RunSuiteFailure,
+    format: crate::cli::OutputFormat,
+) -> anyhow::Result<()> {
+    match format {
+        crate::cli::OutputFormat::Json => json::print_run_suite_failure(failure)?,
+        _ => terminal::print_run_suite_failure(failure),
+    }
+    Ok(())
+}
+
 pub fn print_coverage_gate_report(
     report: &crate::coverage::CoverageGateReport,
     format: crate::cli::OutputFormat,
@@ -220,11 +235,12 @@ pub fn print_coverage_gate_report(
 /// Includes a hidden marker comment so CI pipelines can find/replace
 /// existing togi comments on subsequent runs.
 pub fn format_pr_comment(report: &MutationReport, baseline_score: Option<f64>) -> String {
-    use crate::MutationResult;
+    use crate::{MutationExecution, MutationResult};
     use std::fmt::Write;
 
+    let execution_counts = report.execution_counts();
     let score = mutation_score(report);
-    let tested = report.tested_count();
+    let tested = execution_counts.executed;
     let uncovered = report.uncovered_count();
     let subsumed = report.subsumed_count();
     let emoji = if report.survived == 0 && report.timeout == 0 && report.build_errors == 0 {
@@ -256,11 +272,25 @@ pub fn format_pr_comment(report: &MutationReport, baseline_score: Option<f64>) -
     } else {
         String::new()
     };
+    let reused_str = if execution_counts.reused() > 0 {
+        format!(
+            ", {} exact-cache reused, {} incremental-history reused",
+            execution_counts.exact_cache_reused, execution_counts.incremental_history_reused
+        )
+    } else {
+        String::new()
+    };
     writeln!(
         md,
-        "**{score:.1}%** mutation score{delta_str} — {}/{tested} killed, {} survived, {} timeout, {} build errors{uncovered_str}{subsumed_str} — {:.2}s",
-        report.killed, report.survived, report.timeout, report.build_errors, report.duration.as_secs_f64()
-    ).unwrap();
+        "**{score:.1}%** mutation score{delta_str} — {}/{} freshly executed killed, {} survived, {} timeout, {} build errors{uncovered_str}{subsumed_str}{reused_str} — {:.2}s",
+        execution_counts.executed_killed,
+        tested,
+        report.survived,
+        report.timeout,
+        report.build_errors,
+        report.duration.as_secs_f64()
+    )
+    .unwrap();
     if report.total < report.planned_total {
         writeln!(
             md,
@@ -292,14 +322,23 @@ pub fn format_pr_comment(report: &MutationReport, baseline_score: Option<f64>) -
         writeln!(md).unwrap();
         writeln!(md, "| File | Line | Operator | Description |").unwrap();
         writeln!(md, "|------|------|----------|-------------|").unwrap();
-        for (m, _) in &survived {
+        for (mutation, result) in survived {
+            let provenance = match report.execution_for(mutation.id, *result) {
+                MutationExecution::Executed => String::new(),
+                MutationExecution::ExactCache => " (reused: exact cache)".to_string(),
+                MutationExecution::IncrementalHistory => {
+                    " (reused: incremental history)".to_string()
+                }
+                MutationExecution::NotExecuted(reason) => format!(" (not executed: {reason})"),
+            };
             writeln!(
                 md,
-                "| `{}` | {} | `{}` | {} |",
-                escape_md_cell(&m.file.display().to_string()),
-                m.line,
-                escape_md_cell(&m.operator),
-                escape_md_cell(&m.description)
+                "| `{}` | {} | `{}` | {}{} |",
+                escape_md_cell(&mutation.file.display().to_string()),
+                mutation.line,
+                escape_md_cell(&mutation.operator),
+                escape_md_cell(&mutation.description),
+                provenance,
             )
             .unwrap();
         }
@@ -384,13 +423,13 @@ pub fn mutation_diff(mutation: &Mutation) -> Option<String> {
             writeln!(diff, " {line}").ok()?;
         }
     }
-
     Some(diff)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
     use tempfile::TempDir;
 
     fn make_mutation(
@@ -444,6 +483,7 @@ mod tests {
                 report_mutation(1, "src/b.rs", MutationResult::BuildError),
                 report_mutation(2, "src/c.rs", MutationResult::Killed),
             ],
+            execution_provenance: BTreeMap::new(),
             build_error_diagnostics: vec![
                 BuildErrorDiagnostic::new(
                     0,
@@ -483,6 +523,19 @@ mod tests {
         assert_eq!(groups[0].phase, "build_command");
         assert_eq!(groups[0].files.len(), 2);
         assert_eq!(groups[0].examples.len(), 2);
+    }
+
+    #[test]
+    fn build_error_groups_exclude_reused_build_error_verdicts() {
+        let mut report = crate::test_helpers::sample_report();
+        report.results[0].1 = MutationResult::BuildError;
+        report.killed = 0;
+        report.build_errors = 1;
+        report
+            .execution_provenance
+            .insert(0, crate::MutationExecution::ExactCache);
+
+        assert!(build_error_groups(&report).is_empty());
     }
 
     #[test]
@@ -598,6 +651,28 @@ mod tests {
     }
 
     #[test]
+    fn pr_comment_labels_mixed_survivor_provenance() {
+        let mut report = uncovered_report(vec![
+            report_mutation(0, "src/fresh.rs", MutationResult::Survived),
+            report_mutation(1, "src/exact.rs", MutationResult::Survived),
+            report_mutation(2, "src/history.rs", MutationResult::Survived),
+        ]);
+        report.survived = 3;
+        report
+            .execution_provenance
+            .insert(1, crate::MutationExecution::ExactCache);
+        report
+            .execution_provenance
+            .insert(2, crate::MutationExecution::IncrementalHistory);
+
+        let md = format_pr_comment(&report, None);
+
+        assert!(md.contains("| `src/fresh.rs` | 1 | `eq_to_neq` | Replace == with != |"));
+        assert!(md.contains("Replace == with != (reused: exact cache)"));
+        assert!(md.contains("Replace == with != (reused: incremental history)"));
+    }
+
+    #[test]
     fn pr_comment_no_details_when_all_killed() {
         use crate::{MutationReport, MutationResult};
         use std::time::Duration;
@@ -617,6 +692,7 @@ mod tests {
                 },
                 MutationResult::Killed,
             )],
+            execution_provenance: BTreeMap::new(),
             build_error_diagnostics: vec![],
             schemata: None,
             baseline_timing: None,
@@ -656,6 +732,7 @@ mod tests {
                 },
                 MutationResult::Timeout,
             )],
+            execution_provenance: BTreeMap::new(),
             build_error_diagnostics: vec![],
             schemata: None,
             baseline_timing: None,
@@ -696,6 +773,7 @@ mod tests {
                 },
                 MutationResult::BuildError,
             )],
+            execution_provenance: BTreeMap::new(),
             build_error_diagnostics: vec![],
             schemata: None,
             baseline_timing: None,
@@ -756,6 +834,7 @@ mod tests {
                     MutationResult::BuildError,
                 ),
             ],
+            execution_provenance: BTreeMap::new(),
             build_error_diagnostics: vec![],
             schemata: None,
             baseline_timing: None,
@@ -796,6 +875,7 @@ mod tests {
             .count();
         MutationReport {
             results,
+            execution_provenance: BTreeMap::new(),
             build_error_diagnostics: vec![],
             schemata: None,
             baseline_timing: None,
@@ -823,6 +903,21 @@ mod tests {
         assert_eq!(report.uncovered_count(), 2);
         assert_eq!(report.tested_count(), 1);
         assert_eq!(mutation_score(&report), 100.0);
+    }
+
+    #[test]
+    fn mutation_score_excludes_exact_cache_verdicts() {
+        let mut report = crate::test_helpers::sample_report();
+        report
+            .execution_provenance
+            .insert(0, crate::MutationExecution::ExactCache);
+
+        let counts = report.execution_counts();
+        assert_eq!(counts.executed, 1);
+        assert_eq!(counts.executed_killed, 0);
+        assert_eq!(counts.exact_cache_reused, 1);
+        assert_eq!(report.tested_count(), 1);
+        assert_eq!(mutation_score(&report), 0.0);
     }
 
     #[test]

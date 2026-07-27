@@ -1,4 +1,5 @@
-use crate::{MutationReport, MutationResult};
+use crate::runner::{RunSuiteFailure, RunSuiteFailureOutcome, SuiteFailurePhase};
+use crate::{Mutation, MutationReport, MutationResult};
 use anyhow::Result;
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -12,6 +13,12 @@ struct JsonReport {
     survived: usize,
     timeout: usize,
     build_errors: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    executed_killed: Option<usize>,
+    #[serde(skip_serializing_if = "super::is_zero")]
+    exact_cache_reused: usize,
+    #[serde(skip_serializing_if = "super::is_zero")]
+    incremental_history_reused: usize,
     #[serde(skip_serializing_if = "super::is_zero")]
     uncovered: usize,
     #[serde(skip_serializing_if = "super::is_zero")]
@@ -90,6 +97,7 @@ struct JsonMutation {
     operator: String,
     description: String,
     result: String,
+    execution: JsonMutationExecution,
     #[serde(skip_serializing_if = "Option::is_none")]
     column: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -102,10 +110,114 @@ struct JsonMutation {
     build_error_fingerprint: Option<String>,
 }
 
+#[derive(Serialize)]
+struct JsonMutationExecution {
+    state: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<&'static str>,
+}
+
+#[derive(Serialize)]
+struct JsonRunSuiteFailure {
+    kind: &'static str,
+    phase: &'static str,
+    command: Vec<String>,
+    outcome: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    timeout_ms: Option<u128>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
+}
+
+#[derive(Serialize)]
+struct JsonDryRun {
+    kind: &'static str,
+    dry_run: bool,
+    planned_total: usize,
+    mutations: Vec<JsonDryRunMutation>,
+}
+
+#[derive(Serialize)]
+struct JsonDryRunMutation {
+    id: u32,
+    file: String,
+    line: usize,
+    column: usize,
+    operator: String,
+    description: String,
+    original: String,
+    replacement: String,
+}
+
 pub fn print_report(report: &MutationReport) -> Result<()> {
     let json = to_json_string(report)?;
     println!("{}", json);
     Ok(())
+}
+
+/// Print a machine-readable mutation preview without executing test suites.
+pub fn print_dry_run(mutations: &[Mutation]) -> Result<()> {
+    println!("{}", to_dry_run_json(mutations)?);
+    Ok(())
+}
+
+/// Serialize a dry-run preview as a document distinct from a mutation report.
+pub fn to_dry_run_json(mutations: &[Mutation]) -> Result<String> {
+    let mutations: Vec<JsonDryRunMutation> = mutations
+        .iter()
+        .map(|mutation| JsonDryRunMutation {
+            id: mutation.id + 1,
+            file: mutation.file.display().to_string(),
+            line: mutation.line,
+            column: mutation.column,
+            operator: mutation.operator.clone(),
+            description: mutation.description.clone(),
+            original: mutation.original.clone(),
+            replacement: mutation.replacement.clone(),
+        })
+        .collect();
+    serde_json::to_string_pretty(&JsonDryRun {
+        kind: "dry_run",
+        dry_run: true,
+        planned_total: mutations.len(),
+        mutations,
+    })
+    .map_err(Into::into)
+}
+
+/// Print a run-level suite failure instead of a mutation report.
+pub fn print_run_suite_failure(failure: &RunSuiteFailure) -> Result<()> {
+    println!("{}", to_run_suite_failure_json(failure)?);
+    Ok(())
+}
+
+/// Serialize a baseline suite failure without inventing mutation verdicts.
+pub fn to_run_suite_failure_json(failure: &RunSuiteFailure) -> Result<String> {
+    let (outcome, output, timeout_ms, detail) = match &failure.outcome {
+        RunSuiteFailureOutcome::Failed { output } => ("failed", output.clone(), None, None),
+        RunSuiteFailureOutcome::TimedOut { timeout } => {
+            ("timed_out", None, Some(timeout.as_millis()), None)
+        }
+        RunSuiteFailureOutcome::CannotRun { detail } => {
+            ("cannot_run", None, None, Some(detail.clone()))
+        }
+    };
+    let phase = match failure.phase {
+        SuiteFailurePhase::Build => "build",
+        SuiteFailurePhase::Test => "test",
+    };
+    serde_json::to_string_pretty(&JsonRunSuiteFailure {
+        kind: "suite_failure",
+        phase,
+        command: failure.command.clone(),
+        outcome,
+        output,
+        timeout_ms,
+        detail,
+    })
+    .map_err(Into::into)
 }
 
 /// Serialize report to a JSON string (for testing and programmatic use).
@@ -118,27 +230,38 @@ pub fn to_json_string(report: &MutationReport) -> Result<String> {
     let mutations: Vec<JsonMutation> = report
         .results
         .iter()
-        .map(|(m, r)| JsonMutation {
-            id: m.id + 1,
-            file: m.file.display().to_string(),
-            line: m.line,
-            operator: m.operator.clone(),
-            description: m.description.clone(),
-            result: match r {
-                MutationResult::Killed => "killed".to_string(),
-                MutationResult::Survived => "survived".to_string(),
-                MutationResult::Timeout => "timeout".to_string(),
-                MutationResult::BuildError => "build_error".to_string(),
-                MutationResult::Uncovered => "uncovered".to_string(),
-                MutationResult::Subsumed => "subsumed".to_string(),
-            },
-            column: Some(m.column),
-            original: Some(m.original.clone()),
-            replacement: Some(m.replacement.clone()),
-            diff: super::mutation_diff(m),
-            build_error_fingerprint: diagnostic_by_id
-                .get(&m.id)
-                .map(|diagnostic| diagnostic.fingerprint.clone()),
+        .map(|(m, r)| {
+            let execution = report.execution_for(m.id, *r);
+            JsonMutation {
+                id: m.id + 1,
+                file: m.file.display().to_string(),
+                line: m.line,
+                operator: m.operator.clone(),
+                description: m.description.clone(),
+                result: match r {
+                    MutationResult::Killed => "killed".to_string(),
+                    MutationResult::Survived => "survived".to_string(),
+                    MutationResult::Timeout => "timeout".to_string(),
+                    MutationResult::BuildError => "build_error".to_string(),
+                    MutationResult::Uncovered => "uncovered".to_string(),
+                    MutationResult::Subsumed => "subsumed".to_string(),
+                },
+                execution: JsonMutationExecution {
+                    state: execution.state_name(),
+                    reason: execution.reason().map(|reason| reason.name()),
+                },
+                column: Some(m.column),
+                original: Some(m.original.clone()),
+                replacement: Some(m.replacement.clone()),
+                diff: super::mutation_diff(m),
+                build_error_fingerprint: if *r == MutationResult::BuildError {
+                    diagnostic_by_id
+                        .get(&m.id)
+                        .map(|diagnostic| diagnostic.fingerprint.clone())
+                } else {
+                    None
+                },
+            }
         })
         .collect();
     let build_error_groups = super::build_error_groups(report)
@@ -172,15 +295,19 @@ pub fn to_json_string(report: &MutationReport) -> Result<String> {
         })
         .collect();
 
-    let tested = report.tested_count();
+    let execution_counts = report.execution_counts();
     let json_report = JsonReport {
         total: report.total,
         planned_total: report.planned_total,
-        tested,
+        tested: execution_counts.executed,
         killed: report.killed,
         survived: report.survived,
         timeout: report.timeout,
         build_errors: report.build_errors,
+        executed_killed: (execution_counts.executed_killed != report.killed)
+            .then_some(execution_counts.executed_killed),
+        exact_cache_reused: execution_counts.exact_cache_reused,
+        incremental_history_reused: execution_counts.incremental_history_reused,
         uncovered: report.uncovered_count(),
         subsumed: report.subsumed_count(),
         partial: report.total < report.planned_total,
@@ -221,11 +348,13 @@ pub fn to_json_string(report: &MutationReport) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runner::{RunSuiteFailure, RunSuiteFailureOutcome, SuiteFailurePhase};
     use crate::test_helpers::sample_report;
     use crate::{
         BaselineTiming, BuildErrorDiagnostic, Mutation, SchemataFallbackReasonCount, SchemataReport,
     };
     use serde_json::Value;
+    use std::collections::BTreeMap;
     use std::path::PathBuf;
     use std::time::Duration;
 
@@ -355,6 +484,52 @@ mod tests {
         assert_eq!(mutations[0]["operator"], "lt_to_lte");
         assert_eq!(mutations[0]["result"], "killed");
         assert_eq!(mutations[1]["result"], "survived");
+        assert_eq!(mutations[0]["execution"]["state"], "executed");
+        assert_eq!(mutations[1]["execution"]["state"], "executed");
+    }
+
+    #[test]
+    fn json_output_reports_reuse_and_nonexecution_reasons() {
+        let mut report = sample_report();
+        report
+            .execution_provenance
+            .insert(0, crate::MutationExecution::ExactCache);
+        report
+            .execution_provenance
+            .insert(1, crate::MutationExecution::IncrementalHistory);
+        let mut uncovered = report.results[0].0.clone();
+        uncovered.id = 2;
+        report.results.push((uncovered, MutationResult::Uncovered));
+        let mut subsumed = report.results[1].0.clone();
+        subsumed.id = 3;
+        report.results.push((subsumed, MutationResult::Subsumed));
+        report.total = 4;
+        report.planned_total = 4;
+
+        let value: Value = serde_json::from_str(&to_json_string(&report).unwrap()).unwrap();
+        let mutations = value["mutations"].as_array().unwrap();
+
+        assert_eq!(value["tested"], 0);
+        assert_eq!(value["executed_killed"], 0);
+        assert_eq!(value["exact_cache_reused"], 1);
+        assert_eq!(value["incremental_history_reused"], 1);
+        assert_eq!(value["mutation_score"], 0.0);
+        assert_eq!(
+            mutations[0]["execution"],
+            serde_json::json!({"state": "exact_cache"})
+        );
+        assert_eq!(
+            mutations[1]["execution"],
+            serde_json::json!({"state": "incremental_history"})
+        );
+        assert_eq!(
+            mutations[2]["execution"],
+            serde_json::json!({"state": "not_executed", "reason": "uncovered"})
+        );
+        assert_eq!(
+            mutations[3]["execution"],
+            serde_json::json!({"state": "not_executed", "reason": "subsumed"})
+        );
     }
 
     #[test]
@@ -393,6 +568,7 @@ mod tests {
                 "operator",
                 "description",
                 "result",
+                "execution",
                 "column",
                 "original",
                 "replacement",
@@ -407,6 +583,7 @@ mod tests {
                 "operator",
                 "description",
                 "result",
+                "execution",
                 "column",
                 "original",
                 "replacement",
@@ -475,6 +652,7 @@ mod tests {
                 },
                 MutationResult::BuildError,
             )],
+            execution_provenance: BTreeMap::new(),
             build_error_diagnostics: vec![],
             schemata: None,
             baseline_timing: None,
@@ -521,6 +699,7 @@ mod tests {
                 },
                 MutationResult::BuildError,
             )],
+            execution_provenance: BTreeMap::new(),
             build_error_diagnostics: vec![diagnostic],
             schemata: None,
             baseline_timing: None,
@@ -551,12 +730,17 @@ mod tests {
             value["mutations"][0]["build_error_fingerprint"],
             serde_json::json!(fingerprint)
         );
+        assert_eq!(
+            value["mutations"][0]["execution"],
+            serde_json::json!({"state": "not_executed", "reason": "build_error"})
+        );
     }
 
     #[test]
     fn json_score_100_when_empty_report() {
         let report = MutationReport {
             results: vec![],
+            execution_provenance: BTreeMap::new(),
             build_error_diagnostics: vec![],
             schemata: None,
             baseline_timing: None,
@@ -620,5 +804,62 @@ mod tests {
         assert_eq!(mutations[1]["replacement"], "!=");
         // diff is None because the test file doesn't exist on disk
         assert!(mutations[1]["diff"].is_null());
+    }
+
+    #[test]
+    fn json_dry_run_is_distinct_machine_readable_document() {
+        let report = sample_report();
+        let value: Value =
+            serde_json::from_str(&to_dry_run_json(&[report.results[0].0.clone()]).unwrap())
+                .unwrap();
+
+        assert_eq!(value["kind"], "dry_run");
+        assert_eq!(value["dry_run"], true);
+        assert_eq!(value["planned_total"], 1);
+        assert_eq!(value["mutations"][0]["id"], 1);
+        assert!(value["mutations"][0].get("result").is_none());
+        assert!(value.get("mutation_score").is_none());
+    }
+
+    #[test]
+    fn json_suite_failure_has_no_mutation_report_fields() {
+        let failure = RunSuiteFailure {
+            phase: SuiteFailurePhase::Test,
+            command: vec!["false".into()],
+            outcome: RunSuiteFailureOutcome::Failed {
+                output: Some("test output".into()),
+            },
+        };
+
+        let value: Value =
+            serde_json::from_str(&to_run_suite_failure_json(&failure).unwrap()).unwrap();
+
+        assert_eq!(value["kind"], "suite_failure");
+        assert_eq!(value["phase"], "test");
+        assert_eq!(value["command"], serde_json::json!(["false"]));
+        assert_eq!(value["outcome"], "failed");
+        assert_eq!(value["output"], "test output");
+        assert!(value.get("mutations").is_none());
+        assert!(value.get("mutation_score").is_none());
+    }
+
+    #[test]
+    fn json_suite_failure_serializes_cannot_run_detail() {
+        let failure = RunSuiteFailure {
+            phase: SuiteFailurePhase::Build,
+            command: vec!["missing-command".into()],
+            outcome: RunSuiteFailureOutcome::CannotRun {
+                detail: "not found".into(),
+            },
+        };
+
+        let value: Value =
+            serde_json::from_str(&to_run_suite_failure_json(&failure).unwrap()).unwrap();
+
+        assert_eq!(value["phase"], "build");
+        assert_eq!(value["outcome"], "cannot_run");
+        assert_eq!(value["detail"], "not found");
+        assert!(value.get("output").is_none());
+        assert!(value.get("timeout_ms").is_none());
     }
 }

@@ -1,3 +1,4 @@
+use crate::runner::{RunSuiteFailure, RunSuiteFailureOutcome, SuiteFailurePhase};
 use crate::{MutationReport, MutationResult};
 use std::fmt::Write;
 use std::io::IsTerminal;
@@ -10,15 +11,55 @@ pub fn format_report_plain(report: &MutationReport) -> String {
     format_report(report, false)
 }
 
+/// Print a run-level suite failure instead of a mutation report.
+pub fn print_run_suite_failure(failure: &RunSuiteFailure) {
+    eprint!("{}", format_run_suite_failure(failure));
+}
+
+pub fn format_run_suite_failure(failure: &RunSuiteFailure) -> String {
+    let mut out = String::new();
+    let phase = match failure.phase {
+        SuiteFailurePhase::Build => "build",
+        SuiteFailurePhase::Test => "test",
+    };
+    writeln!(out, "Test suite failure before mutation execution.").unwrap();
+    writeln!(out, "Baseline phase: {phase}").unwrap();
+    writeln!(out, "Command: {}", failure.command.join(" ")).unwrap();
+    match &failure.outcome {
+        RunSuiteFailureOutcome::Failed { output } => {
+            writeln!(out, "Outcome: failed").unwrap();
+            if let Some(output) = output {
+                writeln!(out, "Output:\n{output}").unwrap();
+            }
+        }
+        RunSuiteFailureOutcome::TimedOut { timeout } => {
+            writeln!(
+                out,
+                "Outcome: timed out after {:.2}s",
+                timeout.as_secs_f64()
+            )
+            .unwrap();
+        }
+        RunSuiteFailureOutcome::CannotRun { detail } => {
+            writeln!(out, "Outcome: could not run").unwrap();
+            writeln!(out, "Detail: {detail}").unwrap();
+        }
+    }
+    out
+}
+
 fn format_report(report: &MutationReport, color: bool) -> String {
     let mut out = String::new();
     writeln!(out).unwrap();
+    let execution_counts = report.execution_counts();
 
     for (mutation, result) in &report.results {
         let file = mutation.file.display().to_string();
         let line = mutation.line;
         let operator = &mutation.operator;
         let desc = &mutation.description;
+        let execution = report.execution_for(mutation.id, *result);
+        let execution_text = execution.to_string();
 
         let (tag, extra) = match result {
             MutationResult::Killed => ("✓ KILLED", None),
@@ -93,19 +134,20 @@ fn format_report(report: &MutationReport, color: bool) -> String {
             };
             writeln!(
                 out,
-                "  {} {}:{}  {} {}: {}",
+                "  {} {}:{}  {} {}: {} [{}]",
                 tag_colored,
                 file,
                 line,
                 dim("—"),
                 dim(operator),
-                desc
+                desc,
+                dim(&execution_text)
             )
         } else {
             writeln!(
                 out,
-                "  {:<14}{}:{} — {}: {}",
-                tag, file, line, operator, desc
+                "  {:<14}{}:{} — {}: {} [{}]",
+                tag, file, line, operator, desc, execution_text
             )
         }
         .unwrap();
@@ -126,6 +168,19 @@ fn format_report(report: &MutationReport, color: bool) -> String {
         report.killed, report.survived, report.timeout, report.build_errors
     )
     .unwrap();
+    let exact_cache_reused =
+        count_suffix(execution_counts.exact_cache_reused, "exact-cache reused");
+    let incremental_history_reused = count_suffix(
+        execution_counts.incremental_history_reused,
+        "incremental-history reused",
+    );
+    let not_executed = count_suffix(execution_counts.not_executed, "not executed");
+    writeln!(
+        out,
+        "Execution: {} freshly tested{exact_cache_reused}{incremental_history_reused}{not_executed}",
+        execution_counts.executed
+    )
+    .unwrap();
     if report.total < report.planned_total {
         writeln!(
             out,
@@ -139,7 +194,7 @@ fn format_report(report: &MutationReport, color: bool) -> String {
     }
     writeln!(
         out,
-        "Mutation score (test kills only): {:.1}%",
+        "Mutation score (fresh test kills only): {:.1}%",
         super::mutation_score(report)
     )
     .unwrap();
@@ -289,7 +344,12 @@ fn color_enabled_from_env(is_terminal: bool, env: impl Fn(&str) -> Option<String
 
 /// Guidance text when every mutation is a build error.
 fn all_build_error_guidance(report: &MutationReport) -> Option<String> {
-    if report.build_errors == 0 || report.build_errors != report.total {
+    if report.results.is_empty()
+        || report.results.iter().any(|(mutation, result)| {
+            *result != MutationResult::BuildError
+                || report.execution_for(mutation.id, *result).is_reused()
+        })
+    {
         return None;
     }
     Some(
@@ -306,7 +366,9 @@ fn all_build_error_guidance(report: &MutationReport) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runner::{RunSuiteFailure, RunSuiteFailureOutcome, SuiteFailurePhase};
     use crate::{BuildErrorDiagnostic, Mutation};
+    use std::collections::BTreeMap;
     use std::path::PathBuf;
     use std::time::Duration;
 
@@ -346,6 +408,7 @@ mod tests {
 
         MutationReport {
             results,
+            execution_provenance: BTreeMap::new(),
             build_error_diagnostics: vec![],
             schemata: None,
             baseline_timing: None,
@@ -360,6 +423,26 @@ mod tests {
             timeout,
             build_errors,
         }
+    }
+
+    #[test]
+    fn terminal_suite_failure_is_not_a_mutation_report() {
+        let failure = RunSuiteFailure {
+            phase: SuiteFailurePhase::Test,
+            command: vec!["false".into()],
+            outcome: RunSuiteFailureOutcome::Failed {
+                output: Some("test output".into()),
+            },
+        };
+
+        let output = format_run_suite_failure(&failure);
+
+        assert!(output.contains("Test suite failure before mutation execution."));
+        assert!(output.contains("Baseline phase: test"));
+        assert!(output.contains("Command: false"));
+        assert!(output.contains("Outcome: failed"));
+        assert!(output.contains("test output"));
+        assert!(!output.contains("Mutation score"));
     }
 
     #[test]
@@ -411,7 +494,7 @@ mod tests {
             ));
         let output = format_report_plain(&report);
         assert!(output.contains("Results: 1 killed, 0 survived, 1 timeout, 1 build errors"));
-        assert!(output.contains("Mutation score (test kills only): 50.0%"));
+        assert!(output.contains("Mutation score (fresh test kills only): 50.0%"));
         assert!(output.contains("Build error diagnostics:"));
         assert!(output.contains("unknown / op / regular / build_command"));
         assert!(output.contains("command: cargo check"));
@@ -426,7 +509,33 @@ mod tests {
         ]);
         let output = format_report_plain(&report);
         assert!(output.contains("Results: 1 killed, 1 survived, 0 timeout, 0 build errors"));
-        assert!(output.contains("Mutation score (test kills only): 50.0%"));
+        assert!(output.contains("Mutation score (fresh test kills only): 50.0%"));
+    }
+
+    #[test]
+    fn terminal_output_shows_execution_provenance() {
+        let mut report = report(vec![
+            (mutation(1, "src/a.rs", 1), MutationResult::Killed),
+            (mutation(2, "src/b.rs", 2), MutationResult::Survived),
+        ]);
+        report
+            .execution_provenance
+            .insert(1, crate::MutationExecution::ExactCache);
+        report
+            .execution_provenance
+            .insert(2, crate::MutationExecution::IncrementalHistory);
+
+        let output = format_report_plain(&report);
+
+        assert!(output.contains("[exact cache]"), "got: {output}");
+        assert!(output.contains("[incremental history]"), "got: {output}");
+        assert!(
+            output.contains(
+                "Execution: 0 freshly tested, 1 exact-cache reused, 1 incremental-history reused"
+            ),
+            "got: {output}"
+        );
+        assert!(output.contains("Mutation score (fresh test kills only): 0.0%"));
     }
 
     #[test]
@@ -482,6 +591,18 @@ mod tests {
     }
 
     #[test]
+    fn reused_build_errors_do_not_show_fresh_build_error_guidance() {
+        let mut report = report(vec![(
+            mutation(1, "src/a.rs", 1),
+            MutationResult::BuildError,
+        )]);
+        report
+            .execution_provenance
+            .insert(report.results[0].0.id, crate::MutationExecution::ExactCache);
+
+        assert!(all_build_error_guidance(&report).is_none());
+    }
+    #[test]
     fn terminal_output_lists_uncovered_mutants_distinctly() {
         let report = report(vec![
             (mutation(1, "src/a.rs", 1), MutationResult::Killed),
@@ -500,7 +621,7 @@ mod tests {
                 .contains("Results: 1 killed, 0 survived, 0 timeout, 0 build errors, 1 uncovered")
         );
         // Uncovered mutants are excluded from the tested denominator.
-        assert!(output.contains("Mutation score (test kills only): 100.0%"));
+        assert!(output.contains("Mutation score (fresh test kills only): 100.0%"));
     }
 
     #[test]
@@ -529,7 +650,7 @@ mod tests {
             output.contains("Results: 1 killed, 0 survived, 0 timeout, 0 build errors, 1 subsumed")
         );
         // Subsumed mutants are excluded from the tested denominator.
-        assert!(output.contains("Mutation score (test kills only): 100.0%"));
+        assert!(output.contains("Mutation score (fresh test kills only): 100.0%"));
     }
 
     #[test]
