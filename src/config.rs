@@ -247,9 +247,11 @@ struct ProjectInspection {
     has_cargo_toml: bool,
     has_go_mod: bool,
     has_python_project: bool,
+    python_manifest: Option<&'static str>,
     javascript_runner: Option<JavaScriptRunner>,
     has_pom_xml: bool,
     has_gradle: bool,
+    gradle_manifest: Option<&'static str>,
     has_gemfile: bool,
     has_cmake: bool,
     has_dotnet_project: bool,
@@ -263,16 +265,32 @@ pub enum BuiltinCoverageAdapter {
 
 impl ProjectInspection {
     fn scan(project_root: &Path) -> Self {
+        let python_manifest = if project_root.join("pyproject.toml").exists() {
+            Some("pyproject.toml")
+        } else if project_root.join("setup.py").exists() {
+            Some("setup.py")
+        } else if project_root.join("setup.cfg").exists() {
+            Some("setup.cfg")
+        } else {
+            None
+        };
+        let gradle_manifest = if project_root.join("build.gradle").exists() {
+            Some("build.gradle")
+        } else if project_root.join("build.gradle.kts").exists() {
+            Some("build.gradle.kts")
+        } else {
+            None
+        };
+
         Self {
             has_cargo_toml: project_root.join("Cargo.toml").exists(),
             has_go_mod: project_root.join("go.mod").exists(),
-            has_python_project: project_root.join("pyproject.toml").exists()
-                || project_root.join("setup.py").exists()
-                || project_root.join("setup.cfg").exists(),
+            has_python_project: python_manifest.is_some(),
+            python_manifest,
             javascript_runner: JavaScriptRunner::detect(project_root),
             has_pom_xml: project_root.join("pom.xml").exists(),
-            has_gradle: project_root.join("build.gradle").exists()
-                || project_root.join("build.gradle.kts").exists(),
+            has_gradle: gradle_manifest.is_some(),
+            gradle_manifest,
             has_gemfile: project_root.join("Gemfile").exists(),
             has_cmake: project_root.join("CMakeLists.txt").exists(),
             has_dotnet_project: has_file_with_ext(project_root, "sln")
@@ -289,8 +307,8 @@ impl ProjectInspection {
         if self.has_go_mod {
             detected.push(("go.mod", vec!["go".into(), "test".into(), "./...".into()]));
         }
-        if self.has_python_project {
-            detected.push(("pyproject.toml/setup.py", vec!["pytest".into()]));
+        if let Some(manifest) = self.python_manifest {
+            detected.push((manifest, vec!["pytest".into()]));
         }
         if let Some(runner) = self.javascript_runner {
             detected.push(("package.json", runner.test_command()));
@@ -298,8 +316,8 @@ impl ProjectInspection {
         if self.has_pom_xml {
             detected.push(("pom.xml", vec!["mvn".into(), "test".into()]));
         }
-        if self.has_gradle {
-            detected.push(("build.gradle", vec!["./gradlew".into(), "test".into()]));
+        if let Some(manifest) = self.gradle_manifest {
+            detected.push((manifest, vec!["./gradlew".into(), "test".into()]));
         }
         if self.has_gemfile {
             detected.push((
@@ -368,6 +386,61 @@ pub fn detect_test_command(project_root: &Path) -> Vec<String> {
         );
         vec!["make".into(), "test".into()]
     }
+}
+
+#[derive(Debug)]
+pub struct AmbiguousTestCommand {
+    candidates: Vec<&'static str>,
+}
+
+impl AmbiguousTestCommand {
+    pub fn error(&self) -> anyhow::Error {
+        anyhow::anyhow!(
+            "multiple test runtimes detected ({}); set [test] command in togi.toml or pass --test-cmd <command>",
+            self.candidates.join(", ")
+        )
+    }
+
+    pub fn error_for_path(&self, path: &Path) -> anyhow::Error {
+        anyhow::anyhow!(
+            "multiple test runtimes detected ({}); {} has no explicit project or language test command, so set [test] command in togi.toml or pass --test-cmd <command>",
+            self.candidates.join(", "),
+            path.display()
+        )
+    }
+}
+
+#[derive(Debug)]
+pub enum TestCommandResolution {
+    Resolved,
+    Ambiguous(AmbiguousTestCommand),
+}
+
+// Mirrors runner::normalized_cache_path so ambiguity preflight chooses the
+// same project route that runner would select.
+fn normalized_test_command_path(project_root: &Path, path: &Path) -> String {
+    let relative = if path.is_absolute() {
+        path.canonicalize()
+            .ok()
+            .and_then(|path| {
+                project_root
+                    .canonicalize()
+                    .ok()
+                    .and_then(|root| path.strip_prefix(root).ok().map(PathBuf::from))
+            })
+            .unwrap_or_else(|| path.to_path_buf())
+    } else {
+        path.to_path_buf()
+    };
+
+    relative
+        .components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(part) => Some(part.to_string_lossy()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 /// Returns failfast args to append to a test command, based on the test runner.
@@ -514,6 +587,66 @@ impl Config {
             .map(|(name, proj)| (name.as_str(), proj))
     }
 
+    /// Returns whether a nonempty configured route could require path-aware command resolution.
+    pub fn has_configured_test_command_routes(&self) -> bool {
+        self.test
+            .languages
+            .values()
+            .any(|language| !language.command.is_empty())
+            || self.projects.values().any(|project| {
+                project
+                    .test
+                    .as_ref()
+                    .and_then(|test| test.command.as_ref())
+                    .is_some_and(|command| !command.is_empty())
+            })
+    }
+
+    /// Mirrors runner project/language precedence before it falls back to the global command.
+    pub fn has_configured_test_command_for_path(
+        &self,
+        project_root: &Path,
+        file_path: &Path,
+        language: &str,
+    ) -> bool {
+        let file_path = normalized_test_command_path(project_root, file_path);
+        let file_parts: Vec<&str> = file_path
+            .split('/')
+            .filter(|part| !part.is_empty())
+            .collect();
+        let project = self
+            .projects
+            .values()
+            .filter_map(|project| {
+                let project_path = normalized_test_command_path(project_root, &project.path);
+                let project_parts: Vec<&str> = project_path
+                    .split('/')
+                    .filter(|part| !part.is_empty())
+                    .collect();
+                (!project_parts.is_empty()
+                    && project_parts.len() <= file_parts.len()
+                    && file_parts
+                        .iter()
+                        .zip(&project_parts)
+                        .all(|(file, project)| file == project))
+                .then_some((project_parts.len(), project))
+            })
+            .max_by_key(|(len, _)| *len)
+            .map(|(_, project)| project);
+
+        if let Some(command) = project
+            .and_then(|project| project.test.as_ref())
+            .and_then(|test| test.command.as_ref())
+        {
+            return !command.is_empty();
+        }
+
+        self.test
+            .languages
+            .get(language)
+            .is_some_and(|language| !language.command.is_empty())
+    }
+
     /// Warn if any configured language keys don't match known language names.
     pub fn warn_unknown_languages(&self, known: &[&str]) {
         for key in self.test.languages.keys() {
@@ -528,11 +661,29 @@ impl Config {
         }
     }
 
-    /// If no test command was explicitly set in togi.toml, auto-detect from project files.
-    pub fn resolve_test_command(&mut self, project_root: &Path) {
-        if self.test.command.is_empty() {
-            self.test.command = detect_test_command(project_root);
+    /// Resolve a global test command, leaving it unset when detection is ambiguous.
+    pub fn resolve_test_command(&mut self, project_root: &Path) -> TestCommandResolution {
+        if !self.test.command.is_empty() {
+            return TestCommandResolution::Resolved;
         }
+
+        let detected = ProjectInspection::scan(project_root).detected_test_commands();
+        if detected.len() > 1 {
+            return TestCommandResolution::Ambiguous(AmbiguousTestCommand {
+                candidates: detected.iter().map(|(name, _)| *name).collect(),
+            });
+        }
+
+        self.test.command = if let Some((_, command)) = detected.into_iter().next() {
+            command
+        } else {
+            eprintln!(
+                "warning: no known build system found. Falling back to `make test`. \
+                 Set [test] command in togi.toml to override."
+            );
+            vec!["make".into(), "test".into()]
+        };
+        TestCommandResolution::Resolved
     }
 
     /// If no build command was explicitly set in togi.toml, auto-detect from project files.
@@ -1010,6 +1161,26 @@ fail_on_uncovered_diff = true
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("build.gradle.kts"), "").unwrap();
         assert_eq!(detect_test_command(dir.path()), vec!["./gradlew", "test"]);
+    }
+
+    #[test]
+    fn ambiguous_detection_names_actual_manifests() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("setup.cfg"), "").unwrap();
+        std::fs::write(dir.path().join("build.gradle.kts"), "").unwrap();
+        let mut config = Config::default();
+
+        let TestCommandResolution::Ambiguous(ambiguity) = config.resolve_test_command(dir.path())
+        else {
+            panic!("expected ambiguous test command detection");
+        };
+
+        assert!(config.test.command.is_empty());
+
+        assert_eq!(
+            ambiguity.error().to_string(),
+            "multiple test runtimes detected (setup.cfg, build.gradle.kts); set [test] command in togi.toml or pass --test-cmd <command>"
+        );
     }
 
     #[test]
