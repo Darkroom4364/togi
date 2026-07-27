@@ -136,6 +136,300 @@ fn check_dry_run_lists_mutations() {
         .stdout(predicate::str::contains("mutations would be generated"));
 }
 
+fn setup_ambiguous_runtime_repo() -> TempDir {
+    let dir = setup_git_repo();
+    fs::write(
+        dir.path().join("Cargo.toml"),
+        "[package]\nname = \"example\"\n",
+    )
+    .unwrap();
+    dir
+}
+
+#[test]
+fn check_rejects_ambiguous_automatic_test_command() {
+    let dir = setup_ambiguous_runtime_repo();
+
+    togi()
+        .args(["check", "--base", "not-a-valid-revision"])
+        .current_dir(dir.path())
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains(
+            "multiple test runtimes detected (Cargo.toml, go.mod)",
+        ))
+        .stderr(predicate::str::contains("[test] command"))
+        .stderr(predicate::str::contains("--test-cmd"));
+
+    assert!(!dir.path().join(".togi.lock").exists());
+}
+
+#[test]
+fn check_rejects_empty_language_route_before_baseline_or_cache() {
+    let dir = setup_ambiguous_runtime_repo();
+    fs::write(
+        dir.path().join("togi.toml"),
+        r#"
+[test.languages.go]
+command = []
+"#,
+    )
+    .unwrap();
+
+    togi()
+        .args(["check", "--base", "not-a-valid-revision"])
+        .current_dir(dir.path())
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains(
+            "multiple test runtimes detected (Cargo.toml, go.mod)",
+        ))
+        .stderr(predicate::str::contains("[test] command"));
+
+    assert!(!dir.path().join(".togi.lock").exists());
+    assert!(!dir.path().join(".togi-cache").exists());
+}
+
+#[test]
+fn check_rejects_unrouted_path_when_ambiguity_is_deferred() {
+    let dir = setup_ambiguous_runtime_repo();
+    fs::write(
+        dir.path().join("togi.toml"),
+        r#"
+[test.languages.rust]
+command = ["true"]
+"#,
+    )
+    .unwrap();
+
+    togi()
+        .args(["check", "--base", "HEAD"])
+        .current_dir(dir.path())
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains(
+            "multiple test runtimes detected (Cargo.toml, go.mod)",
+        ))
+        .stderr(predicate::str::contains(
+            "main.go has no explicit project or language test command",
+        ));
+
+    assert!(!dir.path().join(".togi-cache").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn check_rejects_empty_project_route_before_baseline_or_cache() {
+    let dir = setup_ambiguous_runtime_repo();
+    let log = dir.path().join("language-route.log");
+    fs::write(
+        dir.path().join("togi.toml"),
+        r#"
+[test.languages.go]
+command = ["sh", "-c", 'echo language-route >> "$TOGI_TEST_LOG"']
+
+[projects.main]
+path = "main.go"
+
+[projects.main.test]
+command = []
+"#,
+    )
+    .unwrap();
+
+    togi()
+        .args(["check", "--base", "HEAD"])
+        .env("TOGI_TEST_LOG", &log)
+        .current_dir(dir.path())
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains(
+            "multiple test runtimes detected (Cargo.toml, go.mod)",
+        ))
+        .stderr(predicate::str::contains(
+            "main.go has no explicit project or language test command",
+        ));
+
+    assert!(!log.exists());
+    assert!(!dir.path().join(".togi-cache").exists());
+}
+
+#[test]
+fn check_cli_test_command_overrides_ambiguous_automatic_detection() {
+    let dir = setup_ambiguous_runtime_repo();
+
+    togi()
+        .args(["check", "--base", "HEAD", "--dry-run", "--test-cmd", "true"])
+        .current_dir(dir.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("mutations would be generated"));
+}
+
+#[test]
+fn check_config_test_command_overrides_ambiguous_automatic_detection() {
+    let dir = setup_ambiguous_runtime_repo();
+    fs::write(
+        dir.path().join("togi.toml"),
+        r#"
+[test]
+command = ["true"]
+"#,
+    )
+    .unwrap();
+
+    togi()
+        .args(["check", "--base", "HEAD", "--dry-run"])
+        .current_dir(dir.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("mutations would be generated"));
+}
+
+#[cfg(unix)]
+#[test]
+fn check_uses_explicit_routes_in_ambiguous_mixed_runtime_repo() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    std::process::Command::new("git")
+        .arg("init")
+        .current_dir(root)
+        .output()
+        .unwrap();
+    fs::create_dir_all(root.join("rust/src")).unwrap();
+    fs::create_dir_all(root.join("go")).unwrap();
+    fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"mixed\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    )
+    .unwrap();
+    fs::write(root.join("go.mod"), "module example.com/mixed\n\ngo 1.21\n").unwrap();
+    fs::write(
+        root.join("rust/src/lib.rs"),
+        "pub fn compare(a: i32, b: i32) -> bool { a > b }\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("go/main.go"),
+        "package sample\n\nfunc compare(a, b int) bool { return a > b }\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("togi.toml"),
+        r#"
+[test.languages.rust]
+command = ["sh", "-c", 'echo rust-route >> "$TOGI_TEST_LOG"']
+
+[projects.go]
+path = "go"
+
+[projects.go.test]
+command = ["sh", "-c", 'echo project-route >> "$TOGI_TEST_LOG"']
+"#,
+    )
+    .unwrap();
+    let log = root.join("routes.log");
+
+    let output = togi()
+        .args([
+            "check",
+            "--all",
+            "--max-per-run",
+            "2",
+            "--no-schemata",
+            "--operators",
+            "gt_to_gte",
+            "--force-rerun",
+            "--no-incremental-history",
+            "--fail-under",
+            "0",
+        ])
+        .env("TOGI_TEST_LOG", &log)
+        .current_dir(root)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let routes = fs::read_to_string(log).unwrap();
+    assert!(routes.lines().any(|route| route == "rust-route"));
+    assert!(routes.lines().any(|route| route == "project-route"));
+}
+
+#[cfg(unix)]
+#[test]
+fn check_uses_absolute_nested_project_route_in_ambiguous_mixed_runtime_repo() {
+    let dir = setup_ambiguous_runtime_repo();
+    let root = dir.path();
+    let services = root.join("services");
+    let api = services.join("api");
+    fs::create_dir_all(&api).unwrap();
+    fs::write(
+        api.join("main.go"),
+        "package api\n\nfunc compare(a, b int) bool { return a > b }\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("togi.toml"),
+        format!(
+            r#"
+[test.languages.go]
+command = ["sh", "-c", 'echo language-route >> "$TOGI_TEST_LOG"']
+
+[projects.services]
+path = "{}"
+
+[projects.services.test]
+command = ["sh", "-c", 'echo services-route >> "$TOGI_TEST_LOG"']
+
+[projects.api]
+path = "{}"
+
+[projects.api.test]
+command = ["sh", "-c", 'echo api-route >> "$TOGI_TEST_LOG"']
+"#,
+            services.display(),
+            api.display()
+        ),
+    )
+    .unwrap();
+    let log = root.join("routes.log");
+
+    let output = togi()
+        .args([
+            "check",
+            "--all",
+            "--max-per-run",
+            "2",
+            "--no-schemata",
+            "--operators",
+            "gt_to_gte",
+            "--force-rerun",
+            "--no-incremental-history",
+            "--fail-under",
+            "0",
+        ])
+        .env("TOGI_TEST_LOG", &log)
+        .current_dir(root)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let routes = fs::read_to_string(log).unwrap();
+    assert!(routes.lines().any(|route| route == "language-route"));
+    assert!(routes.lines().any(|route| route == "api-route"));
+    assert!(!routes.lines().any(|route| route == "services-route"));
+}
+
 /// Extend the fixture so mutants land on two lines: line 4 (the added `if`)
 /// and line 7 (`return a - b`).
 fn setup_two_line_mutation_repo() -> TempDir {

@@ -249,9 +249,16 @@ fn run_check(cfg: togi::cli::CheckArgs, cancelled: Arc<AtomicBool>) -> anyhow::R
         profile,
     } = resolved;
     let project_root = get_project_root()?;
+    let ambiguous_test_command = match config.resolve_test_command(&project_root) {
+        togi::config::TestCommandResolution::Resolved => None,
+        togi::config::TestCommandResolution::Ambiguous(ambiguity) => Some(ambiguity),
+    };
+    if let Some(ambiguity) = &ambiguous_test_command {
+        if has_custom_test_cmd || !config.has_configured_test_command_routes() {
+            return Err(ambiguity.error());
+        }
+    }
     let _lock = togi::lock::acquire(&project_root)?;
-
-    config.resolve_test_command(&project_root);
     config.resolve_build_command(&project_root);
     warn_if_resource_oversubscribed(config.test.jobs);
     let profile_env = if has_custom_test_cmd {
@@ -278,6 +285,36 @@ fn run_check(cfg: togi::cli::CheckArgs, cancelled: Arc<AtomicBool>) -> anyhow::R
     let changed_files = collect_files(&config, all, &paths, dry_run, &project_root)?;
     if changed_files.is_empty() {
         return Ok(());
+    }
+
+    // Ambiguity can be deferred only when runner precedence selects a configured
+    // project or language command for every collected source file.
+    if let Some(ambiguity) = &ambiguous_test_command {
+        for changed_file in &changed_files {
+            if !project_root.join(&changed_file.path).exists() {
+                continue;
+            }
+            let Some(extension) = changed_file
+                .path
+                .extension()
+                .and_then(|extension| extension.to_str())
+            else {
+                continue;
+            };
+            let Some(language) = all_langs
+                .iter()
+                .find(|language| language.extensions().contains(&extension))
+            else {
+                continue;
+            };
+            if !config.has_configured_test_command_for_path(
+                &project_root,
+                &changed_file.path,
+                language.name(),
+            ) {
+                return Err(ambiguity.error_for_path(&changed_file.path));
+            }
+        }
     }
 
     let coverage_gate_active = config.mutations.min_line_coverage.is_some()
