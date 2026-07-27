@@ -527,6 +527,8 @@ togi check --check-baseline
 
 Baselines are stored in `.togi-baseline`.
 
+New baselines persist source-validated per-mutant evidence. An eligible `--check-baseline` labels fresh surviving mutants `historic`, `new`, or `non_comparable` in reports, while existing aggregate and per-file score gates remain unchanged.
+
 ## Workspace copies
 
 togi runs mutations in temporary workspace copies so parallel jobs do not observe

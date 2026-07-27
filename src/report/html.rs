@@ -36,9 +36,17 @@ struct MutationEntry {
     replacement: String,
     result: &'static str,
     execution: String,
+    baseline_status: Option<&'static str>,
 }
 
 pub fn generate_report(report: &MutationReport) -> Result<String> {
+    generate_report_with_baseline(report, None)
+}
+
+pub fn generate_report_with_baseline(
+    report: &MutationReport,
+    comparison: Option<&crate::baseline::SurvivorBaselineComparison>,
+) -> Result<String> {
     let mut files: BTreeMap<String, FileStats> = BTreeMap::new();
 
     for (mutation, result) in &report.results {
@@ -85,6 +93,10 @@ pub fn generate_report(report: &MutationReport) -> Result<String> {
             replacement: mutation.replacement.clone(),
             result: result_str,
             execution: execution.to_string(),
+            baseline_status: (*result == MutationResult::Survived)
+                .then(|| comparison.and_then(|comparison| comparison.status_for(mutation.id)))
+                .flatten()
+                .map(|status| status.as_str()),
         });
     }
 
@@ -251,13 +263,23 @@ pub fn generate_report(report: &MutationReport) -> Result<String> {
             stats.score_pct()
         )?;
 
-        write!(
-            html,
-            "<table><thead><tr>\
-            <th>Line</th><th>Operator</th><th>Description</th>\
-            <th>Original</th><th>Replacement</th><th>Result</th><th>Execution</th>\
-            </tr></thead><tbody>"
-        )?;
+        if comparison.is_some() {
+            write!(
+                html,
+                "<table><thead><tr>\
+                <th>Line</th><th>Operator</th><th>Description</th>\
+                <th>Original</th><th>Replacement</th><th>Result</th><th>Baseline</th><th>Execution</th>\
+                </tr></thead><tbody>"
+            )?;
+        } else {
+            write!(
+                html,
+                "<table><thead><tr>\
+                <th>Line</th><th>Operator</th><th>Description</th>\
+                <th>Original</th><th>Replacement</th><th>Result</th><th>Execution</th>\
+                </tr></thead><tbody>"
+            )?;
+        }
 
         for m in &stats.mutations {
             let result_class = match m.result {
@@ -268,21 +290,41 @@ pub fn generate_report(report: &MutationReport) -> Result<String> {
                 "subsumed" => "result-subsumed",
                 _ => "result-build-error",
             };
-            write!(
-                html,
-                "<tr class=\"{}\"><td>{}</td><td><code>{}</code></td><td>{}</td>\
-                 <td><code class=\"orig\">{}</code></td>\
-                 <td><code class=\"repl\">{}</code></td>\
-                 <td>{}</td><td>{}</td></tr>",
-                result_class,
-                m.line,
-                html_escape(&m.operator),
-                html_escape(&m.description),
-                html_escape(&m.original),
-                html_escape(&m.replacement),
-                m.result,
-                html_escape(&m.execution)
-            )?;
+            if comparison.is_some() {
+                let baseline_status = m.baseline_status.map(html_escape).unwrap_or_default();
+                write!(
+                    html,
+                    "<tr class=\"{}\"><td>{}</td><td><code>{}</code></td><td>{}</td>\
+                     <td><code class=\"orig\">{}</code></td>\
+                     <td><code class=\"repl\">{}</code></td>\
+                     <td>{}</td><td>{}</td><td>{}</td></tr>",
+                    result_class,
+                    m.line,
+                    html_escape(&m.operator),
+                    html_escape(&m.description),
+                    html_escape(&m.original),
+                    html_escape(&m.replacement),
+                    m.result,
+                    baseline_status,
+                    html_escape(&m.execution)
+                )?;
+            } else {
+                write!(
+                    html,
+                    "<tr class=\"{}\"><td>{}</td><td><code>{}</code></td><td>{}</td>\
+                     <td><code class=\"orig\">{}</code></td>\
+                     <td><code class=\"repl\">{}</code></td>\
+                     <td>{}</td><td>{}</td></tr>",
+                    result_class,
+                    m.line,
+                    html_escape(&m.operator),
+                    html_escape(&m.description),
+                    html_escape(&m.original),
+                    html_escape(&m.replacement),
+                    m.result,
+                    html_escape(&m.execution)
+                )?;
+            }
         }
 
         write!(html, "</tbody></table></section>")?;
@@ -293,7 +335,15 @@ pub fn generate_report(report: &MutationReport) -> Result<String> {
 }
 
 pub fn write_report(report: &MutationReport, path: &std::path::Path) -> Result<()> {
-    let html = generate_report(report)?;
+    write_report_with_baseline(report, path, None)
+}
+
+pub fn write_report_with_baseline(
+    report: &MutationReport,
+    path: &std::path::Path,
+    comparison: Option<&crate::baseline::SurvivorBaselineComparison>,
+) -> Result<()> {
+    let html = generate_report_with_baseline(report, comparison)?;
     std::fs::write(path, html)?;
     Ok(())
 }
@@ -369,6 +419,7 @@ mod tests {
     use super::*;
     use crate::test_helpers::sample_report;
     use crate::{BuildErrorDiagnostic, Mutation};
+    use std::collections::BTreeMap;
     use std::path::PathBuf;
     use std::time::Duration;
 
@@ -392,6 +443,28 @@ mod tests {
         assert!(html.contains("changed &lt; to &lt;="));
         assert!(html.contains("killed"));
         assert!(html.contains("survived"));
+    }
+
+    #[test]
+    fn html_adds_baseline_column_for_active_survivor_comparison_only() {
+        let report = sample_report();
+        let comparison =
+            crate::baseline::SurvivorBaselineComparison::from_statuses(BTreeMap::from([
+                (0, crate::baseline::SurvivorBaselineStatus::New),
+                (1, crate::baseline::SurvivorBaselineStatus::Historic),
+            ]));
+
+        let inactive = generate_report(&report).unwrap();
+        assert_eq!(
+            inactive,
+            generate_report_with_baseline(&report, None).unwrap()
+        );
+        assert!(!inactive.contains("<th>Baseline</th>"));
+
+        let active = generate_report_with_baseline(&report, Some(&comparison)).unwrap();
+        assert!(active.contains("<th>Baseline</th>"));
+        assert!(active.contains("<td>historic</td>"));
+        assert!(!active.contains("<td>new</td>"));
     }
 
     #[test]

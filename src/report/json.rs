@@ -108,6 +108,8 @@ struct JsonMutation {
     diff: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     build_error_fingerprint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    baseline_status: Option<&'static str>,
 }
 
 #[derive(Serialize)]
@@ -152,8 +154,14 @@ struct JsonDryRunMutation {
 }
 
 pub fn print_report(report: &MutationReport) -> Result<()> {
-    let json = to_json_string(report)?;
-    println!("{}", json);
+    print_report_with_baseline(report, None)
+}
+
+pub fn print_report_with_baseline(
+    report: &MutationReport,
+    comparison: Option<&crate::baseline::SurvivorBaselineComparison>,
+) -> Result<()> {
+    println!("{}", to_json_string_with_baseline(report, comparison)?);
     Ok(())
 }
 
@@ -222,6 +230,14 @@ pub fn to_run_suite_failure_json(failure: &RunSuiteFailure) -> Result<String> {
 
 /// Serialize report to a JSON string (for testing and programmatic use).
 pub fn to_json_string(report: &MutationReport) -> Result<String> {
+    to_json_string_with_baseline(report, None)
+}
+
+/// Serialize report with optional per-survivor baseline comparison data.
+pub fn to_json_string_with_baseline(
+    report: &MutationReport,
+    comparison: Option<&crate::baseline::SurvivorBaselineComparison>,
+) -> Result<String> {
     let diagnostic_by_id: BTreeMap<_, _> = report
         .build_error_diagnostics
         .iter()
@@ -261,6 +277,10 @@ pub fn to_json_string(report: &MutationReport) -> Result<String> {
                 } else {
                     None
                 },
+                baseline_status: (*r == MutationResult::Survived)
+                    .then(|| comparison.and_then(|comparison| comparison.status_for(m.id)))
+                    .flatten()
+                    .map(|status| status.as_str()),
             }
         })
         .collect();
@@ -365,6 +385,26 @@ mod tests {
         actual.sort_unstable();
         expected.sort_unstable();
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn json_output_annotates_only_survivors_when_comparison_is_active() {
+        let report = sample_report();
+        let comparison =
+            crate::baseline::SurvivorBaselineComparison::from_statuses(BTreeMap::from([
+                (0, crate::baseline::SurvivorBaselineStatus::New),
+                (1, crate::baseline::SurvivorBaselineStatus::Historic),
+            ]));
+
+        let annotated: Value = serde_json::from_str(
+            &to_json_string_with_baseline(&report, Some(&comparison)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(annotated["mutations"][1]["baseline_status"], "historic");
+        assert!(annotated["mutations"][0].get("baseline_status").is_none());
+
+        let unannotated: Value = serde_json::from_str(&to_json_string(&report).unwrap()).unwrap();
+        assert!(unannotated["mutations"][1].get("baseline_status").is_none());
     }
 
     #[test]

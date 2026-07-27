@@ -4,11 +4,25 @@ use std::fmt::Write;
 use std::io::IsTerminal;
 
 pub fn print_report(report: &MutationReport) {
-    print!("{}", format_report(report, should_colorize()));
+    print!("{}", format_report(report, should_colorize(), None));
+}
+
+pub fn print_report_with_baseline(
+    report: &MutationReport,
+    comparison: Option<&crate::baseline::SurvivorBaselineComparison>,
+) {
+    print!("{}", format_report(report, should_colorize(), comparison));
 }
 
 pub fn format_report_plain(report: &MutationReport) -> String {
-    format_report(report, false)
+    format_report(report, false, None)
+}
+
+pub fn format_report_plain_with_baseline(
+    report: &MutationReport,
+    comparison: &crate::baseline::SurvivorBaselineComparison,
+) -> String {
+    format_report(report, false, Some(comparison))
 }
 
 /// Print a run-level suite failure instead of a mutation report.
@@ -48,7 +62,11 @@ pub fn format_run_suite_failure(failure: &RunSuiteFailure) -> String {
     out
 }
 
-fn format_report(report: &MutationReport, color: bool) -> String {
+fn format_report(
+    report: &MutationReport,
+    color: bool,
+    comparison: Option<&crate::baseline::SurvivorBaselineComparison>,
+) -> String {
     let mut out = String::new();
     writeln!(out).unwrap();
     let execution_counts = report.execution_counts();
@@ -75,6 +93,11 @@ fn format_report(report: &MutationReport, color: bool) -> String {
                     }
                 )
                 .unwrap();
+                if let Some(status) =
+                    comparison.and_then(|comparison| comparison.status_for(mutation.id))
+                {
+                    let _ = writeln!(detail, "              Baseline: {}", status.as_str());
+                }
                 if let Some(diff) = super::mutation_diff(mutation) {
                     for diff_line in diff.lines() {
                         if color {
@@ -423,6 +446,24 @@ mod tests {
             timeout,
             build_errors,
         }
+    }
+
+    #[test]
+    fn terminal_output_annotates_survivors_only_when_comparing_baselines() {
+        let report = report(vec![
+            (mutation(0, "src/killed.rs", 1), MutationResult::Killed),
+            (mutation(1, "src/survived.rs", 2), MutationResult::Survived),
+        ]);
+        let comparison =
+            crate::baseline::SurvivorBaselineComparison::from_statuses(BTreeMap::from([
+                (0, crate::baseline::SurvivorBaselineStatus::Historic),
+                (1, crate::baseline::SurvivorBaselineStatus::New),
+            ]));
+
+        let annotated = format_report_plain_with_baseline(&report, &comparison);
+        assert!(annotated.contains("Baseline: new"));
+        assert_eq!(annotated.matches("Baseline:").count(), 1);
+        assert!(!format_report_plain(&report).contains("Baseline:"));
     }
 
     #[test]

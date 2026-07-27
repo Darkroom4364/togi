@@ -1907,6 +1907,300 @@ fn check_baseline_allows_existing_survivors() {
         )
     });
     assert!(value["survived"].as_u64().unwrap() > 0);
+    let survivors = value["mutations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|mutation| mutation["result"] == "survived")
+        .collect::<Vec<_>>();
+    assert!(!survivors.is_empty());
+    assert!(
+        survivors
+            .iter()
+            .all(|mutation| mutation["baseline_status"] == "non_comparable")
+    );
+}
+
+#[test]
+fn check_baseline_annotates_historic_survivors_in_a_single_json_document() {
+    let dir = setup_git_repo();
+    let common = [
+        "check",
+        "--base",
+        "HEAD",
+        "--format",
+        "json",
+        "--test-cmd",
+        "true",
+        "--no-schemata",
+        "--operators",
+        "gt_to_gte",
+        "--max-per-run",
+        "1",
+        "--jobs",
+        "1",
+        "--force-rerun",
+        "--no-incremental-history",
+        "--fail-under",
+        "0",
+    ];
+
+    let saved = togi()
+        .args(common)
+        .arg("--save-baseline")
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(
+        saved.status.success(),
+        "baseline save failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&saved.stdout),
+        String::from_utf8_lossy(&saved.stderr)
+    );
+    let baseline: serde_json::Value =
+        serde_json::from_slice(&fs::read(dir.path().join(".togi-baseline")).unwrap()).unwrap();
+    assert_eq!(baseline["mutant_snapshot"]["version"], 1);
+
+    let checked = togi()
+        .args(common)
+        .arg("--check-baseline")
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(
+        checked.status.success(),
+        "baseline check failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&checked.stdout),
+        String::from_utf8_lossy(&checked.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&checked.stdout).unwrap_or_else(|e| {
+        panic!(
+            "redirected check-baseline JSON was not one document: {e}\nstdout: {}",
+            String::from_utf8_lossy(&checked.stdout)
+        )
+    });
+    let survivors = report["mutations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|mutation| mutation["result"] == "survived")
+        .collect::<Vec<_>>();
+    assert_eq!(survivors.len(), 1);
+    assert_eq!(survivors[0]["baseline_status"], "historic");
+}
+
+#[test]
+fn check_baseline_annotates_historic_survivors_in_terminal() {
+    let dir = setup_git_repo();
+    let common = [
+        "check",
+        "--base",
+        "HEAD",
+        "--test-cmd",
+        "true",
+        "--no-schemata",
+        "--operators",
+        "gt_to_gte",
+        "--max-per-run",
+        "1",
+        "--jobs",
+        "1",
+        "--force-rerun",
+        "--no-incremental-history",
+        "--fail-under",
+        "0",
+    ];
+
+    let saved = togi()
+        .args(common)
+        .arg("--save-baseline")
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(
+        saved.status.success(),
+        "baseline save failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&saved.stdout),
+        String::from_utf8_lossy(&saved.stderr)
+    );
+
+    let checked = togi()
+        .args(common)
+        .arg("--check-baseline")
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(
+        checked.status.success(),
+        "baseline check failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&checked.stdout),
+        String::from_utf8_lossy(&checked.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&checked.stdout)
+            .matches("Baseline: historic")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn check_baseline_annotations_reach_github_html_sarif_and_pr_comment() {
+    let dir = setup_git_repo();
+    let common = [
+        "check",
+        "--base",
+        "HEAD",
+        "--test-cmd",
+        "true",
+        "--no-schemata",
+        "--operators",
+        "gt_to_gte",
+        "--max-per-run",
+        "1",
+        "--jobs",
+        "1",
+        "--force-rerun",
+        "--no-incremental-history",
+        "--fail-under",
+        "0",
+    ];
+
+    let saved = togi()
+        .args(common)
+        .arg("--save-baseline")
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(
+        saved.status.success(),
+        "baseline save failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&saved.stdout),
+        String::from_utf8_lossy(&saved.stderr)
+    );
+
+    let github = togi()
+        .args(common)
+        .args(["--format", "github", "--check-baseline"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(
+        github.status.success(),
+        "GitHub report failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&github.stdout),
+        String::from_utf8_lossy(&github.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&github.stdout)
+            .matches("[baseline: historic]")
+            .count(),
+        1
+    );
+
+    let sarif = togi()
+        .args(common)
+        .args(["--format", "sarif", "--check-baseline"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(
+        sarif.status.success(),
+        "SARIF report failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&sarif.stdout),
+        String::from_utf8_lossy(&sarif.stderr)
+    );
+    let sarif: serde_json::Value = serde_json::from_slice(&sarif.stdout).unwrap();
+    assert_eq!(
+        sarif["runs"][0]["results"][0]["properties"]["baseline_status"],
+        "historic"
+    );
+
+    let html = togi()
+        .args(common)
+        .args(["--format", "html", "--check-baseline"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(
+        html.status.success(),
+        "HTML report failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&html.stdout),
+        String::from_utf8_lossy(&html.stderr)
+    );
+    let html = fs::read_to_string(dir.path().join("togi-report.html")).unwrap();
+    assert!(html.contains("<th>Baseline</th>"));
+    assert!(html.contains("<td>historic</td>"));
+
+    let pr_comment = dir.path().join("togi-pr-comment.md");
+    let pr_comment_run = togi()
+        .args(common)
+        .arg("--check-baseline")
+        .arg("--pr-comment")
+        .arg(&pr_comment)
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(
+        pr_comment_run.status.success(),
+        "PR comment report failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&pr_comment_run.stdout),
+        String::from_utf8_lossy(&pr_comment_run.stderr)
+    );
+    let pr_comment = fs::read_to_string(pr_comment).unwrap();
+    assert!(pr_comment.contains("| File | Line | Operator | Description | Baseline |"));
+    assert!(pr_comment.contains(" | historic |"));
+}
+
+#[test]
+fn check_baseline_keeps_json_report_when_baseline_is_invalid() {
+    let dir = setup_git_repo();
+    fs::write(dir.path().join(".togi-baseline"), "not json").unwrap();
+
+    let output = togi()
+        .args([
+            "check",
+            "--base",
+            "HEAD",
+            "--format",
+            "json",
+            "--test-cmd",
+            "true",
+            "--no-schemata",
+            "--operators",
+            "gt_to_gte",
+            "--max-per-run",
+            "1",
+            "--jobs",
+            "1",
+            "--force-rerun",
+            "--no-incremental-history",
+            "--check-baseline",
+        ])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("invalid baseline"),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|e| {
+        panic!(
+            "invalid baseline must still leave one report document on stdout: {e}\nstdout: {}",
+            String::from_utf8_lossy(&output.stdout)
+        )
+    });
+    let survivors = report["mutations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|mutation| mutation["result"] == "survived")
+        .collect::<Vec<_>>();
+    assert_eq!(survivors.len(), 1);
+    assert!(survivors[0].get("baseline_status").is_none());
 }
 
 #[test]

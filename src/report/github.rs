@@ -1,15 +1,22 @@
 use crate::{Mutation, MutationExecution, MutationReport, MutationResult};
 
-/// Format a single GitHub Actions warning annotation for a survived mutation.
-fn format_annotation(mutation: &Mutation, execution: MutationExecution) -> String {
+/// Format a GitHub Actions warning annotation for a survived mutation.
+fn format_annotation_with_baseline(
+    mutation: &Mutation,
+    execution: MutationExecution,
+    status: Option<crate::baseline::SurvivorBaselineStatus>,
+) -> String {
     let provenance = match execution {
         MutationExecution::Executed => String::new(),
         MutationExecution::ExactCache => " [reused: exact cache]".to_string(),
         MutationExecution::IncrementalHistory => " [reused: incremental history]".to_string(),
         MutationExecution::NotExecuted(reason) => format!(" [not executed: {reason}]"),
     };
+    let baseline = status
+        .map(|status| format!(" [baseline: {}]", status.as_str()))
+        .unwrap_or_default();
     let message = format!(
-        "Survived mutation: {} ({}){provenance}",
+        "Survived mutation: {} ({}){provenance}{baseline}",
         mutation.operator, mutation.description
     );
     format!(
@@ -31,15 +38,21 @@ fn escape_property(value: &str) -> String {
     escape_data(value).replace(':', "%3A").replace(',', "%2C")
 }
 
-/// Collect warning annotations for every survived mutation in `report`,
-/// in the same order they appear in `report.results`.
-fn annotations(report: &MutationReport) -> Vec<String> {
+/// Collect warning annotations for every survived mutation in `report`.
+fn annotations_with_baseline(
+    report: &MutationReport,
+    comparison: Option<&crate::baseline::SurvivorBaselineComparison>,
+) -> Vec<String> {
     report
         .results
         .iter()
         .filter(|(_, result)| *result == MutationResult::Survived)
         .map(|(mutation, result)| {
-            format_annotation(mutation, report.execution_for(mutation.id, *result))
+            format_annotation_with_baseline(
+                mutation,
+                report.execution_for(mutation.id, *result),
+                comparison.and_then(|comparison| comparison.status_for(mutation.id)),
+            )
         })
         .collect()
 }
@@ -47,7 +60,14 @@ fn annotations(report: &MutationReport) -> Vec<String> {
 /// Print GitHub Actions workflow annotations for survived mutations.
 /// These show inline on PR diffs.
 pub fn print_report(report: &MutationReport) {
-    for line in annotations(report) {
+    print_report_with_baseline(report, None)
+}
+
+pub fn print_report_with_baseline(
+    report: &MutationReport,
+    comparison: Option<&crate::baseline::SurvivorBaselineComparison>,
+) {
+    for line in annotations_with_baseline(report, comparison) {
         println!("{line}");
     }
 
@@ -153,7 +173,7 @@ mod tests {
     #[test]
     fn annotation_format_for_survived_mutation() {
         let m = mutation("src/auth.rs", 47, "lt_to_lte", "changed < to <=");
-        let line = format_annotation(&m, MutationExecution::Executed);
+        let line = format_annotation_with_baseline(&m, MutationExecution::Executed, None);
         assert_eq!(
             line,
             "::warning file=src/auth.rs,line=47::Survived mutation: lt_to_lte (changed < to <=)"
@@ -166,7 +186,7 @@ mod tests {
             mutation("src/a.rs", 1, "op", "desc"),
             MutationResult::Killed,
         )]);
-        assert!(annotations(&report).is_empty());
+        assert!(annotations_with_baseline(&report, None).is_empty());
     }
 
     #[test]
@@ -185,11 +205,35 @@ mod tests {
                 MutationResult::Timeout,
             ),
         ]);
-        let lines = annotations(&report);
+        let lines = annotations_with_baseline(&report, None);
         assert_eq!(lines.len(), 1);
         assert!(lines[0].contains("file=src/b.rs"));
         assert!(lines[0].contains("op_b"));
         assert!(lines[0].contains("survived one"));
+    }
+
+    #[test]
+    fn annotations_include_active_survivor_baseline_status_only() {
+        let mut survived = mutation("src/a.rs", 1, "op", "survived");
+        survived.id = 5;
+        let mut killed = mutation("src/b.rs", 2, "op", "killed");
+        killed.id = 6;
+        let report = report_with(vec![
+            (survived, MutationResult::Survived),
+            (killed, MutationResult::Killed),
+        ]);
+        let comparison =
+            crate::baseline::SurvivorBaselineComparison::from_statuses(BTreeMap::from([
+                (5, crate::baseline::SurvivorBaselineStatus::Historic),
+                (6, crate::baseline::SurvivorBaselineStatus::New),
+            ]));
+
+        let inactive = annotations_with_baseline(&report, None);
+        assert!(!inactive[0].contains("baseline:"));
+        let active = annotations_with_baseline(&report, Some(&comparison));
+        assert_eq!(active.len(), 1);
+        assert!(active[0].ends_with("[baseline: historic]"));
+        assert!(!active[0].contains("baseline: new"));
     }
 
     #[test]
@@ -212,7 +256,7 @@ mod tests {
             .execution_provenance
             .insert(3, MutationExecution::IncrementalHistory);
 
-        let lines = annotations(&report);
+        let lines = annotations_with_baseline(&report, None);
 
         assert_eq!(lines.len(), 3);
         assert!(!lines[0].contains("reused"));
@@ -226,16 +270,20 @@ mod tests {
             mutation("src/dead.rs", 7, "op", "desc"),
             MutationResult::Uncovered,
         )]);
-        assert!(annotations(&report).is_empty());
+        assert!(annotations_with_baseline(&report, None).is_empty());
     }
 
     #[test]
     fn annotation_escapes_special_chars_in_path_and_message() {
         let m = mutation("src/odd,name:thing.rs", 10, "op", "msg with %, \r\n chars");
-        let line = format_annotation(&m, MutationExecution::Executed);
+        let line = format_annotation_with_baseline(
+            &m,
+            MutationExecution::Executed,
+            Some(crate::baseline::SurvivorBaselineStatus::Historic),
+        );
         assert_eq!(
             line,
-            "::warning file=src/odd%2Cname%3Athing.rs,line=10::Survived mutation: op (msg with %25, %0D%0A chars)"
+            "::warning file=src/odd%2Cname%3Athing.rs,line=10::Survived mutation: op (msg with %25, %0D%0A chars) [baseline: historic]"
         );
     }
 
