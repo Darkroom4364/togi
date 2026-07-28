@@ -1,12 +1,19 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-args=(
-  check
-  --base "${TOGI_BASE:-origin/main}"
-  --timeout "${TOGI_TIMEOUT:-30}"
-  --format "${TOGI_FORMAT:-terminal}"
-)
+args=(check)
+
+if [[ -n "${TOGI_BASE:-}" ]]; then
+  args+=(--base "$TOGI_BASE")
+fi
+
+if [[ -n "${TOGI_TIMEOUT:-}" ]]; then
+  args+=(--timeout "$TOGI_TIMEOUT")
+fi
+
+if [[ -n "${TOGI_FORMAT:-}" ]]; then
+  args+=(--format "$TOGI_FORMAT")
+fi
 
 if [[ -n "${TOGI_TEST_CMD:-}" ]]; then
   args+=(--test-cmd "$TOGI_TEST_CMD")

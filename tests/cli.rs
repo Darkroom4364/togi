@@ -2923,6 +2923,99 @@ fn assert_action_helper_test_cmd(test_cmd: &str) {
 }
 
 #[test]
+fn github_action_run_helper_omits_flags_for_unset_inputs() {
+    if !bash_available() {
+        eprintln!("skipping action helper test because bash is unavailable");
+        return;
+    }
+
+    let dir = TempDir::new().unwrap();
+    let fake_togi = dir.path().join("fake-togi.sh");
+    fs::write(&fake_togi, "#!/usr/bin/env bash\nprintf '<%s>\\n' \"$@\"\n").unwrap();
+    std::process::Command::new("bash")
+        .args(["-c", "chmod +x \"$1\"", "--"])
+        .arg(&fake_togi)
+        .output()
+        .unwrap();
+
+    let helper = Path::new(env!("CARGO_MANIFEST_DIR")).join(".github/scripts/run-togi.sh");
+    let output = std::process::Command::new("bash")
+        .arg(helper)
+        .env("TOGI_BIN", &fake_togi)
+        .env_remove("TOGI_BASE")
+        .env_remove("TOGI_TIMEOUT")
+        .env_remove("TOGI_FORMAT")
+        .env_remove("TOGI_TEST_CMD")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "helper failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let args: Vec<String> = stdout.lines().map(String::from).collect();
+    assert_eq!(args, vec!["<check>".to_string()]);
+}
+
+#[test]
+fn github_action_inputs_have_no_baked_in_defaults() {
+    let action_yml =
+        fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("action.yml")).unwrap();
+
+    // Split the inputs: mapping into per-input blocks keyed by name.
+    let mut blocks: Vec<(&str, Vec<&str>)> = Vec::new();
+    let mut in_inputs = false;
+    for line in action_yml.lines() {
+        if line == "inputs:" {
+            in_inputs = true;
+            continue;
+        }
+        if in_inputs {
+            if !line.starts_with("  ") {
+                break;
+            }
+            if let Some(name) = line.strip_prefix("  ") {
+                if !name.starts_with(' ') && name.ends_with(':') {
+                    blocks.push((name.trim_end_matches(':'), Vec::new()));
+                    continue;
+                }
+            }
+            if let Some((_, body)) = blocks.last_mut() {
+                body.push(line);
+            }
+        }
+    }
+
+    for name in ["base", "timeout", "format"] {
+        let (_, body) = blocks
+            .iter()
+            .find(|(block, _)| *block == name)
+            .unwrap_or_else(|| panic!("action.yml is missing the `{name}` input"));
+        assert!(
+            !body
+                .iter()
+                .any(|line| line.trim_start().starts_with("default:")),
+            "action.yml input `{name}` must not bake in a default; unset inputs defer to togi.toml"
+        );
+    }
+
+    let (_, version_body) = blocks
+        .iter()
+        .find(|(block, _)| *block == "version")
+        .expect("action.yml is missing the `version` input");
+    assert!(
+        version_body
+            .iter()
+            .any(|line| line.trim() == "default: 'latest'"),
+        "action.yml input `version` must keep its 'latest' default"
+    );
+}
+
+#[test]
 fn github_action_asset_resolver_matches_release_assets() {
     if !bash_available() {
         eprintln!("skipping action asset resolver test because bash is unavailable");
