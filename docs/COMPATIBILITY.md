@@ -76,30 +76,50 @@ This is a best-effort default; projects without a `Makefile` that defines a
 |----|------|------|--------|-------|
 | Linux | x86_64 | Tier 1 | Build & Test, MSRV, Integration Tests, Dogfood | Primary development target. All features including replay are supported. |
 | macOS | arm64 | Tier 2 | Build & Test | Binary compiles and passes unit tests. End-to-end language mutation tests are not run on macOS in CI. |
-| Windows | x86_64 | Tier 2 | Build & Test | Binary compiles and passes unit tests. **Replay is intentionally fail-closed on Windows** — see below. |
+| Windows | x86_64 | Tier 2 | Build & Test | Binary compiles and passes unit tests. **Replay is file-only on Windows when its temp root is a normal path on the Windows system volume; directory overlays stay fail-closed** — see below. |
 
 macOS CI runs on **arm64** (CI's `macos-latest` runners are arm64), which is
 the macOS arm64 Tier 2 row above. **ARM64 (aarch64) on Linux and Windows is not
 covered by CI and is not claimed as supported.** It may work incidentally but
 is not guaranteed.
 
-### Windows replay: fail-closed
+### Windows replay: file-only, directory overlays fail-closed
 
-`togi replay` is intentionally unavailable on Windows. The disposable workspace
-setup requires race-free atomic directory removal, which is not safe under
-`cap-primitives` 4.0.2 on Windows. The runner rejects replay before any
-workspace mutation or command execution:
+`togi replay` supports **file-only replay** on Windows. Disposable-workspace
+population, overlay application, guarded mutation, and restoration run through
+capability-bounded, no-follow filesystem operations beneath pinned parent
+directory handles. Source validation is path-based; Git clone/checkout and user
+commands use the pinned workspace path, whose system-volume, temp-root, outer,
+and clone components remain held. File and symlink overlay removals are
+supported; junction leaves and mid-path components are removed as reparse points
+and never traversed, so outside-target contents stay intact.
+
+Replay accepts a temp root only when it is a normal absolute `X:\...` path on
+the Windows system volume. UNC, verbatim, mapped, and `SUBST` drive roots fail
+closed before temporary-workspace or Git setup. This assumes a normal
+non-administrator process: the shared Windows system-volume boot-drive mapping
+is the OS-owned anchor. Administrator, LocalSystem, and mount-manager control
+are outside this replay path's threat boundary.
+
+Any overlay that would require removing a directory — a directory leaf
+removal, a directory↔file type change, or a removal whose source ancestor is
+missing or non-directory — remains **fail-closed before any mutation or test
+command spawns**. Race-free directory removal is unavailable under
+`cap-primitives` 4.0.2 on Windows (it drops the directory handle, then
+path-deletes), so replay aborts workspace setup with a diagnostic naming the
+requirement:
 
 ```text
-replay is unavailable on Windows: safe disposable workspace setup requires
-race-free directory removal
+replay cannot remove directory <name> on Windows: safe disposable workspace
+setup requires race-free directory removal; only file and symlink overlay
+removals are supported
 ```
 
-This is tracked in [#449](https://github.com/Darkroom4364/togi/issues/449)
-(Windows file-only replay). Beyond replay, the Windows guarantee is the Tier 2
-scope in the matrix above: the binary compiles and the non-ignored unit test
-suite passes in the Build & Test `windows-latest` leg; end-to-end mutation
-runs are not exercised on Windows in CI.
+Implemented in [#449](https://github.com/Darkroom4364/togi/issues/449).
+Beyond replay, the Windows guarantee is the Tier 2 scope in the matrix above:
+the binary compiles and the non-ignored unit test suite passes in the
+Build & Test `windows-latest` leg; the end-to-end language mutation fixtures
+(Integration Tests leg) are not exercised on Windows in CI.
 
 ### CI evidence
 

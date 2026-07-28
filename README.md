@@ -486,10 +486,12 @@ mapped to an actual CI leg.
 
 Building on the **Rust 1.87** MSRV, togi compiles and passes its non-ignored
 unit test suite in CI on Linux (x86_64), macOS (arm64), and Windows (x86_64);
-end-to-end mutation testing is exercised on Linux only. `togi replay` is
-intentionally fail-closed on
-Windows ([#449](https://github.com/Darkroom4364/togi/issues/449)); see the
-compatibility contract linked above for the exact per-platform guarantee tiers.
+end-to-end mutation testing is exercised on Linux only. `togi replay` supports
+file-only replay on Windows when its temp root is a normal path on the Windows
+system volume; mapped, `SUBST`, UNC, and verbatim roots fail closed before any
+test command runs ([#449](https://github.com/Darkroom4364/togi/issues/449)).
+See the compatibility contract linked above for the exact per-platform
+guarantee tiers.
 
 Adding a language is ~5-10 lines via the `define_language!` macro.
 
@@ -564,8 +566,9 @@ trusted reports: report commands are not sandboxed by togi. Its no-residue
 guarantee applies only to Togi-owned workspace, cache, history, and lock
 operations; report commands remain responsible for their own behavior.
 
-Replay is unavailable on Windows until its disposable-workspace setup can
-guarantee race-free directory removal
+On Windows, replay is file-only: any overlay that would require removing a
+directory fails closed before any mutation or test command spawns, because
+race-free directory removal is unavailable there
 ([#449](https://github.com/Darkroom4364/togi/issues/449)).
 
 Workspace copies, timeouts, descendant-process cleanup, and the optional
