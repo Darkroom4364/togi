@@ -627,6 +627,38 @@ jobs:
       - run: togi check --base origin/main --format github --fail-under 80
 ```
 
+### GitHub Action
+
+The composite Action (`Darkroom4364/togi`) wraps the install-and-run steps
+above. Use it when your project already has a `togi.toml`:
+
+```yaml
+- uses: Darkroom4364/togi@<version>
+```
+
+The Action passes `--base`, `--timeout`, and `--format` to togi **only when
+you supply a non-empty value for the corresponding input**. If you omit them,
+the flags are not passed to the CLI. Omitted `base` and `timeout` then defer
+to your repository `togi.toml` — respecting `[diff].base` and `[test].timeout`
+(including per-language and per-project overrides). Output format is CLI-only:
+`togi.toml` has no format setting, so an omitted `format` falls back to the
+CLI default `terminal`, while a non-empty `format` explicitly selects the CLI
+output format.
+
+Explicitly supplied values still take precedence over `togi.toml` (standard
+CLI-override semantics):
+
+```yaml
+- uses: Darkroom4364/togi@<version>
+  with:
+    base: origin/develop
+    timeout: '120'
+    format: json
+```
+
+The `test-cmd` input has always followed this pattern and is unchanged.
+The `version` input and its `latest` default are also unchanged.
+
 ## Code scanning (SARIF)
 
 `togi check --format sarif` emits a [SARIF 2.1.0](https://docs.github.com/en/code-security/code-scanning/integrating-with-code-scanning/sarif-support-for-code-scanning) report: one result per surviving mutant with its file and line, plus the mutation score in the run's invocation properties. Upload it to GitHub code scanning to see surviving mutants as annotations on the PR diff:

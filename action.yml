@@ -8,18 +8,15 @@ inputs:
   base:
     description: 'Base branch to diff against'
     required: false
-    default: 'origin/main'
   timeout:
     description: 'Per-mutation timeout in seconds'
     required: false
-    default: '30'
   test-cmd:
     description: 'Test command override'
     required: false
   format:
     description: 'Output format (terminal, json, github, html, or sarif)'
     required: false
-    default: 'terminal'
   version:
     description: 'togi version to use'
     required: false
