@@ -479,6 +479,18 @@ Run it yourself: `cargo test -- --ignored` (requires Go).
 | Ruby | `.rb` |
 | C# | `.cs` |
 
+See [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md) for the authoritative compatibility
+contract: guarantee tiers, OS/architecture support, auto-detected test runners, MSRV
+policy, JSON report schema stability, and CLI stability guarantees — every tier
+mapped to an actual CI leg.
+
+Building on the **Rust 1.87** MSRV, togi compiles and passes its non-ignored
+unit test suite in CI on Linux (x86_64), macOS (arm64), and Windows (x86_64);
+end-to-end mutation testing is exercised on Linux only. `togi replay` is
+intentionally fail-closed on
+Windows ([#449](https://github.com/Darkroom4364/togi/issues/449)); see the
+compatibility contract linked above for the exact per-platform guarantee tiers.
+
 Adding a language is ~5-10 lines via the `define_language!` macro.
 
 ## Mutation operators
@@ -553,7 +565,8 @@ guarantee applies only to Togi-owned workspace, cache, history, and lock
 operations; report commands remain responsible for their own behavior.
 
 Replay is unavailable on Windows until its disposable-workspace setup can
-guarantee race-free directory removal.
+guarantee race-free directory removal
+([#449](https://github.com/Darkroom4364/togi/issues/449)).
 
 Workspace copies, timeouts, descendant-process cleanup, and the optional
 `[test] sandbox_command` wrapper improve correctness and reduce exposure, but
@@ -584,8 +597,9 @@ reporting instructions.
 | Code | Meaning |
 |------|---------|
 | 0 | All mutations killed — tests are solid |
-| 1 | Some mutations survived — test gaps found |
+| 1 | Survivors found, `--fail-under` threshold not met, or baseline regression |
 | 2 | Error (config, git, parse failure) |
+| 130 | Interrupted (SIGINT) |
 
 ## CI Integration
 
