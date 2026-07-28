@@ -574,9 +574,10 @@ fn current_project_root() -> anyhow::Result<PathBuf> {
         .context("Git project root was not UTF-8")?
         .trim()
         .to_owned();
-    PathBuf::from(path)
-        .canonicalize()
-        .context("could not canonicalize current Git project root")
+    // Keep Git's own path form: canonicalize() would produce a verbatim
+    // `\\?\`-prefixed path on Windows that `git clone` misclassifies as a
+    // remote. Validation canonicalizes internally where identity matters.
+    Ok(PathBuf::from(path))
 }
 
 fn validate_project_and_source(

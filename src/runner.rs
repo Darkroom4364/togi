@@ -737,6 +737,8 @@ impl GitWorktreeOverlay {
         source_root: &CapDir,
         workspace: &ReplayWorkspace,
     ) -> std::io::Result<()> {
+        #[cfg(windows)]
+        ensure_replay_removals_need_no_directory(source_root, &self.remove_paths)?;
         for relative in &self.remove_paths {
             workspace.remove_relative(relative)?;
         }
@@ -769,20 +771,270 @@ impl WorkspaceCopy {
     }
 }
 
+#[cfg(windows)]
+fn windows_normal_disk_root_letter(path: &Path) -> Option<u8> {
+    use std::os::windows::ffi::OsStrExt;
+
+    let mut units = path.as_os_str().encode_wide();
+    let letter = u8::try_from(units.next()?).ok()?;
+    if !letter.is_ascii_alphabetic()
+        || units.next()? != u16::from(b':')
+        || units.next()? != u16::from(b'\\')
+        || units.next().is_some()
+    {
+        return None;
+    }
+    Some(letter)
+}
+
+/// Return the normal drive root containing the Windows system directory.
+///
+/// The system directory is the trusted OS-owned reference for replay's only
+/// allowed temp volume. Keeping the unsafe calls here prevents a user-defined
+/// DOS device such as `subst X:` from becoming a replay workspace root.
+#[cfg(windows)]
+fn windows_system_volume_root() -> std::io::Result<(PathBuf, u8)> {
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    use windows_sys::Win32::Storage::FileSystem::GetVolumePathNameW;
+    use windows_sys::Win32::System::SystemInformation::GetSystemWindowsDirectoryW;
+
+    let mut directory_buffer = vec![0u16; 260];
+    let system_directory = loop {
+        let capacity = u32::try_from(directory_buffer.len())
+            .map_err(|_| std::io::Error::other("Windows system directory path is too long"))?;
+        // SAFETY: the initialized buffer is writable for `capacity` UTF-16
+        // code units; the API writes at most that many and returns its length.
+        let length = unsafe { GetSystemWindowsDirectoryW(directory_buffer.as_mut_ptr(), capacity) };
+        if length == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let length = length as usize;
+        if length < directory_buffer.len() {
+            break PathBuf::from(OsString::from_wide(&directory_buffer[..length]));
+        }
+        let next_capacity = length
+            .checked_add(1)
+            .ok_or_else(|| std::io::Error::other("Windows system directory path is too long"))?
+            .max(directory_buffer.len().saturating_mul(2));
+        directory_buffer.resize(next_capacity, 0);
+    };
+
+    let mut system_directory_wide: Vec<u16> = system_directory.as_os_str().encode_wide().collect();
+    system_directory_wide.push(0);
+    let mut volume_buffer = vec![0u16; 260];
+    let volume_root = loop {
+        let capacity = u32::try_from(volume_buffer.len())
+            .map_err(|_| std::io::Error::other("Windows volume path is too long"))?;
+        // SAFETY: the input is NUL-terminated and both initialized UTF-16
+        // buffers remain live for the call. The output capacity is supplied
+        // exactly in UTF-16 code units.
+        let success = unsafe {
+            GetVolumePathNameW(
+                system_directory_wide.as_ptr(),
+                volume_buffer.as_mut_ptr(),
+                capacity,
+            )
+        };
+        if success != 0 {
+            let length = volume_buffer
+                .iter()
+                .position(|unit| *unit == 0)
+                .ok_or_else(|| std::io::Error::other("Windows volume path was not terminated"))?;
+            break PathBuf::from(OsString::from_wide(&volume_buffer[..length]));
+        }
+        let error = std::io::Error::last_os_error();
+        if volume_buffer.len() >= 32_768 {
+            return Err(error);
+        }
+        volume_buffer.resize((volume_buffer.len() * 2).min(32_768), 0);
+    };
+
+    let Some(drive) = windows_normal_disk_root_letter(&volume_root) else {
+        return Err(std::io::Error::other(format!(
+            "Windows system volume {} is not a normal local drive root",
+            volume_root.display()
+        )));
+    };
+    Ok((volume_root, drive))
+}
+
+/// Owner of replay's trusted temp root: the validated lexical path plus a
+/// pinned handle chain stabilizing it on Windows.
+///
+/// On Windows the lexical path handed to Git and `current_dir` must resolve
+/// identically for the whole replay, so `pin` accepts only an absolute normal
+/// disk path on the Windows system volume. It opens that volume root as the
+/// explicit ambient trust anchor, then traverses every normal component with
+/// `open_dir_nofollow`, retaining each handle. Any reparse point inside the
+/// configured temp root is rejected fail-closed, and no component can be
+/// renamed while held. On other platforms a single ambient open preserves the
+/// established behavior.
+struct ReplayTempRoot {
+    lexical: PathBuf,
+    root: CapDir,
+    _ancestors: Vec<CapDir>,
+}
+
+impl ReplayTempRoot {
+    #[cfg(windows)]
+    fn pin(path: &Path) -> std::io::Result<Self> {
+        let mut components = path.components();
+        let drive = match components.next() {
+            Some(std::path::Component::Prefix(prefix)) => match prefix.kind() {
+                std::path::Prefix::Disk(letter) => letter,
+                _ => {
+                    return Err(std::io::Error::other(format!(
+                        "replay temp root {} is not an absolute local disk path",
+                        path.display()
+                    )));
+                }
+            },
+            _ => {
+                return Err(std::io::Error::other(format!(
+                    "replay temp root {} is not an absolute local disk path",
+                    path.display()
+                )));
+            }
+        };
+        if !matches!(components.next(), Some(std::path::Component::RootDir)) {
+            return Err(std::io::Error::other(format!(
+                "replay temp root {} is not an absolute local disk path",
+                path.display()
+            )));
+        }
+        let mut parts = Vec::new();
+        for component in components {
+            let std::path::Component::Normal(part) = component else {
+                return Err(std::io::Error::other(format!(
+                    "replay temp root {} contains a non-normal path component",
+                    path.display()
+                )));
+            };
+            parts.push(part.to_os_string());
+        }
+
+        let (system_root, system_drive) = windows_system_volume_root()?;
+        if !drive.eq_ignore_ascii_case(&system_drive) {
+            return Err(std::io::Error::other(format!(
+                "replay temp root {} is not on the Windows system volume {}",
+                path.display(),
+                system_root.display()
+            )));
+        }
+
+        let mut current = CapDir::open_ambient_dir(&system_root, ambient_authority())?;
+        let mut ancestors = Vec::new();
+        for part in parts {
+            let next = current.open_dir_nofollow(Path::new(&part))?;
+            ancestors.push(current);
+            current = next;
+        }
+        Ok(Self {
+            lexical: path.to_path_buf(),
+            root: current,
+            _ancestors: ancestors,
+        })
+    }
+
+    #[cfg(not(windows))]
+    fn pin(path: &Path) -> std::io::Result<Self> {
+        let root = CapDir::open_ambient_dir(path, ambient_authority())?;
+        Ok(Self {
+            lexical: path.to_path_buf(),
+            root,
+            _ancestors: Vec::new(),
+        })
+    }
+}
+
 /// Replay's capability-bounded view of its disposable clone.
 ///
-/// `root` deliberately precedes `workspace` so its capability handle is
-/// dropped before the `WorkspaceCopy` closes its TempDir, which matters on
-/// Windows.
+/// `root` (the clone) and `_outer` (its TempDir ancestor) are held without
+/// `FILE_SHARE_DELETE` on Windows, and `_temp_root` retains the pinned
+/// temp-root chain, so no lexical path component can be renamed or rebound
+/// while path-based Git and build/test subprocesses use `workspace.root()`.
+/// Fields deliberately drop `root` first, then `_outer`, then `workspace`
+/// runs TempDir cleanup while the chain is still held, and `_temp_root` last.
+/// std's Windows `remove_dir_all` deletes handle-relative with no-reparse
+/// opens (the CVE-2022-21658 fix), so normal TempDir cleanup never traverses
+/// a junction swapped into the clone.
 struct ReplayWorkspace {
     root: CapDir,
+    _outer: CapDir,
     workspace: WorkspaceCopy,
+    _temp_root: ReplayTempRoot,
 }
 
 impl ReplayWorkspace {
+    /// Test construction: open an already-populated workspace root, retaining
+    /// the same parent-first/no-follow hierarchy as the production clone
+    /// target: pin the temp-root chain (on Windows every lexical component
+    /// beneath the drive anchor), then open the outer and root leaves
+    /// no-follow through their held parents.
+    #[cfg(test)]
     fn open(workspace: WorkspaceCopy) -> std::io::Result<Self> {
-        let root = CapDir::open_ambient_dir(workspace.root(), ambient_authority())?;
-        Ok(Self { root, workspace })
+        let outer_path = workspace
+            .root()
+            .parent()
+            .ok_or_else(|| std::io::Error::other("replay workspace root has no parent"))?;
+        let root_leaf = workspace
+            .root()
+            .file_name()
+            .ok_or_else(|| std::io::Error::other("replay workspace root has no leaf name"))?;
+        let temp_root_path = outer_path
+            .parent()
+            .ok_or_else(|| std::io::Error::other("replay workspace parent has no parent"))?;
+        let outer_leaf = outer_path
+            .file_name()
+            .ok_or_else(|| std::io::Error::other("replay workspace parent has no leaf name"))?;
+        let temp_root = ReplayTempRoot::pin(temp_root_path)?;
+        let outer = temp_root.root.open_dir_nofollow(Path::new(outer_leaf))?;
+        let root = outer.open_dir_nofollow(Path::new(root_leaf))?;
+        Ok(Self {
+            root,
+            _outer: outer,
+            workspace,
+            _temp_root: temp_root,
+        })
+    }
+
+    /// Production clone target under the ambient temp root.
+    fn create_clone_target() -> std::io::Result<Self> {
+        Self::create_clone_target_in(&std::env::temp_dir())
+    }
+
+    /// Pin the trusted temp-root chain, create the randomized outer TempDir
+    /// beneath the validated lexical root, then re-open the outer basename
+    /// no-follow through the pinned root before Git sees any pathname — a
+    /// junction swapped in between creation and open fails closed here,
+    /// before any Git spawn. The empty `workspace` child is then created and
+    /// pinned the same way, with no retry accepting an existing child. An
+    /// ordinary directory replacing the outer in that same window stays
+    /// inside the trusted temp root; only reparse-point substitution is
+    /// detected and rejected.
+    fn create_clone_target_in(temp_root_path: &Path) -> std::io::Result<Self> {
+        let temp_root = ReplayTempRoot::pin(temp_root_path)?;
+        run_replay_temp_root_ready_hook();
+        let tempdir = tempfile::Builder::new().tempdir_in(&temp_root.lexical)?;
+        run_replay_outer_created_hook(tempdir.path());
+        let outer_leaf = tempdir
+            .path()
+            .file_name()
+            .ok_or_else(|| std::io::Error::other("replay tempdir has no leaf name"))?;
+        let outer = temp_root.root.open_dir_nofollow(Path::new(outer_leaf))?;
+        outer.create_dir(Path::new("workspace"))?;
+        let root = outer.open_dir_nofollow(Path::new("workspace"))?;
+        let root_path = tempdir.path().join("workspace");
+        Ok(Self {
+            root,
+            _outer: outer,
+            workspace: WorkspaceCopy {
+                _tempdir: tempdir,
+                root: root_path,
+                reset_strategy: WorkspaceResetStrategy::Copy,
+            },
+            _temp_root: temp_root,
+        })
     }
 
     /// This path is only for external Git and user-command working directories.
@@ -872,6 +1124,16 @@ impl ReplayWorkspace {
         }
 
         let (destination_parent, destination_leaf) = ensure_cap_parent(&self.root, relative)?;
+        #[cfg(windows)]
+        if let Ok(metadata) = destination_parent.symlink_metadata(&destination_leaf) {
+            // A dir→file type-change needs directory removal, which stays
+            // fail-closed on Windows; name the requirement before staging.
+            if metadata.file_type().is_dir() {
+                return Err(replay_windows_directory_removal_error(Path::new(
+                    &destination_leaf,
+                )));
+            }
+        }
         let mut staged = TempFile::new(&destination_parent)?;
         std::io::copy(&mut source_file, staged.as_file_mut())?;
         staged.as_file_mut().flush()?;
@@ -919,9 +1181,7 @@ fn remove_cap_entry(parent: &CapDir, name: &OsString) -> std::io::Result<()> {
         Ok(metadata) if metadata.file_type().is_dir() => {
             #[cfg(windows)]
             {
-                Err(std::io::Error::other(
-                    "replay cannot safely remove a directory on Windows",
-                ))
+                Err(replay_windows_directory_removal_error(Path::new(name)))
             }
             #[cfg(not(windows))]
             {
@@ -933,6 +1193,49 @@ fn remove_cap_entry(parent: &CapDir, name: &OsString) -> std::io::Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error),
     }
+}
+
+/// Windows cannot yet remove a directory beneath a held capability without a
+/// path-based race (cap-primitives 4.0.2 drops the handle, then path-deletes).
+/// Fail closed with a diagnostic naming the requirement; only file and
+/// symlink overlay removals are supported there.
+#[cfg(windows)]
+fn replay_windows_directory_removal_error(name: &Path) -> std::io::Error {
+    std::io::Error::other(format!(
+        "replay cannot remove directory {} on Windows: safe disposable workspace setup requires race-free directory removal; only file and symlink overlay removals are supported",
+        name.display()
+    ))
+}
+
+/// Windows: removing a tracked leaf whose source ancestor disappeared or
+/// became a non-directory would leave a stale directory behind in the clone,
+/// so faithful replay requires removing that directory. Detect this through
+/// no-follow capability lookups before applying any removals and fail closed
+/// with the directory-removal diagnostic, before any mutation/test spawn.
+#[cfg(windows)]
+fn ensure_replay_removals_need_no_directory(
+    source_root: &CapDir,
+    remove_paths: &[PathBuf],
+) -> std::io::Result<()> {
+    for relative in remove_paths {
+        let (parents, _leaf) = split_replay_relative_path(relative)?;
+        let mut current = source_root.try_clone()?;
+        let mut ancestor = PathBuf::new();
+        for component in parents {
+            ancestor.push(&component);
+            match current.symlink_metadata(&component) {
+                Ok(metadata) if metadata.file_type().is_dir() => {
+                    current = current.open_dir_nofollow(&component)?;
+                }
+                Ok(_) => return Err(replay_windows_directory_removal_error(&ancestor)),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(replay_windows_directory_removal_error(&ancestor));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    Ok(())
 }
 
 fn ensure_cap_directory_child(parent: &CapDir, name: &OsString) -> std::io::Result<CapDir> {
@@ -1016,6 +1319,51 @@ fn set_replay_publish_hook(hook: Option<Box<dyn FnOnce()>>) {
 fn run_replay_publish_hook() {
     #[cfg(test)]
     REPLAY_PUBLISH_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook();
+        }
+    });
+}
+
+#[cfg(test)]
+type ReplayOuterCreatedHook = Box<dyn FnOnce(&Path)>;
+
+#[cfg(test)]
+thread_local! {
+    static REPLAY_OUTER_CREATED_HOOK: std::cell::RefCell<Option<ReplayOuterCreatedHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn set_replay_outer_created_hook(hook: Option<ReplayOuterCreatedHook>) {
+    REPLAY_OUTER_CREATED_HOOK.with(|slot| *slot.borrow_mut() = hook);
+}
+
+fn run_replay_outer_created_hook(outer: &Path) {
+    #[cfg(test)]
+    REPLAY_OUTER_CREATED_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook(outer);
+        }
+    });
+    #[cfg(not(test))]
+    let _ = outer;
+}
+
+#[cfg(test)]
+thread_local! {
+    static REPLAY_TEMP_ROOT_READY_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(all(test, windows))]
+fn set_replay_temp_root_ready_hook(hook: Option<Box<dyn FnOnce()>>) {
+    REPLAY_TEMP_ROOT_READY_HOOK.with(|slot| *slot.borrow_mut() = hook);
+}
+
+fn run_replay_temp_root_ready_hook() {
+    #[cfg(test)]
+    REPLAY_TEMP_ROOT_READY_HOOK.with(|slot| {
         if let Some(hook) = slot.borrow_mut().take() {
             hook();
         }
@@ -1636,16 +1984,14 @@ fn copy_workspace_for_replay(
     expected_source_revision: &str,
     respect_ignores: bool,
 ) -> std::io::Result<ReplayWorkspace> {
+    // Pin the trusted temp root and create the outer TempDir and empty clone
+    // child through no-follow capabilities before any Git subprocess, so the
+    // path Git and later build/test commands use cannot be rebound on
+    // Windows.
+    let workspace = ReplayWorkspace::create_clone_target()?;
     ensure_replay_snapshot_revision(project_root, expected_source_revision)?;
-    let tempdir = tempfile::tempdir()?;
-    let root = tempdir.path().join("workspace");
-    clone_replay_snapshot(project_root, &root, expected_source_revision)?;
+    clone_replay_snapshot(project_root, workspace.root(), expected_source_revision)?;
 
-    let workspace = ReplayWorkspace::open(WorkspaceCopy {
-        _tempdir: tempdir,
-        root,
-        reset_strategy: WorkspaceResetStrategy::Copy,
-    })?;
     let source_root = CapDir::open_ambient_dir(project_root, ambient_authority())?;
     ensure_replay_snapshot_revision(project_root, expected_source_revision)?;
     let overlay = collect_replay_git_worktree_overlay(project_root)?;
@@ -4972,14 +5318,11 @@ pub fn run_replay_mutation(
     mutation: &Mutation,
     config: ReplayRunConfig<'_>,
 ) -> anyhow::Result<ReplayRunOutcome> {
-    // cap-primitives 4.0.2 cannot atomically remove an opened directory on
-    // Windows. Reject before clone setup rather than risk a path-based
-    // directory-replacement window in replay's mutable workspace.
-    #[cfg(windows)]
-    anyhow::bail!(
-        "replay is unavailable on Windows: safe disposable workspace setup requires race-free directory removal"
-    );
-
+    // File-only replay is Windows-safe: clone, populate, validation, and the
+    // staged-rename mutation publish are all capability-bounded beneath pinned
+    // parent handles. cap-primitives 4.0.2 cannot atomically remove an opened
+    // directory on Windows, so `remove_cap_entry` fails closed on directory
+    // removals during workspace setup, before any mutation/test command spawns.
     let workspace = copy_workspace_for_replay(
         project_root,
         config.source_revision,
@@ -5816,6 +6159,67 @@ mod tests {
     use super::*;
     use crate::Mutation;
 
+    #[cfg(windows)]
+    struct SubstDrive {
+        name: String,
+    }
+
+    #[cfg(windows)]
+    impl SubstDrive {
+        fn allocate(target: &Path, system_drive: u8) -> std::io::Result<Self> {
+            for letter in (b'A'..=b'Z').rev() {
+                if letter.eq_ignore_ascii_case(&system_drive) {
+                    continue;
+                }
+                let name = format!("{}:", char::from(letter));
+                let output = std::process::Command::new("subst")
+                    .arg(&name)
+                    .arg(target)
+                    .output()?;
+                if output.status.success() {
+                    return Ok(Self { name });
+                }
+            }
+            Err(std::io::Error::other(
+                "could not allocate a free non-system drive with subst",
+            ))
+        }
+
+        fn root(&self) -> PathBuf {
+            PathBuf::from(format!("{}\\", self.name))
+        }
+    }
+
+    #[cfg(windows)]
+    impl Drop for SubstDrive {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("subst")
+                .arg(&self.name)
+                .arg("/D")
+                .output();
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_normal_disk_root_rejects_non_normal_roots() {
+        assert_eq!(
+            windows_normal_disk_root_letter(Path::new(r"C:\")),
+            Some(b'C')
+        );
+        assert_eq!(
+            windows_normal_disk_root_letter(Path::new(r"c:\")),
+            Some(b'c')
+        );
+        assert_eq!(windows_normal_disk_root_letter(Path::new(r"C:\\")), None);
+        assert_eq!(windows_normal_disk_root_letter(Path::new(r"C:\temp")), None);
+        assert_eq!(
+            windows_normal_disk_root_letter(Path::new(r"\\server\share")),
+            None
+        );
+        assert_eq!(windows_normal_disk_root_letter(Path::new(r"\\?\C:\")), None);
+    }
+
     fn successful_command() -> Vec<String> {
         #[cfg(windows)]
         {
@@ -5835,6 +6239,35 @@ mod tests {
         #[cfg(not(windows))]
         {
             vec!["sh".into(), "-c".into(), "false".into()]
+        }
+    }
+
+    /// Append the exact bytes `invoked` to a log file so tests can prove a
+    /// command spawned (or did not) across platforms.
+    fn appending_log_command(log_path: &Path) -> Vec<String> {
+        #[cfg(windows)]
+        {
+            vec![
+                "powershell".into(),
+                "-NoProfile".into(),
+                "-Command".into(),
+                format!(
+                    "[System.IO.File]::AppendAllText('{}', 'invoked')",
+                    // PowerShell single-quoted literals escape an apostrophe
+                    // by doubling it.
+                    log_path.display().to_string().replace('\'', "''")
+                ),
+            ]
+        }
+        #[cfg(not(windows))]
+        {
+            vec![
+                "sh".into(),
+                "-c".into(),
+                "printf invoked >> \"$1\"".into(),
+                "replay".into(),
+                log_path.display().to_string(),
+            ]
         }
     }
 
@@ -6063,30 +6496,587 @@ mod tests {
     }
 
     #[cfg(windows)]
+    fn create_junction(link: &Path, target: &Path) {
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .status()
+            .expect("failed to spawn mklink /J");
+        assert!(status.success(), "mklink /J failed for {}", link.display());
+    }
+
+    #[cfg(windows)]
+    fn windows_replay_workspace(tempdir: tempfile::TempDir) -> std::io::Result<ReplayWorkspace> {
+        let root = tempdir.path().to_path_buf();
+        ReplayWorkspace::open(WorkspaceCopy {
+            _tempdir: tempdir,
+            root,
+            reset_strategy: WorkspaceResetStrategy::Copy,
+        })
+    }
+
+    #[cfg(windows)]
     #[test]
-    fn replay_is_rejected_on_windows_before_workspace_setup() {
+    fn replay_windows_directory_overlay_removal_fails_closed_before_spawning() -> anyhow::Result<()>
+    {
+        if !git_available() {
+            return Ok(());
+        }
         let (dir, file, mutation) = make_relative_test_setup();
+        run_git(dir.path(), &["init"]);
+        run_git(dir.path(), &["config", "user.email", "test@example.com"]);
+        run_git(dir.path(), &["config", "user.name", "Togi Test"]);
+        // A committed excluded directory forces a directory removal while
+        // sanitizing the clone.
+        std::fs::create_dir_all(dir.path().join("target"))?;
+        std::fs::write(dir.path().join("target/artifact.bin"), b"pinned")?;
+        run_git(dir.path(), &["add", "."]);
+        run_git(dir.path(), &["commit", "-m", "initial"]);
+        let source_revision = git_snapshot_revision(dir.path())?;
+        let expected_source_fingerprint = source_fingerprint(&std::fs::read(&file)?);
+
+        let log_dir = tempfile::tempdir()?;
+        let log_path = log_dir.path().join("replay.log");
         let cancelled = AtomicBool::new(false);
         let error = run_replay_mutation(
             dir.path(),
             &mutation,
             ReplayRunConfig {
-                test_command: successful_command(),
+                test_command: appending_log_command(&log_path),
                 build_command: None,
-                timeout: Duration::from_secs(1),
+                timeout: Duration::from_secs(30),
                 env: HashMap::new(),
                 respect_workspace_ignores: true,
-                source_revision: "expected",
-                source_fingerprint: "sha256:expected",
+                source_revision: &source_revision,
+                source_fingerprint: &expected_source_fingerprint,
                 show_output: false,
                 cancelled: &cancelled,
             },
         )
         .unwrap_err();
-        assert!(error.to_string().contains("unavailable on Windows"));
-        assert_eq!(std::fs::read(file).unwrap(), b"hello world");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("race-free directory removal"),
+            "diagnostic must name the directory-removal requirement: {message}"
+        );
+        assert!(
+            !log_path.exists(),
+            "directory removal must fail before any command spawn"
+        );
+        assert_eq!(std::fs::read(&file)?, b"hello world");
+        Ok(())
     }
-    #[cfg(not(windows))]
+
+    #[cfg(windows)]
+    #[test]
+    fn replay_windows_dir_to_file_type_change_fails_closed_before_spawning() -> anyhow::Result<()> {
+        if !git_available() {
+            return Ok(());
+        }
+        let (dir, file, mutation) = make_relative_test_setup();
+        run_git(dir.path(), &["init"]);
+        run_git(dir.path(), &["config", "user.email", "test@example.com"]);
+        run_git(dir.path(), &["config", "user.name", "Togi Test"]);
+        std::fs::create_dir_all(dir.path().join("slot"))?;
+        std::fs::write(dir.path().join("slot/nested.txt"), b"nested")?;
+        run_git(dir.path(), &["add", "."]);
+        run_git(dir.path(), &["commit", "-m", "initial"]);
+        let source_revision = git_snapshot_revision(dir.path())?;
+        let expected_source_fingerprint = source_fingerprint(&std::fs::read(&file)?);
+        // Working tree replaces the tracked directory with a regular file.
+        std::fs::remove_dir_all(dir.path().join("slot"))?;
+        std::fs::write(dir.path().join("slot"), b"file")?;
+
+        let log_dir = tempfile::tempdir()?;
+        let log_path = log_dir.path().join("replay.log");
+        let cancelled = AtomicBool::new(false);
+        let error = run_replay_mutation(
+            dir.path(),
+            &mutation,
+            ReplayRunConfig {
+                test_command: appending_log_command(&log_path),
+                build_command: None,
+                timeout: Duration::from_secs(30),
+                env: HashMap::new(),
+                respect_workspace_ignores: true,
+                source_revision: &source_revision,
+                source_fingerprint: &expected_source_fingerprint,
+                show_output: false,
+                cancelled: &cancelled,
+            },
+        )
+        .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("race-free directory removal"),
+            "diagnostic must name the directory-removal requirement: {message}"
+        );
+        assert!(
+            !log_path.exists(),
+            "type-change must fail before any command spawn"
+        );
+        assert_eq!(std::fs::read(&file)?, b"hello world");
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn replay_windows_deleted_tracked_directory_fails_closed_before_spawning() -> anyhow::Result<()>
+    {
+        if !git_available() {
+            return Ok(());
+        }
+        let (dir, file, mutation) = make_relative_test_setup();
+        run_git(dir.path(), &["init"]);
+        run_git(dir.path(), &["config", "user.email", "test@example.com"]);
+        run_git(dir.path(), &["config", "user.name", "Togi Test"]);
+        std::fs::create_dir_all(dir.path().join("gone"))?;
+        std::fs::write(dir.path().join("gone/file.txt"), b"nested")?;
+        run_git(dir.path(), &["add", "."]);
+        run_git(dir.path(), &["commit", "-m", "initial"]);
+        let source_revision = git_snapshot_revision(dir.path())?;
+        let expected_source_fingerprint = source_fingerprint(&std::fs::read(&file)?);
+        // Source deletes the whole tracked directory; the overlay only names
+        // the tracked leaf, so faithful replay would require removing the
+        // stale clone directory.
+        std::fs::remove_dir_all(dir.path().join("gone"))?;
+
+        let log_dir = tempfile::tempdir()?;
+        let log_path = log_dir.path().join("replay.log");
+        let cancelled = AtomicBool::new(false);
+        let error = run_replay_mutation(
+            dir.path(),
+            &mutation,
+            ReplayRunConfig {
+                test_command: appending_log_command(&log_path),
+                build_command: None,
+                timeout: Duration::from_secs(30),
+                env: HashMap::new(),
+                respect_workspace_ignores: true,
+                source_revision: &source_revision,
+                source_fingerprint: &expected_source_fingerprint,
+                show_output: false,
+                cancelled: &cancelled,
+            },
+        )
+        .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("race-free directory removal"),
+            "diagnostic must name the directory-removal requirement: {message}"
+        );
+        assert!(
+            message.contains("gone"),
+            "diagnostic must name the stale directory: {message}"
+        );
+        assert!(
+            !log_path.exists(),
+            "stale directory removal must fail before any command spawn"
+        );
+        assert_eq!(std::fs::read(&file)?, b"hello world");
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn replay_windows_file_to_dir_type_change_fails_closed_before_spawning() -> anyhow::Result<()> {
+        if !git_available() {
+            return Ok(());
+        }
+        let (dir, file, mutation) = make_relative_test_setup();
+        run_git(dir.path(), &["init"]);
+        run_git(dir.path(), &["config", "user.email", "test@example.com"]);
+        run_git(dir.path(), &["config", "user.name", "Togi Test"]);
+        std::fs::write(dir.path().join("slot"), b"tracked file")?;
+        run_git(dir.path(), &["add", "."]);
+        run_git(dir.path(), &["commit", "-m", "initial"]);
+        let source_revision = git_snapshot_revision(dir.path())?;
+        let expected_source_fingerprint = source_fingerprint(&std::fs::read(&file)?);
+        // Source replaces the tracked file with a directory; mirroring it
+        // would require removing the clone-side directory after populate.
+        std::fs::remove_file(dir.path().join("slot"))?;
+        std::fs::create_dir(dir.path().join("slot"))?;
+        std::fs::write(dir.path().join("slot/new.rs"), b"new")?;
+
+        let log_dir = tempfile::tempdir()?;
+        let log_path = log_dir.path().join("replay.log");
+        let cancelled = AtomicBool::new(false);
+        let error = run_replay_mutation(
+            dir.path(),
+            &mutation,
+            ReplayRunConfig {
+                test_command: appending_log_command(&log_path),
+                build_command: None,
+                timeout: Duration::from_secs(30),
+                env: HashMap::new(),
+                respect_workspace_ignores: true,
+                source_revision: &source_revision,
+                source_fingerprint: &expected_source_fingerprint,
+                show_output: false,
+                cancelled: &cancelled,
+            },
+        )
+        .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("race-free directory removal"),
+            "diagnostic must name the directory-removal requirement: {message}"
+        );
+        assert!(
+            !log_path.exists(),
+            "file-to-dir type change must fail before any command spawn"
+        );
+        assert_eq!(std::fs::read(&file)?, b"hello world");
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn replay_windows_clone_target_pins_parent_and_child_and_accepts_git_clone()
+    -> anyhow::Result<()> {
+        if !git_available() {
+            return Ok(());
+        }
+        let source = tempfile::tempdir()?;
+        run_git(source.path(), &["init"]);
+        run_git(source.path(), &["config", "user.email", "test@example.com"]);
+        run_git(source.path(), &["config", "user.name", "Togi Test"]);
+        std::fs::write(source.path().join("committed.txt"), b"committed")?;
+        run_git(source.path(), &["add", "."]);
+        run_git(source.path(), &["commit", "-m", "initial"]);
+        let source_revision = git_snapshot_revision(source.path())?;
+
+        let trusted_root = tempfile::tempdir()?;
+        let workspace = ReplayWorkspace::create_clone_target_in(trusted_root.path())?;
+        let outer_path = workspace.workspace._tempdir.path().to_path_buf();
+        let child_path = workspace.root().to_path_buf();
+
+        // Another process cannot rename the pinned temp root, the pinned
+        // outer TempDir, or the pinned clone child, so the path Git and
+        // later commands use cannot be rebound.
+        for path in [trusted_root.path(), &outer_path, &child_path] {
+            let status = std::process::Command::new("cmd")
+                .args(["/C", "ren"])
+                .arg(path)
+                .arg("moved")
+                .status()?;
+            assert!(!status.success(), "{} must be pinned", path.display());
+            assert!(path.is_dir());
+        }
+        assert!(!outer_path.join("moved").exists());
+
+        // Git accepts the pre-created empty child as the clone destination
+        // and checks out the committed content through the pinned path.
+        clone_replay_snapshot(source.path(), workspace.root(), &source_revision)?;
+        assert_eq!(
+            workspace.read_regular(Path::new("committed.txt"))?,
+            b"committed"
+        );
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn replay_windows_clone_target_rejects_outer_junction_swap_before_git() -> std::io::Result<()> {
+        let trusted_root = tempfile::tempdir()?;
+        let outside_dir = tempfile::tempdir()?;
+        let sentinel = outside_dir.path().join("sentinel.txt");
+        std::fs::write(&sentinel, b"outside")?;
+
+        // Simulate a same-user racer: replace the just-created outer TempDir
+        // with a junction to an outside directory before the constructor
+        // re-opens the outer basename through the pinned trusted root.
+        let outside_path = outside_dir.path().to_path_buf();
+        set_replay_outer_created_hook(Some(Box::new(move |outer: &Path| {
+            let moved = outer.with_file_name("outer-moved");
+            std::fs::rename(outer, &moved).unwrap();
+            create_junction(outer, &outside_path);
+        })));
+        let result = ReplayWorkspace::create_clone_target_in(trusted_root.path());
+        set_replay_outer_created_hook(None);
+
+        // The no-follow open rejects the junction before any Git subprocess;
+        // the outside target is never traversed or modified.
+        assert!(result.is_err());
+        assert!(trusted_root.path().join("outer-moved").is_dir());
+        assert_eq!(std::fs::read(&sentinel)?, b"outside");
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn replay_windows_clone_target_rejects_junction_temp_root_before_any_setup()
+    -> std::io::Result<()> {
+        let trusted_base = tempfile::tempdir()?;
+        let outside_dir = tempfile::tempdir()?;
+        let sentinel = outside_dir.path().join("sentinel.txt");
+        std::fs::write(&sentinel, b"outside")?;
+        create_junction(
+            &trusted_base.path().join("junction-temp"),
+            outside_dir.path(),
+        );
+
+        // A configured temp root that is itself a reparse point is rejected
+        // while pinning the lexical chain, before any TempDir or Git setup.
+        let result =
+            ReplayWorkspace::create_clone_target_in(&trusted_base.path().join("junction-temp"));
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&sentinel)?, b"outside");
+        assert_eq!(std::fs::read_dir(outside_dir.path())?.count(), 1);
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn replay_windows_clone_target_rejects_subst_temp_root_before_any_setup() -> std::io::Result<()>
+    {
+        let safe_target = tempfile::tempdir()?;
+        // The test source is itself a normal, accepted system-volume temp
+        // directory before it is exposed through a user-defined DOS device.
+        ReplayTempRoot::pin(safe_target.path())?;
+        let (_, system_drive) = windows_system_volume_root()?;
+        let mapping = SubstDrive::allocate(safe_target.path(), system_drive)?;
+        let outside_dir = tempfile::tempdir()?;
+        let sentinel = outside_dir.path().join("sentinel.txt");
+        std::fs::write(&sentinel, b"outside")?;
+        assert_eq!(std::fs::read_dir(safe_target.path())?.count(), 0);
+
+        let hook_called = std::rc::Rc::new(std::cell::Cell::new(false));
+        let hook_called_clone = std::rc::Rc::clone(&hook_called);
+        set_replay_temp_root_ready_hook(Some(Box::new(move || {
+            hook_called_clone.set(true);
+        })));
+        let result = ReplayWorkspace::create_clone_target_in(&mapping.root().join("togi-replay"));
+        set_replay_temp_root_ready_hook(None);
+
+        let error = result
+            .err()
+            .expect("a SUBST-mapped temp root must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("is not on the Windows system volume")
+        );
+        assert!(!hook_called.get(), "must reject before temp-root setup");
+        assert_eq!(std::fs::read(&sentinel)?, b"outside");
+        assert_eq!(std::fs::read_dir(safe_target.path())?.count(), 0);
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn replay_windows_temp_root_chain_blocks_external_rebind_then_clone_succeeds()
+    -> anyhow::Result<()> {
+        if !git_available() {
+            return Ok(());
+        }
+        let source = tempfile::tempdir()?;
+        run_git(source.path(), &["init"]);
+        run_git(source.path(), &["config", "user.email", "test@example.com"]);
+        run_git(source.path(), &["config", "user.name", "Togi Test"]);
+        std::fs::write(source.path().join("committed.txt"), b"committed")?;
+        run_git(source.path(), &["add", "."]);
+        run_git(source.path(), &["commit", "-m", "initial"]);
+        let source_revision = git_snapshot_revision(source.path())?;
+
+        let trusted_root = tempfile::tempdir()?;
+        let trusted_path = trusted_root.path().to_path_buf();
+        // After the chain is pinned but before the outer TempDir is created,
+        // a same-user racer cannot rename the pinned temp root or its pinned
+        // parent; every lexical component stays bound for Git/current_dir.
+        let hook_path = trusted_path.clone();
+        set_replay_temp_root_ready_hook(Some(Box::new(move || {
+            let rename = |path: &Path, name: &str| {
+                std::process::Command::new("cmd")
+                    .args(["/C", "ren"])
+                    .arg(path)
+                    .arg(name)
+                    .status()
+                    .expect("spawn ren")
+            };
+            assert!(!rename(&hook_path, "moved").success());
+            let parent = hook_path.parent().unwrap().to_path_buf();
+            assert!(!rename(&parent, "moved-parent").success());
+        })));
+        let workspace = ReplayWorkspace::create_clone_target_in(trusted_root.path())?;
+        set_replay_temp_root_ready_hook(None);
+        assert!(trusted_path.is_dir());
+
+        clone_replay_snapshot(source.path(), workspace.root(), &source_revision)?;
+        assert_eq!(
+            workspace.read_regular(Path::new("committed.txt"))?,
+            b"committed"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn replay_clone_target_contains_ordinary_outer_replacement_in_trusted_root()
+    -> std::io::Result<()> {
+        let trusted_root = tempfile::tempdir()?;
+        let outside_dir = tempfile::tempdir()?;
+        let sentinel = outside_dir.path().join("sentinel.txt");
+        std::fs::write(&sentinel, b"outside")?;
+
+        // The residual create-to-open window can substitute an ordinary
+        // directory (not a reparse point) for the outer TempDir. That
+        // replacement stays inside the trusted temp root; nothing escapes
+        // and no atomic-identity claim is made.
+        set_replay_outer_created_hook(Some(Box::new(|outer: &Path| {
+            let moved = outer.with_file_name("outer-moved");
+            std::fs::rename(outer, &moved).unwrap();
+            std::fs::create_dir(outer).unwrap();
+        })));
+        let workspace = ReplayWorkspace::create_clone_target_in(trusted_root.path())?;
+        set_replay_outer_created_hook(None);
+
+        assert!(trusted_root.path().join("outer-moved").is_dir());
+        assert!(workspace.root().starts_with(trusted_root.path()));
+        assert!(workspace.root().is_dir());
+        assert_eq!(std::fs::read_dir(workspace.root())?.count(), 0);
+        assert_eq!(std::fs::read(&sentinel)?, b"outside");
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn replay_windows_cleanup_removes_workspace_without_traversing_junction() -> std::io::Result<()>
+    {
+        let outside_dir = tempfile::tempdir()?;
+        let sentinel = outside_dir.path().join("sentinel.txt");
+        std::fs::write(&sentinel, b"outside")?;
+
+        let workspace_tempdir = tempfile::tempdir()?;
+        let temp_root = workspace_tempdir.path().to_path_buf();
+        let root = temp_root.join("workspace");
+        std::fs::create_dir(&root)?;
+        std::fs::write(root.join("file.txt"), b"clone")?;
+        create_junction(&root.join("alias"), outside_dir.path());
+        {
+            let _workspace = ReplayWorkspace::open(WorkspaceCopy {
+                _tempdir: workspace_tempdir,
+                root: root.clone(),
+                reset_strategy: WorkspaceResetStrategy::Copy,
+            })?;
+        }
+
+        // Normal TempDir cleanup removes the disposable clone; std's Windows
+        // removal is handle-relative with no-reparse opens, so the junction is
+        // removed as a reparse point and its outside target is never touched.
+        assert!(!temp_root.exists());
+        assert_eq!(std::fs::read(&sentinel)?, b"outside");
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn replay_windows_remove_relative_removes_junction_leaf_without_touching_target()
+    -> std::io::Result<()> {
+        let tempdir = tempfile::tempdir()?;
+        let root = tempdir.path().to_path_buf();
+        let outside_dir = tempfile::tempdir()?;
+        let sentinel = outside_dir.path().join("sentinel.txt");
+        std::fs::write(&sentinel, b"outside")?;
+        create_junction(&root.join("alias"), outside_dir.path());
+        let workspace = windows_replay_workspace(tempdir)?;
+
+        workspace.remove_relative(Path::new("alias"))?;
+
+        assert!(std::fs::symlink_metadata(root.join("alias")).is_err());
+        assert_eq!(std::fs::read(&sentinel)?, b"outside");
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn replay_windows_remove_relative_never_traverses_midpath_junction() -> std::io::Result<()> {
+        let tempdir = tempfile::tempdir()?;
+        let root = tempdir.path().to_path_buf();
+        let outside_dir = tempfile::tempdir()?;
+        let sentinel = outside_dir.path().join("sentinel.txt");
+        std::fs::write(&sentinel, b"outside")?;
+        create_junction(&root.join("alias"), outside_dir.path());
+        let workspace = windows_replay_workspace(tempdir)?;
+
+        // The junction mid-path component is removed as a reparse point, never
+        // opened, so the outside target keeps its contents.
+        workspace.remove_relative(Path::new("alias/sentinel.txt"))?;
+
+        assert!(std::fs::symlink_metadata(root.join("alias")).is_err());
+        assert_eq!(std::fs::read(&sentinel)?, b"outside");
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn replay_windows_publish_replaces_midpath_junction_inside_clone() -> std::io::Result<()> {
+        let tempdir = tempfile::tempdir()?;
+        let root = tempdir.path().to_path_buf();
+        let outside_dir = tempfile::tempdir()?;
+        let sentinel = outside_dir.path().join("sentinel.txt");
+        std::fs::write(&sentinel, b"outside")?;
+        create_junction(&root.join("alias"), outside_dir.path());
+        let workspace = windows_replay_workspace(tempdir)?;
+
+        workspace.replace_regular(Path::new("alias/sentinel.txt"), b"mutated")?;
+
+        assert_eq!(std::fs::read(&sentinel)?, b"outside");
+        assert_eq!(
+            workspace.read_regular(Path::new("alias/sentinel.txt"))?,
+            b"mutated"
+        );
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn replay_windows_remove_relative_removes_file_symlink_leaf() -> std::io::Result<()> {
+        let tempdir = tempfile::tempdir()?;
+        let root = tempdir.path().to_path_buf();
+        let outside_dir = tempfile::tempdir()?;
+        let sentinel = outside_dir.path().join("sentinel.txt");
+        std::fs::write(&sentinel, b"outside")?;
+        if std::os::windows::fs::symlink_file(&sentinel, root.join("alias")).is_err() {
+            eprintln!("skipping: symlink creation requires SeCreateSymbolicLinkPrivilege");
+            return Ok(());
+        }
+        let workspace = windows_replay_workspace(tempdir)?;
+
+        workspace.remove_relative(Path::new("alias"))?;
+
+        assert!(std::fs::symlink_metadata(root.join("alias")).is_err());
+        assert_eq!(std::fs::read(&sentinel)?, b"outside");
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn replay_windows_held_parent_capability_blocks_external_rename_but_allows_leaf_rename()
+    -> std::io::Result<()> {
+        let tempdir = tempfile::tempdir()?;
+        let parent = tempdir.path().join("parent");
+        std::fs::create_dir(&parent)?;
+        std::fs::write(parent.join("leaf.txt"), b"leaf")?;
+        // cap-primitives opens directories without FILE_SHARE_DELETE.
+        let _held = CapDir::open_ambient_dir(&parent, ambient_authority())?;
+
+        // Another process cannot rename the pinned parent out from under us.
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "ren"])
+            .arg(&parent)
+            .arg("moved")
+            .status()?;
+        assert!(!status.success(), "held parent must not be renamable");
+        assert!(parent.is_dir());
+        assert!(!tempdir.path().join("moved").exists());
+
+        // A leaf beneath the pinned parent remains freely renamable.
+        std::fs::rename(parent.join("leaf.txt"), parent.join("renamed.txt"))?;
+        assert_eq!(std::fs::read(parent.join("renamed.txt"))?, b"leaf");
+        Ok(())
+    }
+
     #[test]
     fn replay_runner_uses_only_workspace_and_validates_original_bytes() -> anyhow::Result<()> {
         let (dir, file, mutation) = make_relative_test_setup();
@@ -6106,18 +7096,14 @@ mod tests {
         std::fs::write(&history_path, "sentinel history")?;
         let cache_before = std::fs::read(&history_path)?;
         let log_dir = tempfile::tempdir()?;
-        let log_path = log_dir.path().join("replay.log");
+        // An apostrophe in the log path exercises the shell-quoting of the
+        // platform log command (PowerShell single-quote doubling on Windows).
+        let log_path = log_dir.path().join("re'play.log");
         let cancelled = AtomicBool::new(false);
         let config = ReplayRunConfig {
-            test_command: vec![
-                "sh".into(),
-                "-c".into(),
-                "printf invoked >> \"$1\"".into(),
-                "replay".into(),
-                log_path.display().to_string(),
-            ],
+            test_command: appending_log_command(&log_path),
             build_command: None,
-            timeout: Duration::from_secs(1),
+            timeout: Duration::from_secs(30),
             env: HashMap::new(),
             respect_workspace_ignores: true,
             source_revision: &source_revision,
@@ -6140,15 +7126,9 @@ mod tests {
             dir.path(),
             &mismatched,
             ReplayRunConfig {
-                test_command: vec![
-                    "sh".into(),
-                    "-c".into(),
-                    "printf invoked >> \"$1\"".into(),
-                    "replay".into(),
-                    rejected_log.display().to_string(),
-                ],
+                test_command: appending_log_command(&rejected_log),
                 build_command: None,
-                timeout: Duration::from_secs(1),
+                timeout: Duration::from_secs(30),
                 env: HashMap::new(),
                 respect_workspace_ignores: true,
                 source_revision: &source_revision,
@@ -6164,7 +7144,6 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(not(windows))]
     #[test]
     fn replay_runner_requires_git_snapshot_before_spawning_commands() -> anyhow::Result<()> {
         let (dir, _file, mutation) = make_relative_test_setup();
@@ -6176,15 +7155,9 @@ mod tests {
             dir.path(),
             &mutation,
             ReplayRunConfig {
-                test_command: vec![
-                    "sh".into(),
-                    "-c".into(),
-                    "printf invoked >> \"$1\"".into(),
-                    "replay".into(),
-                    log_path.display().to_string(),
-                ],
+                test_command: appending_log_command(&log_path),
                 build_command: None,
-                timeout: Duration::from_secs(1),
+                timeout: Duration::from_secs(30),
                 env: HashMap::new(),
                 respect_workspace_ignores: true,
                 source_revision: "expected",
@@ -6198,7 +7171,6 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(not(windows))]
     #[test]
     fn replay_runner_rejects_snapshot_fingerprint_mismatch_before_spawning_commands()
     -> anyhow::Result<()> {
@@ -6223,15 +7195,9 @@ mod tests {
             dir.path(),
             &mutation,
             ReplayRunConfig {
-                test_command: vec![
-                    "sh".into(),
-                    "-c".into(),
-                    "printf invoked >> \"$1\"".into(),
-                    "replay".into(),
-                    log_path.display().to_string(),
-                ],
+                test_command: appending_log_command(&log_path),
                 build_command: None,
-                timeout: Duration::from_secs(1),
+                timeout: Duration::from_secs(30),
                 env: HashMap::new(),
                 respect_workspace_ignores: true,
                 source_revision: &source_revision,
@@ -6442,7 +7408,6 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(not(windows))]
     #[test]
     fn regular_direct_recipes_cover_fresh_cache_history_and_schema_fallback() -> anyhow::Result<()>
     {
