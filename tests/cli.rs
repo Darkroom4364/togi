@@ -3,7 +3,7 @@ use predicates::prelude::*;
 use std::fs;
 #[cfg(unix)]
 use std::os::unix::{fs::PermissionsExt, process::CommandExt};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
@@ -2865,100 +2865,496 @@ fn check_help_lists_test_selection_file_flag() {
         .stdout(predicate::str::contains("--test-selection-file"));
 }
 
-#[test]
-fn github_action_run_helper_preserves_multiword_test_cmd() {
-    if !bash_available() {
-        eprintln!("skipping action helper test because bash is unavailable");
-        return;
-    }
-
-    assert_action_helper_test_cmd("go test ./...");
-    assert_action_helper_test_cmd("cargo test --workspace --all-features");
+fn jq_available() -> bool {
+    std::process::Command::new("jq")
+        .arg("--version")
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
 }
 
-fn assert_action_helper_test_cmd(test_cmd: &str) {
+struct ActionHelperFixture {
+    dir: TempDir,
+    fake_togi: PathBuf,
+    invocation_log: PathBuf,
+    github_output: PathBuf,
+    report_path: PathBuf,
+}
+
+fn action_helper_fixture() -> ActionHelperFixture {
     let dir = TempDir::new().unwrap();
     let fake_togi = dir.path().join("fake-togi.sh");
-    fs::write(&fake_togi, "#!/usr/bin/env bash\nprintf '<%s>\\n' \"$@\"\n").unwrap();
-    std::process::Command::new("bash")
+    let invocation_log = dir.path().join("invocations.log");
+    let github_output = dir.path().join("github-output");
+    let report_path = dir.path().join("togi-report.json");
+    fs::write(
+        &fake_togi,
+        r#"#!/usr/bin/env bash
+set -u
+args=("$@")
+format=terminal
+for ((index = 0; index < ${#args[@]}; index++)); do
+  if [[ "${args[index]}" == "--format" ]]; then
+    format="${args[$((index + 1))]}"
+    break
+  fi
+done
+for arg in "${args[@]}"; do
+  printf '<%s>\n' "$arg" >> "$FAKE_TOGI_LOG"
+done
+printf '%s\n' '--' >> "$FAKE_TOGI_LOG"
+if [[ "$format" == "json" ]]; then
+  printf '%s\n' "${FAKE_TOGI_JSON:?}"
+  exit "${FAKE_TOGI_JSON_STATUS:-0}"
+fi
+printf 'review-format=%s\n' "$format"
+exit "${FAKE_TOGI_REVIEW_STATUS:-0}"
+"#,
+    )
+    .unwrap();
+    let output = std::process::Command::new("bash")
         .args(["-c", "chmod +x \"$1\"", "--"])
         .arg(&fake_togi)
         .output()
         .unwrap();
+    assert!(output.status.success());
 
+    ActionHelperFixture {
+        dir,
+        fake_togi,
+        invocation_log,
+        github_output,
+        report_path,
+    }
+}
+
+struct ActionHelperRun<'a> {
+    base: Option<&'a str>,
+    timeout: Option<&'a str>,
+    format: Option<&'a str>,
+    test_cmd: Option<&'a str>,
+    review_status: i32,
+    json_status: i32,
+    json: &'a str,
+}
+
+fn run_action_helper(
+    fixture: &ActionHelperFixture,
+    run: ActionHelperRun<'_>,
+) -> std::process::Output {
     let helper = Path::new(env!("CARGO_MANIFEST_DIR")).join(".github/scripts/run-togi.sh");
-    let output = std::process::Command::new("bash")
+    let mut command = std::process::Command::new("bash");
+    command
         .arg(helper)
-        .env("TOGI_BIN", &fake_togi)
-        .env("TOGI_BASE", "HEAD~1")
-        .env("TOGI_TIMEOUT", "45")
-        .env("TOGI_FORMAT", "json")
-        .env("TOGI_TEST_CMD", test_cmd)
-        .output()
-        .unwrap();
+        .current_dir(fixture.dir.path())
+        .env("TOGI_BIN", &fixture.fake_togi)
+        .env("RUNNER_TEMP", fixture.dir.path())
+        .env("GITHUB_OUTPUT", &fixture.github_output)
+        .env("FAKE_TOGI_LOG", &fixture.invocation_log)
+        .env("FAKE_TOGI_REVIEW_STATUS", run.review_status.to_string())
+        .env("FAKE_TOGI_JSON_STATUS", run.json_status.to_string())
+        .env("FAKE_TOGI_JSON", run.json);
+    for (name, value) in [
+        ("TOGI_BASE", run.base),
+        ("TOGI_TIMEOUT", run.timeout),
+        ("TOGI_FORMAT", run.format),
+        ("TOGI_TEST_CMD", run.test_cmd),
+    ] {
+        if let Some(value) = value {
+            command.env(name, value);
+        } else {
+            command.env_remove(name);
+        }
+    }
+    command.output().unwrap()
+}
 
-    assert!(
-        output.status.success(),
-        "helper failed\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
+fn action_helper_invocations(fixture: &ActionHelperFixture) -> Vec<Vec<String>> {
+    let mut invocations = Vec::new();
+    let mut invocation = Vec::new();
+    for line in fs::read_to_string(&fixture.invocation_log).unwrap().lines() {
+        if line == "--" {
+            invocations.push(std::mem::take(&mut invocation));
+        } else {
+            assert!(
+                line.starts_with('<') && line.ends_with('>'),
+                "unexpected fake invocation log line: {line}"
+            );
+            invocation.push(line[1..line.len() - 1].to_string());
+        }
+    }
+    assert!(invocation.is_empty(), "unterminated fake invocation");
+    invocations
+}
+
+fn action_args(args: &[&str]) -> Vec<String> {
+    args.iter().map(|arg| (*arg).to_string()).collect()
+}
+
+fn assert_action_outputs(fixture: &ActionHelperFixture) {
+    assert_eq!(
+        fs::read_to_string(&fixture.github_output).unwrap(),
+        format!(
+            "report-path={}\nmutation-score=75.5\nsurvivor-count=1\n",
+            fixture.report_path.display()
+        )
+    );
+}
+
+const NORMAL_ACTION_REPORT: &str =
+    r#"{"kind":"mutation_report","schema_version":1,"mutation_score":75.5,"survived":1}"#;
+
+#[test]
+fn github_action_run_helper_preserves_selected_format_and_exit_one() {
+    if !bash_available() || !jq_available() {
+        eprintln!("skipping action helper test because bash or jq is unavailable");
+        return;
+    }
+
+    let fixture = action_helper_fixture();
+    let output = run_action_helper(
+        &fixture,
+        ActionHelperRun {
+            base: Some("HEAD~1"),
+            timeout: Some("45"),
+            format: Some("github"),
+            test_cmd: Some("cargo test --workspace --all-features"),
+            review_status: 1,
+            json_status: 1,
+            json: NORMAL_ACTION_REPORT,
+        },
     );
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let args: Vec<String> = stdout.lines().map(String::from).collect();
     assert_eq!(
-        args,
+        output.status.code(),
+        Some(1),
+        "helper failed with stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "review-format=github\n"
+    );
+    assert_eq!(
+        action_helper_invocations(&fixture),
         vec![
-            "<check>".to_string(),
-            "<--base>".to_string(),
-            "<HEAD~1>".to_string(),
-            "<--timeout>".to_string(),
-            "<45>".to_string(),
-            "<--format>".to_string(),
-            "<json>".to_string(),
-            "<--test-cmd>".to_string(),
-            format!("<{test_cmd}>"),
+            action_args(&[
+                "check",
+                "--base",
+                "HEAD~1",
+                "--timeout",
+                "45",
+                "--format",
+                "github",
+                "--test-cmd",
+                "cargo test --workspace --all-features",
+            ]),
+            action_args(&[
+                "check",
+                "--base",
+                "HEAD~1",
+                "--timeout",
+                "45",
+                "--format",
+                "json",
+                "--test-cmd",
+                "cargo test --workspace --all-features",
+            ]),
         ]
     );
+    assert_eq!(
+        fs::read_to_string(&fixture.report_path).unwrap(),
+        format!("{NORMAL_ACTION_REPORT}\n")
+    );
+    assert_action_outputs(&fixture);
 }
 
 #[test]
-fn github_action_run_helper_omits_flags_for_unset_inputs() {
-    if !bash_available() {
-        eprintln!("skipping action helper test because bash is unavailable");
+fn github_action_run_helper_reuses_selected_json_stdout_once() {
+    if !bash_available() || !jq_available() {
+        eprintln!("skipping action helper test because bash or jq is unavailable");
         return;
     }
 
-    let dir = TempDir::new().unwrap();
-    let fake_togi = dir.path().join("fake-togi.sh");
-    fs::write(&fake_togi, "#!/usr/bin/env bash\nprintf '<%s>\\n' \"$@\"\n").unwrap();
-    std::process::Command::new("bash")
+    let fixture = action_helper_fixture();
+    let output = run_action_helper(
+        &fixture,
+        ActionHelperRun {
+            base: Some("HEAD~1"),
+            timeout: Some("45"),
+            format: Some("json"),
+            test_cmd: Some("go test ./..."),
+            review_status: 1,
+            json_status: 1,
+            json: NORMAL_ACTION_REPORT,
+        },
+    );
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        format!("{NORMAL_ACTION_REPORT}\n")
+    );
+    assert_eq!(
+        action_helper_invocations(&fixture),
+        vec![action_args(&[
+            "check",
+            "--base",
+            "HEAD~1",
+            "--timeout",
+            "45",
+            "--format",
+            "json",
+            "--test-cmd",
+            "go test ./...",
+        ])]
+    );
+    assert_eq!(
+        fs::read_to_string(&fixture.report_path).unwrap(),
+        format!("{NORMAL_ACTION_REPORT}\n")
+    );
+    assert_action_outputs(&fixture);
+}
+
+#[cfg(not(windows))]
+#[test]
+fn github_action_run_helper_keeps_native_report_output_path() {
+    if !bash_available() || !jq_available() {
+        eprintln!("skipping action helper test because bash or jq is unavailable");
+        return;
+    }
+
+    let fixture = action_helper_fixture();
+    let cygpath_dir = fixture.dir.path().join("fake-bin");
+    fs::create_dir(&cygpath_dir).unwrap();
+    let cygpath = cygpath_dir.join("cygpath");
+    fs::write(
+        &cygpath,
+        "#!/usr/bin/env bash\n[[ \"$1\" == \"-u\" ]] || exit 2\nprintf '%s\\n' \"$FAKE_CYGPATH_RESULT\"\n",
+    )
+    .unwrap();
+    let output = std::process::Command::new("bash")
         .args(["-c", "chmod +x \"$1\"", "--"])
-        .arg(&fake_togi)
+        .arg(&cygpath)
         .output()
         .unwrap();
-
+    assert!(output.status.success());
+    let inherited_path = std::env::var("PATH").expect("PATH must be set");
+    let path = format!("{}:{inherited_path}", cygpath_dir.display());
     let helper = Path::new(env!("CARGO_MANIFEST_DIR")).join(".github/scripts/run-togi.sh");
     let output = std::process::Command::new("bash")
         .arg(helper)
-        .env("TOGI_BIN", &fake_togi)
+        .current_dir(fixture.dir.path())
+        .env("PATH", path)
+        .env("TOGI_BIN", &fixture.fake_togi)
+        .env("TOGI_REPORT_PATH", r"C:\runner\temp\togi-report.json")
+        .env("RUNNER_TEMP", fixture.dir.path())
+        .env("GITHUB_OUTPUT", &fixture.github_output)
+        .env("FAKE_TOGI_LOG", &fixture.invocation_log)
+        .env("FAKE_TOGI_REVIEW_STATUS", "0")
+        .env("FAKE_TOGI_JSON_STATUS", "0")
+        .env("FAKE_TOGI_JSON", NORMAL_ACTION_REPORT)
+        .env("FAKE_CYGPATH_RESULT", &fixture.report_path)
         .env_remove("TOGI_BASE")
         .env_remove("TOGI_TIMEOUT")
-        .env_remove("TOGI_FORMAT")
         .env_remove("TOGI_TEST_CMD")
+        .env("TOGI_FORMAT", "github")
         .output()
         .unwrap();
 
+    assert!(output.status.success());
+    assert!(fixture.report_path.exists());
+    assert_eq!(
+        action_helper_invocations(&fixture),
+        vec![
+            action_args(&["check", "--format", "github"]),
+            action_args(&["check", "--format", "json"]),
+        ]
+    );
+    assert_eq!(
+        fs::read_to_string(&fixture.github_output).unwrap(),
+        "report-path=C:\\runner\\temp\\togi-report.json\nmutation-score=75.5\nsurvivor-count=1\n"
+    );
+}
+
+#[test]
+fn github_action_run_helper_omits_unset_review_flags() {
+    if !bash_available() || !jq_available() {
+        eprintln!("skipping action helper test because bash or jq is unavailable");
+        return;
+    }
+
+    let fixture = action_helper_fixture();
+    let output = run_action_helper(
+        &fixture,
+        ActionHelperRun {
+            base: None,
+            timeout: None,
+            format: None,
+            test_cmd: None,
+            review_status: 0,
+            json_status: 0,
+            json: NORMAL_ACTION_REPORT,
+        },
+    );
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "review-format=terminal\n"
+    );
+    assert_eq!(
+        action_helper_invocations(&fixture),
+        vec![
+            action_args(&["check"]),
+            action_args(&["check", "--format", "json"]),
+        ]
+    );
+    assert_action_outputs(&fixture);
+}
+
+#[test]
+fn github_action_run_helper_removes_invalid_or_fatal_sidecar_reports() {
+    if !bash_available() || !jq_available() {
+        eprintln!("skipping action helper test because bash or jq is unavailable");
+        return;
+    }
+
+    for (json_status, json) in [(1, "not json"), (2, NORMAL_ACTION_REPORT)] {
+        let fixture = action_helper_fixture();
+        let output = run_action_helper(
+            &fixture,
+            ActionHelperRun {
+                base: Some("HEAD~1"),
+                timeout: None,
+                format: Some("github"),
+                test_cmd: None,
+                review_status: 1,
+                json_status,
+                json,
+            },
+        );
+
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "unexpected status for JSON sidecar status {json_status}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!fixture.report_path.exists());
+        assert!(
+            !fixture.github_output.exists()
+                || fs::read_to_string(&fixture.github_output)
+                    .unwrap()
+                    .is_empty()
+        );
+    }
+}
+
+#[test]
+fn github_action_run_helper_propagates_fatal_review_and_cleans_stale_report() {
+    if !bash_available() || !jq_available() {
+        eprintln!("skipping action helper test because bash or jq is unavailable");
+        return;
+    }
+
+    let fixture = action_helper_fixture();
+    fs::write(&fixture.report_path, "stale report").unwrap();
+    let output = run_action_helper(
+        &fixture,
+        ActionHelperRun {
+            base: Some("HEAD~1"),
+            timeout: None,
+            format: Some("github"),
+            test_cmd: None,
+            review_status: 2,
+            json_status: 0,
+            json: NORMAL_ACTION_REPORT,
+        },
+    );
+
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(
+        action_helper_invocations(&fixture),
+        vec![action_args(&[
+            "check", "--base", "HEAD~1", "--format", "github",
+        ])]
+    );
+    assert!(!fixture.report_path.exists());
     assert!(
-        output.status.success(),
-        "helper failed\nstdout:\n{}\nstderr:\n{}",
+        !fixture.github_output.exists()
+            || fs::read_to_string(&fixture.github_output)
+                .unwrap()
+                .is_empty()
+    );
+}
+
+#[test]
+fn github_action_report_replays_a_direct_mutation() {
+    if !bash_available() || !jq_available() {
+        eprintln!("skipping action replay test because bash or jq is unavailable");
+        return;
+    }
+
+    let repo = setup_git_repo();
+    fs::write(
+        repo.path().join("togi.toml"),
+        "[mutations]\nschemata = false\nmax_per_run = 1\n",
+    )
+    .unwrap();
+    fs::write(repo.path().join("test.sh"), "#!/bin/sh\nexit 0\n").unwrap();
+
+    let report_dir = TempDir::new().unwrap();
+    let report_path = report_dir.path().join("togi-report.json");
+    let github_output = report_dir.path().join("github-output");
+    let helper = Path::new(env!("CARGO_MANIFEST_DIR")).join(".github/scripts/run-togi.sh");
+    let output = std::process::Command::new("bash")
+        .arg(helper)
+        .current_dir(repo.path())
+        .env("TOGI_BIN", assert_cmd::cargo::cargo_bin("togi"))
+        .env("RUNNER_TEMP", report_dir.path())
+        .env("GITHUB_OUTPUT", &github_output)
+        .env("TOGI_BASE", "HEAD")
+        .env("TOGI_FORMAT", "github")
+        .env("TOGI_TEST_CMD", "sh test.sh")
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "Action helper did not preserve the surviving review failure\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("::warning"));
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let args: Vec<String> = stdout.lines().map(String::from).collect();
-    assert_eq!(args, vec!["<check>".to_string()]);
+    let report: serde_json::Value =
+        serde_json::from_slice(&fs::read(&report_path).unwrap()).unwrap();
+    assert_eq!(report["kind"], "mutation_report");
+    assert!(report["schema_version"].as_u64().is_some());
+    let mutation = report["mutations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|mutation| mutation["replay"]["kind"] == "regular_direct")
+        .expect("report should contain a directly replayable mutation");
+    let mutation_id = mutation["id"].as_u64().unwrap().to_string();
+    let output_values = fs::read_to_string(&github_output).unwrap();
+    assert!(output_values.contains(&format!("report-path={}", report_path.display())));
+    assert!(output_values.contains("mutation-score="));
+    assert!(output_values.contains("survivor-count="));
+
+    togi()
+        .args([
+            "replay",
+            &mutation_id,
+            "--report",
+            report_path.to_str().unwrap(),
+        ])
+        .current_dir(repo.path())
+        .assert()
+        .success();
 }
 
 #[test]
@@ -3003,16 +3399,50 @@ fn github_action_inputs_have_no_baked_in_defaults() {
         );
     }
 
-    let (_, version_body) = blocks
-        .iter()
-        .find(|(block, _)| *block == "version")
-        .expect("action.yml is missing the `version` input");
-    assert!(
-        version_body
+    for (name, default) in [
+        ("version", "'latest'"),
+        ("upload-report", "'true'"),
+        ("report-retention-days", "'14'"),
+        ("report-artifact-name", "'togi-report'"),
+    ] {
+        let (_, body) = blocks
             .iter()
-            .any(|line| line.trim() == "default: 'latest'"),
-        "action.yml input `version` must keep its 'latest' default"
-    );
+            .find(|(block, _)| *block == name)
+            .unwrap_or_else(|| panic!("action.yml is missing the `{name}` input"));
+        assert!(
+            body.iter()
+                .any(|line| line.trim() == format!("default: {default}")),
+            "action.yml input `{name}` must keep its {default} default"
+        );
+    }
+}
+
+#[test]
+fn github_action_declares_replay_report_contract() {
+    let action_yml = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("action.yml"))
+        .unwrap()
+        .replace("\r\n", "\n");
+
+    for expected in [
+        "outputs:\n  report-path:",
+        "value: ${{ steps.run-togi.outputs.report-path }}",
+        "value: ${{ steps.run-togi.outputs.mutation-score }}",
+        "value: ${{ steps.run-togi.outputs.survivor-count }}",
+        "id: run-togi",
+        "TOGI_REPORT_PATH: ${{ runner.temp }}/togi-report.json",
+        "report-artifact-name:",
+        "if: ${{ always() && inputs.upload-report == 'true' && steps.run-togi.outputs.report-path != '' }}",
+        "uses: actions/upload-artifact@v7",
+        "name: ${{ inputs.report-artifact-name }}",
+        "path: ${{ runner.temp }}/togi-report.json",
+        "retention-days: ${{ inputs.report-retention-days }}",
+        "if-no-files-found: warn",
+    ] {
+        assert!(
+            action_yml.contains(expected),
+            "action.yml is missing `{expected}`"
+        );
+    }
 }
 
 #[test]
