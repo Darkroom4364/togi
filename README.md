@@ -676,6 +676,53 @@ CLI-override semantics):
 The `test-cmd` input has always followed this pattern and is unchanged.
 The `version` input and its `latest` default are also unchanged.
 
+For a normal mutation report, every Action run also creates a replayable
+`togi-report.json`. When `format` is not `json`, the Action preserves the
+selected review run and then runs the same binary with `--format json` to
+capture the report. When `format: json` is selected, that one JSON stream is
+saved without a second run. The selected review run remains the PR gate:
+survivors still make the Action exit 1.
+
+By default, the Action uploads the report as the `togi-report` artifact for
+14 days. Configure retention with `report-retention-days`, or set
+`upload-report: 'false'` to keep the report local to the job without uploading
+it:
+
+```yaml
+- id: togi
+  uses: Darkroom4364/togi@<version>
+  with:
+    format: github
+    report-retention-days: '14'
+    # upload-report: 'false'
+```
+
+The Action exposes `report-path`, `mutation-score`, and `survivor-count` as
+step outputs. Because a survivor intentionally fails the Action, later steps
+that consume the artifact or outputs must use `if: always()`.
+
+Download and replay a report in a checkout at the report's recorded source
+revision:
+
+```yaml
+- uses: actions/download-artifact@v8
+  if: ${{ always() }}
+  with:
+    name: togi-report
+    path: togi-artifact
+- name: Replay a recorded mutant
+  if: ${{ always() }}
+  run: togi replay <mutant-id> --report togi-artifact/togi-report.json
+```
+
+Choose an ID whose report has `replay.kind` set to `regular_direct`; records
+explicitly marked unavailable by togi's existing replay contract cannot be
+replayed.
+
+Replay executes commands recorded in the report. Download and replay only
+trusted artifacts, and retain them only as long as their source and command
+metadata are appropriate for your repository.
+
 ## Code scanning (SARIF)
 
 `togi check --format sarif` emits a [SARIF 2.1.0](https://docs.github.com/en/code-security/code-scanning/integrating-with-code-scanning/sarif-support-for-code-scanning) report: one result per surviving mutant with its file and line, plus the mutation score in the run's invocation properties. Upload it to GitHub code scanning to see surviving mutants as annotations on the PR diff:

@@ -17,10 +17,29 @@ inputs:
   format:
     description: 'Output format (terminal, json, github, html, or sarif)'
     required: false
+  upload-report:
+    description: 'Upload the replayable JSON report artifact'
+    required: false
+    default: 'true'
+  report-retention-days:
+    description: 'Retention in days for the replayable JSON report artifact'
+    required: false
+    default: '14'
   version:
     description: 'togi version to use'
     required: false
     default: 'latest'
+
+outputs:
+  report-path:
+    description: 'Path to the generated replayable JSON report'
+    value: ${{ steps.run-togi.outputs.report-path }}
+  mutation-score:
+    description: 'Mutation score from the replayable JSON report'
+    value: ${{ steps.run-togi.outputs.mutation-score }}
+  survivor-count:
+    description: 'Survivor count from the replayable JSON report'
+    value: ${{ steps.run-togi.outputs.survivor-count }}
 
 runs:
   using: 'composite'
@@ -93,11 +112,22 @@ runs:
         TOGI_ARCHIVE="$TOGI_ARCHIVE" TOGI_BINARY="$TOGI_BINARY" TOGI_ARCHIVE_PATH="$TOGI_ARCHIVE_PATH" bash "${{ github.action_path }}/.github/scripts/install-togi-archive.sh"
 
     - name: Run togi
+      id: run-togi
       shell: bash
       env:
         TOGI_BASE: ${{ inputs.base }}
         TOGI_TIMEOUT: ${{ inputs.timeout }}
         TOGI_FORMAT: ${{ inputs.format }}
         TOGI_TEST_CMD: ${{ inputs.test-cmd }}
+        TOGI_REPORT_PATH: ${{ runner.temp }}/togi-report.json
       run: |
         bash "${{ github.action_path }}/.github/scripts/run-togi.sh"
+
+    - name: Upload replayable report
+      if: ${{ always() && inputs.upload-report == 'true' }}
+      uses: actions/upload-artifact@v7
+      with:
+        name: togi-report
+        path: ${{ runner.temp }}/togi-report.json
+        retention-days: ${{ inputs.report-retention-days }}
+        if-no-files-found: warn
