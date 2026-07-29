@@ -3116,6 +3116,67 @@ fn github_action_run_helper_reuses_selected_json_stdout_once() {
     assert_action_outputs(&fixture);
 }
 
+#[cfg(not(windows))]
+#[test]
+fn github_action_run_helper_keeps_native_report_output_path() {
+    if !bash_available() || !jq_available() {
+        eprintln!("skipping action helper test because bash or jq is unavailable");
+        return;
+    }
+
+    let fixture = action_helper_fixture();
+    let cygpath_dir = fixture.dir.path().join("fake-bin");
+    fs::create_dir(&cygpath_dir).unwrap();
+    let cygpath = cygpath_dir.join("cygpath");
+    fs::write(
+        &cygpath,
+        "#!/usr/bin/env bash\n[[ \"$1\" == \"-u\" ]] || exit 2\nprintf '%s\\n' \"$FAKE_CYGPATH_RESULT\"\n",
+    )
+    .unwrap();
+    let output = std::process::Command::new("bash")
+        .args(["-c", "chmod +x \"$1\"", "--"])
+        .arg(&cygpath)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let inherited_path = std::env::var("PATH").expect("PATH must be set");
+    let path = format!("{}:{inherited_path}", cygpath_dir.display());
+    let helper = Path::new(env!("CARGO_MANIFEST_DIR")).join(".github/scripts/run-togi.sh");
+    let output = std::process::Command::new("bash")
+        .arg(helper)
+        .current_dir(fixture.dir.path())
+        .env("PATH", path)
+        .env("TOGI_BIN", &fixture.fake_togi)
+        .env("TOGI_REPORT_PATH", r"C:\runner\temp\togi-report.json")
+        .env("RUNNER_TEMP", fixture.dir.path())
+        .env("GITHUB_OUTPUT", &fixture.github_output)
+        .env("FAKE_TOGI_LOG", &fixture.invocation_log)
+        .env("FAKE_TOGI_REVIEW_STATUS", "0")
+        .env("FAKE_TOGI_JSON_STATUS", "0")
+        .env("FAKE_TOGI_JSON", NORMAL_ACTION_REPORT)
+        .env("FAKE_CYGPATH_RESULT", &fixture.report_path)
+        .env_remove("TOGI_BASE")
+        .env_remove("TOGI_TIMEOUT")
+        .env_remove("TOGI_TEST_CMD")
+        .env("TOGI_FORMAT", "github")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert!(fixture.report_path.exists());
+    assert_eq!(
+        action_helper_invocations(&fixture),
+        vec![
+            action_args(&["check", "--format", "github"]),
+            action_args(&["check", "--format", "json"]),
+        ]
+    );
+    assert_eq!(
+        fs::read_to_string(&fixture.github_output).unwrap(),
+        "report-path=C:\\runner\\temp\\togi-report.json\nmutation-score=75.5\nsurvivor-count=1\n"
+    );
+}
+
 #[test]
 fn github_action_run_helper_omits_unset_review_flags() {
     if !bash_available() || !jq_available() {
@@ -3367,7 +3428,7 @@ fn github_action_declares_replay_report_contract() {
         "value: ${{ steps.run-togi.outputs.survivor-count }}",
         "id: run-togi",
         "TOGI_REPORT_PATH: ${{ runner.temp }}/togi-report.json",
-        "if: ${{ always() && inputs.upload-report == 'true' }}",
+        "if: ${{ always() && inputs.upload-report == 'true' && steps.run-togi.outputs.report-path != '' }}",
         "uses: actions/upload-artifact@v7",
         "name: togi-report",
         "path: ${{ runner.temp }}/togi-report.json",

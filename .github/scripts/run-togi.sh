@@ -6,7 +6,8 @@ if ! command -v jq >/dev/null 2>&1; then
   exit 2
 fi
 
-report_path="${TOGI_REPORT_PATH:-${RUNNER_TEMP:-.}/togi-report.json}"
+report_output_path="${TOGI_REPORT_PATH:-${RUNNER_TEMP:-.}/togi-report.json}"
+report_path="$report_output_path"
 if command -v cygpath >/dev/null 2>&1; then
   report_path=$(cygpath -u "$report_path")
 fi
@@ -111,7 +112,7 @@ if [[ -z "${GITHUB_OUTPUT:-}" ]]; then
   exit 2
 fi
 if ! {
-  printf 'report-path=%s\n' "$report_path"
+  printf 'report-path=%s\n' "$report_output_path"
   printf 'mutation-score=%s\n' "$mutation_score"
   printf 'survivor-count=%s\n' "$survivor_count"
 } >>"$GITHUB_OUTPUT"; then
