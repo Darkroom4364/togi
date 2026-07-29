@@ -1,5 +1,3 @@
-#![cfg(not(windows))]
-
 use assert_cmd::Command;
 use serde_json::{Value, json};
 use std::fs;
@@ -100,6 +98,13 @@ fn setup_replay_fixture() -> ReplayFixture {
         "package main\n\nfunc add(a, b int) int {\n\tif a > b {\n\t\treturn a\n\t}\n\treturn a + b\n}\n",
     )
     .unwrap();
+    #[cfg(windows)]
+    fs::write(
+        root.join("test.cmd"),
+        "@echo off\r\ngit rev-parse --is-inside-work-tree >nul || exit /b 1\r\n>>\"%TOGI_REPLAY_LOG%\" echo x\r\nexit /b 0\r\n",
+    )
+    .unwrap();
+    #[cfg(not(windows))]
     fs::write(
         root.join("test.sh"),
         "#!/bin/sh\ntest \"$(git rev-parse --is-inside-work-tree)\" = true || exit 1\nprintf x >> \"$TOGI_REPLAY_LOG\"\nexit 0\n",
@@ -116,7 +121,7 @@ fn setup_replay_fixture() -> ReplayFixture {
             "--format",
             "json",
             "--test-cmd",
-            "sh test.sh",
+            fixture_test_cmd(),
             "--no-schemata",
             "--max-per-run",
             "1",
@@ -159,6 +164,26 @@ fn setup_replay_fixture() -> ReplayFixture {
         source_path,
         report,
     }
+}
+
+#[cfg(windows)]
+fn fixture_test_cmd() -> &'static str {
+    "cmd /C test.cmd"
+}
+
+#[cfg(not(windows))]
+fn fixture_test_cmd() -> &'static str {
+    "sh test.sh"
+}
+
+#[cfg(windows)]
+fn fixture_effective_command() -> &'static str {
+    "Effective command: [\"cmd\",\"/C\",\"test.cmd\"]"
+}
+
+#[cfg(not(windows))]
+fn fixture_effective_command() -> &'static str {
+    "Effective command: [\"sh\",\"test.sh\"]"
 }
 
 fn write_json(path: &Path, value: &Value) {
@@ -226,7 +251,7 @@ fn replay_forces_a_real_direct_execution_without_source_or_cache_residue() {
     assert!(stdout.contains("Expected historical result: survived"));
     assert!(stdout.contains("Fresh result: survived"));
     assert!(stdout.contains("forced fresh direct execution"));
-    assert!(stdout.contains("Effective command: [\"sh\",\"test.sh\"]"));
+    assert!(stdout.contains(fixture_effective_command()));
     assert_ne!(fs::read(&fixture.log_path).unwrap(), log_before);
     assert_eq!(fs::read(&fixture.source_path).unwrap(), source_before);
     assert_eq!(git_status(fixture.repo.path()), status_before);
@@ -371,6 +396,54 @@ fn replay_rejects_symlink_alias_to_control_path_before_spawning() {
 
     let mut alias_report = fixture.report.clone();
     alias_report["mutations"][0]["source_path"] = json!("alias.go");
+    write_json(&fixture.report_path, &alias_report);
+    fs::write(&fixture.log_path, []).unwrap();
+    let output = togi()
+        .args([
+            "replay",
+            &id,
+            "--report",
+            fixture.report_path.to_str().unwrap(),
+        ])
+        .current_dir(fixture.repo.path())
+        .env("TOGI_REPLAY_LOG", &fixture.log_path)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("resolved replay source path targets a Togi or Git control path")
+    );
+    assert!(fs::read(&fixture.log_path).unwrap().is_empty());
+    assert_eq!(fs::read(&cached_source).unwrap(), source_bytes);
+}
+
+#[cfg(windows)]
+#[test]
+fn replay_rejects_junction_alias_to_control_path_before_spawning() {
+    let fixture = setup_replay_fixture();
+    let id = fixture.report["mutations"][0]["id"]
+        .as_u64()
+        .unwrap()
+        .to_string();
+    let cache_dir = fixture.repo.path().join(".togi-cache");
+    let cached_source = cache_dir.join("alias-target.go");
+    let source_bytes = fs::read(&fixture.source_path).unwrap();
+    fs::create_dir_all(&cache_dir).unwrap();
+    fs::write(&cached_source, &source_bytes).unwrap();
+    // Junctions need no special privilege and must be treated like symlinks:
+    // the alias resolves into Togi control state and is rejected pre-spawn.
+    let status = std::process::Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(fixture.repo.path().join("alias.d"))
+        .arg(&cache_dir)
+        .status()
+        .unwrap();
+    assert!(status.success(), "mklink /J failed");
+
+    let mut alias_report = fixture.report.clone();
+    alias_report["mutations"][0]["source_path"] = json!("alias.d/alias-target.go");
     write_json(&fixture.report_path, &alias_report);
     fs::write(&fixture.log_path, []).unwrap();
     let output = togi()
