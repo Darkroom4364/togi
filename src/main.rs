@@ -32,18 +32,32 @@ struct ResolvedCheckConfig {
 
 fn main() {
     let cancelled = Arc::new(AtomicBool::new(false));
-    let cancelled_handler = cancelled.clone();
 
     // First Ctrl+C sets the flag so the runner can stop gracefully.
     // Second Ctrl+C force-exits for impatient users.
-    ctrlc::set_handler(move || {
-        if cancelled_handler.swap(true, Ordering::SeqCst) {
-            eprintln!("\nForce exit — files may need manual restoration (check git status)");
-            process::exit(130);
-        }
-        eprintln!("\nInterrupted — finishing current mutation and cleaning up...");
-    })
-    .expect("failed to set Ctrl+C handler");
+    #[cfg(unix)]
+    {
+        use signal_hook::consts::SIGINT;
+        // Conditional shutdown MUST precede flag registration: if the flag
+        // were registered first, the first SIGINT would both set the flag
+        // AND immediately terminate.
+        signal_hook::flag::register_conditional_shutdown(SIGINT, 130, cancelled.clone())
+            .expect("failed to register SIGINT conditional shutdown");
+        signal_hook::flag::register(SIGINT, cancelled.clone())
+            .expect("failed to register SIGINT flag handler");
+    }
+    #[cfg(windows)]
+    {
+        let cancelled_handler = cancelled.clone();
+        ctrlc::set_handler(move || {
+            if cancelled_handler.swap(true, Ordering::SeqCst) {
+                eprintln!("\nForce exit — files may need manual restoration (check git status)");
+                process::exit(130);
+            }
+            eprintln!("\nInterrupted — finishing current mutation and cleaning up...");
+        })
+        .expect("failed to set Ctrl+C handler");
+    }
 
     let cli = togi::cli::Cli::parse();
 
