@@ -3284,7 +3284,7 @@ fn github_action_report_replays_a_direct_mutation() {
     assert!(output_values.contains("mutation-score="));
     assert!(output_values.contains("survivor-count="));
 
-    std::process::Command::new(assert_cmd::cargo::cargo_bin("togi"))
+    togi()
         .args([
             "replay",
             &mutation_id,
@@ -3292,12 +3292,8 @@ fn github_action_report_replays_a_direct_mutation() {
             report_path.to_str().unwrap(),
         ])
         .current_dir(repo.path())
-        .output()
-        .unwrap()
-        .status
-        .success()
-        .then_some(())
-        .expect("replay should accept the Action report");
+        .assert()
+        .success();
 }
 
 #[test]
