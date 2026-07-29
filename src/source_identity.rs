@@ -1,4 +1,5 @@
 use sha2::{Digest, Sha256};
+use std::fmt::Write;
 use std::path::{Component, Path, PathBuf};
 
 /// Normalize a source path to Togi's canonical project-relative slash form.
@@ -58,7 +59,14 @@ pub(crate) fn resolve_normalized_project_relative_path(
 
 /// SHA-256 of the exact on-disk source bytes, including a stable algorithm tag.
 pub(crate) fn source_fingerprint(source: &[u8]) -> String {
-    format!("sha256:{:x}", Sha256::digest(source))
+    let digest = Sha256::digest(source);
+    // "sha256:" (7) + 32 bytes × 2 hex chars = 71
+    let mut s = String::with_capacity(71);
+    s.push_str("sha256:");
+    for &byte in digest.as_slice() {
+        write!(s, "{:02x}", byte).unwrap();
+    }
+    s
 }
 
 /// Verify that a stored byte range is in bounds and still names the original
