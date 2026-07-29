@@ -3403,6 +3403,7 @@ fn github_action_inputs_have_no_baked_in_defaults() {
         ("version", "'latest'"),
         ("upload-report", "'true'"),
         ("report-retention-days", "'14'"),
+        ("report-artifact-name", "'togi-report'"),
     ] {
         let (_, body) = blocks
             .iter()
@@ -3429,9 +3430,10 @@ fn github_action_declares_replay_report_contract() {
         "value: ${{ steps.run-togi.outputs.survivor-count }}",
         "id: run-togi",
         "TOGI_REPORT_PATH: ${{ runner.temp }}/togi-report.json",
+        "report-artifact-name:",
         "if: ${{ always() && inputs.upload-report == 'true' && steps.run-togi.outputs.report-path != '' }}",
         "uses: actions/upload-artifact@v7",
-        "name: togi-report",
+        "name: ${{ inputs.report-artifact-name }}",
         "path: ${{ runner.temp }}/togi-report.json",
         "retention-days: ${{ inputs.report-retention-days }}",
         "if-no-files-found: warn",
@@ -3441,10 +3443,6 @@ fn github_action_declares_replay_report_contract() {
             "action.yml is missing `{expected}`"
         );
     }
-    assert!(
-        !action_yml.contains("report-artifact-name"),
-        "the Action report contract must not add an artifact-name input"
-    );
 }
 
 #[test]

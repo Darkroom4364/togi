@@ -683,16 +683,19 @@ capture the report. When `format: json` is selected, that one JSON stream is
 saved without a second run. The selected review run remains the PR gate:
 survivors still make the Action exit 1.
 
-By default, the Action uploads the report as the `togi-report` artifact for
-14 days. Configure retention with `report-retention-days`, or set
-`upload-report: 'false'` to keep the report local to the job without uploading
-it:
+By default, the Action uploads the report as the `togi-report` artifact
+(`report-artifact-name: 'togi-report'`) for 14 days. Configure retention with
+`report-retention-days`, or set `upload-report: 'false'` to keep the report
+local to the job without uploading it. In a matrix or when invoking the Action
+more than once in a job, set a unique `report-artifact-name`, such as
+`togi-report-${{ matrix.shard }}`, to avoid artifact-name conflicts:
 
 ```yaml
 - id: togi
   uses: Darkroom4364/togi@<version>
   with:
     format: github
+    report-artifact-name: togi-report-${{ matrix.shard }}
     report-retention-days: '14'
     # upload-report: 'false'
 ```
@@ -708,7 +711,7 @@ revision:
 - uses: actions/download-artifact@v8
   if: ${{ always() }}
   with:
-    name: togi-report
+    name: togi-report-${{ matrix.shard }}
     path: togi-artifact
 - name: Replay a recorded mutant
   if: ${{ always() }}
