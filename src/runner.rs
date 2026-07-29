@@ -6733,6 +6733,55 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn replay_windows_file_removal_survives_and_keeps_removed_file_absent() -> anyhow::Result<()> {
+        if !git_available() {
+            return Ok(());
+        }
+        let (dir, file, mutation) = make_relative_test_setup();
+        run_git(dir.path(), &["init"]);
+        run_git(dir.path(), &["config", "user.email", "test@example.com"]);
+        run_git(dir.path(), &["config", "user.name", "Togi Test"]);
+        std::fs::write(dir.path().join("removed.txt"), b"removed content")?;
+        run_git(dir.path(), &["add", "."]);
+        run_git(dir.path(), &["commit", "-m", "initial"]);
+        let source_revision = git_snapshot_revision(dir.path())?;
+        let expected_source_fingerprint = source_fingerprint(&std::fs::read(&file)?);
+        std::fs::remove_file(dir.path().join("removed.txt"))?;
+
+        let log_dir = tempfile::tempdir()?;
+        let log_path = log_dir.path().join("replay.log");
+        let cancelled = AtomicBool::new(false);
+        let mut env = HashMap::new();
+        env.insert("TOGI_REPLAY_LOG".into(), log_path.display().to_string());
+        let outcome = run_replay_mutation(
+            dir.path(),
+            &mutation,
+            ReplayRunConfig {
+                test_command: vec![
+                    "powershell".into(),
+                    "-NoProfile".into(),
+                    "-Command".into(),
+                    "if (Test-Path -LiteralPath 'removed.txt') { exit 1 }; [System.IO.File]::AppendAllText($env:TOGI_REPLAY_LOG, 'invoked')".into(),
+                ],
+                build_command: None,
+                timeout: Duration::from_secs(30),
+                env,
+                respect_workspace_ignores: true,
+                source_revision: &source_revision,
+                source_fingerprint: &expected_source_fingerprint,
+                show_output: false,
+                cancelled: &cancelled,
+            },
+        )?;
+        assert_eq!(outcome.result, MutationResult::Survived);
+        assert_eq!(std::fs::read(&log_path)?, b"invoked");
+        assert_eq!(std::fs::read(&file)?, b"hello world");
+        assert!(!dir.path().join("removed.txt").exists());
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn replay_windows_clone_target_pins_parent_and_child_and_accepts_git_clone()
     -> anyhow::Result<()> {
         if !git_available() {
