@@ -5385,6 +5385,19 @@ fn run_command(
         }
     };
 
+    // Defense-in-depth: the child was reaped but process-group
+    // descendants may still hold pipes open. Check the cancellation
+    // flag before any result or side-effect propagation.
+    if cancelled.load(Ordering::Acquire) {
+        process_tree.terminate(child.id());
+        finish_capture_threads(
+            &mut stdout_capture,
+            &mut stderr_capture,
+            capture_cleanup_deadline(),
+        );
+        return MutationOutcome::cancelled();
+    }
+
     process_tree.terminate(child.id());
 
     let result = if status.success() {
