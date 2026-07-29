@@ -3418,8 +3418,9 @@ fn github_action_inputs_have_no_baked_in_defaults() {
 
 #[test]
 fn github_action_declares_replay_report_contract() {
-    let action_yml =
-        fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("action.yml")).unwrap();
+    let action_yml = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("action.yml"))
+        .unwrap()
+        .replace("\r\n", "\n");
 
     for expected in [
         "outputs:\n  report-path:",
