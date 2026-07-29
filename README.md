@@ -688,14 +688,14 @@ By default, the Action uploads the report as the `togi-report` artifact
 `report-retention-days`, or set `upload-report: 'false'` to keep the report
 local to the job without uploading it. In a matrix or when invoking the Action
 more than once in a job, set a unique `report-artifact-name`, such as
-`togi-report-${{ matrix.shard }}`, to avoid artifact-name conflicts:
+`togi-report-${{ matrix.shard }}`, to avoid artifact-name conflicts. A
+matching download step must use the same custom name.
 
 ```yaml
 - id: togi
   uses: Darkroom4364/togi@<version>
   with:
     format: github
-    report-artifact-name: togi-report-${{ matrix.shard }}
     report-retention-days: '14'
     # upload-report: 'false'
 ```
@@ -711,7 +711,7 @@ revision:
 - uses: actions/download-artifact@v8
   if: ${{ always() }}
   with:
-    name: togi-report-${{ matrix.shard }}
+    name: togi-report
     path: togi-artifact
 - name: Replay a recorded mutant
   if: ${{ always() }}
