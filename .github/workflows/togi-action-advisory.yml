@@ -31,9 +31,9 @@ jobs:
           cache-bin: false
       - name: Run Togi action (advisory)
         id: togi
-        uses: Darkroom4364/togi@05560884c9faf6e438e158245d7f19b4a28f63df # v0.4.0 release action source
+        uses: Darkroom4364/togi@a1503b2ebac4c63d377b015c4825b97cab25ec68 # v0.4.1 release action source
         with:
-          version: v0.4.0
+          version: v0.4.1
           base: origin/${{ github.base_ref }}
           test-cmd: cargo test --locked
           timeout: '120'
