@@ -44,9 +44,14 @@ if [[ -n "${TOGI_TEST_CMD:-}" ]]; then
 fi
 
 togi_bin="${TOGI_BIN:-togi}"
+run_togi() (
+  unset TOGI_BASE TOGI_TIMEOUT TOGI_FORMAT TOGI_TEST_CMD TOGI_REPORT_PATH TOGI_BIN
+  "$togi_bin" "$@"
+)
+
 
 if [[ "${TOGI_FORMAT:-}" == "json" ]]; then
-  "$togi_bin" "${review_args[@]}" | tee "$report_path"
+  run_togi "${review_args[@]}" | tee "$report_path"
   statuses=("${PIPESTATUS[@]}")
   review_status=${statuses[0]}
   tee_status=${statuses[1]}
@@ -57,7 +62,7 @@ if [[ "${TOGI_FORMAT:-}" == "json" ]]; then
   fi
   json_status=$review_status
 else
-  "$togi_bin" "${review_args[@]}"
+  run_togi "${review_args[@]}"
   review_status=$?
   case "$review_status" in
     0|1)
@@ -68,7 +73,7 @@ else
       ;;
   esac
 
-  "$togi_bin" "${json_args[@]}" >"$report_path"
+  run_togi "${json_args[@]}" >"$report_path"
   json_status=$?
 fi
 
