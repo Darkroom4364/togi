@@ -130,6 +130,9 @@ pub struct CheckArgs {
     /// JSON source-line to test-name map for targeted test runs
     #[arg(long)]
     pub test_selection_file: Option<PathBuf>,
+    /// Re-run narrowed survivors with their full test route before reporting them
+    #[arg(long)]
+    pub confirm_survivors: bool,
 
     /// Disable structured incremental history reuse
     #[arg(long)]

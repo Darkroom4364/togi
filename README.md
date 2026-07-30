@@ -403,12 +403,14 @@ fail the run when LCOV coverage is below a threshold:
 - `--fail-on-uncovered-diff` fails when any changed line is uncovered
 - `togi test-map` generates a Go line-to-test map from per-test coverage
 - `--test-selection-file coverage/test-selection.json` narrows each mutant to tests that cover that line when the configured runner supports test selection
+- `--confirm-survivors` re-runs only narrowed survivors through their original full route; a full-suite kill is reported as `killed`, not as an actionable survivor.
 
 ```bash
 togi check --coverage auto
 togi check --coverage-cmd ./scripts/collect-coverage.sh --coverage-file coverage/lcov.info
 togi test-map --path . --output coverage/test-selection.json
 togi check --coverage-file coverage/lcov.info --test-selection-file coverage/test-selection.json
+togi check --test-selection-file coverage/test-selection.json --confirm-survivors
 togi check --coverage-file coverage/lcov.info --min-line-coverage 80 --min-diff-coverage 90
 ```
 

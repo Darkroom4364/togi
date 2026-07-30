@@ -2857,12 +2857,13 @@ fn read_log(path: &Path) -> String {
 }
 
 #[test]
-fn check_help_lists_test_selection_file_flag() {
+fn check_help_lists_test_selection_confirmation_flags() {
     togi()
         .args(["check", "--help"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("--test-selection-file"));
+        .stdout(predicate::str::contains("--test-selection-file"))
+        .stdout(predicate::str::contains("--confirm-survivors"));
 }
 
 fn jq_available() -> bool {

@@ -379,6 +379,11 @@ pub fn format_pr_comment_with_baseline(
                 }
                 MutationExecution::NotExecuted(reason) => format!(" (not executed: {reason})"),
             };
+            let selection = report
+                .selection_for(mutation.id)
+                .map(|selection| format!(" (selection: {selection})"))
+                .unwrap_or_default();
+            let provenance = format!("{provenance}{selection}");
             if let Some(comparison) = comparison {
                 let baseline_status = comparison
                     .status_for(mutation.id)
@@ -552,6 +557,7 @@ mod tests {
     #[test]
     fn build_error_groups_deduplicate_by_diagnostic_fingerprint() {
         let report = MutationReport {
+            selection_provenance: std::collections::BTreeMap::new(),
             results: vec![
                 report_mutation(0, "src/a.rs", MutationResult::BuildError),
                 report_mutation(1, "src/b.rs", MutationResult::BuildError),
@@ -773,6 +779,7 @@ mod tests {
         use crate::{MutationReport, MutationResult};
         use std::time::Duration;
         let report = MutationReport {
+            selection_provenance: std::collections::BTreeMap::new(),
             results: vec![(
                 Mutation {
                     id: 0,
@@ -813,6 +820,7 @@ mod tests {
         use crate::{MutationReport, MutationResult};
         use std::time::Duration;
         let report = MutationReport {
+            selection_provenance: std::collections::BTreeMap::new(),
             results: vec![(
                 Mutation {
                     id: 0,
@@ -854,6 +862,7 @@ mod tests {
         use crate::{MutationReport, MutationResult};
         use std::time::Duration;
         let report = MutationReport {
+            selection_provenance: std::collections::BTreeMap::new(),
             results: vec![(
                 Mutation {
                     id: 0,
@@ -898,6 +907,7 @@ mod tests {
         use crate::{MutationReport, MutationResult};
         use std::time::Duration;
         let report = MutationReport {
+            selection_provenance: std::collections::BTreeMap::new(),
             results: vec![
                 (
                     Mutation {
@@ -970,6 +980,7 @@ mod tests {
             .filter(|(_, r)| *r == MutationResult::Killed)
             .count();
         MutationReport {
+            selection_provenance: std::collections::BTreeMap::new(),
             results,
             execution_provenance: BTreeMap::new(),
             build_error_diagnostics: vec![],

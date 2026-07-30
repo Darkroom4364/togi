@@ -161,6 +161,8 @@ pub struct MutationConfig {
     pub coverage_command: Vec<String>,
     pub test_selection_file: Option<PathBuf>,
     #[serde(default)]
+    pub confirm_survivors: bool,
+    #[serde(default)]
     pub min_line_coverage: Option<f64>,
     #[serde(default)]
     pub min_diff_coverage: Option<f64>,
@@ -543,6 +545,7 @@ impl Default for MutationConfig {
             coverage_file: None,
             coverage_command: vec![],
             test_selection_file: None,
+            confirm_survivors: false,
             min_line_coverage: None,
             min_diff_coverage: None,
             fail_on_uncovered_diff: false,
@@ -836,6 +839,7 @@ base = "origin/develop"
 [mutations]
 max_per_run = 50
 schemata = true
+confirm_survivors = true
 "#;
         let config: Config = toml::from_str(toml_str).unwrap();
         assert_eq!(config.test.profile, Some(ResourceProfile::Ci));
@@ -850,6 +854,7 @@ schemata = true
         assert_eq!(config.diff.base, "origin/develop");
         assert_eq!(config.mutations.max_per_run, 50);
         assert!(config.mutations.schemata);
+        assert!(config.mutations.confirm_survivors);
     }
 
     #[test]
@@ -901,6 +906,7 @@ commnad = ["cargo", "test"]
             config.mutations.test_selection_file,
             Some("coverage/test-selection.json".into())
         );
+        assert!(!config.mutations.confirm_survivors);
         assert!(config.mutations.min_line_coverage.is_none());
         assert!(config.mutations.min_diff_coverage.is_none());
         assert!(!config.mutations.fail_on_uncovered_diff);
@@ -934,6 +940,7 @@ commnad = ["cargo", "test"]
         assert!(config.mutations.operators.is_empty());
         assert!(config.mutations.coverage_file.is_none());
         assert!(config.mutations.test_selection_file.is_none());
+        assert!(!config.mutations.confirm_survivors);
         assert!(config.mutations.min_line_coverage.is_none());
         assert!(config.mutations.min_diff_coverage.is_none());
         assert!(!config.mutations.fail_on_uncovered_diff);

@@ -139,6 +139,7 @@ struct ExplainMutation {
     description: String,
     result: String,
     execution: Option<ExplainMutationExecution>,
+    test_selection: Option<ExplainTestSelection>,
     original: Option<String>,
     replacement: Option<String>,
     diff: Option<String>,
@@ -148,6 +149,12 @@ struct ExplainMutation {
 struct ExplainMutationExecution {
     state: String,
     reason: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ExplainTestSelection {
+    mode: String,
+    confirmation: Option<String>,
 }
 
 fn explain_mutation(mutant_id: u32, report_path: &Path) -> anyhow::Result<()> {
@@ -204,6 +211,12 @@ fn explain_mutation(mutant_id: u32, report_path: &Path) -> anyhow::Result<()> {
 
     println!();
     println!("Execution: {execution_detail}");
+    if let Some(selection) = &mutation.test_selection {
+        println!("Test selection: {}", selection.mode);
+        if let Some(confirmation) = &selection.confirmation {
+            println!("Full-suite confirmation: {confirmation}");
+        }
+    }
     if test_executed {
         if let Some(command) = report.test_command.as_ref().filter(|cmd| !cmd.is_empty()) {
             println!("Test command: {}", serde_json::to_string(command)?);
@@ -768,6 +781,9 @@ fn resolve_config(cfg: togi::cli::CheckArgs) -> anyhow::Result<ResolvedCheckConf
     }
     if let Some(path) = cfg.test_selection_file {
         config.mutations.test_selection_file = Some(path);
+    }
+    if cfg.confirm_survivors {
+        config.mutations.confirm_survivors = true;
     }
     if cfg.no_incremental_history {
         config.mutations.incremental_history = false;
@@ -1417,6 +1433,7 @@ fn coverage_only_report(
     togi::MutationReport {
         results: Vec::new(),
         execution_provenance: BTreeMap::new(),
+        selection_provenance: BTreeMap::new(),
         build_error_diagnostics: Vec::new(),
         schemata: None,
         baseline_timing: None,
@@ -1536,6 +1553,7 @@ fn command_config(
             config.mutations.test_selection_file.as_deref(),
             project_root,
         ),
+        confirm_survivors: config.mutations.confirm_survivors,
     }
 }
 
@@ -1981,6 +1999,7 @@ mod tests {
             min_diff_coverage: None,
             fail_on_uncovered_diff: false,
             test_selection_file: None,
+            confirm_survivors: false,
             no_incremental_history: false,
             learned_selection: false,
             force_rerun: false,
@@ -2009,6 +2028,21 @@ mod tests {
 
         assert_eq!(resolved.config.test.jobs, 1);
         assert!(resolved.fail_fast);
+    }
+
+    #[test]
+    fn resolve_config_cli_confirmation_enables_survivor_confirmation() {
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let config_path = dir.path().join("togi.toml");
+        std::fs::write(&config_path, "[mutations]\nconfirm_survivors = false\n")
+            .expect("config should be written");
+        let mut cfg = check_config();
+        cfg.config = Some(config_path);
+        cfg.confirm_survivors = true;
+
+        let resolved = resolve_config(cfg).expect("config should resolve");
+
+        assert!(resolved.config.mutations.confirm_survivors);
     }
 
     #[test]

@@ -583,6 +583,7 @@ mod tests {
     fn fixture_report(results: Vec<(Mutation, MutationResult)>) -> MutationReport {
         let total = results.len();
         MutationReport {
+            selection_provenance: std::collections::BTreeMap::new(),
             killed: results
                 .iter()
                 .filter(|(_, result)| *result == MutationResult::Killed)
