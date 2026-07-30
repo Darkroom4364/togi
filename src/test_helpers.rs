@@ -8,6 +8,7 @@ use std::time::Duration;
 /// A standard two-mutation report for testing report formatters.
 pub fn sample_report() -> MutationReport {
     MutationReport {
+        selection_provenance: std::collections::BTreeMap::new(),
         results: vec![
             (
                 Mutation {

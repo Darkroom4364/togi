@@ -111,6 +111,8 @@ struct JsonMutation {
     result: String,
     execution: JsonMutationExecution,
     #[serde(skip_serializing_if = "Option::is_none")]
+    test_selection: Option<JsonTestSelection>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     column: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     original: Option<String>,
@@ -141,6 +143,13 @@ struct JsonMutationExecution {
     state: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     reason: Option<&'static str>,
+}
+
+#[derive(Serialize)]
+struct JsonTestSelection {
+    mode: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    confirmation: Option<&'static str>,
 }
 
 #[derive(Serialize)]
@@ -385,6 +394,14 @@ fn to_json_string_with_baseline_and_replay_optional(
         .iter()
         .map(|(m, r)| {
             let execution = report.execution_for(m.id, *r);
+            let test_selection = report
+                .selection_for(m.id)
+                .map(|selection| JsonTestSelection {
+                    mode: selection.mode_name(),
+                    confirmation: selection
+                        .confirmation()
+                        .map(|confirmation| confirmation.name()),
+                });
             let replay_fields = replay_capture.map(|(capture, recipes)| {
                 json_replay_mutation_fields(
                     capture,
@@ -413,6 +430,7 @@ fn to_json_string_with_baseline_and_replay_optional(
                     state: execution.state_name(),
                     reason: execution.reason().map(|reason| reason.name()),
                 },
+                test_selection,
                 column: Some(m.column),
                 original: Some(m.original.clone()),
                 replacement: Some(m.replacement.clone()),
@@ -543,7 +561,7 @@ mod tests {
     use crate::test_helpers::sample_report;
     use crate::{
         BaselineTiming, BuildErrorDiagnostic, Mutation, MutationExecution,
-        SchemataFallbackReasonCount, SchemataReport,
+        SchemataFallbackReasonCount, SchemataReport, SurvivorConfirmation, TestSelectionProvenance,
     };
     use serde_json::Value;
     use std::collections::BTreeMap;
@@ -702,6 +720,34 @@ mod tests {
     }
 
     #[test]
+    fn json_output_records_selection_mode_and_confirmation() {
+        let mut report = sample_report();
+        report.selection_provenance.insert(
+            0,
+            TestSelectionProvenance::Narrowed {
+                confirmation: SurvivorConfirmation::Killed,
+            },
+        );
+        report
+            .selection_provenance
+            .insert(1, TestSelectionProvenance::Full);
+
+        let value: Value = serde_json::from_str(&to_json_string(&report).unwrap()).unwrap();
+
+        assert_eq!(value["mutations"][0]["test_selection"]["mode"], "narrowed");
+        assert_eq!(
+            value["mutations"][0]["test_selection"]["confirmation"],
+            "killed"
+        );
+        assert_eq!(value["mutations"][1]["test_selection"]["mode"], "full");
+        assert!(
+            value["mutations"][1]["test_selection"]
+                .get("confirmation")
+                .is_none()
+        );
+    }
+
+    #[test]
     fn json_output_reports_reuse_and_nonexecution_reasons() {
         let mut report = sample_report();
         report
@@ -850,6 +896,7 @@ mod tests {
     #[test]
     fn json_score_zero_when_all_build_errors() {
         let report = MutationReport {
+            selection_provenance: std::collections::BTreeMap::new(),
             results: vec![(
                 Mutation {
                     id: 1,
@@ -897,6 +944,7 @@ mod tests {
         );
         let fingerprint = diagnostic.fingerprint.clone();
         let report = MutationReport {
+            selection_provenance: std::collections::BTreeMap::new(),
             results: vec![(
                 Mutation {
                     id: 1,
@@ -952,6 +1000,7 @@ mod tests {
     #[test]
     fn json_score_100_when_empty_report() {
         let report = MutationReport {
+            selection_provenance: std::collections::BTreeMap::new(),
             results: vec![],
             execution_provenance: BTreeMap::new(),
             build_error_diagnostics: vec![],
@@ -1055,6 +1104,7 @@ mod tests {
         };
         let capture = ReplayReportCapture::capture(project.path(), std::slice::from_ref(&mutation));
         let mut report = MutationReport {
+            selection_provenance: std::collections::BTreeMap::new(),
             results: vec![(mutation.clone(), MutationResult::Survived)],
             execution_provenance: BTreeMap::from([(0, MutationExecution::Executed)]),
             build_error_diagnostics: vec![],

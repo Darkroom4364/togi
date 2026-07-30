@@ -1,4 +1,7 @@
-use crate::{Mutation, MutationExecution, MutationReport, MutationResult};
+use crate::{
+    Mutation, MutationExecution, MutationReport, MutationResult, SurvivorConfirmation,
+    TestSelectionProvenance,
+};
 use anyhow::Result;
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -72,6 +75,60 @@ struct SarifInvocationProperties {
     #[serde(skip_serializing_if = "super::is_zero")]
     subsumed: usize,
     mutation_score: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selection_confirmation: Option<SarifSelectionConfirmationSummary>,
+}
+
+#[derive(Serialize)]
+struct SarifSelectionConfirmationSummary {
+    full: usize,
+    narrowed: usize,
+    confirmation_not_requested: usize,
+    confirmation_not_needed: usize,
+    confirmation_confirmed_survived: usize,
+    confirmation_killed: usize,
+    confirmation_timed_out: usize,
+    confirmation_build_error: usize,
+}
+
+impl SarifSelectionConfirmationSummary {
+    fn from_report(report: &MutationReport) -> Option<Self> {
+        if report.selection_provenance.is_empty() {
+            return None;
+        }
+
+        let mut summary = Self {
+            full: 0,
+            narrowed: 0,
+            confirmation_not_requested: 0,
+            confirmation_not_needed: 0,
+            confirmation_confirmed_survived: 0,
+            confirmation_killed: 0,
+            confirmation_timed_out: 0,
+            confirmation_build_error: 0,
+        };
+        for selection in report.selection_provenance.values() {
+            match selection {
+                TestSelectionProvenance::Full => summary.full += 1,
+                TestSelectionProvenance::Narrowed { confirmation } => {
+                    summary.narrowed += 1;
+                    match confirmation {
+                        SurvivorConfirmation::NotRequested => {
+                            summary.confirmation_not_requested += 1
+                        }
+                        SurvivorConfirmation::NotNeeded => summary.confirmation_not_needed += 1,
+                        SurvivorConfirmation::ConfirmedSurvived => {
+                            summary.confirmation_confirmed_survived += 1
+                        }
+                        SurvivorConfirmation::Killed => summary.confirmation_killed += 1,
+                        SurvivorConfirmation::TimedOut => summary.confirmation_timed_out += 1,
+                        SurvivorConfirmation::BuildError => summary.confirmation_build_error += 1,
+                    }
+                }
+            }
+        }
+        Some(summary)
+    }
 }
 
 #[derive(Serialize)]
@@ -92,6 +149,10 @@ struct SarifResultProperties {
     nonexecution_reason: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     baseline_status: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    test_selection_mode: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selection_confirmation: Option<&'static str>,
 }
 
 #[derive(Serialize)]
@@ -133,6 +194,7 @@ fn result_for_with_baseline(
     mutation: &Mutation,
     execution: MutationExecution,
     status: Option<crate::baseline::SurvivorBaselineStatus>,
+    selection: Option<TestSelectionProvenance>,
 ) -> SarifResult {
     SarifResult {
         rule_id: mutation.operator.clone(),
@@ -156,11 +218,17 @@ fn result_for_with_baseline(
                 },
             },
         }],
-        properties: (!execution.is_tested() || status.is_some()).then(|| SarifResultProperties {
-            execution: execution.state_name(),
-            nonexecution_reason: execution.reason().map(|reason| reason.name()),
-            baseline_status: status.map(|status| status.as_str()),
-        }),
+        properties: (!execution.is_tested() || status.is_some() || selection.is_some()).then(
+            || SarifResultProperties {
+                execution: execution.state_name(),
+                nonexecution_reason: execution.reason().map(|reason| reason.name()),
+                baseline_status: status.map(|status| status.as_str()),
+                test_selection_mode: selection.map(|selection| selection.mode_name()),
+                selection_confirmation: selection
+                    .and_then(|selection| selection.confirmation())
+                    .map(|confirmation| confirmation.name()),
+            },
+        ),
     }
 }
 
@@ -251,6 +319,7 @@ pub fn to_sarif_string_with_baseline(
                     uncovered: report.uncovered_count(),
                     subsumed: report.subsumed_count(),
                     mutation_score: super::mutation_score(report),
+                    selection_confirmation: SarifSelectionConfirmationSummary::from_report(report),
                 },
             }],
             results: surviving
@@ -260,6 +329,7 @@ pub fn to_sarif_string_with_baseline(
                         mutation,
                         *execution,
                         comparison.and_then(|comparison| comparison.status_for(mutation.id)),
+                        report.selection_for(mutation.id),
                     )
                 })
                 .collect(),
@@ -273,6 +343,7 @@ pub fn to_sarif_string_with_baseline(
 mod tests {
     use super::*;
     use crate::test_helpers::sample_report;
+    use crate::{SurvivorConfirmation, TestSelectionProvenance};
     use serde_json::Value;
     use std::collections::BTreeMap;
     use std::path::PathBuf;
@@ -311,6 +382,7 @@ mod tests {
             .filter(|(_, r)| *r == MutationResult::BuildError)
             .count();
         MutationReport {
+            selection_provenance: std::collections::BTreeMap::new(),
             planned_total: results.len(),
             early_stop_reason: None,
             total: results.len(),
@@ -388,6 +460,62 @@ mod tests {
         let results = value["runs"][0]["results"].as_array().unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0]["ruleId"], "op_b");
+    }
+
+    #[test]
+    fn sarif_keeps_confirmation_outcomes_in_invocation_properties() {
+        let mut report = report_with(vec![
+            (
+                mutation(0, "src/killed.rs", 1, "op", "killed by confirmation"),
+                MutationResult::Killed,
+            ),
+            (
+                mutation(1, "src/survived.rs", 2, "op", "confirmed survivor"),
+                MutationResult::Survived,
+            ),
+        ]);
+        report.selection_provenance.insert(
+            0,
+            TestSelectionProvenance::Narrowed {
+                confirmation: SurvivorConfirmation::Killed,
+            },
+        );
+        report.selection_provenance.insert(
+            1,
+            TestSelectionProvenance::Narrowed {
+                confirmation: SurvivorConfirmation::ConfirmedSurvived,
+            },
+        );
+
+        let value = parse(&report);
+
+        assert_eq!(value["runs"][0]["results"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            value["runs"][0]["results"][0]["properties"]["test_selection_mode"],
+            "narrowed"
+        );
+        assert_eq!(
+            value["runs"][0]["results"][0]["properties"]["selection_confirmation"],
+            "confirmed_survived"
+        );
+        assert_eq!(
+            value["runs"][0]["invocations"][0]["properties"]["selection_confirmation"],
+            serde_json::json!({
+                "full": 0,
+                "narrowed": 2,
+                "confirmation_not_requested": 0,
+                "confirmation_not_needed": 0,
+                "confirmation_confirmed_survived": 1,
+                "confirmation_killed": 1,
+                "confirmation_timed_out": 0,
+                "confirmation_build_error": 0
+            })
+        );
+        assert!(
+            parse(&sample_report())["runs"][0]["invocations"][0]["properties"]
+                .get("selection_confirmation")
+                .is_none()
+        );
     }
 
     #[test]

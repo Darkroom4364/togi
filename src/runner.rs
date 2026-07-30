@@ -8,7 +8,7 @@ use crate::source_identity::{
 };
 use crate::{
     BuildErrorDiagnostic, Mutation, MutationExecution, MutationReport, MutationResult,
-    SchemataFallbackReasonCount, SchemataReport,
+    SchemataFallbackReasonCount, SchemataReport, SurvivorConfirmation, TestSelectionProvenance,
 };
 use anyhow::{Context, bail};
 #[cfg(not(windows))]
@@ -68,6 +68,8 @@ pub struct CommandConfig {
     pub language_timeouts: HashMap<String, Duration>,
     /// Optional source-line to test-name map used to narrow test commands.
     pub test_selection: Option<TestSelectionConfig>,
+    /// Confirm actual narrowed survivors against their original full route.
+    pub confirm_survivors: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -353,9 +355,12 @@ pub fn run_suite_failure(error: &anyhow::Error) -> Option<&RunSuiteFailure> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SelectedTestCommand {
     argv: Vec<String>,
+    /// Original route argv retained only when test selection changed it.
+    unnarrowed_argv: Option<Vec<String>>,
     timeout: Duration,
     uses_default_timeout: bool,
     selected_tests: Vec<String>,
+    selection_active: bool,
 }
 
 impl SelectedTestCommand {
@@ -387,6 +392,26 @@ impl SelectedTestCommand {
             env_parts.join(",")
         )
     }
+    fn is_narrowed(&self) -> bool {
+        self.unnarrowed_argv.is_some()
+    }
+
+    fn unnarrowed_argv(&self) -> Option<&[String]> {
+        self.unnarrowed_argv.as_deref()
+    }
+
+    fn selection_provenance(
+        &self,
+        confirmation: SurvivorConfirmation,
+    ) -> Option<TestSelectionProvenance> {
+        if !self.selection_active {
+            None
+        } else if self.is_narrowed() {
+            Some(TestSelectionProvenance::Narrowed { confirmation })
+        } else {
+            Some(TestSelectionProvenance::Full)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -405,6 +430,7 @@ fn select_test_command_with_history(
     history: Option<&cache::IncrementalHistoryStore>,
 ) -> SelectedTestCommand {
     let mut selected = select_unnarrowed_test_command(project_root, commands, mutation);
+    selected.selection_active = commands.test_selection.is_some();
 
     if let Some(test_selection) = &commands.test_selection {
         if let Some(mut tests) = test_selection.tests_for(project_root, mutation) {
@@ -417,7 +443,10 @@ fn select_test_command_with_history(
             }) {
                 tests.sort_by_key(|test| if *test == preferred { 0 } else { 1 });
             }
-            selected.argv = narrow_test_command(selected.argv, &tests);
+            let narrowed = narrow_test_command(selected.argv.clone(), &tests);
+            if narrowed != selected.argv {
+                selected.unnarrowed_argv = Some(std::mem::replace(&mut selected.argv, narrowed));
+            }
             selected.selected_tests = tests;
         }
     }
@@ -458,9 +487,11 @@ fn select_unnarrowed_test_command(
 
     SelectedTestCommand {
         argv,
+        unnarrowed_argv: None,
         timeout,
         uses_default_timeout,
         selected_tests: Vec::new(),
+        selection_active: false,
     }
 }
 
@@ -3066,6 +3097,7 @@ struct QueuedMutation {
     index: usize,
     mutation: Mutation,
     restore_checked: bool,
+    primary_restore: Option<RestoredMutationResult>,
 }
 
 #[derive(Debug)]
@@ -3073,6 +3105,7 @@ struct MutationRunRecord {
     mutation: Mutation,
     result: MutationResult,
     execution: MutationExecution,
+    selection: Option<TestSelectionProvenance>,
     build_error_diagnostic: Option<BuildErrorDiagnostic>,
     replay_recipe: Option<RegularDirectRecipe>,
 }
@@ -3088,12 +3121,18 @@ impl MutationRunRecord {
             result,
             execution: MutationExecution::for_result(result),
             build_error_diagnostic,
+            selection: None,
             replay_recipe: None,
         }
     }
 
     fn with_execution(mut self, execution: MutationExecution) -> Self {
         self.execution = execution;
+        self
+    }
+
+    fn with_selection(mut self, selection: Option<TestSelectionProvenance>) -> Self {
+        self.selection = selection;
         self
     }
 
@@ -3490,8 +3529,25 @@ impl PreparedMutationRun {
         respect_workspace_ignores: bool,
         origin: DirectRecipeOrigin,
     ) -> RegularDirectRecipe {
+        self.direct_recipe_for(
+            &self.selected_test.argv,
+            commands,
+            env,
+            respect_workspace_ignores,
+            origin,
+        )
+    }
+
+    fn direct_recipe_for(
+        &self,
+        test_command: &[String],
+        commands: &CommandConfig,
+        env: &HashMap<String, String>,
+        respect_workspace_ignores: bool,
+        origin: DirectRecipeOrigin,
+    ) -> RegularDirectRecipe {
         RegularDirectRecipe {
-            test_command: sandboxed_command(&commands.sandbox_command, &self.selected_test.argv),
+            test_command: sandboxed_command(&commands.sandbox_command, test_command),
             build_command: (commands.build_command_explicit && !commands.build_command.is_empty())
                 .then(|| sandboxed_command(&commands.sandbox_command, &commands.build_command)),
             timeout_ms: u64::try_from(self.selected_test.timeout.as_millis()).unwrap_or(u64::MAX),
@@ -3565,6 +3621,38 @@ impl PreparedMutationRun {
     }
 }
 
+fn needs_survivor_confirmation(
+    commands: &CommandConfig,
+    selected: &SelectedTestCommand,
+    result: MutationResult,
+) -> bool {
+    commands.confirm_survivors && selected.is_narrowed() && result == MutationResult::Survived
+}
+
+fn confirmation_from_result(result: MutationResult) -> SurvivorConfirmation {
+    match result {
+        MutationResult::Survived => SurvivorConfirmation::ConfirmedSurvived,
+        MutationResult::Killed => SurvivorConfirmation::Killed,
+        MutationResult::Timeout => SurvivorConfirmation::TimedOut,
+        MutationResult::BuildError => SurvivorConfirmation::BuildError,
+        MutationResult::Uncovered | MutationResult::Subsumed => SurvivorConfirmation::BuildError,
+    }
+}
+
+fn confirmation_workspace_reset_error(
+    workspace_root: &Path,
+    error: std::io::Error,
+) -> MutationOutcome {
+    MutationOutcome::build_error_with(
+        "confirmation_workspace_reset",
+        vec![],
+        format!(
+            "could not reset isolated mutation workspace {} before full-suite confirmation: {error}",
+            workspace_root.display()
+        ),
+    )
+}
+
 fn run_queued_mutation(
     queued: QueuedMutation,
     reservation: TestSlotReservation,
@@ -3574,9 +3662,9 @@ fn run_queued_mutation(
         index,
         mutation,
         restore_checked,
+        primary_restore,
     } = queued;
 
-    // Stop if cancelled (Ctrl+C).
     if shared.cancelled.load(Ordering::Relaxed) {
         return None;
     }
@@ -3593,31 +3681,41 @@ fn run_queued_mutation(
             env: shared.env,
         },
     );
-    // Capture the exact direct recipe before any cache/history lookup.
-    let direct_recipe = prepared.direct_recipe(
+    let primary_direct_recipe = prepared.direct_recipe(
         shared.commands,
         shared.env,
         shared.respect_workspace_ignores,
         DirectRecipeOrigin::Executed,
     );
+    let restored = primary_restore.or_else(|| {
+        (!restore_checked)
+            .then(|| {
+                prepared.restore_result(shared.project_root, shared.history, shared.force_rerun)
+            })
+            .flatten()
+    });
 
-    // Normal runs retain lazy cache lookup; early-stop runs preclassify every
-    // candidate before scheduling and mark fresh entries as already checked.
-    if !restore_checked {
-        if let Some(restored) =
-            prepared.restore_result(shared.project_root, shared.history, shared.force_rerun)
-        {
+    if let Some(restored) = restored {
+        if !needs_survivor_confirmation(shared.commands, &prepared.selected_test, restored.result) {
             reservation.release();
             exclude_restored_from_early_stop(shared.early_stop, restored.execution);
             record_progress(&shared, &mutation, restored.result, None, true);
+            let confirmation = if prepared.selected_test.is_narrowed()
+                && restored.result == MutationResult::Survived
+            {
+                SurvivorConfirmation::NotRequested
+            } else {
+                SurvivorConfirmation::NotNeeded
+            };
             let mut record = MutationRunRecord::new(mutation, restored.result, None)
-                .with_execution(restored.execution);
+                .with_execution(restored.execution)
+                .with_selection(prepared.selected_test.selection_provenance(confirmation));
             if matches!(
                 restored.result,
                 MutationResult::Killed | MutationResult::Survived | MutationResult::Timeout
             ) {
                 if let Some(origin) = DirectRecipeOrigin::from_execution(restored.execution) {
-                    let mut recipe = direct_recipe.clone();
+                    let mut recipe = primary_direct_recipe.clone();
                     recipe.origin = origin;
                     record = record.with_replay_recipe(recipe);
                 }
@@ -3626,9 +3724,12 @@ fn run_queued_mutation(
         }
     }
 
-    let outcome = {
-        let workspace_slot = shared.workspace_pool.acquire();
-        let workspace_root = workspace_slot.root().to_path_buf();
+    let primary_was_restored = restored.is_some();
+    let workspace_slot = shared.workspace_pool.acquire();
+    let workspace_root = workspace_slot.root().to_path_buf();
+    let primary_outcome = if let Some(restored) = restored {
+        MutationOutcome::new(restored.result, None)
+    } else {
         if workspace_slot.needs_reset() {
             if let Err(e) =
                 workspace_slot.reset(shared.project_root, shared.respect_workspace_ignores)
@@ -3652,7 +3753,12 @@ fn run_queued_mutation(
                 );
                 return Some((
                     index,
-                    MutationRunRecord::new(mutation, MutationResult::BuildError, Some(diagnostic)),
+                    MutationRunRecord::new(mutation, MutationResult::BuildError, Some(diagnostic))
+                        .with_selection(
+                            prepared
+                                .selected_test
+                                .selection_provenance(SurvivorConfirmation::NotNeeded),
+                        ),
                 ));
             }
         }
@@ -3674,21 +3780,87 @@ fn run_queued_mutation(
         )
     };
 
-    if outcome.cancelled {
+    if primary_outcome.cancelled {
         return None;
     }
-    if outcome.result == MutationResult::BuildError {
-        reservation.release();
-    } else {
-        reservation.commit();
+    if !primary_was_restored {
+        prepared.store_cache(shared.project_root, primary_outcome.result);
+        prepared.record_history(
+            shared.history,
+            primary_outcome.result,
+            primary_outcome.test_output.as_deref(),
+        );
     }
 
-    prepared.store_cache(shared.project_root, outcome.result);
-    prepared.record_history(
-        shared.history,
-        outcome.result,
-        outcome.test_output.as_deref(),
-    );
+    let primary_result = primary_outcome.result;
+    let mut outcome = primary_outcome;
+    let mut execution = restored
+        .map(|restored| restored.execution)
+        .unwrap_or_else(|| MutationExecution::for_result(outcome.result));
+    let mut direct_recipe = primary_direct_recipe;
+    let confirmation =
+        if needs_survivor_confirmation(shared.commands, &prepared.selected_test, primary_result) {
+            let full_argv = prepared
+                .selected_test
+                .unnarrowed_argv()
+                .expect("narrowed test command must retain its full route");
+            outcome =
+                match workspace_slot.reset(shared.project_root, shared.respect_workspace_ignores) {
+                    Ok(()) => {
+                        let workspace_target = ResolvedMutation::new_for_execution(
+                            shared.project_root,
+                            &workspace_root,
+                            &mutation,
+                        );
+                        run_single_mutation(
+                            full_argv,
+                            shared.commands.sandbox_command.as_slice(),
+                            BuildCommand {
+                                argv: shared.build_command,
+                                explicit: shared.build_command_explicit,
+                            },
+                            prepared.selected_test.timeout,
+                            &workspace_root,
+                            workspace_target,
+                            shared.show_output,
+                            shared.env,
+                            shared.cancelled,
+                        )
+                    }
+                    Err(error) => confirmation_workspace_reset_error(&workspace_root, error),
+                };
+            if outcome.cancelled {
+                return None;
+            }
+            execution = MutationExecution::for_result(outcome.result);
+            direct_recipe = prepared.direct_recipe_for(
+                full_argv,
+                shared.commands,
+                shared.env,
+                shared.respect_workspace_ignores,
+                DirectRecipeOrigin::Executed,
+            );
+            confirmation_from_result(outcome.result)
+        } else if prepared.selected_test.is_narrowed() && primary_result == MutationResult::Survived
+        {
+            SurvivorConfirmation::NotRequested
+        } else {
+            SurvivorConfirmation::NotNeeded
+        };
+
+    if primary_was_restored {
+        if outcome.result == MutationResult::BuildError {
+            reservation.release();
+        } else {
+            reservation.commit();
+        }
+    } else if primary_result == MutationResult::BuildError {
+        reservation.release();
+    } else {
+        // A primary test already consumed this candidate's slot even if the
+        // full confirmation later cannot run.
+        reservation.commit();
+    }
 
     let result = outcome.result;
     record_progress(
@@ -3700,7 +3872,9 @@ fn run_queued_mutation(
     );
     record_early_stop(&shared, result);
     let diagnostic = build_error_diagnostic_from_outcome(&mutation, "regular", &outcome);
-    let mut record = MutationRunRecord::new(mutation, result, diagnostic);
+    let mut record = MutationRunRecord::new(mutation, result, diagnostic)
+        .with_execution(execution)
+        .with_selection(prepared.selected_test.selection_provenance(confirmation));
     if matches!(
         result,
         MutationResult::Killed | MutationResult::Survived | MutationResult::Timeout
@@ -3844,6 +4018,7 @@ impl TestRunner {
                         index,
                         mutation,
                         restore_checked: false,
+                        primary_restore: None,
                     })
                     .collect(),
                 restored: Vec::new(),
@@ -3867,6 +4042,7 @@ impl TestRunner {
                     index,
                     mutation: mutation.clone(),
                     restore_checked: false,
+                    primary_restore: None,
                 });
                 continue;
             }
@@ -3894,9 +4070,30 @@ impl TestRunner {
             if let Some(restored_result) =
                 prepared.restore_result(&self.project_root, history.as_ref(), self.force_rerun)
             {
+                if needs_survivor_confirmation(
+                    &self.commands,
+                    &prepared.selected_test,
+                    restored_result.result,
+                ) {
+                    fresh.push(QueuedMutation {
+                        index,
+                        mutation: mutation.clone(),
+                        restore_checked: true,
+                        primary_restore: Some(restored_result),
+                    });
+                    continue;
+                }
+                let confirmation = if prepared.selected_test.is_narrowed()
+                    && restored_result.result == MutationResult::Survived
+                {
+                    SurvivorConfirmation::NotRequested
+                } else {
+                    SurvivorConfirmation::NotNeeded
+                };
                 let mut record =
                     MutationRunRecord::new(mutation.clone(), restored_result.result, None)
-                        .with_execution(restored_result.execution);
+                        .with_execution(restored_result.execution)
+                        .with_selection(prepared.selected_test.selection_provenance(confirmation));
                 if matches!(
                     restored_result.result,
                     MutationResult::Killed | MutationResult::Survived | MutationResult::Timeout
@@ -3915,6 +4112,7 @@ impl TestRunner {
                     index,
                     mutation: mutation.clone(),
                     restore_checked: true,
+                    primary_restore: None,
                 });
             }
         }
@@ -3998,6 +4196,15 @@ impl TestRunner {
         }
         let planned_total = mutations.len();
         let preclassified = self.preclassify_for_early_stop(&mutations);
+        let pending_restores: HashMap<u32, RestoredMutationResult> = preclassified
+            .fresh
+            .iter()
+            .filter_map(|queued| {
+                queued
+                    .primary_restore
+                    .map(|restored| (queued.mutation.id, restored))
+            })
+            .collect();
         let restored_ids: HashSet<u32> = preclassified
             .restored
             .iter()
@@ -4077,6 +4284,7 @@ impl TestRunner {
                 early_stop.clone(),
                 tested_counter.clone(),
                 restore_checked,
+                &pending_restores,
             ) {
                 Ok((records, demoted)) => {
                     schemata_summary.fast_path += records
@@ -4111,6 +4319,7 @@ impl TestRunner {
                     .enumerate()
                     .map(|(index, mutation)| QueuedMutation {
                         index,
+                        primary_restore: pending_restores.get(&mutation.id).copied(),
                         mutation,
                         restore_checked,
                     })
@@ -4339,6 +4548,7 @@ impl TestRunner {
         early_stop: Option<Arc<EarlyStopState>>,
         tested_counter: Arc<AtomicUsize>,
         restore_checked: bool,
+        pending_restores: &HashMap<u32, RestoredMutationResult>,
     ) -> Result<(Vec<MutationRunRecord>, Vec<Mutation>), crate::schemata::SchemaRewriteError> {
         self.run_schema_mutations_inner(
             language,
@@ -4346,10 +4556,12 @@ impl TestRunner {
             early_stop,
             tested_counter,
             restore_checked,
+            pending_restores,
             true,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn run_schema_mutations_inner(
         &self,
         language: &str,
@@ -4357,6 +4569,7 @@ impl TestRunner {
         early_stop: Option<Arc<EarlyStopState>>,
         tested_counter: Arc<AtomicUsize>,
         restore_checked: bool,
+        pending_restores: &HashMap<u32, RestoredMutationResult>,
         allow_build_bisection: bool,
     ) -> Result<(Vec<MutationRunRecord>, Vec<Mutation>), crate::schemata::SchemaRewriteError> {
         let rewrites =
@@ -4414,10 +4627,19 @@ impl TestRunner {
             } else {
                 prepared.selected_test.argv.clone()
             };
-            if !restore_checked {
-                if let Some(restored) =
+            let primary_restore = pending_restores.get(&mutation.id).copied().or_else(|| {
+                if restore_checked {
+                    None
+                } else {
                     prepared.restore_result(&self.project_root, history.as_ref(), self.force_rerun)
-                {
+                }
+            });
+            if let Some(restored) = primary_restore {
+                if !needs_survivor_confirmation(
+                    &self.commands,
+                    &prepared.selected_test,
+                    restored.result,
+                ) {
                     reservation.release();
                     exclude_restored_from_early_stop(early_stop.as_ref(), restored.execution);
                     if self.verbose {
@@ -4428,16 +4650,29 @@ impl TestRunner {
                             mutation.operator
                         );
                     }
+                    let confirmation = if prepared.selected_test.is_narrowed()
+                        && restored.result == MutationResult::Survived
+                    {
+                        SurvivorConfirmation::NotRequested
+                    } else {
+                        SurvivorConfirmation::NotNeeded
+                    };
                     results.push(
                         MutationRunRecord::new(mutation.clone(), restored.result, None)
-                            .with_execution(restored.execution),
+                            .with_execution(restored.execution)
+                            .with_selection(
+                                prepared.selected_test.selection_provenance(confirmation),
+                            ),
                     );
                     continue;
                 }
             }
 
+            let primary_was_restored = primary_restore.is_some();
             let mut cacheable = true;
-            let outcome = if workspace_needs_reset {
+            let outcome = if let Some(restored) = primary_restore {
+                MutationOutcome::new(restored.result, None)
+            } else if workspace_needs_reset {
                 if let Err(e) = workspace.reset(&self.project_root, self.respect_workspace_ignores)
                 {
                     cacheable = false;
@@ -4518,6 +4753,7 @@ impl TestRunner {
                                     early_stop.clone(),
                                     tested_counter.clone(),
                                     restore_checked,
+                                    pending_restores,
                                     false,
                                 ) {
                                     Ok((batch_records, batch_demoted)) => {
@@ -4563,24 +4799,91 @@ impl TestRunner {
                 }
                 break;
             }
-            if outcome.result == MutationResult::BuildError {
+            if !primary_was_restored {
+                if cacheable {
+                    prepared.store_cache(&self.project_root, outcome.result);
+                }
+                prepared.record_history(
+                    history.as_ref(),
+                    outcome.result,
+                    outcome.test_output.as_deref(),
+                );
+            }
+
+            let primary_result = outcome.result;
+            let mut final_outcome = outcome;
+            let mut execution = primary_restore
+                .map(|restored| restored.execution)
+                .unwrap_or(MutationExecution::Executed);
+            let confirmation = if needs_survivor_confirmation(
+                &self.commands,
+                &prepared.selected_test,
+                primary_result,
+            ) {
+                let full_argv = prepared
+                    .selected_test
+                    .unnarrowed_argv()
+                    .expect("narrowed test command must retain its full argv");
+                let full_argv = if language == "go" {
+                    force_go_no_test_cache(full_argv.to_vec())
+                } else {
+                    full_argv.to_vec()
+                };
+                let mut confirmation_cacheable = true;
+                let confirmed = match workspace
+                    .reset(&self.project_root, self.respect_workspace_ignores)
+                {
+                    Ok(()) => {
+                        workspace_needs_reset = true;
+                        run_schema_workspace_mutation(
+                            self,
+                            workspace.root(),
+                            &rewrites,
+                            &full_argv,
+                            prepared.selected_test.timeout,
+                            &env,
+                            &mut confirmation_cacheable,
+                        )
+                    }
+                    Err(error) => MutationOutcome::build_error_with(
+                        "confirmation_workspace_reset",
+                        vec![],
+                        format!(
+                            "could not reset schema workspace {} before full-suite confirmation: {error}",
+                            workspace.root().display()
+                        ),
+                    ),
+                };
+                if confirmed.cancelled {
+                    break;
+                }
+                execution = MutationExecution::Executed;
+                final_outcome = confirmed;
+                confirmation_from_result(final_outcome.result)
+            } else if prepared.selected_test.is_narrowed()
+                && primary_result == MutationResult::Survived
+            {
+                SurvivorConfirmation::NotRequested
+            } else {
+                SurvivorConfirmation::NotNeeded
+            };
+
+            if primary_was_restored {
+                if final_outcome.result == MutationResult::BuildError {
+                    reservation.release();
+                } else {
+                    reservation.commit();
+                }
+            } else if primary_result == MutationResult::BuildError {
                 reservation.release();
             } else {
                 reservation.commit();
             }
             if let Some(early_stop) = &early_stop {
-                early_stop.record(outcome.result);
+                early_stop.record(final_outcome.result);
             }
-            if cacheable {
-                prepared.store_cache(&self.project_root, outcome.result);
-            }
-            prepared.record_history(
-                history.as_ref(),
-                outcome.result,
-                outcome.test_output.as_deref(),
-            );
             if self.verbose {
-                let symbol = match outcome.result {
+                let symbol = match final_outcome.result {
                     MutationResult::Killed => "✓ killed",
                     MutationResult::Survived => "✗ survived",
                     MutationResult::Timeout => "⧖ timeout",
@@ -4596,8 +4899,8 @@ impl TestRunner {
                     mutation.operator
                 );
             }
-            if self.show_output && outcome.result == MutationResult::Survived {
-                if let Some(output) = outcome.test_output.as_deref() {
+            if self.show_output && final_outcome.result == MutationResult::Survived {
+                if let Some(output) = final_outcome.test_output.as_deref() {
                     eprintln!(
                         "  ┌─ test output for {}:{} ({})",
                         mutation.file.display(),
@@ -4610,12 +4913,13 @@ impl TestRunner {
                     eprintln!("  └─");
                 }
             }
-            let diagnostic = build_error_diagnostic_from_outcome(mutation, "schemata", &outcome);
-            results.push(MutationRunRecord::new(
-                mutation.clone(),
-                outcome.result,
-                diagnostic,
-            ));
+            let diagnostic =
+                build_error_diagnostic_from_outcome(mutation, "schemata", &final_outcome);
+            results.push(
+                MutationRunRecord::new(mutation.clone(), final_outcome.result, diagnostic)
+                    .with_execution(execution)
+                    .with_selection(prepared.selected_test.selection_provenance(confirmation)),
+            );
         }
 
         Ok((results, demoted))
@@ -4764,6 +5068,7 @@ impl TestRunner {
         let mut results = Vec::with_capacity(all_records.len());
         let mut build_error_diagnostics = Vec::new();
         let mut execution_provenance = BTreeMap::new();
+        let mut selection_provenance = BTreeMap::new();
         let mut replay_recipes = BTreeMap::new();
         let mut total = 0;
         let mut killed = 0;
@@ -4777,6 +5082,7 @@ impl TestRunner {
                 result,
                 execution,
                 build_error_diagnostic,
+                selection,
                 replay_recipe,
             } = record;
             total += 1;
@@ -4793,6 +5099,9 @@ impl TestRunner {
             }
             if execution != MutationExecution::for_result(result) {
                 execution_provenance.insert(mutation.id, execution);
+            }
+            if let Some(selection) = selection {
+                selection_provenance.insert(mutation.id, selection);
             }
             if let Some(diagnostic) = build_error_diagnostic {
                 debug_assert_eq!(result, MutationResult::BuildError);
@@ -4813,6 +5122,7 @@ impl TestRunner {
             MutationReport {
                 results,
                 execution_provenance,
+                selection_provenance,
                 build_error_diagnostics,
                 schemata: None,
                 baseline_timing: None,
@@ -4957,6 +5267,7 @@ fn records_from_report(
     let MutationReport {
         results,
         execution_provenance,
+        selection_provenance,
         build_error_diagnostics,
         ..
     } = report;
@@ -4972,8 +5283,10 @@ fn records_from_report(
                 .copied()
                 .unwrap_or_else(|| MutationExecution::for_result(result));
             let diagnostic = diagnostics.remove(&mutation.id);
-            let mut record =
-                MutationRunRecord::new(mutation, result, diagnostic).with_execution(execution);
+            let selection = selection_provenance.get(&mutation.id).copied();
+            let mut record = MutationRunRecord::new(mutation, result, diagnostic)
+                .with_execution(execution)
+                .with_selection(selection);
             if let Some(recipe) = replay_recipes.remove(&record.mutation.id) {
                 record = record.with_replay_recipe(recipe);
             }
@@ -7570,13 +7883,28 @@ mod tests {
         mutation: &Mutation,
         reuse_source: ReuseSource,
     ) -> anyhow::Result<()> {
-        let env = HashMap::new();
+        seed_reused_survivor_with_env(
+            project_root,
+            commands,
+            mutation,
+            reuse_source,
+            &HashMap::new(),
+        )
+    }
+
+    fn seed_reused_survivor_with_env(
+        project_root: &Path,
+        commands: &CommandConfig,
+        mutation: &Mutation,
+        reuse_source: ReuseSource,
+        env: &HashMap<String, String>,
+    ) -> anyhow::Result<()> {
         let selected = select_test_command(project_root, commands, mutation);
         let command_context = selected.cache_context(
             &commands.build_command,
             commands.build_command_explicit,
             &commands.sandbox_command,
-            &env,
+            env,
         );
         let context_hash = cache_context_fingerprint(project_root);
         let source_path = if mutation.file.is_absolute() {
@@ -7641,6 +7969,66 @@ test "$runs" -eq 1
             "state".into(),
             state_dir.display().to_string(),
         ]
+    }
+
+    #[cfg(unix)]
+    fn fake_selection_command(
+        project_root: &Path,
+        command_name: &str,
+        narrowed_marker: &str,
+        full_status: i32,
+    ) -> (HashMap<String, String>, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let bin = project_root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let command = bin.join(command_name);
+        let log = project_root.join("confirmation-command.log");
+        std::fs::write(
+            &command,
+            format!(
+                "#!/bin/sh\nprintf '<%s>\\n' \"$*\" >> \"$TOGI_CONFIRMATION_LOG\"\ncase \" $* \" in\n  *\" {narrowed_marker} \"*) exit 0 ;;\n  *) exit {full_status} ;;\nesac\n"
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&command).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&command, permissions).unwrap();
+
+        let mut env = HashMap::new();
+        env.insert(
+            "PATH".into(),
+            format!(
+                "{}:{}",
+                bin.display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        );
+        env.insert("TOGI_CONFIRMATION_LOG".into(), log.display().to_string());
+        (env, log)
+    }
+
+    #[cfg(unix)]
+    fn confirmation_runner(
+        project_root: &Path,
+        commands: CommandConfig,
+        env: HashMap<String, String>,
+    ) -> TestRunner {
+        TestRunner {
+            commands,
+            parallelism: 1,
+            project_root: project_root.to_path_buf(),
+            verbose: false,
+            show_output: false,
+            max_tested: None,
+            early_stop: EarlyStopConfig::default(),
+            respect_workspace_ignores: true,
+            env,
+            incremental_history: false,
+            force_rerun: true,
+            learned_selection: false,
+            cancelled: Arc::new(AtomicBool::new(false)),
+        }
     }
 
     fn c_operator_mutation(id: u32, file: &str, source: &str, nth: usize) -> Mutation {
@@ -7863,6 +8251,7 @@ test "$runs" -eq 1
 
     fn test_command_config() -> CommandConfig {
         CommandConfig {
+            confirm_survivors: false,
             command: vec!["cargo".into(), "test".into()],
             force_default_command: false,
             force_default_timeout: false,
@@ -8062,12 +8451,16 @@ test "$runs" -eq 1
     fn selected_test_command_cache_context_preserves_argv_boundaries() {
         let selected = SelectedTestCommand {
             argv: vec!["cargo test".into()],
+            unnarrowed_argv: None,
+            selection_active: false,
             timeout: Duration::from_secs(2),
             uses_default_timeout: false,
             selected_tests: Vec::new(),
         };
         let ambiguous = SelectedTestCommand {
             argv: vec!["cargo".into(), "test".into()],
+            unnarrowed_argv: None,
+            selection_active: false,
             timeout: Duration::from_secs(2),
             uses_default_timeout: false,
             selected_tests: Vec::new(),
@@ -8375,6 +8768,196 @@ test "$runs" -eq 1
     }
 
     #[test]
+    fn narrowed_routes_retain_their_full_command_for_confirmation() {
+        for (path, command, test) in [
+            (
+                "src/calc.go",
+                vec!["go".into(), "test".into(), "./...".into()],
+                "TestAdd",
+            ),
+            ("src/calc.py", vec!["pytest".into()], "selected_test"),
+            (
+                "src/calc.test.ts",
+                vec!["vitest".into(), "run".into()],
+                "selected_test",
+            ),
+            (
+                "src/lib.rs",
+                vec!["cargo".into(), "test".into()],
+                "selected_test",
+            ),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let mut selection = TestSelectionConfig::new();
+            selection.insert(root.path(), Path::new(path), 1, vec![test.into()]);
+            let mut commands = test_command_config();
+            let full_command = command.clone();
+            commands.command = command;
+            commands.test_selection = Some(selection);
+            let mut mutation = make_test_mutation(Path::new(path));
+            mutation.line = 1;
+
+            let selected = select_test_command(root.path(), &commands, &mutation);
+
+            assert_eq!(
+                selected.unnarrowed_argv(),
+                Some(full_command.as_slice()),
+                "{path} must retain its original route"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn confirmation_kills_a_narrowed_survivor_on_its_full_route() {
+        let (dir, _, mutation) = make_relative_test_setup();
+        let mut selection = TestSelectionConfig::new();
+        selection.insert(
+            dir.path(),
+            Path::new("test.txt"),
+            1,
+            vec!["selected_test".into()],
+        );
+        let (env, log) = fake_selection_command(dir.path(), "pytest", "-k selected_test", 1);
+        let mut commands = test_command_config();
+        commands.command = vec!["pytest".into()];
+        commands.test_selection = Some(selection);
+        commands.confirm_survivors = true;
+
+        let report = confirmation_runner(dir.path(), commands, env)
+            .run(vec![mutation.clone()])
+            .report;
+
+        assert_eq!(report.results.len(), 1);
+        assert_eq!(report.results[0].0.id, mutation.id);
+        assert_eq!(report.results[0].1, MutationResult::Killed);
+        assert_eq!(report.survived, 0);
+        assert_eq!(
+            report.selection_for(mutation.id),
+            Some(TestSelectionProvenance::Narrowed {
+                confirmation: SurvivorConfirmation::Killed,
+            })
+        );
+        assert_eq!(
+            std::fs::read_to_string(log)
+                .unwrap()
+                .lines()
+                .collect::<Vec<_>>(),
+            ["<-k selected_test>", "<>"],
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn disabled_confirmation_leaves_narrowed_survivors_unchanged() {
+        let (dir, _, mutation) = make_relative_test_setup();
+        let mut selection = TestSelectionConfig::new();
+        selection.insert(
+            dir.path(),
+            Path::new("test.txt"),
+            1,
+            vec!["selected_test".into()],
+        );
+        let (env, log) = fake_selection_command(dir.path(), "pytest", "-k selected_test", 1);
+        let mut commands = test_command_config();
+        commands.command = vec!["pytest".into()];
+        commands.test_selection = Some(selection);
+
+        let report = confirmation_runner(dir.path(), commands, env)
+            .run(vec![mutation.clone()])
+            .report;
+
+        assert_eq!(report.results.len(), 1);
+        assert_eq!(report.results[0].0.id, mutation.id);
+        assert_eq!(report.results[0].1, MutationResult::Survived);
+        assert_eq!(
+            report.selection_for(mutation.id),
+            Some(TestSelectionProvenance::Narrowed {
+                confirmation: SurvivorConfirmation::NotRequested,
+            })
+        );
+        assert_eq!(
+            std::fs::read_to_string(log)
+                .unwrap()
+                .lines()
+                .collect::<Vec<_>>(),
+            ["<-k selected_test>"],
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn confirmation_rechecks_a_cached_narrowed_survivor_without_rewriting_its_cache() {
+        let (dir, _, mutation) = make_relative_test_setup();
+        let mut selection = TestSelectionConfig::new();
+        selection.insert(
+            dir.path(),
+            Path::new("test.txt"),
+            1,
+            vec!["selected_test".into()],
+        );
+        let (env, log) = fake_selection_command(dir.path(), "pytest", "-k selected_test", 1);
+        let mut commands = test_command_config();
+        commands.command = vec!["pytest".into()];
+        commands.test_selection = Some(selection);
+        commands.confirm_survivors = true;
+        seed_reused_survivor_with_env(
+            dir.path(),
+            &commands,
+            &mutation,
+            ReuseSource::ExactCache,
+            &env,
+        )
+        .unwrap();
+
+        let mut runner = confirmation_runner(dir.path(), commands, env);
+        runner.force_rerun = false;
+        let report = runner.run(vec![mutation.clone()]).report;
+
+        assert_eq!(report.results.len(), 1);
+        assert_eq!(report.results[0].0.id, mutation.id);
+        assert_eq!(report.results[0].1, MutationResult::Killed);
+        assert_eq!(
+            report.execution_for(mutation.id, MutationResult::Killed),
+            MutationExecution::Executed
+        );
+        assert_eq!(
+            report.selection_for(mutation.id),
+            Some(TestSelectionProvenance::Narrowed {
+                confirmation: SurvivorConfirmation::Killed,
+            })
+        );
+        assert_eq!(
+            std::fs::read_to_string(log)
+                .unwrap()
+                .lines()
+                .collect::<Vec<_>>(),
+            ["<>"],
+        );
+        let selected = select_test_command(dir.path(), &runner.commands, &mutation);
+        let source = std::fs::read(dir.path().join("test.txt")).unwrap();
+        let key = CacheKey::new(
+            &source,
+            &cache_identity(dir.path(), &mutation),
+            &mutation.description,
+            &format!(
+                "{};context={:016x}",
+                selected.cache_context(
+                    &runner.commands.build_command,
+                    runner.commands.build_command_explicit,
+                    &runner.commands.sandbox_command,
+                    &runner.env,
+                ),
+                cache_context_fingerprint(dir.path())
+            ),
+        );
+        assert_eq!(
+            cache::lookup(dir.path(), &key),
+            Some(MutationResult::Survived)
+        );
+    }
+
+    #[test]
     fn select_test_command_falls_back_for_multiple_cargo_tests() -> anyhow::Result<()> {
         let tmp = tempfile::tempdir()?;
         let mut selection = TestSelectionConfig::new();
@@ -8534,6 +9117,7 @@ test "$runs" -eq 1
         let mut selection = TestSelectionConfig::new();
         selection.insert(dir.path(), &file, mutation.line, vec!["test_add".into()]);
         let commands = || CommandConfig {
+            confirm_survivors: false,
             command: failing_command(),
             force_default_command: false,
             force_default_timeout: false,
@@ -8649,6 +9233,7 @@ test "$runs" -eq 1
         std::fs::write(dir.path().join(&cached.file), "hello")?;
         std::fs::write(dir.path().join(&historical.file), "hello")?;
         let commands = CommandConfig {
+            confirm_survivors: false,
             command: successful_command(),
             force_default_command: false,
             force_default_timeout: false,
@@ -8761,6 +9346,7 @@ test "$runs" -eq 1
         let (dir, file, mutation) = make_test_setup();
 
         let commands = || CommandConfig {
+            confirm_survivors: false,
             command: failing_command(),
             force_default_command: false,
             force_default_timeout: false,
@@ -8903,6 +9489,7 @@ test "$runs" -eq 1
                       echo 'test result: FAILED. 1 passed; 1 failed;'\n\
                       exit 1\n";
         let commands = CommandConfig {
+            confirm_survivors: false,
             command: vec!["sh".into(), "-c".into(), script.into()],
             force_default_command: false,
             force_default_timeout: false,
@@ -8972,6 +9559,7 @@ test "$runs" -eq 1
     /// skipped execution observable in the report.
     fn seed_killer_cluster_history(dir: &Path, file: &Path, mutations: &[Mutation]) {
         let commands = CommandConfig {
+            confirm_survivors: false,
             command: failing_command(),
             force_default_command: false,
             force_default_timeout: false,
@@ -9010,6 +9598,7 @@ test "$runs" -eq 1
     fn killer_cluster_runner(dir: &Path, learned_selection: bool) -> TestRunner {
         TestRunner {
             commands: CommandConfig {
+                confirm_survivors: false,
                 command: failing_command(),
                 force_default_command: false,
                 force_default_timeout: false,
@@ -10469,6 +11058,7 @@ sleep 10"#
 
         let runner = TestRunner {
             commands: CommandConfig {
+                confirm_survivors: false,
                 command: vec!["sleep".into(), "10".into()],
                 force_default_command: false,
                 force_default_timeout: false,
@@ -10535,6 +11125,7 @@ sleep 10"#
 
         let runner = TestRunner {
             commands: CommandConfig {
+                confirm_survivors: false,
                 command: vec!["true".into()],
                 force_default_command: false,
                 force_default_timeout: false,
@@ -10606,6 +11197,7 @@ int main(void) {
 
         let runner = TestRunner {
             commands: CommandConfig {
+                confirm_survivors: false,
                 command: vec!["./calc".into()],
                 force_default_command: false,
                 force_default_timeout: false,
@@ -10671,6 +11263,7 @@ int main() {
 
         let runner = TestRunner {
             commands: CommandConfig {
+                confirm_survivors: false,
                 command: vec!["./calc".into()],
                 force_default_command: false,
                 force_default_timeout: false,
@@ -10735,6 +11328,7 @@ esac
 
         let runner = TestRunner {
             commands: CommandConfig {
+                confirm_survivors: false,
                 command: vec!["sh".into(), "-c".into(), script.into()],
                 force_default_command: false,
                 force_default_timeout: false,
@@ -10784,6 +11378,7 @@ esac
         ];
         let runner = TestRunner {
             commands: CommandConfig {
+                confirm_survivors: false,
                 command: successful_command(),
                 force_default_command: false,
                 force_default_timeout: false,
@@ -10850,6 +11445,7 @@ touch side_effect
 
         let runner = TestRunner {
             commands: CommandConfig {
+                confirm_survivors: false,
                 command: vec!["sh".into(), "-c".into(), script.into()],
                 force_default_command: false,
                 force_default_timeout: false,
@@ -10909,6 +11505,7 @@ esac
         let mut env = HashMap::new();
         env.insert("STATE_DIR".to_string(), state.path().display().to_string());
         let commands = CommandConfig {
+            confirm_survivors: false,
             command: vec!["sh".into(), "-c".into(), script.into()],
             force_default_command: false,
             force_default_timeout: false,
@@ -10927,6 +11524,8 @@ esac
         let selected = select_test_command(dir.path(), &commands, &first);
         let cache_selected = SelectedTestCommand {
             argv: selected.argv,
+            unnarrowed_argv: None,
+            selection_active: false,
             timeout: selected.timeout,
             uses_default_timeout: selected.uses_default_timeout,
             selected_tests: selected.selected_tests,
@@ -11004,6 +11603,7 @@ esac
         std::fs::write(dir.path().join("calc.go"), source)?;
         let mutation = go_operator_mutation(0, "calc.go", source, 0);
         let commands = CommandConfig {
+            confirm_survivors: false,
             command: failing_command(),
             force_default_command: false,
             force_default_timeout: false,
@@ -11113,6 +11713,7 @@ func third(a, b int) bool { return a == b }
                     .map(|id| go_operator_mutation(id, "calc.go", source, id as usize))
                     .collect::<Vec<_>>();
                 let commands = CommandConfig {
+                    confirm_survivors: false,
                     command: failing_command(),
                     force_default_command: false,
                     force_default_timeout: false,
@@ -11181,6 +11782,7 @@ func third(a, b int) bool { return a == b }
                 .map(|id| go_operator_mutation(id, "calc.go", source, id as usize))
                 .collect::<Vec<_>>();
             let commands = CommandConfig {
+                confirm_survivors: false,
                 command: first_run_survives_second_kills_command(state.path()),
                 force_default_command: false,
                 force_default_timeout: false,
@@ -11285,6 +11887,7 @@ def second(c, d):
         let python_cached = python(1, 0);
         let python_history = python(2, 1);
         let commands = CommandConfig {
+            confirm_survivors: false,
             command: successful_command(),
             force_default_command: false,
             force_default_timeout: false,
@@ -11411,6 +12014,7 @@ func second(c, d int) bool { return c == d }
         // per-mutant runs (raw splice, no wraps) build fine (#412).
         let build = "if grep -rq __togi_active .; then exit 1; fi";
         let commands = CommandConfig {
+            confirm_survivors: false,
             command: vec!["sh".into(), "-c".into(), "exit 1".into()],
             force_default_command: false,
             force_default_timeout: false,
@@ -11472,6 +12076,7 @@ func second(c, d int) bool { return c == d }
         // first mutation's schema batch compiles and should keep the fast path.
         let build = r#"if grep -rq '__togi_active("1")' .; then exit 1; fi"#;
         let commands = CommandConfig {
+            confirm_survivors: false,
             command: vec!["sh".into(), "-c".into(), "exit 1".into()],
             force_default_command: false,
             force_default_timeout: false,
@@ -11555,6 +12160,7 @@ class Calc {
 
         let runner = TestRunner {
             commands: CommandConfig {
+                confirm_survivors: false,
                 command: vec!["java".into(), "Calc".into()],
                 force_default_command: false,
                 force_default_timeout: false,
@@ -11615,6 +12221,7 @@ mod tests {
 
         let runner = TestRunner {
             commands: CommandConfig {
+                confirm_survivors: false,
                 command: vec!["cargo".into(), "test".into(), "--quiet".into()],
                 force_default_command: false,
                 force_default_timeout: false,
@@ -11654,6 +12261,46 @@ mod tests {
         assert_eq!(report.results[0].1, MutationResult::Killed);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn schemata_confirmation_rechecks_narrowed_rust_survivors_on_the_full_route() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        let source = "pub fn same(a: i32, b: i32) -> bool { a == b }\n";
+        std::fs::write(dir.path().join("src/lib.rs"), source).unwrap();
+        let mutation = rust_operator_mutation(0, "src/lib.rs", source, 0);
+        let mut selection = TestSelectionConfig::new();
+        selection.insert(
+            dir.path(),
+            Path::new("src/lib.rs"),
+            1,
+            vec!["narrow_test".into()],
+        );
+        let (env, log) = fake_selection_command(dir.path(), "cargo", "narrow_test", 1);
+        let mut commands = test_command_config();
+        commands.command = vec!["cargo".into(), "test".into()];
+        commands.test_selection = Some(selection);
+        commands.confirm_survivors = true;
+
+        let report = confirmation_runner(dir.path(), commands, env)
+            .run_with_schemata(vec![mutation.clone()])
+            .report;
+
+        assert_eq!(report.results[0].1, MutationResult::Killed);
+        assert_eq!(
+            report.selection_for(mutation.id),
+            Some(TestSelectionProvenance::Narrowed {
+                confirmation: SurvivorConfirmation::Killed,
+            })
+        );
+        assert_eq!(
+            std::fs::read_to_string(log)
+                .unwrap()
+                .lines()
+                .collect::<Vec<_>>(),
+            ["<test narrow_test>", "<test>"],
+        );
+    }
     #[test]
     fn max_tested_limits_mutations() {
         let (dir, file, _) = make_test_setup();
@@ -11669,6 +12316,7 @@ mod tests {
 
         let runner = TestRunner {
             commands: CommandConfig {
+                confirm_survivors: false,
                 command: vec!["true".into()],
                 force_default_command: false,
                 force_default_timeout: false,
@@ -11715,6 +12363,7 @@ mod tests {
 
         let runner = TestRunner {
             commands: CommandConfig {
+                confirm_survivors: false,
                 command: vec!["true".into()],
                 force_default_command: false,
                 force_default_timeout: false,
@@ -11773,6 +12422,7 @@ mod tests {
 
         let runner = TestRunner {
             commands: CommandConfig {
+                confirm_survivors: false,
                 command: vec!["true".into()],
                 force_default_command: false,
                 force_default_timeout: false,
@@ -11848,6 +12498,7 @@ mod tests {
                     })
                     .collect::<anyhow::Result<Vec<_>>>()?;
                 let commands = CommandConfig {
+                    confirm_survivors: false,
                     command: failing_command(),
                     force_default_command: false,
                     force_default_timeout: false,
@@ -11916,6 +12567,7 @@ mod tests {
                 })
                 .collect::<anyhow::Result<Vec<_>>>()?;
             let commands = CommandConfig {
+                confirm_survivors: false,
                 command: first_run_survives_second_kills_command(state.path()),
                 force_default_command: false,
                 force_default_timeout: false,
@@ -12012,6 +12664,7 @@ sleep 0.2
 
         let runner = TestRunner {
             commands: CommandConfig {
+                confirm_survivors: false,
                 command: vec!["sh".into(), "-c".into(), script.into()],
                 force_default_command: false,
                 force_default_timeout: false,
@@ -12088,6 +12741,7 @@ sleep 0.2
 
         let runner = TestRunner {
             commands: CommandConfig {
+                confirm_survivors: false,
                 command: vec!["true".into()],
                 force_default_command: false,
                 force_default_timeout: false,
@@ -12155,6 +12809,7 @@ rmdir "$lock"
             let mut env = HashMap::new();
             env.insert("STATE_DIR".to_string(), state.path().display().to_string());
             let commands = CommandConfig {
+                confirm_survivors: false,
                 command: vec!["sh".into(), "-c".into(), script.into()],
                 force_default_command: false,
                 force_default_timeout: false,
@@ -12259,6 +12914,7 @@ rmdir "$lock"
 
         let runner = TestRunner {
             commands: CommandConfig {
+                confirm_survivors: false,
                 command: vec!["true".into()],
                 force_default_command: false,
                 force_default_timeout: false,
@@ -12337,6 +12993,7 @@ rmdir "$lock"
 
         let runner = TestRunner {
             commands: CommandConfig {
+                confirm_survivors: false,
                 command: vec!["sh".into(), "-c".into(), script.into()],
                 force_default_command: false,
                 force_default_timeout: false,
@@ -12405,6 +13062,7 @@ rmdir "$lock"
 
         let runner = TestRunner {
             commands: CommandConfig {
+                confirm_survivors: false,
                 command: vec!["true".into()],
                 force_default_command: false,
                 force_default_timeout: false,
@@ -12453,6 +13111,7 @@ rmdir "$lock"
 
         let runner = TestRunner {
             commands: CommandConfig {
+                confirm_survivors: false,
                 command: vec!["true".into()], // default would survive
                 force_default_command: false,
                 force_default_timeout: false,
@@ -12526,6 +13185,7 @@ while [ "$(find "{barrier}" -type f | wc -l)" -lt 4 ]; do sleep 0.1; done"#,
 
         let runner = TestRunner {
             commands: CommandConfig {
+                confirm_survivors: false,
                 command: vec!["sh".into(), "-c".into(), script],
                 force_default_command: false,
                 force_default_timeout: false,
@@ -12607,6 +13267,7 @@ exit 1"#
 
         let runner = TestRunner {
             commands: CommandConfig {
+                confirm_survivors: false,
                 command: vec!["sh".into(), "-c".into(), script],
                 force_default_command: false,
                 force_default_timeout: false,
@@ -12660,6 +13321,7 @@ exit 1"#
 
         let runner = TestRunner {
             commands: CommandConfig {
+                confirm_survivors: false,
                 command: vec![
                     "sh".into(),
                     "-c".into(),
@@ -12721,6 +13383,7 @@ exit 1"#
 
         let runner = TestRunner {
             commands: CommandConfig {
+                confirm_survivors: false,
                 command: vec!["sleep".into(), "1".into()],
                 force_default_command: false,
                 force_default_timeout: false,

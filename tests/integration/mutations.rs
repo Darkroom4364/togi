@@ -110,6 +110,7 @@ fn end_to_end_go_fixture_reports_expected_outcomes_with_fresh_tests() {
 
     let runner = togi::runner::TestRunner {
         commands: togi::runner::CommandConfig {
+            confirm_survivors: false,
             command: vec!["go".into(), "test".into(), "./...".into()],
             force_default_command: false,
             force_default_timeout: false,

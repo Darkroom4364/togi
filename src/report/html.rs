@@ -52,6 +52,7 @@ pub fn generate_report_with_baseline(
     for (mutation, result) in &report.results {
         let file_path = mutation.file.display().to_string();
         let execution = report.execution_for(mutation.id, *result);
+        let selection = report.selection_for(mutation.id);
         let result_str = match result {
             MutationResult::Killed => "killed",
             MutationResult::Survived => "survived",
@@ -92,7 +93,9 @@ pub fn generate_report_with_baseline(
             original: mutation.original.clone(),
             replacement: mutation.replacement.clone(),
             result: result_str,
-            execution: execution.to_string(),
+            execution: selection
+                .map(|selection| format!("{execution}; {selection}"))
+                .unwrap_or_else(|| execution.to_string()),
             baseline_status: (*result == MutationResult::Survived)
                 .then(|| comparison.and_then(|comparison| comparison.status_for(mutation.id)))
                 .flatten()
@@ -535,6 +538,7 @@ mod tests {
     #[test]
     fn html_contains_build_error_diagnostics() {
         let report = MutationReport {
+            selection_provenance: std::collections::BTreeMap::new(),
             results: vec![(
                 Mutation {
                     id: 1,
@@ -609,6 +613,7 @@ mod tests {
             ));
         }
         let report = MutationReport {
+            selection_provenance: std::collections::BTreeMap::new(),
             results,
             execution_provenance: BTreeMap::new(),
             build_error_diagnostics,
@@ -633,6 +638,7 @@ mod tests {
     #[test]
     fn html_escapes_special_chars() {
         let report = MutationReport {
+            selection_provenance: std::collections::BTreeMap::new(),
             results: vec![(
                 Mutation {
                     id: 1,
@@ -689,6 +695,7 @@ mod tests {
         }
 
         let report = MutationReport {
+            selection_provenance: std::collections::BTreeMap::new(),
             results,
             execution_provenance: BTreeMap::new(),
             build_error_diagnostics: vec![],

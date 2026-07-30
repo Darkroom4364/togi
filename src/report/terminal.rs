@@ -78,6 +78,10 @@ fn format_report(
         let desc = &mutation.description;
         let execution = report.execution_for(mutation.id, *result);
         let execution_text = execution.to_string();
+        let selection_text = report
+            .selection_for(mutation.id)
+            .map(|selection| format!("; {selection}"))
+            .unwrap_or_default();
 
         let (tag, extra) = match result {
             MutationResult::Killed => ("✓ KILLED", None),
@@ -157,20 +161,21 @@ fn format_report(
             };
             writeln!(
                 out,
-                "  {} {}:{}  {} {}: {} [{}]",
+                "  {} {}:{}  {} {}: {} [{}{}]",
                 tag_colored,
                 file,
                 line,
                 dim("—"),
                 dim(operator),
                 desc,
-                dim(&execution_text)
+                dim(&execution_text),
+                dim(&selection_text)
             )
         } else {
             writeln!(
                 out,
-                "  {:<14}{}:{} — {}: {} [{}]",
-                tag, file, line, operator, desc, execution_text
+                "  {:<14}{}:{} — {}: {} [{}{}]",
+                tag, file, line, operator, desc, execution_text, selection_text
             )
         }
         .unwrap();
@@ -390,7 +395,7 @@ fn all_build_error_guidance(report: &MutationReport) -> Option<String> {
 mod tests {
     use super::*;
     use crate::runner::{RunSuiteFailure, RunSuiteFailureOutcome, SuiteFailurePhase};
-    use crate::{BuildErrorDiagnostic, Mutation};
+    use crate::{BuildErrorDiagnostic, Mutation, SurvivorConfirmation, TestSelectionProvenance};
     use std::collections::BTreeMap;
     use std::path::PathBuf;
     use std::time::Duration;
@@ -430,6 +435,7 @@ mod tests {
             .count();
 
         MutationReport {
+            selection_provenance: std::collections::BTreeMap::new(),
             results,
             execution_provenance: BTreeMap::new(),
             build_error_diagnostics: vec![],
@@ -464,6 +470,24 @@ mod tests {
         assert!(annotated.contains("Baseline: new"));
         assert_eq!(annotated.matches("Baseline:").count(), 1);
         assert!(!format_report_plain(&report).contains("Baseline:"));
+    }
+
+    #[test]
+    fn terminal_output_records_selection_confirmation() {
+        let mut report = report(vec![(
+            mutation(0, "src/survived.rs", 1),
+            MutationResult::Survived,
+        )]);
+        report.selection_provenance.insert(
+            0,
+            TestSelectionProvenance::Narrowed {
+                confirmation: SurvivorConfirmation::ConfirmedSurvived,
+            },
+        );
+
+        let output = format_report_plain(&report);
+
+        assert!(output.contains("narrowed; confirmation: confirmed_survived"));
     }
 
     #[test]

@@ -1,10 +1,11 @@
-use crate::{Mutation, MutationExecution, MutationReport, MutationResult};
+use crate::{Mutation, MutationExecution, MutationReport, MutationResult, TestSelectionProvenance};
 
 /// Format a GitHub Actions warning annotation for a survived mutation.
 fn format_annotation_with_baseline(
     mutation: &Mutation,
     execution: MutationExecution,
     status: Option<crate::baseline::SurvivorBaselineStatus>,
+    selection: Option<TestSelectionProvenance>,
 ) -> String {
     let provenance = match execution {
         MutationExecution::Executed => String::new(),
@@ -15,8 +16,11 @@ fn format_annotation_with_baseline(
     let baseline = status
         .map(|status| format!(" [baseline: {}]", status.as_str()))
         .unwrap_or_default();
+    let selection = selection
+        .map(|selection| format!(" [selection: {selection}]"))
+        .unwrap_or_default();
     let message = format!(
-        "Survived mutation: {} ({}){provenance}{baseline}",
+        "Survived mutation: {} ({}){provenance}{baseline}{selection}",
         mutation.operator, mutation.description
     );
     format!(
@@ -52,6 +56,7 @@ fn annotations_with_baseline(
                 mutation,
                 report.execution_for(mutation.id, *result),
                 comparison.and_then(|comparison| comparison.status_for(mutation.id)),
+                report.selection_for(mutation.id),
             )
         })
         .collect()
@@ -152,6 +157,7 @@ mod tests {
             .filter(|(_, r)| *r == MutationResult::Survived)
             .count();
         MutationReport {
+            selection_provenance: std::collections::BTreeMap::new(),
             planned_total: results.len(),
             early_stop_reason: None,
             total: results.len(),
@@ -173,7 +179,7 @@ mod tests {
     #[test]
     fn annotation_format_for_survived_mutation() {
         let m = mutation("src/auth.rs", 47, "lt_to_lte", "changed < to <=");
-        let line = format_annotation_with_baseline(&m, MutationExecution::Executed, None);
+        let line = format_annotation_with_baseline(&m, MutationExecution::Executed, None, None);
         assert_eq!(
             line,
             "::warning file=src/auth.rs,line=47::Survived mutation: lt_to_lte (changed < to <=)"
@@ -280,6 +286,7 @@ mod tests {
             &m,
             MutationExecution::Executed,
             Some(crate::baseline::SurvivorBaselineStatus::Historic),
+            None,
         );
         assert_eq!(
             line,

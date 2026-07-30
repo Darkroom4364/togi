@@ -171,6 +171,72 @@ impl fmt::Display for MutationExecution {
     }
 }
 
+/// How the test command for a mutation was selected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TestSelectionProvenance {
+    /// The configured full test route ran unchanged.
+    Full,
+    /// A test-selection map narrowed the primary route.
+    Narrowed { confirmation: SurvivorConfirmation },
+}
+
+impl TestSelectionProvenance {
+    pub fn mode_name(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Narrowed { .. } => "narrowed",
+        }
+    }
+
+    pub fn confirmation(self) -> Option<SurvivorConfirmation> {
+        match self {
+            Self::Full => None,
+            Self::Narrowed { confirmation } => Some(confirmation),
+        }
+    }
+}
+
+impl fmt::Display for TestSelectionProvenance {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Full => write!(f, "full suite"),
+            Self::Narrowed { confirmation } => {
+                write!(f, "narrowed; confirmation: {confirmation}")
+            }
+        }
+    }
+}
+
+/// Outcome of the full-suite check requested for a narrowed survivor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SurvivorConfirmation {
+    NotRequested,
+    NotNeeded,
+    ConfirmedSurvived,
+    Killed,
+    TimedOut,
+    BuildError,
+}
+
+impl SurvivorConfirmation {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::NotRequested => "not_requested",
+            Self::NotNeeded => "not_needed",
+            Self::ConfirmedSurvived => "confirmed_survived",
+            Self::Killed => "killed",
+            Self::TimedOut => "timed_out",
+            Self::BuildError => "build_error",
+        }
+    }
+}
+
+impl fmt::Display for SurvivorConfirmation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
 /// Why a mutation did not run its mutated test suite.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum MutationNonExecutionReason {
@@ -264,6 +330,8 @@ pub struct MutationReport {
     /// by mutation id. Verdicts absent here derive their canonical execution
     /// state from `MutationResult`.
     pub execution_provenance: BTreeMap<u32, MutationExecution>,
+    /// Sparse test-selection provenance for runs with a configured selection map.
+    pub selection_provenance: BTreeMap<u32, TestSelectionProvenance>,
     /// Diagnostics for mutations classified as `BuildError`.
     pub build_error_diagnostics: Vec<BuildErrorDiagnostic>,
     pub schemata: Option<SchemataReport>,
@@ -310,6 +378,11 @@ impl MutationReport {
             .get(&mutation_id)
             .copied()
             .unwrap_or_else(|| MutationExecution::for_result(result))
+    }
+
+    /// Return test-selection provenance when a selection map was configured.
+    pub fn selection_for(&self, mutation_id: u32) -> Option<TestSelectionProvenance> {
+        self.selection_provenance.get(&mutation_id).copied()
     }
 
     /// Count fresh executions, restored verdicts, and non-executed outcomes.
