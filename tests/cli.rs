@@ -2878,6 +2878,7 @@ struct ActionHelperFixture {
     fake_togi: PathBuf,
     invocation_log: PathBuf,
     github_output: PathBuf,
+    child_environment_log: PathBuf,
     report_path: PathBuf,
 }
 
@@ -2887,10 +2888,21 @@ fn action_helper_fixture() -> ActionHelperFixture {
     let invocation_log = dir.path().join("invocations.log");
     let github_output = dir.path().join("github-output");
     let report_path = dir.path().join("togi-report.json");
+    let child_environment_log = dir.path().join("child-environment.log");
     fs::write(
         &fake_togi,
         r#"#!/usr/bin/env bash
 set -u
+if [[ -n "${FAKE_TOGI_ENV_LOG:-}" ]]; then
+  printf 'TOGI_BASE=%s\n' "${TOGI_BASE-__unset__}" >> "$FAKE_TOGI_ENV_LOG"
+  printf 'TOGI_TIMEOUT=%s\n' "${TOGI_TIMEOUT-__unset__}" >> "$FAKE_TOGI_ENV_LOG"
+  printf 'TOGI_FORMAT=%s\n' "${TOGI_FORMAT-__unset__}" >> "$FAKE_TOGI_ENV_LOG"
+  printf 'TOGI_TEST_CMD=%s\n' "${TOGI_TEST_CMD-__unset__}" >> "$FAKE_TOGI_ENV_LOG"
+  printf 'TOGI_REPORT_PATH=%s\n' "${TOGI_REPORT_PATH-__unset__}" >> "$FAKE_TOGI_ENV_LOG"
+  printf 'TOGI_BIN=%s\n' "${TOGI_BIN-__unset__}" >> "$FAKE_TOGI_ENV_LOG"
+  printf '%s\n' '--' >> "$FAKE_TOGI_ENV_LOG"
+fi
+
 args=("$@")
 format=terminal
 for ((index = 0; index < ${#args[@]}; index++)); do
@@ -2924,6 +2936,7 @@ exit "${FAKE_TOGI_REVIEW_STATUS:-0}"
         fake_togi,
         invocation_log,
         github_output,
+        child_environment_log,
         report_path,
     }
 }
@@ -2950,7 +2963,9 @@ fn run_action_helper(
         .env("TOGI_BIN", &fixture.fake_togi)
         .env("RUNNER_TEMP", fixture.dir.path())
         .env("GITHUB_OUTPUT", &fixture.github_output)
+        .env("TOGI_REPORT_PATH", &fixture.report_path)
         .env("FAKE_TOGI_LOG", &fixture.invocation_log)
+        .env("FAKE_TOGI_ENV_LOG", &fixture.child_environment_log)
         .env("FAKE_TOGI_REVIEW_STATUS", run.review_status.to_string())
         .env("FAKE_TOGI_JSON_STATUS", run.json_status.to_string())
         .env("FAKE_TOGI_JSON", run.json);
@@ -3067,6 +3082,47 @@ fn github_action_run_helper_preserves_selected_format_and_exit_one() {
         format!("{NORMAL_ACTION_REPORT}\n")
     );
     assert_action_outputs(&fixture);
+}
+
+#[test]
+fn github_action_run_helper_isolates_private_environment_from_child_togi() {
+    if !bash_available() || !jq_available() {
+        eprintln!("skipping action helper test because bash or jq is unavailable");
+        return;
+    }
+
+    let fixture = action_helper_fixture();
+    let output = run_action_helper(
+        &fixture,
+        ActionHelperRun {
+            base: Some("origin/main"),
+            timeout: Some("120"),
+            format: Some("github"),
+            test_cmd: Some("cargo test --locked"),
+            review_status: 0,
+            json_status: 0,
+            json: NORMAL_ACTION_REPORT,
+        },
+    );
+
+    assert!(output.status.success());
+    assert_eq!(
+        fs::read_to_string(&fixture.report_path).unwrap(),
+        format!("{NORMAL_ACTION_REPORT}\n")
+    );
+    assert_action_outputs(&fixture);
+    let isolated_child_environment = concat!(
+        "TOGI_BASE=__unset__\n",
+        "TOGI_TIMEOUT=__unset__\n",
+        "TOGI_FORMAT=__unset__\n",
+        "TOGI_TEST_CMD=__unset__\n",
+        "TOGI_REPORT_PATH=__unset__\n",
+        "TOGI_BIN=__unset__\n",
+    );
+    assert_eq!(
+        fs::read_to_string(&fixture.child_environment_log).unwrap(),
+        format!("{isolated_child_environment}--\n{isolated_child_environment}--\n")
+    );
 }
 
 #[test]
