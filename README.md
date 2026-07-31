@@ -69,18 +69,53 @@ Try it: `examples/polyglot-demo.sh` runs a PR-sized Go + Rust + Python change th
 
 ## Install
 
-Prefer a versioned GitHub Release and verify the published checksums:
+### Linux x86_64 (Tier 1) first success
+
+This tested released-binary path is for Linux x86_64 only. See the
+[compatibility contract](docs/COMPATIBILITY.md) for other platforms and support
+tiers.
+
+You need Bash, `curl`, `tar`, `sha256sum`, and `git`, plus a project with a
+passing test command that togi can auto-detect or that you configure as
+described in [Configuration](#configuration). Run the check from a Git checkout
+with a parent commit and at least one changed supported source line.
 
 ```bash
-TOGI_VERSION=vX.Y.Z
-curl -fsSLo togi.tar.gz \
-  "https://github.com/Darkroom4364/togi/releases/download/${TOGI_VERSION}/togi-linux-x86_64.tar.gz"
-curl -fsSLo checksums.txt \
-  "https://github.com/Darkroom4364/togi/releases/download/${TOGI_VERSION}/checksums.txt"
-sha256sum --ignore-missing -c checksums.txt
-tar xzf togi.tar.gz
-install -m 0755 ./togi "$HOME/.local/bin/togi"
+(
+  set -euo pipefail
+  TOGI_VERSION=v0.4.1
+  TOGI_ARCHIVE=togi-linux-x86_64.tar.gz
+  RELEASE_BASE="https://github.com/Darkroom4364/togi/releases/download/${TOGI_VERSION}"
+  TEMP_DIR="$(mktemp -d)"
+  trap 'rm -rf "$TEMP_DIR"' EXIT
+  cd "$TEMP_DIR"
+
+  curl -fsSLo "$TOGI_ARCHIVE" "${RELEASE_BASE}/${TOGI_ARCHIVE}"
+  curl -fsSLo checksums.txt "${RELEASE_BASE}/checksums.txt"
+  EXPECTED_SHA=$(awk -v file="$TOGI_ARCHIVE" '$2 == file || $2 == "./" file { print $1 }' checksums.txt)
+  [ -n "$EXPECTED_SHA" ] || { echo "No checksum found for ${TOGI_ARCHIVE}" >&2; exit 1; }
+  ACTUAL_SHA=$(sha256sum "$TOGI_ARCHIVE" | awk '{print $1}')
+  [ "$ACTUAL_SHA" = "$EXPECTED_SHA" ] || { echo "Checksum mismatch for ${TOGI_ARCHIVE}" >&2; exit 1; }
+
+  tar xzf "$TOGI_ARCHIVE"
+  mkdir -p "$HOME/.local/bin"
+  install -m 0755 ./togi "$HOME/.local/bin/togi"
+)
+export PATH="$HOME/.local/bin:$PATH"
+togi --version
 ```
+
+In the checkout you want to check:
+
+```bash
+git rev-parse --verify HEAD~1
+togi check --base HEAD~1
+```
+
+Exit `0` means all mutations were killed. Exit `1` means the mutation run
+completed and found surviving mutants. Exit `2` means an execution error (for
+example configuration, Git, or parsing) that you should fix before relying on
+the result.
 
 If you intentionally want a source-based install tied to a reviewed revision:
 

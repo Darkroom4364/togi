@@ -134,6 +134,22 @@ jobs:
       - name: Integration tests
         run: cargo test --locked -- --ignored
 
+  released-binary-smoke:
+    name: Released Binary Smoke
+    runs-on: ubuntu-latest
+    env:
+      TOGI_VERSION: v0.4.1
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+          cache: false
+      - name: Run released-binary smoke test
+        run: bash ./.github/scripts/run-released-binary-smoke.sh
+
   dogfood:
     name: Dogfood (togi on togi)
     runs-on: ubuntu-latest
