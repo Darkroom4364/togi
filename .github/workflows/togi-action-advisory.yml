@@ -19,7 +19,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -29,6 +29,8 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
         with:
           cache-bin: false
+      - name: Fetch fixture dependencies
+        run: cargo fetch --locked
       - name: Run Togi action (advisory)
         id: togi
         uses: Darkroom4364/togi@a1503b2ebac4c63d377b015c4825b97cab25ec68 # v0.4.1 release action source
@@ -41,3 +43,13 @@ jobs:
           upload-report: 'true'
           report-artifact-name: togi-action-advisory-report
           report-retention-days: '14'
+      - name: Record Togi report (advisory)
+        if: ${{ always() }}
+        env:
+          TOGI_REPORT_PATH: ${{ steps.togi.outputs.report-path }}
+          TOGI_MUTATION_SCORE: ${{ steps.togi.outputs.mutation-score }}
+          TOGI_SURVIVOR_COUNT: ${{ steps.togi.outputs.survivor-count }}
+        run: |
+          printf 'report path: %s\n' "$TOGI_REPORT_PATH"
+          printf 'mutation score: %s\n' "$TOGI_MUTATION_SCORE"
+          printf 'survivor count: %s\n' "$TOGI_SURVIVOR_COUNT"

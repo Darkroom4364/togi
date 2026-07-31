@@ -3503,6 +3503,111 @@ fn github_action_declares_replay_report_contract() {
 }
 
 #[test]
+fn github_action_guide_and_advisory_pin_released_contract() {
+    let readme = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md"))
+        .unwrap()
+        .replace("\r\n", "\n");
+    let marker = "```yaml\n# .github/workflows/togi.yml\nname: Mutation testing\n";
+    let workflow_start = readme
+        .find(marker)
+        .expect("README must contain the named Togi workflow");
+    let workflow = &readme[workflow_start + "```yaml\n".len()..];
+    let (workflow, _) = workflow
+        .split_once("\n```\n")
+        .expect("named Togi workflow must have a closing fence");
+
+    for expected in [
+        "on:\n  pull_request:",
+        "permissions:\n  contents: read",
+        "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1",
+        "fetch-depth: 0",
+        "persist-credentials: false",
+        "actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0",
+        "node-version: 24 # Choose the version required by this repository.",
+        "name: Install project test dependencies\n        run: npm ci",
+        "Darkroom4364/togi@a1503b2ebac4c63d377b015c4825b97cab25ec68 # v0.4.1",
+        "version: v0.4.1",
+        "base: origin/${{ github.base_ref }}",
+        "test-cmd: npm test",
+        "format: json",
+        "report-artifact-name: togi-report",
+        "report-retention-days: '14'",
+        "name: Record Togi report\n        if: ${{ always() }}",
+        "TOGI_REPORT_PATH: ${{ steps.togi.outputs.report-path }}",
+        "TOGI_MUTATION_SCORE: ${{ steps.togi.outputs.mutation-score }}",
+        "TOGI_SURVIVOR_COUNT: ${{ steps.togi.outputs.survivor-count }}",
+    ] {
+        assert!(
+            workflow.contains(expected),
+            "documented Togi workflow is missing `{expected}`"
+        );
+    }
+    assert!(
+        !workflow.contains("pull_request_target"),
+        "documented Togi workflow must not use pull_request_target"
+    );
+    assert!(
+        !workflow.contains("continue-on-error"),
+        "documented Togi workflow must preserve the blocking gate"
+    );
+
+    for (before, after) in [
+        (
+            "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+            "actions/setup-node@820762786026740c76f36085b0efc47a31fe5020",
+        ),
+        (
+            "actions/setup-node@820762786026740c76f36085b0efc47a31fe5020",
+            "run: npm ci",
+        ),
+        (
+            "run: npm ci",
+            "Darkroom4364/togi@a1503b2ebac4c63d377b015c4825b97cab25ec68",
+        ),
+    ] {
+        assert!(
+            workflow.find(before).unwrap() < workflow.find(after).unwrap(),
+            "documented Togi workflow must place `{before}` before `{after}`"
+        );
+    }
+
+    for expected in [
+        "Those inputs override `togi.toml`",
+        "`format: github`; the Action preserves that review run and performs a second\nfull JSON mutation run",
+        "A failed baseline test or build\nis a fatal exit `2`",
+        "Never use `pull_request_target` to run PR code.",
+    ] {
+        assert!(
+            readme.contains(expected),
+            "README Action guidance is missing `{expected}`"
+        );
+    }
+
+    let advisory = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join(".github/workflows/togi-action-advisory.yml"),
+    )
+    .unwrap()
+    .replace("\r\n", "\n");
+    for expected in [
+        "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1",
+        "name: Fetch fixture dependencies\n        run: cargo fetch --locked",
+        "Darkroom4364/togi@a1503b2ebac4c63d377b015c4825b97cab25ec68 # v0.4.1 release action source",
+        "version: v0.4.1",
+        "test-cmd: cargo test --locked",
+        "format: json",
+        "name: Record Togi report (advisory)\n        if: ${{ always() }}",
+        "TOGI_REPORT_PATH: ${{ steps.togi.outputs.report-path }}",
+        "TOGI_MUTATION_SCORE: ${{ steps.togi.outputs.mutation-score }}",
+        "TOGI_SURVIVOR_COUNT: ${{ steps.togi.outputs.survivor-count }}",
+    ] {
+        assert!(
+            advisory.contains(expected),
+            "advisory workflow is missing `{expected}`"
+        );
+    }
+}
+
+#[test]
 fn github_action_asset_resolver_matches_release_assets() {
     if !bash_available() {
         eprintln!("skipping action asset resolver test because bash is unavailable");

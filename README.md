@@ -683,66 +683,107 @@ jobs:
 
 ### GitHub Action
 
-The composite Action (`Darkroom4364/togi`) wraps the install-and-run steps
-above. Use it when your project already has a `togi.toml`:
+The composite Action installs a released Togi binary, runs it, and uploads a
+replayable JSON report. This Node/TypeScript example is a blocking PR gate:
 
 ```yaml
-- uses: Darkroom4364/togi@<version>
+# .github/workflows/togi.yml
+name: Mutation testing
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  togi:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24 # Choose the version required by this repository.
+      - name: Install project test dependencies
+        run: npm ci
+      - id: togi
+        uses: Darkroom4364/togi@a1503b2ebac4c63d377b015c4825b97cab25ec68 # v0.4.1
+        with:
+          version: v0.4.1
+          base: origin/${{ github.base_ref }}
+          test-cmd: npm test
+          format: json
+          report-artifact-name: togi-report
+          report-retention-days: '14'
+      - name: Record Togi report
+        if: ${{ always() }}
+        env:
+          TOGI_REPORT_PATH: ${{ steps.togi.outputs.report-path }}
+          TOGI_MUTATION_SCORE: ${{ steps.togi.outputs.mutation-score }}
+          TOGI_SURVIVOR_COUNT: ${{ steps.togi.outputs.survivor-count }}
+        run: |
+          printf 'report path: %s\n' "$TOGI_REPORT_PATH"
+          printf 'mutation score: %s\n' "$TOGI_MUTATION_SCORE"
+          printf 'survivor count: %s\n' "$TOGI_SURVIVOR_COUNT"
 ```
 
-The Action passes `--base`, `--timeout`, and `--format` to togi **only when
-you supply a non-empty value for the corresponding input**. If you omit them,
-the flags are not passed to the CLI. Omitted `base` and `timeout` then defer
-to your repository `togi.toml` — respecting `[diff].base` and `[test].timeout`
-(including per-language and per-project overrides). Output format is CLI-only:
-`togi.toml` has no format setting, so an omitted `format` falls back to the
-CLI default `terminal`, while a non-empty `format` explicitly selects the CLI
-output format.
+Choose the Node version required by your project rather than relying on the
+Ubuntu runner's preinstalled Node. Replace `npm ci` and `npm test` with your
+project's dependency-install and test commands. The example uses the Tier 1
+Linux x86_64 target on `ubuntu-latest`; the Action selects the release asset
+from the runner. See the [compatibility contract](docs/COMPATIBILITY.md) before
+using another runner or architecture.
 
-Explicitly supplied values still take precedence over `togi.toml` (standard
-CLI-override semantics):
+`fetch-depth: 0` makes the PR base available for
+`origin/${{ github.base_ref }}`. The checkout therefore needs a Git history
+that contains the base branch and a project with changed supported source
+lines. The Action source and downloaded binary are both pinned to v0.4.1; do
+not replace `version: v0.4.1` with the mutable `latest` default unless that is
+an intentional upgrade policy.
 
-```yaml
-- uses: Darkroom4364/togi@<version>
-  with:
-    base: origin/develop
-    timeout: '120'
-    format: json
+The Action passes `--base`, `--timeout`, `--format`, and `--test-cmd` only for
+non-empty inputs. Those inputs override `togi.toml`; remove `test-cmd` to use
+your configured `[test] command`, and remove `base` when your `[diff].base`
+should select it instead. Output format is CLI-only, so `togi.toml` has no
+format setting. For example:
+
+```toml
+[diff]
+base = "origin/main"
+
+[test]
+command = ["npm", "test"]
 ```
 
-The `test-cmd` input has always followed this pattern and is unchanged.
-The `version` input and its `latest` default are also unchanged.
+`format: json` is the one-run path: its JSON stream becomes the replayable
+`togi-report.json`. To opt into GitHub annotations instead, set
+`format: github`; the Action preserves that review run and performs a second
+full JSON mutation run to create the replayable report.
 
-For a normal mutation report, every Action run also creates a replayable
-`togi-report.json`. When `format` is not `json`, the Action preserves the
-selected review run and then runs the same binary with `--format json` to
-capture the report. When `format: json` is selected, that one JSON stream is
-saved without a second run. The selected review run remains the PR gate:
-survivors still make the Action exit 1.
+For a normal mutation report, the Action uploads `togi-report.json` as the
+`togi-report` artifact. This example explicitly retains it for 14 days. Set a
+unique `report-artifact-name` in a matrix or when invoking the Action more than
+once, and use that same name when downloading. Set `upload-report: 'false'`
+only when you intentionally do not need the artifact. The `report-path`,
+`mutation-score`, and `survivor-count` outputs are runner-local evidence; the
+post-Action `if: always()` step records them after an intentional survivor
+failure without changing the failed Action result.
 
-By default, the Action uploads the report as the `togi-report` artifact
-(`report-artifact-name: 'togi-report'`) for 14 days. Configure retention with
-`report-retention-days`, or set `upload-report: 'false'` to keep the report
-local to the job without uploading it. In a matrix or when invoking the Action
-more than once in a job, set a unique `report-artifact-name`, such as
-`togi-report-${{ matrix.shard }}`, to avoid artifact-name conflicts. A
-matching download step must use the same custom name.
+Exit `1` means survivors, a `--fail-under` threshold miss, or a saved-baseline
+regression, so the example remains a PR gate. A failed baseline test or build
+is a fatal exit `2`, produces no normal mutation report, and leaves no valid
+Action outputs or artifact; `always()` does not make that error successful.
 
-```yaml
-- id: togi
-  uses: Darkroom4364/togi@<version>
-  with:
-    format: github
-    report-retention-days: '14'
-    # upload-report: 'false'
-```
+Use `pull_request` for untrusted forks, keep the read-only permissions and
+disabled persisted credentials shown above, and do not expose secrets to this
+job. Never use `pull_request_target` to run PR code. Togi executes
+repository-defined test commands with the runner's permissions.
 
-The Action exposes `report-path`, `mutation-score`, and `survivor-count` as
-step outputs. Because a survivor intentionally fails the Action, later steps
-that consume the artifact or outputs must use `if: always()`.
-
-Download and replay a report in a checkout at the report's recorded source
-revision:
+Download and replay a report only in a checkout at the report's recorded source
+revision and only when the artifact is trusted:
 
 ```yaml
 - uses: actions/download-artifact@v8
@@ -756,12 +797,9 @@ revision:
 ```
 
 Choose an ID whose report has `replay.kind` set to `regular_direct`; records
-explicitly marked unavailable by togi's existing replay contract cannot be
-replayed.
-
-Replay executes commands recorded in the report. Download and replay only
-trusted artifacts, and retain them only as long as their source and command
-metadata are appropriate for your repository.
+explicitly marked unavailable by Togi's replay contract cannot be replayed.
+Replay executes recorded commands, so retain artifacts only as long as their
+source and command metadata remain appropriate for your repository.
 
 ## Code scanning (SARIF)
 
