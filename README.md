@@ -131,6 +131,29 @@ cd togi
 cargo build --release
 ```
 
+### Before first run
+
+**Zero config** only means togi auto-detects a test command from a supported
+project marker. It does not provision your project's dependencies, runtimes, or
+test runner, or make an unsupported platform or language supported.
+
+Before running `togi check`, use a trusted Git checkout with a resolvable base:
+the default is `origin/main`, or choose one with `--base`. Install the project's
+normal dependencies and ensure the selected test command passes.
+
+The [compatibility contract](docs/COMPATIBILITY.md) contains the supported
+marker defaults. When no supported marker is present, togi's best-effort fallback
+is `make test`, which requires a `Makefile` with a `test` target. If detection is
+missing, ambiguous, or unsuitable, run `togi init` and review or edit the
+generated `togi.toml`, configure `togi.toml` directly, or use one-shot
+`--test-cmd`.
+
+The compatibility contract remains the authoritative support matrix: Tier 1 is
+end-to-end CI-verified, Tier 2 is build- and unit-test-verified only, and not
+supported has no CI guarantee. Linux and Windows ARM64 (aarch64) are not
+supported.
+
+
 ## Usage
 
 ```bash
@@ -261,7 +284,7 @@ mutant source, command context, and relevant covering tests are unchanged.
 
 ## Configuration
 
-Optional. togi works with zero config — it auto-detects your language and test command.
+Optional. togi auto-detects a test command where supported; see [Before first run](#before-first-run) for its exact scope, prerequisites, and support boundaries.
 
 Run `togi init` to auto-detect your language, test runner (including pnpm/yarn/bun), and generate a `togi.toml`. For polyglot repos it creates per-language sections automatically.
 
