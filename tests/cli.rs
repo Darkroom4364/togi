@@ -3608,6 +3608,38 @@ fn github_action_guide_and_advisory_pin_released_contract() {
 }
 
 #[test]
+fn before_first_run_documents_zero_config_contract() {
+    let readme = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md"))
+        .unwrap()
+        .replace("\r\n", "\n");
+    let section_start = readme
+        .find("### Before first run\n")
+        .expect("README must contain a Before first run section");
+    let section = &readme[section_start..];
+    let (section, _) = section
+        .split_once("\n## Usage\n")
+        .expect("Before first run section must end before Usage");
+    let section = section.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    for expected in [
+        "**Zero config** only means togi auto-detects a test command from a supported project marker.",
+        "It does not provision your project's dependencies, runtimes, or test runner, or make an unsupported platform or language supported.",
+        "Before running `togi check`, use a trusted Git checkout with a resolvable base: the default is `origin/main`, or choose one with `--base`.",
+        "Install the project's normal dependencies and ensure the selected test command passes.",
+        "The [compatibility contract](docs/COMPATIBILITY.md) contains the supported marker defaults.",
+        "When no supported marker is present, togi's best-effort fallback is `make test`, which requires a `Makefile` with a `test` target.",
+        "run `togi init` and review or edit the generated `togi.toml`, configure `togi.toml` directly, or use one-shot `--test-cmd`.",
+        "The compatibility contract remains the authoritative support matrix: Tier 1 is end-to-end CI-verified, Tier 2 is build- and unit-test-verified only, and not supported has no CI guarantee.",
+        "Linux and Windows ARM64 (aarch64) are not supported.",
+    ] {
+        assert!(
+            section.contains(expected),
+            "Before first run section is missing `{expected}`"
+        );
+    }
+}
+
+#[test]
 fn github_action_asset_resolver_matches_release_assets() {
     if !bash_available() {
         eprintln!("skipping action asset resolver test because bash is unavailable");
