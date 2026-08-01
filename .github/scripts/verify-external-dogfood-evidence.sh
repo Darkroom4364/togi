@@ -28,6 +28,7 @@ readonly DEPENDENCY_FETCH_TIMEOUT_SECONDS=480
 readonly PREFLIGHT_TIMEOUT_SECONDS=600
 readonly DRY_RUN_TIMEOUT_SECONDS=300
 readonly CLEANUP_TIMEOUT_SECONDS=120
+readonly PHASE_KILL_GRACE_SECONDS=10
 readonly WORKFLOW_TIMEOUT_MINUTES=90
 
 usage() {
@@ -130,6 +131,7 @@ jq -e \
     --argjson preflight_timeout "$PREFLIGHT_TIMEOUT_SECONDS" \
     --argjson dry_run_timeout "$DRY_RUN_TIMEOUT_SECONDS" \
     --argjson cleanup_timeout "$CLEANUP_TIMEOUT_SECONDS" \
+    --argjson phase_kill_grace "$PHASE_KILL_GRACE_SECONDS" \
     --argjson workflow_timeout_minutes "$WORKFLOW_TIMEOUT_MINUTES" '
     .schema_version == 1 and .case == "mitigrid-v0.4.1-pack" and
     (.workflow_source_revision | test("^[0-9a-f]{40}$")) and
@@ -147,7 +149,8 @@ jq -e \
                 target_clone_timeout_seconds: $target_clone_timeout, target_checkout_timeout_seconds: $target_checkout_timeout,
                 dependency_fetch_timeout_seconds: $dependency_fetch_timeout, preflight_timeout_seconds: $preflight_timeout,
                 dry_run_timeout_seconds: $dry_run_timeout, outer_timeout_seconds: $outer_timeout,
-                cleanup_timeout_seconds: $cleanup_timeout, workflow_timeout_minutes: $workflow_timeout_minutes}
+                cleanup_timeout_seconds: $cleanup_timeout, phase_kill_grace_seconds: $phase_kill_grace,
+                workflow_timeout_minutes: $workflow_timeout_minutes}
 ' "$case_dir/case.json" >/dev/null || die "case metadata does not describe the one approved case"
 workflow_sha=$(jq -r '.workflow_source_revision' "$case_dir/case.json")
 
@@ -192,16 +195,16 @@ expected_changed_paths=$(printf '%s\n' ".togi-baseline" "$TARGET_PATH" "docs/gov
 
 expected_commands=$(cat <<EOF
 workflow-deadline: timeout-minutes $WORKFLOW_TIMEOUT_MINUTES
-approval-fetch: curl --connect-timeout $CURL_CONNECT_TIMEOUT_SECONDS --max-time $CURL_MAX_TIME_SECONDS
-release-archive-download: curl --connect-timeout $CURL_CONNECT_TIMEOUT_SECONDS --max-time $CURL_MAX_TIME_SECONDS
-release-checksums-download: curl --connect-timeout $CURL_CONNECT_TIMEOUT_SECONDS --max-time $CURL_MAX_TIME_SECONDS
-target-clone: timeout --preserve-status ${TARGET_CLONE_TIMEOUT_SECONDS}s git clone --filter=blob:none --no-checkout $TARGET_REPOSITORY
-target-checkout: timeout --preserve-status ${TARGET_CHECKOUT_TIMEOUT_SECONDS}s git checkout --detach $TARGET_REVISION
-dependency-fetch: timeout --preserve-status ${DEPENDENCY_FETCH_TIMEOUT_SECONDS}s cargo fetch --locked
-preflight: timeout --preserve-status ${PREFLIGHT_TIMEOUT_SECONDS}s cargo test --locked --workspace
-dry-run: timeout --preserve-status ${DRY_RUN_TIMEOUT_SECONDS}s togi check --dry-run --format json --base $TARGET_BASE --test-cmd 'cargo test --locked --workspace' --build-cmd 'cargo check --locked --workspace'
-execution: timeout --preserve-status ${OUTER_TIMEOUT_SECONDS}s togi check --format json --base $TARGET_BASE --test-cmd 'cargo test --locked --workspace' --build-cmd 'cargo check --locked --workspace' --timeout $MUTATION_TIMEOUT_SECONDS --jobs $MUTATION_JOBS --force-rerun --no-incremental-history
-cleanup: timeout --preserve-status ${CLEANUP_TIMEOUT_SECONDS}s togi clean
+approval-fetch: timeout --kill-after=${PHASE_KILL_GRACE_SECONDS}s ${CURL_MAX_TIME_SECONDS}s curl --connect-timeout $CURL_CONNECT_TIMEOUT_SECONDS --max-time $CURL_MAX_TIME_SECONDS
+release-archive-download: timeout --kill-after=${PHASE_KILL_GRACE_SECONDS}s ${CURL_MAX_TIME_SECONDS}s curl --connect-timeout $CURL_CONNECT_TIMEOUT_SECONDS --max-time $CURL_MAX_TIME_SECONDS
+release-checksums-download: timeout --kill-after=${PHASE_KILL_GRACE_SECONDS}s ${CURL_MAX_TIME_SECONDS}s curl --connect-timeout $CURL_CONNECT_TIMEOUT_SECONDS --max-time $CURL_MAX_TIME_SECONDS
+target-clone: timeout --kill-after=${PHASE_KILL_GRACE_SECONDS}s ${TARGET_CLONE_TIMEOUT_SECONDS}s git clone --filter=blob:none --no-checkout $TARGET_REPOSITORY
+target-checkout: timeout --kill-after=${PHASE_KILL_GRACE_SECONDS}s ${TARGET_CHECKOUT_TIMEOUT_SECONDS}s git checkout --detach $TARGET_REVISION
+dependency-fetch: timeout --kill-after=${PHASE_KILL_GRACE_SECONDS}s ${DEPENDENCY_FETCH_TIMEOUT_SECONDS}s cargo fetch --locked
+preflight: timeout --kill-after=${PHASE_KILL_GRACE_SECONDS}s ${PREFLIGHT_TIMEOUT_SECONDS}s cargo test --locked --workspace
+dry-run: timeout --kill-after=${PHASE_KILL_GRACE_SECONDS}s ${DRY_RUN_TIMEOUT_SECONDS}s togi check --dry-run --format json --base $TARGET_BASE --test-cmd 'cargo test --locked --workspace' --build-cmd 'cargo check --locked --workspace'
+execution: timeout --kill-after=${PHASE_KILL_GRACE_SECONDS}s ${OUTER_TIMEOUT_SECONDS}s togi check --format json --base $TARGET_BASE --test-cmd 'cargo test --locked --workspace' --build-cmd 'cargo check --locked --workspace' --timeout $MUTATION_TIMEOUT_SECONDS --jobs $MUTATION_JOBS --force-rerun --no-incremental-history
+cleanup: timeout --kill-after=${PHASE_KILL_GRACE_SECONDS}s ${CLEANUP_TIMEOUT_SECONDS}s togi clean
 EOF
 )
 [[ "$(cat "$case_dir/commands.txt")" == "$expected_commands" ]] || die "recorded commands are not the approved commands"

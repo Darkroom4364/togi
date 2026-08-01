@@ -34,8 +34,13 @@ be absent before recording final cleanliness.
 `refs/heads/main`. Dispatch reviewed `main` with `expected_workflow_sha` equal
 to the full commit SHA being run. The runner requires the workflow-supplied
 default-branch ref to equal `GITHUB_REF`, and the SHA to equal both `GITHUB_SHA`
-and the checked-out Togi revision. A top-level `external-dogfood` concurrency
-group queues rather than cancels runs. It runs only on Linux x86_64
+and the checked-out Togi revision. Its top-level ref-scoped
+`external-dogfood-${{ github.ref }}` concurrency group has
+`cancel-in-progress: false` and `queue: max`: it permits one running and up to
+100 pending runs per ref, then cancels additional submissions. Rejected
+feature-ref dispatches therefore cannot consume the approved-main queue.
+Runs are FIFO by when they begin waiting, not dispatch time; scheduling can
+still make ordering non-deterministic. It runs only on Linux x86_64
 (`ubuntu-24.04`) with a 90-minute job deadline and a 2,100-second outer
 execution deadline.
 
@@ -44,16 +49,19 @@ archive's named manifest entry and its calculated SHA-256 to equal the fixed
 release checksum, safely extracts it, and requires `togi --version` to be
 exactly `togi 0.4.1`. It never builds or executes Togi from the workflow source.
 
-Every network or expensive target phase has a declared bound recorded in both
-`case.json` and `commands.txt`: each of the approval/archive/checksum downloads
-uses a 15-second connect timeout and a 120-second total curl timeout; target
-clone and checkout use 300 and 120 seconds; locked dependency fetch, preflight,
-and dry run use 480, 600, and 300 seconds; the actual execution uses 2,100
-seconds; and cleanup uses 120 seconds. The three download maxima plus those
-seven bounded phases total 4,380 seconds (73 minutes), leaving 17 minutes of
-the 90-minute job deadline for checkout/setup, release inspection, validation,
-and upload. Target commands retain their approved arguments; the
-`timeout --preserve-status` wrappers are protocol bounds.
+Every network or expensive target phase has a declared wall limit and a common
+10-second kill grace recorded in both `case.json` and `commands.txt`. Each of
+the approval/archive/checksum downloads retains its 15-second curl connect
+timeout and 120-second curl maximum, but is also wrapped by
+`timeout --kill-after=10s 120s` so its retry envelope is physically bounded.
+Target clone and checkout use 300 and 120 seconds; locked dependency fetch,
+preflight, and dry run use 480, 600, and 300 seconds; the actual execution uses
+2,100 seconds; and cleanup uses 120 seconds. The ten watchdogs' command limits
+sum to 4,380 seconds; their ten finite kill-grace allowances add 100 seconds,
+for a 4,480-second maximum (74 minutes 40 seconds). The 90-minute job leaves
+920 seconds (15 minutes 20 seconds) for checkout/setup, release inspection,
+validation, and upload. Target commands retain their approved arguments; the
+watchdogs are protocol bounds.
 
 The target uses a new `HOME` and `CARGO_HOME`. It fetches
 locked dependencies once, then uses an allowlisted `env -i` environment with an
@@ -77,12 +85,13 @@ document. The target's
 checked-in `togi.toml` must set `max_per_run = 0`. The generated count—not a
 truncation cap—must be between 1 and 20 inclusive and equal the dry-run mutation
 array length. The actual run repeats the explicit base and test/build command
-under `timeout --preserve-status 2100s`, with a per-mutation timeout of 120
+under `timeout --kill-after=10s 2100s`, with a per-mutation timeout of 120
 seconds, `--jobs 2 --force-rerun --no-incremental-history`, and no
-`--max-per-run`. A timeout or other nonzero status in any prior phase aborts the
-run and is nonpublishable. For execution, only exit status 0 or 1 reaches
-validation; a timeout status is nonpublishable, and a survivor is an observed
-result, not a protocol failure.
+`--max-per-run`. These watchdogs do not use `--preserve-status`: GNU `timeout`
+returns 124 when its deadline fires, and a forced kill remains nonpublishable
+(normally 137). A timeout or other nonzero status in any prior phase aborts the
+run and is nonpublishable. For execution, only normal exit status 0 or 1 reaches
+validation; a survivor is an observed result, not a protocol failure.
 
 ## Evidence artifact and validation
 

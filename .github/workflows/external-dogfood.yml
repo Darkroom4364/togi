@@ -9,8 +9,9 @@ on:
         type: string
 
 concurrency:
-  group: external-dogfood
+  group: external-dogfood-${{ github.ref }}
   cancel-in-progress: false
+  queue: max
 
 permissions:
   contents: read
