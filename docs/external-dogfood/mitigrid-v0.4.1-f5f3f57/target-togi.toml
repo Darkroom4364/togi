@@ -1,0 +1,17 @@
+[test]
+command = ["cargo", "test", "--locked", "--workspace"]
+build_command = ["cargo", "check", "--locked", "--workspace"]
+timeout = 120
+jobs = 2
+
+[diff]
+base = "origin/main"
+
+[mutations]
+# Keep release baselines complete. Build-error, timeout, equivalent, and
+# non-behavioral survivors are triaged in release notes or follow-up issues
+# instead of filtered here, so future --check-baseline runs stay comparable.
+# Togi 0.1.0 currently produces no mutants for test_records_import.rs, but the
+# file stays in the release command so new Togi support is noticed immediately.
+# Use --max-per-run only for local probes.
+max_per_run = 0

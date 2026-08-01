@@ -1,0 +1,199 @@
+
+running 29 tests
+test commands::pack::tests::path_file_name_reports_missing_filename ... ok
+test commands::report::tests::appends_html_fragment_before_closing_body ... ok
+test commands::report::tests::appends_html_fragment_to_bodyless_html ... ok
+test commands::run::tests::parses_run_dry_run_after_target ... ok
+test commands::run::tests::parses_run_allow_exec_before_run_id ... ok
+test commands::run::tests::rejects_conflicting_run_trust_options ... ok
+test commands::run::tests::rejects_run_without_run_id ... ok
+test commands::run::tests::rejects_unknown_run_option ... ok
+test commands::validate::tests::parses_validate_json_after_target ... ok
+test commands::validate::tests::parses_validate_json_before_target ... ok
+test evidence::tests::generated_evidence_registry_records_opencem_tool_version ... ok
+test evidence::tests::optional_provenance_distinguishes_missing_and_existing_files ... ok
+test evidence::tests::reads_legacy_check_result_without_schema_version_as_v0_1_0 ... ok
+test evidence::tests::report_citations_include_run_result_check_and_artifact_ids ... ok
+test paths::tests::artifact_registry_path_is_under_artifacts ... ok
+test paths::tests::check_result_path_uses_safe_run_id ... ok
+test evidence::tests::rejects_unsupported_check_result_schema_version ... ok
+test paths::tests::path_display_preserves_absolute_roots ... ok
+test paths::tests::project_relative_path_display_uses_forward_slashes ... ok
+test paths::tests::provenance_path_is_run_scoped_under_artifacts ... ok
+test paths::tests::report_paths_are_run_scoped_under_artifacts ... ok
+test paths::tests::safe_filename_replaces_colons ... ok
+test commands::pack::tests::pack_includes_imported_requirements_manifest ... ok
+test commands::pack::tests::pack_requires_reports_for_requested_run ... ok
+test tests::ingest_rejects_invalid_thermal_basic_sidecar_before_writing ... ok
+test tests::check_rejects_invalid_thermal_basic_sidecar_before_writing ... ok
+test tests::rejects_invalid_trace_id ... ok
+test tests::check_rejects_invalid_labtrace_sidecar_before_writing ... ok
+test tests::ingest_rejects_invalid_labtrace_sidecar_before_writing ... ok
+
+test result: ok. 29 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+
+running 27 tests
+test imported_test_record_messages_are_markdown_escaped_in_reports ... ok
+test diff_highlights_changed_checks_and_artifacts ... ok
+test diff_compares_artifact_id_path_sha_and_repeated_kind_keys ... ok
+test imports_doorstop_requirements_for_run_references ... ok
+test imports_opentap_listener_csv ... ok
+test imports_openhtf_record_into_report_and_provenance ... ok
+test init_creates_required_directories_without_overwriting_manifest ... ok
+test model_run_rejects_undeclared_inputs_in_dry_run_and_execution ... ok
+test model_run_verifies_declared_inputs_before_execution_but_not_dry_run ... ok
+test imports_junit_xml_into_check_results_and_pack ... ok
+test imports_strictdoc_requirements_for_run_references ... ok
+test registry_backed_commands_reject_tampered_artifacts ... ok
+test repeated_requirement_imports_merge_and_reimport_idempotently ... ok
+test report_requires_check_results_first ... ok
+test repeated_test_record_imports_merge_and_reimport_idempotently ... ok
+test requirement_import_conflicts_report_existing_source ... ok
+test test_record_import_conflicts_report_existing_source ... ok
+test model_run_command_generates_reportable_evidence ... ok
+test symlink_artifacts_are_rejected_before_workflows_read_them ... ok
+test pack_refuses_symlinked_pack_outputs ... ok
+test validate_json_reports_expired_labtrace_calibration ... ok
+test validate_json_reports_invalid_labtrace_sidecar_schema ... ok
+test validate_json_reports_invalid_thermal_basic_sidecar_schema ... ok
+test thermal_basic_links_model_output_to_validation_check ... ok
+test validate_json_reports_schema_errors ... ok
+test thermal_workflow_generates_reviewable_report_and_trace ... ok
+test validate_detects_generated_evidence_tampering ... ok
+
+test result: ok. 27 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.70s
+
+
+running 103 tests
+test artifacts::tests::artifact_registry_rejects_artifact_record_missing_required_field ... ok
+test artifacts::tests::artifact_registry_rejects_unknown_artifact_record_fields ... ok
+test artifacts::tests::detects_hash_mismatch ... ok
+test artifacts::tests::builds_artifact_record_with_size_and_hash ... ok
+test artifacts::tests::new_registry_uses_schema_and_upsert_inserts_sorted_artifacts ... ok
+test artifacts::tests::upsert_refreshes_timestamp_when_replacing_existing_artifact ... ok
+test artifacts::tests::hashes_content_larger_than_read_buffer ... ok
+test artifacts::tests::missing_artifact_does_not_stop_later_validation ... ok
+test checks::tests::check_run_result_serializes_schema_version ... ok
+test artifacts::tests::rejects_symlink_artifacts_before_hashing ... ok
+test artifacts::tests::validates_schema_version_size_and_hash_errors_together ... ok
+test checks::tests::legacy_check_run_result_without_schema_version_defaults_to_v0_1_0 ... ok
+test checks::tests::numeric_comparisons_distinguish_threshold_boundaries ... ok
+test checks::tests::column_exists_without_target_column_reports_clear_error ... ok
+test checks::tests::passed_count_counts_only_pass_statuses ... ok
+test checks::tests::no_checks_for_existing_run_returns_dedicated_error ... ok
+test checks::tests::representative_observed_values_match_operator_semantics ... ok
+test checks::tests::fails_missing_column_clearly ... ok
+test checks::tests::rejects_symlink_artifacts_before_reading_checks ... ok
+test checks::tests::passes_threshold_check_over_csv ... ok
+test manifest::tests::allows_missing_declared_model_outputs_before_run ... ok
+test manifest::tests::allows_missing_declared_model_outputs_but_flags_other_missing_artifacts ... ok
+test checks::tests::threshold_check_fails_missing_column_clearly ... ok
+test checks::tests::threshold_check_reports_non_numeric_values ... ok
+test manifest::tests::allows_undeclared_outputs_for_non_model_runs ... ok
+test manifest::tests::flags_invalid_project_id_with_project_id_field ... ok
+test manifest::tests::flags_incomplete_threshold_checks ... ok
+test manifest::tests::flags_duplicate_ids_across_object_kinds ... ok
+test manifest::tests::flags_missing_schema_version ... ok
+test manifest::tests::flags_model_inputs_not_declared_as_artifacts ... ok
+test manifest::tests::flags_unknown_requirement_reference ... ok
+test manifest::tests::flags_unportable_artifact_paths ... ok
+test manifest::tests::parses_and_validates_basic_manifest ... ok
+test manifest::tests::rejects_unknown_manifest_fields ... ok
+test manifest::tests::parses_schema_level_run_parameters_and_reports ... ok
+test manifest::tests::validates_check_ops_and_accepts_exists ... ok
+test manifest::tests::rejects_symlink_artifact_paths ... ok
+test paths::tests::create_directories_reject_dangling_target_symlink ... ok
+test paths::tests::portable_project_relative_paths_accept_project_relative_forms ... ok
+test paths::tests::portable_project_relative_paths_reject_non_portable_forms ... ok
+test paths::tests::create_paths_reject_parent_symlink_outside_project ... ok
+test paths::tests::create_directories_reject_parent_symlink ... ok
+test provenance::tests::parameter_provenance_ids_fallback_and_sanitize_names ... ok
+test provenance::tests::builds_core_evidence_edges ... ok
+test paths::tests::create_paths_reject_dangling_target_symlink ... ok
+test provenance::tests::declared_outputs_limit_artifact_assumption_and_parameter_edges ... ok
+test provenance::tests::records_report_artifact_production_from_added_report_citations ... ok
+test provenance::tests::trace_lines_reports_exact_message_for_isolated_ids ... ok
+test provenance::tests::traces_outgoing_edges_without_cycles ... ok
+test provenance::tests::records_report_citations ... ok
+test reports::tests::html_report_renders_placeholder_rows_for_empty_sections ... ok
+test reports::tests::provenance_edges_match_when_either_endpoint_is_relevant ... ok
+test reports::tests::html_report_escapes_special_characters_in_cells ... ok
+test reports::tests::rejects_check_result_run_mismatches ... ok
+test reports::tests::markdown_report_escapes_user_controlled_content ... ok
+test reports::tests::relevant_provenance_ids_include_check_result_check_and_artifact_ids ... ok
+test requirements_import::tests::conflicting_imported_requirement_reports_source_context ... ok
+test reports::tests::renders_static_html_report ... ok
+test requirements_import::tests::conflicting_imported_requirement_with_same_format_requires_same_source ... ok
+test requirements_import::tests::imports_strictdoc_file ... ok
+test reports::tests::renders_deterministic_markdown_report ... ok
+test requirements_import::tests::imports_doorstop_directory ... ok
+test requirements_import::tests::imports_strictdoc_ignores_non_requirement_blocks_with_requirement_fields ... ok
+test requirements_import::tests::merge_normalizes_legacy_document_before_reimport_pruning ... ok
+test requirements_import::tests::normalizes_legacy_imported_requirement_sources ... ok
+test requirements_import::tests::merges_imported_requirements_by_source_and_id ... ok
+test requirements_import::tests::path_display_preserves_absolute_roots ... ok
+test requirements_import::tests::path_display_preserves_relative_paths ... ok
+test requirements_import::tests::imports_strictdoc_multiline_field ... ok
+test requirements_import::tests::strictdoc_block_flush_discards_non_requirement_fields ... ok
+test requirements_import::tests::renders_and_parses_imported_requirements_document ... ok
+test requirements_import::tests::skips_doorstop_metadata_files_that_look_like_requirements ... ok
+test schema::tests::domain_pack_registry_resolves_thermal_basic_refs_by_public_ids ... ok
+test schema::tests::domain_pack_registry_resolves_labtrace_refs_by_public_ids ... ok
+test schema::tests::check_run_result_schema_rejects_missing_schema_version ... ok
+test schema::tests::check_run_result_schema_rejects_wrong_schema_version ... ok
+test schema::tests::reports_domain_pack_schema_errors_in_deterministic_order ... ok
+test schema::tests::reports_thermal_basic_sidecar_error_locations ... ok
+test schema::tests::reports_labtrace_sidecar_error_locations ... ok
+test schema::tests::validates_generated_check_run_results_against_schema ... ok
+test schema::tests::thermal_basic_quantity_rejects_negative_uncertainty ... ok
+test schema::tests::reports_core_schema_errors_in_deterministic_order ... ok
+test schema::tests::validates_thermal_basic_sidecar_against_schema ... ok
+test schema::tests::validates_labtrace_sidecar_against_schema ... ok
+test test_records_import::tests::conflicting_imported_check_reports_source_context ... ok
+test test_records_import::tests::conflicting_imported_test_record_reports_source_context ... ok
+test test_records_import::tests::imports_junit_error_case_body_message ... ok
+test test_records_import::tests::imports_junit_failure_and_skipped_cases ... ok
+test test_records_import::tests::imports_openhtf_phase_outcomes_and_result_fields ... ok
+test test_records_import::tests::imports_openhtf_phases_as_custom_check_results ... ok
+test test_records_import::tests::imports_opentap_csv_verdicts ... ok
+test test_records_import::tests::imports_opentap_result_column_and_semicolon_delimiter ... ok
+test test_records_import::tests::normalizes_legacy_imported_test_record_sources ... ok
+test test_records_import::tests::merges_imported_test_records_by_source_and_id ... ok
+test schema::tests::reports_schema_error_locations ... ok
+test test_records_import::tests::rejects_junit_xml_without_testcases ... ok
+test test_records_import::tests::rejects_malformed_openhtf_json ... ok
+test tests::accepts_stable_ids ... ok
+test tests::rejects_empty_ids ... ok
+test tests::rejects_ids_with_spaces ... ok
+test test_records_import::tests::rejects_unclosed_junit_testcase ... ok
+test test_records_import::tests::rejects_opentap_csv_without_verdict_or_result_column ... ok
+test schema::tests::validates_thermal_project_against_schema ... ok
+
+test result: ok. 103 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+
+
+running 10 tests
+test tests::accepts_equal_calibration_dates_and_rejects_backwards_validity ... ok
+test tests::calibration_html_escapes_quotes_in_row_values ... ok
+test tests::calibration_markdown_escapes_hostile_row_values ... ok
+test tests::flags_expired_calibration ... ok
+test tests::rejects_empty_mapping_column ... ok
+test tests::rejects_empty_sensor_kind ... ok
+test tests::treats_today_as_current_and_previous_dates_as_expired ... ok
+test tests::renders_calibration_rows_in_deterministic_order ... ok
+test tests::renders_calibration_sections_for_artifact ... ok
+test tests::validates_labtrace_thermal_manifest ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

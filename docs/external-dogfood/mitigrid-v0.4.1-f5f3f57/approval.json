@@ -1,0 +1,7 @@
+{
+  "author": "Darkroom4364",
+  "body": "I authorize one no-secret, read-only external-dogfood run of released Darkroom4364/togi v0.4.1 on Darkroom4364/Mitigrid commit f5f3f57c92fdb3405b92eca7c9b6a6d3d704c1e8, base 16e7c9e49f353fd7f4254276b3a7ece99c6dedf6, scoped to crates/opencem-cli/src/commands/pack.rs, using cargo test --locked --workspace and cargo check --locked --workspace. The run may publish its bounded raw stdout/stderr, JSON reports, environment metadata, and checksums in Darkroom4364/togi. It must use no secrets and must not modify Mitigrid.",
+  "created_at": "2026-08-01T09:21:16Z",
+  "id": 5150807894,
+  "url": "https://github.com/Darkroom4364/Mitigrid/pull/125#issuecomment-5150807894"
+}

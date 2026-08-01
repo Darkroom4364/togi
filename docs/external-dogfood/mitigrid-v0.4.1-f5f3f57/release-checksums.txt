@@ -1,0 +1,4 @@
+6be7bf55d3c84a539cdaa4e60e5b5ef212ddb0e2575cd6b85ceae50218abce5c  ./togi-linux-x86_64.tar.gz
+00149081b44ed700ecca4afebef5e8f9dcabd82a89a447e0fab77078134c64a1  ./togi-macos-arm64.tar.gz
+f83c814d139a4fe525a00be2b802e3ad7cbe537282440d8687b155b8b8b77c29  ./togi-macos-x86_64.tar.gz
+f8399ba5740c0c06ecf891cb349108e2707dcdd8492f53f44fd2be93e0b3a8f7  ./togi-windows-x86_64.zip

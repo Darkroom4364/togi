@@ -1,0 +1,193 @@
+diff --git a/.togi-baseline b/.togi-baseline
+index 41aed0d..f749315 100644
+--- a/.togi-baseline
++++ b/.togi-baseline
+@@ -1,24 +1,24 @@
+ {
+   "files": {
+     "crates/opencem-cli/src/commands/pack.rs": {
+-      "killed": 17,
++      "killed": 19,
+       "total": 19
+     },
+-    "crates/opencem-cli/src/evidence.rs": {
+-      "killed": 20,
+-      "total": 20
++    "crates/opencem-core/src/artifacts.rs": {
++      "killed": 8,
++      "total": 17
+     },
+     "crates/opencem-cli/src/paths.rs": {
+       "killed": 18,
+       "total": 18
+     },
++    "crates/opencem-cli/src/evidence.rs": {
++      "killed": 20,
++      "total": 20
++    },
+     "crates/opencem-cli/src/commands/report.rs": {
+       "killed": 10,
+       "total": 10
+-    },
+-    "crates/opencem-core/src/artifacts.rs": {
+-      "killed": 10,
+-      "total": 17
+     }
+   },
+   "killed": 75,
+diff --git a/crates/opencem-cli/src/commands/pack.rs b/crates/opencem-cli/src/commands/pack.rs
+index a7e2356..20b793d 100644
+--- a/crates/opencem-cli/src/commands/pack.rs
++++ b/crates/opencem-cli/src/commands/pack.rs
+@@ -53,11 +53,7 @@ pub(crate) fn pack_run(run_id: &str, target: Option<PathBuf>) -> Result<(), Stri
+         &root,
+         &manifest_path,
+         &staging_root,
+-        PathBuf::from("manifests").join(
+-            manifest_path
+-                .file_name()
+-                .unwrap_or_else(|| std::ffi::OsStr::new("project.yaml")),
+-        ),
++        PathBuf::from("manifests").join(path_file_name(&manifest_path)?),
+         "project-manifest",
+         &mut files,
+     )?;
+@@ -66,11 +62,7 @@ pub(crate) fn pack_run(run_id: &str, target: Option<PathBuf>) -> Result<(), Stri
+             &root,
+             &labtrace_path,
+             &staging_root,
+-            PathBuf::from("manifests").join(
+-                labtrace_path
+-                    .file_name()
+-                    .unwrap_or_else(|| std::ffi::OsStr::new("labtrace.yaml")),
+-            ),
++            PathBuf::from("manifests").join(path_file_name(&labtrace_path)?),
+             "labtrace-manifest",
+             &mut files,
+         )?;
+@@ -262,6 +254,11 @@ fn copy_pack_file(
+     Ok(())
+ }
+ 
++fn path_file_name(path: &Path) -> Result<&std::ffi::OsStr, String> {
++    path.file_name()
++        .ok_or_else(|| format!("{} has no filename", path.display()))
++}
++
+ fn require_generated_record<'a>(
+     registry_by_id: &'a BTreeMap<&str, &'a ArtifactRecord>,
+     expected: &GeneratedEvidence,
+@@ -301,6 +298,8 @@ fn require_generated_record<'a>(
+ 
+ #[cfg(test)]
+ mod tests {
++    use super::path_file_name;
++
+     use std::fs;
+     use std::path::{Path, PathBuf};
+     use std::time::{SystemTime, UNIX_EPOCH};
+@@ -382,6 +381,20 @@ requirements:
+         Ok(())
+     }
+ 
++    #[test]
++    fn path_file_name_reports_missing_filename() -> Result<(), String> {
++        assert_eq!(
++            path_file_name(Path::new("project.yaml"))?,
++            std::ffi::OsStr::new("project.yaml")
++        );
++        let err = match path_file_name(Path::new("")) {
++            Ok(filename) => return Err(format!("unexpected filename {filename:?}")),
++            Err(err) => err,
++        };
++        assert!(err.contains("has no filename"));
++        Ok(())
++    }
++
+     fn run_cli(args: Vec<&str>) -> Result<(), String> {
+         crate::run(args.into_iter().map(str::to_string).collect())
+     }
+diff --git a/docs/governance/mutation-baseline-v0.1.md b/docs/governance/mutation-baseline-v0.1.md
+new file mode 100644
+index 0000000..9de8b9b
+--- /dev/null
++++ b/docs/governance/mutation-baseline-v0.1.md
+@@ -0,0 +1,39 @@
++# Mutation Baseline v0.1
++
++This note records the accepted mutation-test baseline for residual issues #102
++through #105 after the final #88 run.
++
++## Source Run
++
++- Tool: Togi 0.1.0
++- Command scope:
++  - `crates/opencem-cli/src/commands/pack.rs`
++  - `crates/opencem-cli/src/commands/report.rs`
++  - `crates/opencem-cli/src/evidence.rs`
++  - `crates/opencem-cli/src/paths.rs`
++  - `crates/opencem-core/src/artifacts.rs`
++- Final result: 75 killed, 4 survived, 5 timeout, 8 build errors
++- Saved `.togi-baseline`: 75 killed of 84 comparable mutants
++- Score: 89.3%
++- Duration: 434.96s
++
++## Residual Classification
++
++- #102: pack fallback filename survivors were fixed by replacing defensive
++  fallback strings with an explicit missing-filename error path.
++- #103: the artifact hash buffer mutations from 8192 to 8191 and 8193 are
++  accepted as equivalent behavior. Streaming hash correctness is independent of
++  chunk size.
++- #104: the `current_unix_seconds` fallback mutation from 0 to 1 is accepted as
++  an unreachable clock fallback on supported systems.
++- #104: the metadata read-error `continue` survivor is accepted as a
++  race/permission edge. Testing it deterministically requires a filesystem race.
++- #105: hash loop termination timeouts are expected non-terminating mutants.
++- #105: build errors are non-typechecking mutations and should stay visible in
++  future reports.
++
++## v0.1 Decision
++
++The saved `.togi-baseline` is accepted for v0.1 with the classifications above.
++Future mutation runs should keep build errors and timeouts visible rather than
++hiding them inside the comparable-mutant score.
+diff --git a/docs/governance/public-readiness.md b/docs/governance/public-readiness.md
+index 1e398d2..c2c678b 100644
+--- a/docs/governance/public-readiness.md
++++ b/docs/governance/public-readiness.md
+@@ -42,9 +42,10 @@ gate for making OpenCEM's pre-1.0 repository public. Creating the first public
+   Evidence: issue #88 refreshed the targeted Togi 0.1.0 baseline over pack,
+   report, generated evidence, CLI path helpers, and artifact registry/hash
+   validation. The saved `.togi-baseline` records 75 killed of 84 comparable
+-  mutants. The full run generated 92 mutations: 75 killed, 5 survived, 4
++  mutants. The full run generated 92 mutations: 75 killed, 4 survived, 5
+   timeouts, and 8 build-error mutants. Residual survivor, timeout, and
+-  build-error triage is tracked in issues #102 through #105.
++  build-error triage is tracked in issues #102 through #105 and summarized in
++  [Mutation Baseline v0.1](mutation-baseline-v0.1.md).
+ - [ ] Review `cargo audit`, `cargo deny`, or equivalent dependency-vulnerability
+   results while the accepted YAML parser risk remains.
+ - [ ] Confirm CI and `scripts/ci-release-gate.sh` are green on `main`.
+diff --git a/docs/governance/release-policy.md b/docs/governance/release-policy.md
+index ba18a3a..5becfb9 100644
+--- a/docs/governance/release-policy.md
++++ b/docs/governance/release-policy.md
+@@ -109,11 +109,13 @@ togi check --all \
+ 
+ The issue #88 v0.1 release-readiness run used Togi 0.1.0 with this command.
+ The saved `.togi-baseline` records 75 killed of 84 comparable mutants. The full
+-run generated 92 mutations: 75 killed, 5 survived, 4 timeouts, and 8 build-error
+-mutants, for an 89.3% test-kill score in 331.77 seconds on the local release
++run generated 92 mutations: 75 killed, 4 survived, 5 timeouts, and 8 build-error
++mutants, for an 89.3% test-kill score in 434.96 seconds on the local release
+ review machine. Residual survivor, timeout, and build-error triage is tracked in
+-issues #102 through #105. The first public tag release notes must cite this
+-baseline or the newer rerun baseline that replaces it.
++issues #102 through #105 and summarized in
++[Mutation Baseline v0.1](mutation-baseline-v0.1.md). The first public tag
++release notes must cite this baseline or the newer rerun baseline that replaces
++it.
+ 
+ Maintainers should review surviving or noisy mutations before release and either
+ improve tests, accept the residual risk explicitly, or file follow-up work. CI

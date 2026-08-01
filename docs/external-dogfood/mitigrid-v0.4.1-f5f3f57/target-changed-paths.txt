@@ -1,0 +1,5 @@
+.togi-baseline
+crates/opencem-cli/src/commands/pack.rs
+docs/governance/mutation-baseline-v0.1.md
+docs/governance/public-readiness.md
+docs/governance/release-policy.md

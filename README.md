@@ -9,6 +9,10 @@ togi (鍛 — Japanese for "sharpening") is a fast, diff-targeted mutation testi
 
 It finds the test gaps hidden behind green builds: togi mutates the code you changed, runs the relevant tests, and shows the exact mutants your suite failed to kill.
 
+## External released-binary evidence
+
+A released [Togi v0.4.1](docs/external-dogfood/mitigrid-v0.4.1-f5f3f57/) binary completed one permitted, bounded run on Mitigrid revision [`f5f3f57c92fdb3405b92eca7c9b6a6d3d704c1e8`](https://github.com/Darkroom4364/Mitigrid/commit/f5f3f57c92fdb3405b92eca7c9b6a6d3d704c1e8); the [workflow artifact](https://github.com/Darkroom4364/togi/actions/runs/30696356930) recorded 2/2 tested and killed, with 0 survivors, timeouts, or build errors, a complete non-partial report, reported duration 80,289ms, and outer wall time 120,264ms. Its artifact offline verifier passed. This is one bounded reproducibility result, not adoption, general compatibility, or performance evidence.
+
 ## What it does
 
 Mutation testing is usually too slow to run on every PR. togi is built for the PR loop:
