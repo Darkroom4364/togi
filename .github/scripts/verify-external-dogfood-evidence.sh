@@ -195,7 +195,7 @@ workflow-deadline: timeout-minutes $WORKFLOW_TIMEOUT_MINUTES
 approval-fetch: curl --connect-timeout $CURL_CONNECT_TIMEOUT_SECONDS --max-time $CURL_MAX_TIME_SECONDS
 release-archive-download: curl --connect-timeout $CURL_CONNECT_TIMEOUT_SECONDS --max-time $CURL_MAX_TIME_SECONDS
 release-checksums-download: curl --connect-timeout $CURL_CONNECT_TIMEOUT_SECONDS --max-time $CURL_MAX_TIME_SECONDS
-target-clone: timeout --preserve-status ${TARGET_CLONE_TIMEOUT_SECONDS}s git clone --no-checkout $TARGET_REPOSITORY
+target-clone: timeout --preserve-status ${TARGET_CLONE_TIMEOUT_SECONDS}s git clone --filter=blob:none --no-checkout $TARGET_REPOSITORY
 target-checkout: timeout --preserve-status ${TARGET_CHECKOUT_TIMEOUT_SECONDS}s git checkout --detach $TARGET_REVISION
 dependency-fetch: timeout --preserve-status ${DEPENDENCY_FETCH_TIMEOUT_SECONDS}s cargo fetch --locked
 preflight: timeout --preserve-status ${PREFLIGHT_TIMEOUT_SECONDS}s cargo test --locked --workspace

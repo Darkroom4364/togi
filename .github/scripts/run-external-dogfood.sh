@@ -140,6 +140,8 @@ jq -n -S \
     --arg workflow_source_revision "$EXPECTED_WORKFLOW_SHA" \
     --arg workflow_source_ref "$EXPECTED_WORKFLOW_REF" \
     --arg approval_url "$APPROVAL_URL" \
+    --argjson approval_id "$APPROVAL_COMMENT_ID" \
+    --arg approval_author "$APPROVAL_AUTHOR" \
     --arg approval_body "$APPROVAL_BODY" \
     --arg release_tag "$TOGI_VERSION" \
     --arg archive "$TOGI_ARCHIVE" \
@@ -165,7 +167,7 @@ jq -n -S \
       case: "mitigrid-v0.4.1-pack",
       workflow_source_revision: $workflow_source_revision,
       workflow_source_ref: $workflow_source_ref,
-      approval: {url: $approval_url, id: 5150807894, author: "Darkroom4364", body: $approval_body},
+      approval: {url: $approval_url, id: $approval_id, author: $approval_author, body: $approval_body},
       release: {tag: $release_tag, archive: $archive, archive_sha256: $archive_sha256},
       target: {repository: $repository, revision: $revision, base: $base, mutation_scope: $path,
                direct_parent_changed_paths: [".togi-baseline", $path, "docs/governance/mutation-baseline-v0.1.md",
@@ -223,7 +225,7 @@ jq -n -S \
       actual_sha256: $actual_sha256, version: $version}' >"$output_dir/release-verification.json"
 
 target_dir="$work_root/target"
-GIT_TERMINAL_PROMPT=0 timeout --preserve-status "${TARGET_CLONE_TIMEOUT_SECONDS}s" git clone --no-checkout "$TARGET_REPOSITORY" "$target_dir"
+GIT_TERMINAL_PROMPT=0 timeout --preserve-status "${TARGET_CLONE_TIMEOUT_SECONDS}s" git clone --filter=blob:none --no-checkout "$TARGET_REPOSITORY" "$target_dir"
 GIT_TERMINAL_PROMPT=0 timeout --preserve-status "${TARGET_CHECKOUT_TIMEOUT_SECONDS}s" git -C "$target_dir" checkout --detach "$TARGET_REVISION"
 [[ "$(git -C "$target_dir" rev-parse HEAD)" == "$TARGET_REVISION" ]] || die "target checkout revision did not match"
 git -C "$target_dir" cat-file -e "${TARGET_BASE}^{commit}"
@@ -284,7 +286,7 @@ printf '%s\n' \
     "approval-fetch: curl --connect-timeout $CURL_CONNECT_TIMEOUT_SECONDS --max-time $CURL_MAX_TIME_SECONDS" \
     "release-archive-download: curl --connect-timeout $CURL_CONNECT_TIMEOUT_SECONDS --max-time $CURL_MAX_TIME_SECONDS" \
     "release-checksums-download: curl --connect-timeout $CURL_CONNECT_TIMEOUT_SECONDS --max-time $CURL_MAX_TIME_SECONDS" \
-    "target-clone: timeout --preserve-status ${TARGET_CLONE_TIMEOUT_SECONDS}s git clone --no-checkout $TARGET_REPOSITORY" \
+    "target-clone: timeout --preserve-status ${TARGET_CLONE_TIMEOUT_SECONDS}s git clone --filter=blob:none --no-checkout $TARGET_REPOSITORY" \
     "target-checkout: timeout --preserve-status ${TARGET_CHECKOUT_TIMEOUT_SECONDS}s git checkout --detach $TARGET_REVISION" \
     "dependency-fetch: timeout --preserve-status ${DEPENDENCY_FETCH_TIMEOUT_SECONDS}s cargo fetch --locked" \
     "preflight: timeout --preserve-status ${PREFLIGHT_TIMEOUT_SECONDS}s cargo test --locked --workspace" \
