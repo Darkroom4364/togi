@@ -1,0 +1,59 @@
+{
+  "approval": {
+    "author": "Darkroom4364",
+    "body": "I authorize one no-secret, read-only external-dogfood run of released Darkroom4364/togi v0.4.1 on Darkroom4364/Mitigrid commit f5f3f57c92fdb3405b92eca7c9b6a6d3d704c1e8, base 16e7c9e49f353fd7f4254276b3a7ece99c6dedf6, scoped to crates/opencem-cli/src/commands/pack.rs, using cargo test --locked --workspace and cargo check --locked --workspace. The run may publish its bounded raw stdout/stderr, JSON reports, environment metadata, and checksums in Darkroom4364/togi. It must use no secrets and must not modify Mitigrid.",
+    "id": 5150807894,
+    "url": "https://github.com/Darkroom4364/Mitigrid/pull/125#issuecomment-5150807894"
+  },
+  "case": "mitigrid-v0.4.1-pack",
+  "limits": {
+    "cleanup_timeout_seconds": 120,
+    "curl_connect_timeout_seconds": 15,
+    "curl_max_time_seconds": 120,
+    "dependency_fetch_timeout_seconds": 480,
+    "dry_run_timeout_seconds": 300,
+    "generated_mutant_ceiling": 20,
+    "jobs": 2,
+    "outer_timeout_seconds": 2100,
+    "per_mutation_timeout_seconds": 120,
+    "phase_kill_grace_seconds": 10,
+    "preflight_timeout_seconds": 600,
+    "target_checkout_timeout_seconds": 120,
+    "target_clone_timeout_seconds": 300,
+    "workflow_timeout_minutes": 90
+  },
+  "release": {
+    "archive": "togi-linux-x86_64.tar.gz",
+    "archive_sha256": "6be7bf55d3c84a539cdaa4e60e5b5ef212ddb0e2575cd6b85ceae50218abce5c",
+    "tag": "v0.4.1"
+  },
+  "schema_version": 1,
+  "target": {
+    "base": "16e7c9e49f353fd7f4254276b3a7ece99c6dedf6",
+    "build_command": [
+      "cargo",
+      "check",
+      "--locked",
+      "--workspace"
+    ],
+    "direct_parent_changed_paths": [
+      ".togi-baseline",
+      "crates/opencem-cli/src/commands/pack.rs",
+      "docs/governance/mutation-baseline-v0.1.md",
+      "docs/governance/public-readiness.md",
+      "docs/governance/release-policy.md"
+    ],
+    "mutation_scope": "crates/opencem-cli/src/commands/pack.rs",
+    "repository": "https://github.com/Darkroom4364/Mitigrid.git",
+    "revision": "f5f3f57c92fdb3405b92eca7c9b6a6d3d704c1e8",
+    "test_command": [
+      "cargo",
+      "test",
+      "--locked",
+      "--workspace"
+    ],
+    "togi_toml_max_per_run": 0
+  },
+  "workflow_source_ref": "refs/heads/main",
+  "workflow_source_revision": "3538431df9db95575edba23cda4afc3fe108faba"
+}

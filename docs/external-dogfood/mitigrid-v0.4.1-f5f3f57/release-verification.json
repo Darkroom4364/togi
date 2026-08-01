@@ -1,0 +1,7 @@
+{
+  "actual_sha256": "6be7bf55d3c84a539cdaa4e60e5b5ef212ddb0e2575cd6b85ceae50218abce5c",
+  "archive": "togi-linux-x86_64.tar.gz",
+  "expected_sha256": "6be7bf55d3c84a539cdaa4e60e5b5ef212ddb0e2575cd6b85ceae50218abce5c",
+  "tag": "v0.4.1",
+  "version": "togi 0.4.1"
+}

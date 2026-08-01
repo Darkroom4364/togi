@@ -1,0 +1,27 @@
+{
+  "kind": "dry_run",
+  "dry_run": true,
+  "planned_total": 2,
+  "mutations": [
+    {
+      "id": 1,
+      "file": "crates/opencem-cli/src/commands/pack.rs",
+      "line": 56,
+      "column": 23,
+      "operator": "string_to_empty",
+      "description": "Replace string literal with empty string",
+      "original": "\"manifests\"",
+      "replacement": "\"\""
+    },
+    {
+      "id": 2,
+      "file": "crates/opencem-cli/src/commands/pack.rs",
+      "line": 65,
+      "column": 27,
+      "operator": "string_to_empty",
+      "description": "Replace string literal with empty string",
+      "original": "\"manifests\"",
+      "replacement": "\"\""
+    }
+  ]
+}

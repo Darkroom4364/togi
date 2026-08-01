@@ -1,0 +1,109 @@
+{
+  "kind": "mutation_report",
+  "schema_version": 1,
+  "generator": "togi/0.4.1",
+  "source_revision": "f5f3f57c92fdb3405b92eca7c9b6a6d3d704c1e8",
+  "total": 2,
+  "planned_total": 2,
+  "tested": 2,
+  "killed": 2,
+  "survived": 0,
+  "timeout": 0,
+  "build_errors": 0,
+  "partial": false,
+  "mutation_score": 100.0,
+  "duration_ms": 80289,
+  "test_command": [
+    "cargo",
+    "test",
+    "--locked",
+    "--workspace"
+  ],
+  "build_command": [
+    "cargo",
+    "check",
+    "--locked",
+    "--workspace"
+  ],
+  "build_error_groups": [],
+  "mutations": [
+    {
+      "id": 1,
+      "file": "crates/opencem-cli/src/commands/pack.rs",
+      "line": 56,
+      "operator": "string_to_empty",
+      "description": "Replace string literal with empty string",
+      "result": "killed",
+      "execution": {
+        "state": "executed"
+      },
+      "column": 23,
+      "original": "\"manifests\"",
+      "replacement": "\"\"",
+      "diff": "--- a/crates/opencem-cli/src/commands/pack.rs\n+++ b/crates/opencem-cli/src/commands/pack.rs\n@@ -55,3 +55,3 @@\n         &staging_root,\n-        PathBuf::from(\"manifests\").join(path_file_name(&manifest_path)?),\n+        PathBuf::from(\"\").join(path_file_name(&manifest_path)?),\n         \"project-manifest\",\n",
+      "language": "rust",
+      "source_path": "crates/opencem-cli/src/commands/pack.rs",
+      "byte_start": 2331,
+      "byte_end": 2342,
+      "source_fingerprint": "sha256:18951916320386dfad4513aed038a3555df8d52c5a9e4f9127d55bd518aa6285",
+      "replay": {
+        "kind": "regular_direct",
+        "test_command": [
+          "cargo",
+          "test",
+          "--locked",
+          "--workspace"
+        ],
+        "build_command": [
+          "cargo",
+          "check",
+          "--locked",
+          "--workspace"
+        ],
+        "timeout_ms": 120000,
+        "env": {},
+        "respect_workspace_ignores": true,
+        "origin": "executed"
+      }
+    },
+    {
+      "id": 2,
+      "file": "crates/opencem-cli/src/commands/pack.rs",
+      "line": 65,
+      "operator": "string_to_empty",
+      "description": "Replace string literal with empty string",
+      "result": "killed",
+      "execution": {
+        "state": "executed"
+      },
+      "column": 27,
+      "original": "\"manifests\"",
+      "replacement": "\"\"",
+      "diff": "--- a/crates/opencem-cli/src/commands/pack.rs\n+++ b/crates/opencem-cli/src/commands/pack.rs\n@@ -64,3 +64,3 @@\n             &staging_root,\n-            PathBuf::from(\"manifests\").join(path_file_name(&labtrace_path)?),\n+            PathBuf::from(\"\").join(path_file_name(&labtrace_path)?),\n             \"labtrace-manifest\",\n",
+      "language": "rust",
+      "source_path": "crates/opencem-cli/src/commands/pack.rs",
+      "byte_start": 2628,
+      "byte_end": 2639,
+      "source_fingerprint": "sha256:18951916320386dfad4513aed038a3555df8d52c5a9e4f9127d55bd518aa6285",
+      "replay": {
+        "kind": "regular_direct",
+        "test_command": [
+          "cargo",
+          "test",
+          "--locked",
+          "--workspace"
+        ],
+        "build_command": [
+          "cargo",
+          "check",
+          "--locked",
+          "--workspace"
+        ],
+        "timeout_ms": 120000,
+        "env": {},
+        "respect_workspace_ignores": true,
+        "origin": "executed"
+      }
+    }
+  ]
+}

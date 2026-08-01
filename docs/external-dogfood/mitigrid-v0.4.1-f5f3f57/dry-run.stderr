@@ -1,0 +1,4 @@
+warning: skipping .togi-baseline — no file extension: .togi-baseline
+warning: skipping docs/governance/mutation-baseline-v0.1.md — unsupported language for extension: .md
+warning: skipping docs/governance/public-readiness.md — unsupported language for extension: .md
+warning: skipping docs/governance/release-policy.md — unsupported language for extension: .md

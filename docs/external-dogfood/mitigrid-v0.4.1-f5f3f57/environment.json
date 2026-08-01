@@ -1,0 +1,25 @@
+{
+  "locale": "C",
+  "runner": {
+    "arch": "x86_64",
+    "cpu_count": "4",
+    "image": "ubuntu24",
+    "image_version": "20260720.247.2",
+    "os": "Linux",
+    "uname": "Linux 6.17.0-1020-azure x86_64"
+  },
+  "schema_version": 1,
+  "target": {
+    "cargo_lock_sha256": "775acdbbdc11b6125561f1a98fdee51d7328fd33c8ff40c54bd3891705e30711",
+    "togi_toml_sha256": "e9edefba6da352247b7c19cb3ab6f741e7f47ced7b826a6056448fb44ee300b4"
+  },
+  "timezone": "UTC",
+  "versions": {
+    "cargo": "cargo 1.97.1 (c980f4866 2026-06-30)",
+    "git": "git version 2.54.0",
+    "rustc": "rustc 1.97.1 (8bab26f4f 2026-07-14)",
+    "togi": "togi 0.4.1"
+  },
+  "workflow_source_ref": "refs/heads/main",
+  "workflow_source_revision": "3538431df9db95575edba23cda4afc3fe108faba"
+}
