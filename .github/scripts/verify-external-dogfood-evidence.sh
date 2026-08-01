@@ -15,6 +15,7 @@ readonly TARGET_REPOSITORY=https://github.com/Darkroom4364/Mitigrid.git
 readonly TARGET_REVISION=f5f3f57c92fdb3405b92eca7c9b6a6d3d704c1e8
 readonly TARGET_BASE=16e7c9e49f353fd7f4254276b3a7ece99c6dedf6
 readonly TARGET_PATH=crates/opencem-cli/src/commands/pack.rs
+readonly DEFAULT_WORKFLOW_REF=refs/heads/main
 readonly GENERATED_MUTANT_CEILING=20
 readonly MUTATION_TIMEOUT_SECONDS=120
 readonly MUTATION_JOBS=2
@@ -61,7 +62,7 @@ core_files=(
     approval.json case.json cargo-fetch-status.txt cargo-fetch.stderr cargo-fetch.stdout commands.txt
     dry-run-status.txt dry-run.json dry-run.stderr dry-run.stdout environment.json
     preflight-status.txt preflight.stderr preflight.stdout release-checksums.txt release-verification.json
-    report.json target-after-status.txt target-before-status.txt target-togi.toml target.patch
+    report.json target-after-status.txt target-before-status.txt target-changed-paths.txt target-togi.toml target.patch
     togi-exit-status.txt togi-version.txt togi.stderr togi.stdout wall-time.json
 )
 hashed_files=("${core_files[@]}" metrics.json validation.txt)
@@ -98,6 +99,7 @@ cmp -s "$case_dir/togi.stdout" "$case_dir/report.json" || die "report JSON is no
 
 jq -e \
     --arg workflow_sha "$(jq -r '.workflow_source_revision' "$case_dir/case.json")" \
+    --arg workflow_ref "$DEFAULT_WORKFLOW_REF" \
     --arg approval_url "$APPROVAL_URL" \
     --arg approval_body "$APPROVAL_BODY" \
     --arg archive "$TOGI_ARCHIVE" \
@@ -112,9 +114,12 @@ jq -e \
     --argjson outer_timeout "$OUTER_TIMEOUT_SECONDS" '
     .schema_version == 1 and .case == "mitigrid-v0.4.1-pack" and
     (.workflow_source_revision | test("^[0-9a-f]{40}$")) and .workflow_source_revision == $workflow_sha and
+    .workflow_source_ref == $workflow_ref and
     .approval == {url: $approval_url, id: 5150807894, author: "Darkroom4364", body: $approval_body} and
     .release == {tag: "v0.4.1", archive: $archive, archive_sha256: $archive_sha256} and
-    .target == {repository: $repository, revision: $revision, base: $base, path: $path,
+    .target == {repository: $repository, revision: $revision, base: $base, mutation_scope: $path,
+                direct_parent_changed_paths: [".togi-baseline", $path, "docs/governance/mutation-baseline-v0.1.md",
+                                              "docs/governance/public-readiness.md", "docs/governance/release-policy.md"],
                 test_command: ["cargo", "test", "--locked", "--workspace"],
                 build_command: ["cargo", "check", "--locked", "--workspace"],
                 togi_toml_max_per_run: 0} and
@@ -128,9 +133,9 @@ jq -e --arg url "$APPROVAL_URL" --arg body "$APPROVAL_BODY" '
     (.created_at | type == "string" and length > 0)
 ' "$case_dir/approval.json" >/dev/null || die "approval provenance is invalid"
 
-jq -e --arg workflow_sha "$workflow_sha" '
+jq -e --arg workflow_sha "$workflow_sha" --arg workflow_ref "$DEFAULT_WORKFLOW_REF" '
     def sha256: type == "string" and test("^[0-9a-f]{64}$");
-    .schema_version == 1 and .workflow_source_revision == $workflow_sha and
+    .schema_version == 1 and .workflow_source_revision == $workflow_sha and .workflow_source_ref == $workflow_ref and
     .runner.os == "Linux" and .runner.arch == "x86_64" and
     (.runner.image | type == "string") and (.runner.image_version | type == "string") and
     (.runner.uname | type == "string") and (.runner.cpu_count | type == "string" and test("^[1-9][0-9]*$")) and
@@ -159,22 +164,24 @@ togi_status=$(cat "$case_dir/togi-exit-status.txt")
 [[ ! -s "$case_dir/target-before-status.txt" ]] || die "target was dirty before execution"
 [[ ! -s "$case_dir/target-after-status.txt" ]] || die "target was dirty after execution"
 [[ -s "$case_dir/target.patch" ]] || die "target patch is empty"
-validate_togi_config
+expected_changed_paths=$(printf '%s\n' ".togi-baseline" "$TARGET_PATH" "docs/governance/mutation-baseline-v0.1.md" "docs/governance/public-readiness.md" "docs/governance/release-policy.md")
+[[ "$(cat "$case_dir/target-changed-paths.txt")" == "$expected_changed_paths" ]] || die "direct-parent changed paths are invalid"
 
 expected_commands=$(cat <<EOF
 preflight: cargo test --locked --workspace
-dry-run: togi check --dry-run --format json --base $TARGET_BASE --path $TARGET_PATH --test-cmd 'cargo test --locked --workspace' --build-cmd 'cargo check --locked --workspace'
-execution: timeout --preserve-status 35m togi check --format json --base $TARGET_BASE --path $TARGET_PATH --test-cmd 'cargo test --locked --workspace' --build-cmd 'cargo check --locked --workspace' --timeout $MUTATION_TIMEOUT_SECONDS --jobs $MUTATION_JOBS --force-rerun --no-incremental-history
+dry-run: togi check --dry-run --format json --base $TARGET_BASE --test-cmd 'cargo test --locked --workspace' --build-cmd 'cargo check --locked --workspace'
+execution: timeout --preserve-status 35m togi check --format json --base $TARGET_BASE --test-cmd 'cargo test --locked --workspace' --build-cmd 'cargo check --locked --workspace' --timeout $MUTATION_TIMEOUT_SECONDS --jobs $MUTATION_JOBS --force-rerun --no-incremental-history
 EOF
 )
 [[ "$(cat "$case_dir/commands.txt")" == "$expected_commands" ]] || die "recorded commands are not the approved commands"
 
-jq -e --argjson ceiling "$GENERATED_MUTANT_CEILING" '
+jq -e --argjson ceiling "$GENERATED_MUTANT_CEILING" --arg target_path "$TARGET_PATH" '
     def natural: type == "number" and . >= 0 and floor == .;
-    type == "object" and .kind == "dry_run" and .schema_version == 1 and .generator == "togi/0.4.1" and
-    .dry_run == true and (.planned_total | natural) and (.mutations | type == "array") and
+    type == "object" and (keys | sort) == ["dry_run", "kind", "mutations", "planned_total"] and
+    .kind == "dry_run" and .dry_run == true and (.planned_total | natural) and (.mutations | type == "array") and
     .planned_total == (.mutations | length) and .planned_total >= 1 and .planned_total <= $ceiling and
-    (.mutations | all(.[]; (.id | natural) and (.file | type == "string") and (.line | natural) and
+    (.mutations | all(.[]; (keys | sort) == ["column", "description", "file", "id", "line", "operator", "original", "replacement"] and
+        (.id | natural) and (.file == $target_path) and (.line | natural) and (.column | natural) and
         (.operator | type == "string") and (.description | type == "string") and
         (.original | type == "string") and (.replacement | type == "string")))
 ' "$case_dir/dry-run.json" >/dev/null || die "dry run is not the approved bounded v0.4.1 plan"
@@ -182,6 +189,7 @@ dry_run_planned_total=$(jq -r '.planned_total' "$case_dir/dry-run.json")
 
 jq -e \
     --arg revision "$TARGET_REVISION" \
+    --arg target_path "$TARGET_PATH" \
     --argjson dry_run_planned_total "$dry_run_planned_total" '
     def natural: type == "number" and . >= 0 and floor == .;
     def result_count($result): [.mutations[] | select(.result == $result)] | length;
@@ -209,7 +217,8 @@ jq -e \
     (.executed_killed // .killed) == .killed and (.exact_cache_reused // 0) == 0 and
     (.incremental_history_reused // 0) == 0 and (.uncovered // 0) == 0 and (.subsumed // 0) == 0 and
     .timeout == 0 and .build_errors == 0 and .partial == false and (.early_stop_reason? // null) == null and
-    (.mutations | all(.[]; (.id | natural) and (.result == "killed" or .result == "survived") and
+    (.mutations | all(.[]; (.id | natural) and (.file == $target_path) and
+        (.result == "killed" or .result == "survived") and
         (.execution | type == "object") and .execution.state == "executed")) and
     (((.killed / .tested * 100) - .mutation_score) | fabs) < 0.000001
 ' "$case_dir/report.json" >/dev/null || die "report does not contain a complete fresh v0.4.1 execution"

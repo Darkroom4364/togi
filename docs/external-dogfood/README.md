@@ -11,28 +11,32 @@ contains no run result and no versioned case directory.
 A case is eligible only when its public owner has explicitly authorized that
 exact no-secret, read-only run. Ownership, a public repository, or a compatible
 license alone are not permission. The runner is purpose-built for the only
-currently approved case and refuses any changed target, revision, base, path,
-commands, release, or approval provenance:
+currently approved case and refuses any changed target, revision, base, mutation
+scope, commands, release, or approval provenance:
 
 - approval: [Mitigrid PR #125 comment 5150807894](https://github.com/Darkroom4364/Mitigrid/pull/125#issuecomment-5150807894), authored by `Darkroom4364`;
 - released binary: Togi `v0.4.1`, `togi-linux-x86_64.tar.gz`, SHA-256 `6be7bf55d3c84a539cdaa4e60e5b5ef212ddb0e2575cd6b85ceae50218abce5c`;
 - target: `https://github.com/Darkroom4364/Mitigrid.git` at `f5f3f57c92fdb3405b92eca7c9b6a6d3d704c1e8`, whose direct parent is `16e7c9e49f353fd7f4254276b3a7ece99c6dedf6`;
-- diff scope: `crates/opencem-cli/src/commands/pack.rs`;
+- direct-parent diff: exactly `.togi-baseline`, `crates/opencem-cli/src/commands/pack.rs`, `docs/governance/mutation-baseline-v0.1.md`, `docs/governance/public-readiness.md`, and `docs/governance/release-policy.md`; mutation scope: `crates/opencem-cli/src/commands/pack.rs`;
 - preflight/test command: `cargo test --locked --workspace`; build command: `cargo check --locked --workspace`.
 
 The workflow fetches the public approval comment and requires its id, author,
 URL, and complete body to match before it clones the target. It uses no user
-inputs for a target or command, no secrets, no caches, and a fresh target clone.
-The target must be clean before and after the run; the runner removes Togi's
-local state before recording the final cleanliness check.
+inputs for a target or command, no secrets, no cache reuse, and a fresh target
+clone. The target must be clean before and after the run; after `togi clean`,
+the runner deletes only `.togi.lock` and requires both it and `.togi-cache` to
+be absent before recording final cleanliness.
 
 ## Dispatch and reproducibility
 
-`external-dogfood.yml` is `workflow_dispatch` only. Dispatch it from reviewed
-`main` with `expected_workflow_sha` equal to the full commit SHA being run. The
-runner also requires that value to equal both `GITHUB_SHA` and the checked-out
-Togi revision. It runs only on Linux x86_64 (`ubuntu-24.04`) with a 40-minute
-job deadline and a 35-minute outer execution deadline.
+`external-dogfood.yml` is `workflow_dispatch` only. Its job runs only when
+`github.ref` is the repository default branch; currently it requires
+`refs/heads/main`. Dispatch reviewed `main` with `expected_workflow_sha` equal
+to the full commit SHA being run. The runner requires the workflow-supplied
+default-branch ref to equal `GITHUB_REF`, and the SHA to equal both `GITHUB_SHA`
+and the checked-out Togi revision. It runs only on Linux x86_64
+(`ubuntu-24.04`) with a 40-minute job deadline and a 35-minute outer execution
+deadline.
 
 The runner downloads the published archive and `checksums.txt`, requires the
 archive's named manifest entry and its calculated SHA-256 to equal the fixed
@@ -48,22 +52,30 @@ OS, uname/architecture, CPU count, tool versions, locale/timezone, target
 lockfile and config digests, and protocol identities/limits. It does not dump
 the environment, home directory, credentials, or tokens.
 
-Before execution, the full workspace preflight must pass. The released binary
-then performs an uncapped JSON dry run with the approved explicit base and path;
-the target's checked-in `togi.toml` must set `max_per_run = 0`. The generated
-count—not a truncation cap—must be between 1 and 20 inclusive and equal the
-dry-run mutation array length. The actual run repeats the explicit base/path
-and test/build command under `timeout --preserve-status 35m`, with `--timeout
-120 --jobs 2 --force-rerun --no-incremental-history` and no `--max-per-run`.
-Only exit status 0 or 1 reaches validation; a survivor is an observed result,
-not a protocol failure.
+Before execution, the full workspace preflight must pass. Togi v0.4.1 cannot
+combine its diff `--base` mode with `--path`; the runner therefore uses the
+approved explicit base without `--path`. Before its dry run it proves and
+records the full direct-parent diff's exact five-path boundary in
+`target-changed-paths.txt`, preserves that full binary diff, and requires every
+dry-run and report mutation to name the approved mutation-scope path. The other
+four changed files are non-mutable to released v0.4.1: `.togi-baseline` and the
+three Markdown governance files have unsupported file types, which the mutator
+reports only on stderr. JSON stdout remains the single dry-run or report
+document. The target's
+checked-in `togi.toml` must set `max_per_run = 0`. The generated count—not a
+truncation cap—must be between 1 and 20 inclusive and equal the dry-run mutation
+array length. The actual run repeats the explicit base and test/build command
+under `timeout --preserve-status 35m`, with a per-mutation timeout of 120
+seconds, `--jobs 2 --force-rerun --no-incremental-history`, and no
+`--max-per-run`. Only exit status 0 or 1 reaches validation; a survivor is an
+observed result, not a protocol failure.
 
 ## Evidence artifact and validation
 
 The named workflow artifact contains:
 
-- immutable case, approval, release verification, environment, command, target
-  diff/config, and clean-worktree metadata;
+- immutable case, approval, release verification, environment, command, full
+  target diff, exact changed-path list/config, and clean-worktree metadata;
 - raw stdout/stderr and status files for dependency fetch, preflight, dry run,
   and execution;
 - `dry-run.json` and `report.json`, each a byte-for-byte copy of its raw stdout;
@@ -72,24 +84,26 @@ The named workflow artifact contains:
 - `validation.txt` and a final `SHA256SUMS` covering every expected artifact
   except itself.
 
-The offline verifier first validates the exact authorization, identities,
-commands, release, complete dry-run plan, report schema/count invariants, and
-clean/full execution. It permits survivors but rejects timeouts, build errors,
-uncovered or subsumed mutations, exact-cache/history reuse, partial or
-early-stopped reports, or a non-fresh execution. `--generate` derives canonical
-metrics for an initial artifact; `--verify` recomputes them and validates all
-checksums without network access.
+The offline verifier first validates the exact authorization, default-branch
+provenance, identities, commands, full direct-parent diff boundary, complete
+dry-run plan and mutation scope, report schema/count invariants, and clean/full
+execution. It permits survivors but rejects timeouts, build errors, uncovered
+or subsumed mutations, exact-cache/history reuse, partial or early-stopped
+reports, or a non-fresh execution. `--generate` derives canonical metrics for
+an initial artifact; `--verify` recomputes them and validates all checksums
+without network access.
 
 ```bash
 bash .github/scripts/verify-external-dogfood-evidence.sh --verify CASE_DIRECTORY
 ```
 
-For a rerun, dispatch reviewed main again with its exact SHA, preserve the new
-artifact, and run the offline verifier on both artifacts. Compare the recorded
-workflow revision, release digest, target/base/path, lockfile/config digests,
-runner image/OS/architecture, CPU, tool versions, locale/timezone, dry-run
-count, and generated metrics before treating outcomes as comparable. A changed
-environment or dependency resolution is recorded drift, not proof of a Togi
+For a rerun, dispatch reviewed default-branch `main` again with its exact SHA,
+preserve the new artifact, and run the offline verifier on both artifacts.
+Compare the recorded workflow revision/ref, release digest, target/base/direct
+diff boundary/mutation scope, lockfile/config digests, runner
+image/OS/architecture, CPU, tool versions, locale/timezone, dry-run count, and
+generated metrics before treating outcomes as comparable. Changed environment
+or dependency resolution is recorded drift, not proof of a Togi
 regression or improvement.
 
 ## Publication sequence

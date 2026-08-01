@@ -17,6 +17,7 @@ readonly TARGET_REPOSITORY=https://github.com/Darkroom4364/Mitigrid.git
 readonly TARGET_REVISION=f5f3f57c92fdb3405b92eca7c9b6a6d3d704c1e8
 readonly TARGET_BASE=16e7c9e49f353fd7f4254276b3a7ece99c6dedf6
 readonly TARGET_PATH=crates/opencem-cli/src/commands/pack.rs
+readonly DEFAULT_WORKFLOW_REF=refs/heads/main
 readonly GENERATED_MUTANT_CEILING=20
 readonly MUTATION_TIMEOUT_SECONDS=120
 readonly MUTATION_JOBS=2
@@ -27,8 +28,8 @@ usage() {
 Usage: run-external-dogfood.sh OUTPUT_DIRECTORY
 
 Runs the one approved external-dogfood case. OUTPUT_DIRECTORY must be absent or
-an empty absolute directory. EXPECTED_WORKFLOW_SHA, GITHUB_SHA, and
-GITHUB_WORKSPACE are required from the workflow environment.
+an empty absolute directory. EXPECTED_WORKFLOW_SHA, EXPECTED_WORKFLOW_REF,
+GITHUB_REF, GITHUB_SHA, and GITHUB_WORKSPACE are required from the workflow environment.
 EOF
 }
 
@@ -92,10 +93,14 @@ else
 fi
 
 : "${EXPECTED_WORKFLOW_SHA:?EXPECTED_WORKFLOW_SHA is required}"
+: "${EXPECTED_WORKFLOW_REF:?EXPECTED_WORKFLOW_REF is required}"
+: "${GITHUB_REF:?GITHUB_REF is required}"
 : "${GITHUB_SHA:?GITHUB_SHA is required}"
 : "${GITHUB_WORKSPACE:?GITHUB_WORKSPACE is required}"
 [[ "$EXPECTED_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]] || die "EXPECTED_WORKFLOW_SHA is not a full lowercase commit SHA"
 [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]] || die "GITHUB_SHA is not a full lowercase commit SHA"
+[[ "$EXPECTED_WORKFLOW_REF" == "$DEFAULT_WORKFLOW_REF" ]] || die "expected workflow ref is not the reviewed default branch"
+[[ "$GITHUB_REF" == "$EXPECTED_WORKFLOW_REF" ]] || die "workflow ref does not match the reviewed default branch"
 [[ "$EXPECTED_WORKFLOW_SHA" == "$GITHUB_SHA" ]] || die "workflow dispatch SHA does not match GITHUB_SHA"
 workflow_head=$(git -C "$GITHUB_WORKSPACE" rev-parse HEAD)
 [[ "$workflow_head" == "$EXPECTED_WORKFLOW_SHA" ]] || die "checked-out Togi revision does not match expected workflow SHA"
@@ -123,6 +128,7 @@ jq -S '{url: .html_url, id, author: .user.login, created_at, body}' "$approval_r
 
 jq -n -S \
     --arg workflow_source_revision "$EXPECTED_WORKFLOW_SHA" \
+    --arg workflow_source_ref "$EXPECTED_WORKFLOW_REF" \
     --arg approval_url "$APPROVAL_URL" \
     --arg approval_body "$APPROVAL_BODY" \
     --arg release_tag "$TOGI_VERSION" \
@@ -139,9 +145,12 @@ jq -n -S \
     '{schema_version: 1,
       case: "mitigrid-v0.4.1-pack",
       workflow_source_revision: $workflow_source_revision,
+      workflow_source_ref: $workflow_source_ref,
       approval: {url: $approval_url, id: 5150807894, author: "Darkroom4364", body: $approval_body},
       release: {tag: $release_tag, archive: $archive, archive_sha256: $archive_sha256},
-      target: {repository: $repository, revision: $revision, base: $base, path: $path,
+      target: {repository: $repository, revision: $revision, base: $base, mutation_scope: $path,
+               direct_parent_changed_paths: [".togi-baseline", $path, "docs/governance/mutation-baseline-v0.1.md",
+                                             "docs/governance/public-readiness.md", "docs/governance/release-policy.md"],
                test_command: ["cargo", "test", "--locked", "--workspace"],
                build_command: ["cargo", "check", "--locked", "--workspace"],
                togi_toml_max_per_run: 0},
@@ -196,8 +205,11 @@ git -C "$target_dir" cat-file -e "${TARGET_BASE}^{commit}"
 [[ "$(git -C "$target_dir" rev-parse "${TARGET_REVISION}^")" == "$TARGET_BASE" ]] || die "approved base is not the target revision's direct parent"
 git -C "$target_dir" merge-base --is-ancestor "$TARGET_BASE" "$TARGET_REVISION"
 [[ -f "$target_dir/$TARGET_PATH" ]] || die "approved target path is absent"
-git -C "$target_dir" diff --binary "$TARGET_BASE" "$TARGET_REVISION" -- "$TARGET_PATH" >"$output_dir/target.patch"
-[[ -s "$output_dir/target.patch" ]] || die "approved target path has no diff from its base"
+expected_changed_paths=$(printf '%s\n' ".togi-baseline" "$TARGET_PATH" "docs/governance/mutation-baseline-v0.1.md" "docs/governance/public-readiness.md" "docs/governance/release-policy.md")
+git -C "$target_dir" diff --no-ext-diff --name-only --no-renames "$TARGET_BASE" "$TARGET_REVISION" | LC_ALL=C sort >"$output_dir/target-changed-paths.txt"
+[[ "$(cat "$output_dir/target-changed-paths.txt")" == "$expected_changed_paths" ]] || die "direct-parent diff does not match the approved five-path boundary"
+git -C "$target_dir" diff --no-ext-diff --binary "$TARGET_BASE" "$TARGET_REVISION" >"$output_dir/target.patch"
+[[ -s "$output_dir/target.patch" ]] || die "approved direct-parent diff is empty"
 [[ -f "$target_dir/togi.toml" ]] || die "target togi.toml is absent"
 awk '
     /^\[mutations\]/{ in_mutations = 1; next }
@@ -244,15 +256,15 @@ printf '%s\n' "$preflight_status" >"$output_dir/preflight-status.txt"
 
 printf '%s\n' \
     'preflight: cargo test --locked --workspace' \
-    "dry-run: togi check --dry-run --format json --base $TARGET_BASE --path $TARGET_PATH --test-cmd 'cargo test --locked --workspace' --build-cmd 'cargo check --locked --workspace'" \
-    "execution: timeout --preserve-status 35m togi check --format json --base $TARGET_BASE --path $TARGET_PATH --test-cmd 'cargo test --locked --workspace' --build-cmd 'cargo check --locked --workspace' --timeout $MUTATION_TIMEOUT_SECONDS --jobs $MUTATION_JOBS --force-rerun --no-incremental-history" \
+    "dry-run: togi check --dry-run --format json --base $TARGET_BASE --test-cmd 'cargo test --locked --workspace' --build-cmd 'cargo check --locked --workspace'" \
+    "execution: timeout --preserve-status 35m togi check --format json --base $TARGET_BASE --test-cmd 'cargo test --locked --workspace' --build-cmd 'cargo check --locked --workspace' --timeout $MUTATION_TIMEOUT_SECONDS --jobs $MUTATION_JOBS --force-rerun --no-incremental-history" \
     >"$output_dir/commands.txt"
 
 set +e
 (
     cd "$target_dir"
     env -i "${runtime_env[@]}" CARGO_NET_OFFLINE=true "$togi_bin" check \
-        --dry-run --format json --base "$TARGET_BASE" --path "$TARGET_PATH" \
+        --dry-run --format json --base "$TARGET_BASE" \
         --test-cmd "cargo test --locked --workspace" \
         --build-cmd "cargo check --locked --workspace"
 ) >"$output_dir/dry-run.stdout" 2>"$output_dir/dry-run.stderr"
@@ -262,11 +274,15 @@ printf '%s\n' "$dry_run_status" >"$output_dir/dry-run-status.txt"
 [[ "$dry_run_status" -eq 0 ]] || die "dry run failed"
 validate_single_json_document "$output_dir/dry-run.stdout"
 cp "$output_dir/dry-run.stdout" "$output_dir/dry-run.json"
-jq -e --argjson ceiling "$GENERATED_MUTANT_CEILING" '
+jq -e --argjson ceiling "$GENERATED_MUTANT_CEILING" --arg target_path "$TARGET_PATH" '
     def natural: type == "number" and . >= 0 and floor == .;
-    type == "object" and .kind == "dry_run" and .schema_version == 1 and .generator == "togi/0.4.1" and
-    .dry_run == true and (.planned_total | natural) and (.mutations | type == "array") and
-    .planned_total == (.mutations | length) and .planned_total >= 1 and .planned_total <= $ceiling
+    type == "object" and (keys | sort) == ["dry_run", "kind", "mutations", "planned_total"] and
+    .kind == "dry_run" and .dry_run == true and (.planned_total | natural) and (.mutations | type == "array") and
+    .planned_total == (.mutations | length) and .planned_total >= 1 and .planned_total <= $ceiling and
+    (.mutations | all(.[]; (keys | sort) == ["column", "description", "file", "id", "line", "operator", "original", "replacement"] and
+        (.id | natural) and (.file == $target_path) and (.line | natural) and (.column | natural) and
+        (.operator | type == "string") and (.description | type == "string") and
+        (.original | type == "string") and (.replacement | type == "string")))
 ' "$output_dir/dry-run.json" >/dev/null || die "dry run did not produce the approved bounded v0.4.1 plan"
 
 start_ns=$(date -u +%s%N)
@@ -274,7 +290,7 @@ set +e
 (
     cd "$target_dir"
     env -i "${runtime_env[@]}" CARGO_NET_OFFLINE=true timeout --preserve-status 35m "$togi_bin" check \
-        --format json --base "$TARGET_BASE" --path "$TARGET_PATH" \
+        --format json --base "$TARGET_BASE" \
         --test-cmd "cargo test --locked --workspace" \
         --build-cmd "cargo check --locked --workspace" \
         --timeout "$MUTATION_TIMEOUT_SECONDS" --jobs "$MUTATION_JOBS" \
@@ -301,11 +317,15 @@ set +e
 clean_status=$?
 set -e
 [[ "$clean_status" -eq 0 ]] || die "Togi clean failed"
+rm -f -- "$target_dir/.togi.lock"
+[[ ! -e "$target_dir/.togi-cache" ]] || die "Togi cache remained after cleanup"
+[[ ! -e "$target_dir/.togi.lock" ]] || die "Togi lock remained after cleanup"
 git -C "$target_dir" status --porcelain --untracked-files=all >"$output_dir/target-after-status.txt"
 [[ ! -s "$output_dir/target-after-status.txt" ]] || die "target worktree was not clean after execution"
 
 jq -n -S \
     --arg workflow_source_revision "$EXPECTED_WORKFLOW_SHA" \
+    --arg workflow_source_ref "$EXPECTED_WORKFLOW_REF" \
     --arg runner_os "${RUNNER_OS:-Linux}" \
     --arg runner_image "${ImageOS:-unknown}" \
     --arg runner_image_version "${ImageVersion:-unknown}" \
@@ -320,7 +340,7 @@ jq -n -S \
     --arg timezone "UTC" \
     --arg cargo_lock_sha256 "$(sha256sum "$target_dir/Cargo.lock" | awk '{print $1}')" \
     --arg togi_toml_sha256 "$(sha256sum "$target_dir/togi.toml" | awk '{print $1}')" \
-    '{schema_version: 1, workflow_source_revision: $workflow_source_revision,
+    '{schema_version: 1, workflow_source_revision: $workflow_source_revision, workflow_source_ref: $workflow_source_ref,
       runner: {os: $runner_os, image: $runner_image, image_version: $runner_image_version,
                uname: $uname, arch: $arch, cpu_count: $cpu_count},
       versions: {cargo: $cargo_version, rustc: $rustc_version, git: $git_version, togi: $togi_version},
@@ -335,7 +355,7 @@ checksum_files=(
     approval.json case.json cargo-fetch-status.txt cargo-fetch.stderr cargo-fetch.stdout commands.txt
     dry-run-status.txt dry-run.json dry-run.stderr dry-run.stdout environment.json
     preflight-status.txt preflight.stderr preflight.stdout release-checksums.txt release-verification.json
-    report.json target-after-status.txt target-before-status.txt target-togi.toml target.patch
+    report.json target-after-status.txt target-before-status.txt target-changed-paths.txt target-togi.toml target.patch
     togi-exit-status.txt togi-version.txt togi.stderr togi.stdout validation.txt wall-time.json metrics.json
 )
 (
