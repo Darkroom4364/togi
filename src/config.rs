@@ -244,11 +244,17 @@ impl JavaScriptRunner {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DetectedTestRoute {
+    marker: &'static str,
+    command: Vec<String>,
+    languages: &'static [&'static str],
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct ProjectInspection {
     has_cargo_toml: bool,
     has_go_mod: bool,
-    has_python_project: bool,
     python_manifest: Option<&'static str>,
     javascript_runner: Option<JavaScriptRunner>,
     has_pom_xml: bool,
@@ -287,7 +293,6 @@ impl ProjectInspection {
         Self {
             has_cargo_toml: project_root.join("Cargo.toml").exists(),
             has_go_mod: project_root.join("go.mod").exists(),
-            has_python_project: python_manifest.is_some(),
             python_manifest,
             javascript_runner: JavaScriptRunner::detect(project_root),
             has_pom_xml: project_root.join("pom.xml").exists(),
@@ -301,37 +306,70 @@ impl ProjectInspection {
         }
     }
 
-    fn detected_test_commands(&self) -> Vec<(&'static str, Vec<String>)> {
+    fn detected_test_routes(&self) -> Vec<DetectedTestRoute> {
         let mut detected = Vec::new();
         if self.has_cargo_toml {
-            detected.push(("Cargo.toml", vec!["cargo".into(), "test".into()]));
+            detected.push(DetectedTestRoute {
+                marker: "Cargo.toml",
+                command: vec!["cargo".into(), "test".into()],
+                languages: &["rust"],
+            });
         }
         if self.has_go_mod {
-            detected.push(("go.mod", vec!["go".into(), "test".into(), "./...".into()]));
+            detected.push(DetectedTestRoute {
+                marker: "go.mod",
+                command: vec!["go".into(), "test".into(), "./...".into()],
+                languages: &["go"],
+            });
         }
-        if let Some(manifest) = self.python_manifest {
-            detected.push((manifest, vec!["pytest".into()]));
+        if let Some(marker) = self.python_manifest {
+            detected.push(DetectedTestRoute {
+                marker,
+                command: vec!["pytest".into()],
+                languages: &["python"],
+            });
         }
         if let Some(runner) = self.javascript_runner {
-            detected.push(("package.json", runner.test_command()));
+            detected.push(DetectedTestRoute {
+                marker: "package.json",
+                command: runner.test_command(),
+                languages: &["typescript"],
+            });
         }
         if self.has_pom_xml {
-            detected.push(("pom.xml", vec!["mvn".into(), "test".into()]));
+            detected.push(DetectedTestRoute {
+                marker: "pom.xml",
+                command: vec!["mvn".into(), "test".into()],
+                languages: &["java"],
+            });
         }
-        if let Some(manifest) = self.gradle_manifest {
-            detected.push((manifest, vec!["./gradlew".into(), "test".into()]));
+        if let Some(marker) = self.gradle_manifest {
+            detected.push(DetectedTestRoute {
+                marker,
+                command: vec!["./gradlew".into(), "test".into()],
+                languages: &["java"],
+            });
         }
         if self.has_gemfile {
-            detected.push((
-                "Gemfile",
-                vec!["bundle".into(), "exec".into(), "rspec".into()],
-            ));
+            detected.push(DetectedTestRoute {
+                marker: "Gemfile",
+                command: vec!["bundle".into(), "exec".into(), "rspec".into()],
+                languages: &["ruby"],
+            });
         }
         if self.has_cmake {
-            detected.push(("CMakeLists.txt", vec!["ctest".into()]));
+            detected.push(DetectedTestRoute {
+                marker: "CMakeLists.txt",
+                command: vec!["ctest".into()],
+                languages: &["c", "cpp"],
+            });
         }
         if self.has_dotnet_project {
-            detected.push((".sln/.csproj", vec!["dotnet".into(), "test".into()]));
+            detected.push(DetectedTestRoute {
+                marker: ".sln/.csproj",
+                command: vec!["dotnet".into(), "test".into()],
+                languages: &["c_sharp"],
+            });
         }
         detected
     }
@@ -367,20 +405,23 @@ impl ProjectInspection {
 }
 
 pub fn detect_test_command(project_root: &Path) -> Vec<String> {
-    let detected = ProjectInspection::scan(project_root).detected_test_commands();
+    let detected = ProjectInspection::scan(project_root).detected_test_routes();
+    select_test_command(&detected)
+}
 
+fn select_test_command(detected: &[DetectedTestRoute]) -> Vec<String> {
     if detected.len() > 1 {
-        let names: Vec<&str> = detected.iter().map(|(name, _)| *name).collect();
+        let names: Vec<&str> = detected.iter().map(|route| route.marker).collect();
         eprintln!(
             "warning: multiple build systems detected ({}). Using `{}`. \
              Set [test] command in togi.toml to override.",
             names.join(", "),
-            detected[0].1.join(" ")
+            detected[0].command.join(" ")
         );
     }
 
-    if let Some((_, cmd)) = detected.into_iter().next() {
-        cmd
+    if let Some(route) = detected.first() {
+        route.command.clone()
     } else {
         eprintln!(
             "warning: no known build system found. Falling back to `make test`. \
@@ -388,6 +429,27 @@ pub fn detect_test_command(project_root: &Path) -> Vec<String> {
         );
         vec!["make".into(), "test".into()]
     }
+}
+
+fn validate_init_language_routes(routes: &[DetectedTestRoute]) -> anyhow::Result<()> {
+    let mut routes_by_language = HashMap::new();
+
+    for route in routes {
+        for &language in route.languages {
+            if let Some(previous) = routes_by_language.insert(language, route) {
+                if previous.command != route.command {
+                    anyhow::bail!(
+                        "multiple test commands for {language} detected ({} and {}); \
+                         configure an explicit [test] command or [projects.*.test] routes",
+                        previous.marker,
+                        route.marker
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -485,7 +547,7 @@ fn default_jobs_for_available_parallelism(available: usize) -> usize {
 }
 
 fn default_base() -> String {
-    "origin/main".into()
+    crate::diff::DEFAULT_DIFF_BASE.into()
 }
 
 fn default_max_per_run() -> usize {
@@ -670,15 +732,15 @@ impl Config {
             return TestCommandResolution::Resolved;
         }
 
-        let detected = ProjectInspection::scan(project_root).detected_test_commands();
+        let detected = ProjectInspection::scan(project_root).detected_test_routes();
         if detected.len() > 1 {
             return TestCommandResolution::Ambiguous(AmbiguousTestCommand {
-                candidates: detected.iter().map(|(name, _)| *name).collect(),
+                candidates: detected.iter().map(|route| route.marker).collect(),
             });
         }
 
-        self.test.command = if let Some((_, command)) = detected.into_iter().next() {
-            command
+        self.test.command = if let Some(route) = detected.into_iter().next() {
+            route.command
         } else {
             eprintln!(
                 "warning: no known build system found. Falling back to `make test`. \
@@ -698,10 +760,16 @@ impl Config {
 
     /// Write a template togi.toml to the given path.
     pub fn write_template(path: &Path) -> anyhow::Result<()> {
-        let project_root = path.parent().unwrap_or(Path::new("."));
+        let project_root = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
         let inspection = ProjectInspection::scan(project_root);
-        let test_cmd = detect_test_command(project_root);
+        let routes = inspection.detected_test_routes();
+        validate_init_language_routes(&routes)?;
+        let test_cmd = select_test_command(&routes);
         let build_cmd = inspection.detect_build_command();
+        let base_toml = toml::Value::String(crate::diff::init_diff_base(project_root)).to_string();
 
         let test_cmd_toml: Vec<String> = test_cmd.iter().map(|s| format!("\"{}\"", s)).collect();
 
@@ -749,32 +817,15 @@ impl Config {
         ));
 
         let mut lang_sections: Vec<String> = Vec::new();
-        // Only add language sections for languages that aren't the primary test command
-        if inspection.has_python_project && test_cmd.first().map(|s| s.as_str()) != Some("pytest") {
-            lang_sections.push("[test.languages.python]\ncommand = [\"pytest\"]\n".to_string());
-        }
-        if inspection.javascript_runner.is_some()
-            && !matches!(
-                test_cmd.first().map(|s| s.as_str()),
-                Some("npm" | "pnpm" | "yarn" | "bun")
-            )
-        {
-            let runner = inspection
-                .javascript_runner
-                .map(JavaScriptRunner::binary)
-                .unwrap_or("npm");
-            lang_sections.push(format!(
-                "[test.languages.typescript]\ncommand = [\"{}\", \"test\"]\n",
-                runner
-            ));
-        }
-        if inspection.has_go_mod && test_cmd.first().map(|s| s.as_str()) != Some("go") {
-            lang_sections
-                .push("[test.languages.go]\ncommand = [\"go\", \"test\", \"./...\"]\n".to_string());
-        }
-        if inspection.has_cargo_toml && test_cmd.first().map(|s| s.as_str()) != Some("cargo") {
-            lang_sections
-                .push("[test.languages.rust]\ncommand = [\"cargo\", \"test\"]\n".to_string());
+        for route in routes.iter().skip(1) {
+            let command_toml: Vec<String> =
+                route.command.iter().map(|s| format!("\"{}\"", s)).collect();
+            for language in route.languages {
+                lang_sections.push(format!(
+                    "[test.languages.{language}]\ncommand = [{}]\n",
+                    command_toml.join(", ")
+                ));
+            }
         }
 
         if !lang_sections.is_empty() {
@@ -786,9 +837,9 @@ impl Config {
             template.push('\n');
         }
 
-        template.push_str(
+        template.push_str(&format!(
             "[diff]\n\
-             base = \"origin/main\"\n\
+             base = {base_toml}\n\
              \n\
              [mutations]\n\
              max_per_run = 20\n\
@@ -796,7 +847,7 @@ impl Config {
              # schemata = true  # use supported mutant schemata as the fast path\n\
              # incremental_history = true  # reuse safe results from previous runs\n\
              # respect_workspace_ignores = true  # honor .ignore/.gitignore in mutation workspaces\n",
-        );
+        ));
 
         std::fs::write(path, template)?;
         Ok(())
@@ -1054,6 +1105,117 @@ sandbox_command = ["bwrap", "--ro-bind", "/", "/", "--"]
         let content = std::fs::read_to_string(&path).unwrap();
         // pytest wins as primary, so JS gets a language section
         assert!(content.contains("[test.languages.typescript]"));
+    }
+
+    #[test]
+    fn write_template_routes_all_supported_markers() {
+        let dir = tempfile::tempdir().unwrap();
+        for file in [
+            "Cargo.toml",
+            "go.mod",
+            "pyproject.toml",
+            "package.json",
+            "pnpm-lock.yaml",
+            "pom.xml",
+            "Gemfile",
+            "CMakeLists.txt",
+            "example.csproj",
+        ] {
+            std::fs::write(dir.path().join(file), "").unwrap();
+        }
+        let path = dir.path().join("togi.toml");
+        Config::write_template(&path).unwrap();
+        let content = std::fs::read_to_string(path).unwrap();
+        let config: Config = toml::from_str(&content).unwrap();
+
+        let primary: Vec<String> = vec!["cargo".to_owned(), "test".to_owned()];
+        assert_eq!(config.test.command, primary);
+        for (language, expected) in [
+            ("go", vec!["go", "test", "./..."]),
+            ("python", vec!["pytest"]),
+            ("typescript", vec!["pnpm", "test"]),
+            ("java", vec!["mvn", "test"]),
+            ("ruby", vec!["bundle", "exec", "rspec"]),
+            ("c", vec!["ctest"]),
+            ("cpp", vec!["ctest"]),
+            ("c_sharp", vec!["dotnet", "test"]),
+        ] {
+            let expected: Vec<String> = expected.into_iter().map(str::to_owned).collect();
+            assert_eq!(
+                config.test.languages[language].command, expected,
+                "unexpected command for {language}"
+            );
+        }
+
+        let mut previous = 0;
+        for language in [
+            "go",
+            "python",
+            "typescript",
+            "java",
+            "ruby",
+            "c",
+            "cpp",
+            "c_sharp",
+        ] {
+            let section = format!("[test.languages.{language}]");
+            let position = content.find(&section).unwrap();
+            assert!(position > previous, "{section} is out of order");
+            previous = position;
+        }
+    }
+
+    #[test]
+    fn write_template_rejects_conflicting_java_routes() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("pom.xml"), "").unwrap();
+        std::fs::write(dir.path().join("build.gradle"), "").unwrap();
+        let path = dir.path().join("togi.toml");
+
+        let err = Config::write_template(&path).unwrap_err();
+        assert!(err.to_string().contains("pom.xml"));
+        assert!(err.to_string().contains("build.gradle"));
+        assert!(!path.exists());
+        assert!(err.to_string().contains("[projects.*.test]"));
+    }
+
+    #[test]
+    fn write_template_escapes_quoted_origin_head_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let run = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .env("GIT_AUTHOR_NAME", "test")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "test")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        run(&["init"]);
+        std::fs::write(root.join("main.rs"), "fn main() {}\n").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-m", "initial"]);
+        run(&["update-ref", "refs/remotes/origin/trunk\"quoted", "HEAD"]);
+        run(&[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/trunk\"quoted",
+        ]);
+
+        let path = root.join("togi.toml");
+        Config::write_template(&path).unwrap();
+        let content = std::fs::read_to_string(path).unwrap();
+        let config: Config = toml::from_str(&content).unwrap();
+        assert_eq!(config.diff.base, "origin/trunk\"quoted");
     }
 
     #[test]

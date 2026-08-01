@@ -83,7 +83,279 @@ fn init_creates_config() {
         .success()
         .stdout(predicate::str::contains("Created togi.toml"));
 
-    assert!(dir.path().join("togi.toml").exists());
+    let config = fs::read_to_string(dir.path().join("togi.toml")).unwrap();
+    assert!(config.contains("base = \"origin/main\""));
+}
+
+#[test]
+fn init_uses_head_parent_in_no_remote_repo() {
+    let dir = setup_git_repo();
+    std::process::Command::new("git")
+        .args(["add", "."])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    std::process::Command::new("git")
+        .args(["commit", "-m", "second"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    togi()
+        .arg("init")
+        .current_dir(dir.path())
+        .assert()
+        .success();
+    assert!(
+        fs::read_to_string(dir.path().join("togi.toml"))
+            .unwrap()
+            .contains("base = \"HEAD~1\"")
+    );
+
+    togi()
+        .args(["check", "--dry-run", "--test-cmd", "true"])
+        .current_dir(dir.path())
+        .assert()
+        .success();
+}
+
+#[test]
+fn init_uses_head_for_root_commit_in_no_remote_repo() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    for args in [
+        &["init"][..],
+        &["config", "user.email", "test@test.com"][..],
+        &["config", "user.name", "Test"][..],
+    ] {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .unwrap();
+    }
+    fs::write(root.join("go.mod"), "module example.com/test\n\ngo 1.21\n").unwrap();
+    fs::write(root.join("main.go"), "package main\nfunc main() {}\n").unwrap();
+    std::process::Command::new("git")
+        .args(["add", "."])
+        .current_dir(root)
+        .output()
+        .unwrap();
+    std::process::Command::new("git")
+        .args(["commit", "-m", "initial"])
+        .current_dir(root)
+        .output()
+        .unwrap();
+
+    togi().arg("init").current_dir(root).assert().success();
+    let config = fs::read_to_string(root.join("togi.toml")).unwrap();
+    assert!(config.contains("base = \"HEAD\""));
+
+    togi()
+        .args(["check", "--dry-run", "--test-cmd", "true"])
+        .current_dir(root)
+        .assert()
+        .success();
+}
+
+#[test]
+fn init_escapes_quoted_origin_head_target_in_relative_config() {
+    let dir = setup_git_repo();
+    let root = dir.path();
+    let update_ref = std::process::Command::new("git")
+        .args(["update-ref", "refs/remotes/origin/trunk\"quoted", "HEAD"])
+        .current_dir(root)
+        .output()
+        .unwrap();
+    assert!(update_ref.status.success());
+    let origin_head = std::process::Command::new("git")
+        .args([
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/trunk\"quoted",
+        ])
+        .current_dir(root)
+        .output()
+        .unwrap();
+    assert!(origin_head.status.success());
+
+    togi().arg("init").current_dir(root).assert().success();
+    let config: toml::Value =
+        toml::from_str(&fs::read_to_string(root.join("togi.toml")).unwrap()).unwrap();
+    assert_eq!(
+        config["diff"]["base"].as_str(),
+        Some("origin/trunk\"quoted")
+    );
+}
+#[test]
+fn init_generates_all_supported_root_routes() {
+    let dir = TempDir::new().unwrap();
+    for file in [
+        "Cargo.toml",
+        "go.mod",
+        "pyproject.toml",
+        "package.json",
+        "pom.xml",
+        "Gemfile",
+        "CMakeLists.txt",
+        "example.csproj",
+    ] {
+        fs::write(dir.path().join(file), "").unwrap();
+    }
+
+    togi()
+        .arg("init")
+        .current_dir(dir.path())
+        .assert()
+        .success();
+    let config = fs::read_to_string(dir.path().join("togi.toml")).unwrap();
+    for language in [
+        "go",
+        "python",
+        "typescript",
+        "java",
+        "ruby",
+        "c",
+        "cpp",
+        "c_sharp",
+    ] {
+        assert!(
+            config.contains(&format!("[test.languages.{language}]")),
+            "missing route for {language}"
+        );
+    }
+}
+
+#[test]
+fn init_rejects_conflicting_java_routes_without_writing_config() {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("pom.xml"), "").unwrap();
+    fs::write(dir.path().join("build.gradle"), "").unwrap();
+
+    togi()
+        .arg("init")
+        .current_dir(dir.path())
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("pom.xml"))
+        .stderr(predicate::str::contains("build.gradle"))
+        .stderr(predicate::str::contains("[projects.*.test]"));
+    assert!(!dir.path().join("togi.toml").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn init_routes_non_primary_languages_over_cargo() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    let git = |args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    git(&["init"]);
+    git(&["config", "user.email", "test@test.com"]);
+    git(&["config", "user.name", "Test"]);
+    for (file, content) in [
+        (
+            "Cargo.toml",
+            "[package]\nname = \"example\"\nversion = \"0.1.0\"\n",
+        ),
+        ("Gemfile", ""),
+        ("pom.xml", ""),
+        ("CMakeLists.txt", ""),
+        ("example.csproj", ""),
+        ("calc.rb", "def is_big(x)\n  x + 1 > 3\nend\n"),
+        (
+            "Calc.java",
+            "public final class Calc {\n    public static boolean isBig(int x) {\n        return x + 1 > 3;\n    }\n}\n",
+        ),
+        ("calc.c", "int is_big(int x) {\n    return x + 1 > 3;\n}\n"),
+        (
+            "calc.cpp",
+            "bool is_big(int x) {\n    return x + 1 > 3;\n}\n",
+        ),
+        (
+            "Calc.cs",
+            "public static class Calc\n{\n    public static bool IsBig(int x)\n    {\n        return x + 1 > 3;\n    }\n}\n",
+        ),
+    ] {
+        fs::write(root.join(file), content).unwrap();
+    }
+    git(&["add", "."]);
+    git(&["commit", "-m", "initial"]);
+
+    togi().arg("init").current_dir(root).assert().success();
+    let bin = root.join("bin");
+    fs::create_dir(&bin).unwrap();
+    for command in ["bundle", "mvn", "ctest", "dotnet"] {
+        let executable = bin.join(command);
+        fs::write(
+            &executable,
+            "#!/bin/sh\nbasename \"$0\" >> \"$TOGI_TEST_LOG\"\n",
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&executable, permissions).unwrap();
+    }
+    let log = root.join("route.log");
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    for (source, expected_command) in [
+        ("calc.rb", "bundle"),
+        ("Calc.java", "mvn"),
+        ("calc.c", "ctest"),
+        ("calc.cpp", "ctest"),
+        ("Calc.cs", "dotnet"),
+    ] {
+        let changed = fs::read_to_string(root.join(source)).unwrap();
+        fs::write(root.join(source), changed.replace("> 3", "> 4")).unwrap();
+        git(&["add", source]);
+        git(&["commit", "-m", source]);
+
+        let _ = fs::remove_file(&log);
+        let output = togi()
+            .args([
+                "check",
+                "--base",
+                "HEAD~1",
+                "--max-per-run",
+                "1",
+                "--no-schemata",
+            ])
+            .current_dir(root)
+            .env("PATH", &path)
+            .env("TOGI_TEST_LOG", &log)
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let log_content = fs::read_to_string(&log).unwrap();
+        let commands: Vec<_> = log_content.lines().collect();
+        assert!(!commands.is_empty(), "{source} ran no test command");
+        assert!(
+            commands.iter().all(|command| *command == expected_command),
+            "{source} did not use {expected_command}: {commands:?}"
+        );
+    }
 }
 
 #[test]
