@@ -20,6 +20,15 @@ readonly GENERATED_MUTANT_CEILING=20
 readonly MUTATION_TIMEOUT_SECONDS=120
 readonly MUTATION_JOBS=2
 readonly OUTER_TIMEOUT_SECONDS=2100
+readonly CURL_CONNECT_TIMEOUT_SECONDS=15
+readonly CURL_MAX_TIME_SECONDS=120
+readonly TARGET_CLONE_TIMEOUT_SECONDS=300
+readonly TARGET_CHECKOUT_TIMEOUT_SECONDS=120
+readonly DEPENDENCY_FETCH_TIMEOUT_SECONDS=480
+readonly PREFLIGHT_TIMEOUT_SECONDS=600
+readonly DRY_RUN_TIMEOUT_SECONDS=300
+readonly CLEANUP_TIMEOUT_SECONDS=120
+readonly WORKFLOW_TIMEOUT_MINUTES=90
 
 usage() {
     cat <<'EOF'
@@ -98,9 +107,10 @@ cmp -s "$case_dir/dry-run.stdout" "$case_dir/dry-run.json" || die "dry-run JSON 
 cmp -s "$case_dir/togi.stdout" "$case_dir/report.json" || die "report JSON is not a byte-for-byte copy of stdout"
 
 jq -e \
-    --arg workflow_sha "$(jq -r '.workflow_source_revision' "$case_dir/case.json")" \
     --arg workflow_ref "$DEFAULT_WORKFLOW_REF" \
     --arg approval_url "$APPROVAL_URL" \
+    --argjson approval_id "$APPROVAL_COMMENT_ID" \
+    --arg approval_author "$APPROVAL_AUTHOR" \
     --arg approval_body "$APPROVAL_BODY" \
     --arg archive "$TOGI_ARCHIVE" \
     --arg archive_sha256 "$TOGI_ARCHIVE_SHA256" \
@@ -111,11 +121,20 @@ jq -e \
     --argjson ceiling "$GENERATED_MUTANT_CEILING" \
     --argjson mutation_timeout "$MUTATION_TIMEOUT_SECONDS" \
     --argjson jobs "$MUTATION_JOBS" \
-    --argjson outer_timeout "$OUTER_TIMEOUT_SECONDS" '
+    --argjson outer_timeout "$OUTER_TIMEOUT_SECONDS" \
+    --argjson curl_connect_timeout "$CURL_CONNECT_TIMEOUT_SECONDS" \
+    --argjson curl_max_time "$CURL_MAX_TIME_SECONDS" \
+    --argjson target_clone_timeout "$TARGET_CLONE_TIMEOUT_SECONDS" \
+    --argjson target_checkout_timeout "$TARGET_CHECKOUT_TIMEOUT_SECONDS" \
+    --argjson dependency_fetch_timeout "$DEPENDENCY_FETCH_TIMEOUT_SECONDS" \
+    --argjson preflight_timeout "$PREFLIGHT_TIMEOUT_SECONDS" \
+    --argjson dry_run_timeout "$DRY_RUN_TIMEOUT_SECONDS" \
+    --argjson cleanup_timeout "$CLEANUP_TIMEOUT_SECONDS" \
+    --argjson workflow_timeout_minutes "$WORKFLOW_TIMEOUT_MINUTES" '
     .schema_version == 1 and .case == "mitigrid-v0.4.1-pack" and
-    (.workflow_source_revision | test("^[0-9a-f]{40}$")) and .workflow_source_revision == $workflow_sha and
+    (.workflow_source_revision | test("^[0-9a-f]{40}$")) and
     .workflow_source_ref == $workflow_ref and
-    .approval == {url: $approval_url, id: 5150807894, author: "Darkroom4364", body: $approval_body} and
+    .approval == {url: $approval_url, id: $approval_id, author: $approval_author, body: $approval_body} and
     .release == {tag: "v0.4.1", archive: $archive, archive_sha256: $archive_sha256} and
     .target == {repository: $repository, revision: $revision, base: $base, mutation_scope: $path,
                 direct_parent_changed_paths: [".togi-baseline", $path, "docs/governance/mutation-baseline-v0.1.md",
@@ -124,12 +143,16 @@ jq -e \
                 build_command: ["cargo", "check", "--locked", "--workspace"],
                 togi_toml_max_per_run: 0} and
     .limits == {generated_mutant_ceiling: $ceiling, per_mutation_timeout_seconds: $mutation_timeout,
-                jobs: $jobs, outer_timeout_seconds: $outer_timeout}
+                jobs: $jobs, curl_connect_timeout_seconds: $curl_connect_timeout, curl_max_time_seconds: $curl_max_time,
+                target_clone_timeout_seconds: $target_clone_timeout, target_checkout_timeout_seconds: $target_checkout_timeout,
+                dependency_fetch_timeout_seconds: $dependency_fetch_timeout, preflight_timeout_seconds: $preflight_timeout,
+                dry_run_timeout_seconds: $dry_run_timeout, outer_timeout_seconds: $outer_timeout,
+                cleanup_timeout_seconds: $cleanup_timeout, workflow_timeout_minutes: $workflow_timeout_minutes}
 ' "$case_dir/case.json" >/dev/null || die "case metadata does not describe the one approved case"
 workflow_sha=$(jq -r '.workflow_source_revision' "$case_dir/case.json")
 
-jq -e --arg url "$APPROVAL_URL" --arg body "$APPROVAL_BODY" '
-    .url == $url and .id == 5150807894 and .author == "Darkroom4364" and .body == $body and
+jq -e --arg url "$APPROVAL_URL" --argjson id "$APPROVAL_COMMENT_ID" --arg author "$APPROVAL_AUTHOR" --arg body "$APPROVAL_BODY" '
+    .url == $url and .id == $id and .author == $author and .body == $body and
     (.created_at | type == "string" and length > 0)
 ' "$case_dir/approval.json" >/dev/null || die "approval provenance is invalid"
 
@@ -168,9 +191,17 @@ expected_changed_paths=$(printf '%s\n' ".togi-baseline" "$TARGET_PATH" "docs/gov
 [[ "$(cat "$case_dir/target-changed-paths.txt")" == "$expected_changed_paths" ]] || die "direct-parent changed paths are invalid"
 
 expected_commands=$(cat <<EOF
-preflight: cargo test --locked --workspace
-dry-run: togi check --dry-run --format json --base $TARGET_BASE --test-cmd 'cargo test --locked --workspace' --build-cmd 'cargo check --locked --workspace'
-execution: timeout --preserve-status 35m togi check --format json --base $TARGET_BASE --test-cmd 'cargo test --locked --workspace' --build-cmd 'cargo check --locked --workspace' --timeout $MUTATION_TIMEOUT_SECONDS --jobs $MUTATION_JOBS --force-rerun --no-incremental-history
+workflow-deadline: timeout-minutes $WORKFLOW_TIMEOUT_MINUTES
+approval-fetch: curl --connect-timeout $CURL_CONNECT_TIMEOUT_SECONDS --max-time $CURL_MAX_TIME_SECONDS
+release-archive-download: curl --connect-timeout $CURL_CONNECT_TIMEOUT_SECONDS --max-time $CURL_MAX_TIME_SECONDS
+release-checksums-download: curl --connect-timeout $CURL_CONNECT_TIMEOUT_SECONDS --max-time $CURL_MAX_TIME_SECONDS
+target-clone: timeout --preserve-status ${TARGET_CLONE_TIMEOUT_SECONDS}s git clone --no-checkout $TARGET_REPOSITORY
+target-checkout: timeout --preserve-status ${TARGET_CHECKOUT_TIMEOUT_SECONDS}s git checkout --detach $TARGET_REVISION
+dependency-fetch: timeout --preserve-status ${DEPENDENCY_FETCH_TIMEOUT_SECONDS}s cargo fetch --locked
+preflight: timeout --preserve-status ${PREFLIGHT_TIMEOUT_SECONDS}s cargo test --locked --workspace
+dry-run: timeout --preserve-status ${DRY_RUN_TIMEOUT_SECONDS}s togi check --dry-run --format json --base $TARGET_BASE --test-cmd 'cargo test --locked --workspace' --build-cmd 'cargo check --locked --workspace'
+execution: timeout --preserve-status ${OUTER_TIMEOUT_SECONDS}s togi check --format json --base $TARGET_BASE --test-cmd 'cargo test --locked --workspace' --build-cmd 'cargo check --locked --workspace' --timeout $MUTATION_TIMEOUT_SECONDS --jobs $MUTATION_JOBS --force-rerun --no-incremental-history
+cleanup: timeout --preserve-status ${CLEANUP_TIMEOUT_SECONDS}s togi clean
 EOF
 )
 [[ "$(cat "$case_dir/commands.txt")" == "$expected_commands" ]] || die "recorded commands are not the approved commands"

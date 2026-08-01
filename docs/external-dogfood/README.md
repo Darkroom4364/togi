@@ -34,14 +34,26 @@ be absent before recording final cleanliness.
 `refs/heads/main`. Dispatch reviewed `main` with `expected_workflow_sha` equal
 to the full commit SHA being run. The runner requires the workflow-supplied
 default-branch ref to equal `GITHUB_REF`, and the SHA to equal both `GITHUB_SHA`
-and the checked-out Togi revision. It runs only on Linux x86_64
-(`ubuntu-24.04`) with a 40-minute job deadline and a 35-minute outer execution
-deadline.
+and the checked-out Togi revision. A top-level `external-dogfood` concurrency
+group queues rather than cancels runs. It runs only on Linux x86_64
+(`ubuntu-24.04`) with a 90-minute job deadline and a 2,100-second outer
+execution deadline.
 
 The runner downloads the published archive and `checksums.txt`, requires the
 archive's named manifest entry and its calculated SHA-256 to equal the fixed
 release checksum, safely extracts it, and requires `togi --version` to be
 exactly `togi 0.4.1`. It never builds or executes Togi from the workflow source.
+
+Every network or expensive target phase has a declared bound recorded in both
+`case.json` and `commands.txt`: each of the approval/archive/checksum downloads
+uses a 15-second connect timeout and a 120-second total curl timeout; target
+clone and checkout use 300 and 120 seconds; locked dependency fetch, preflight,
+and dry run use 480, 600, and 300 seconds; the actual execution uses 2,100
+seconds; and cleanup uses 120 seconds. The three download maxima plus those
+seven bounded phases total 4,380 seconds (73 minutes), leaving 17 minutes of
+the 90-minute job deadline for checkout/setup, release inspection, validation,
+and upload. Target commands retain their approved arguments; the
+`timeout --preserve-status` wrappers are protocol bounds.
 
 The target uses a new `HOME` and `CARGO_HOME`. It fetches
 locked dependencies once, then uses an allowlisted `env -i` environment with an
@@ -65,10 +77,12 @@ document. The target's
 checked-in `togi.toml` must set `max_per_run = 0`. The generated count—not a
 truncation cap—must be between 1 and 20 inclusive and equal the dry-run mutation
 array length. The actual run repeats the explicit base and test/build command
-under `timeout --preserve-status 35m`, with a per-mutation timeout of 120
+under `timeout --preserve-status 2100s`, with a per-mutation timeout of 120
 seconds, `--jobs 2 --force-rerun --no-incremental-history`, and no
-`--max-per-run`. Only exit status 0 or 1 reaches validation; a survivor is an
-observed result, not a protocol failure.
+`--max-per-run`. A timeout or other nonzero status in any prior phase aborts the
+run and is nonpublishable. For execution, only exit status 0 or 1 reaches
+validation; a timeout status is nonpublishable, and a survivor is an observed
+result, not a protocol failure.
 
 ## Evidence artifact and validation
 

@@ -22,6 +22,15 @@ readonly GENERATED_MUTANT_CEILING=20
 readonly MUTATION_TIMEOUT_SECONDS=120
 readonly MUTATION_JOBS=2
 readonly OUTER_TIMEOUT_SECONDS=2100
+readonly CURL_CONNECT_TIMEOUT_SECONDS=15
+readonly CURL_MAX_TIME_SECONDS=120
+readonly TARGET_CLONE_TIMEOUT_SECONDS=300
+readonly TARGET_CHECKOUT_TIMEOUT_SECONDS=120
+readonly DEPENDENCY_FETCH_TIMEOUT_SECONDS=480
+readonly PREFLIGHT_TIMEOUT_SECONDS=600
+readonly DRY_RUN_TIMEOUT_SECONDS=300
+readonly CLEANUP_TIMEOUT_SECONDS=120
+readonly WORKFLOW_TIMEOUT_MINUTES=90
 
 usage() {
     cat <<'EOF'
@@ -105,7 +114,7 @@ fi
 workflow_head=$(git -C "$GITHUB_WORKSPACE" rev-parse HEAD)
 [[ "$workflow_head" == "$EXPECTED_WORKFLOW_SHA" ]] || die "checked-out Togi revision does not match expected workflow SHA"
 
-for command in awk cargo curl find git jq nproc sha256sum sort tar timeout; do
+for command in awk cargo curl find git install jq nproc rustc sha256sum sort tar timeout; do
     require_command "$command"
 done
 [[ "$(uname -s)" == Linux ]] || die "this protocol requires Linux"
@@ -119,6 +128,7 @@ trap cleanup EXIT
 
 approval_response="$work_root/approval-response.json"
 curl -fsSL --proto '=https' --tlsv1.2 --retry 3 --retry-delay 1 \
+    --connect-timeout "$CURL_CONNECT_TIMEOUT_SECONDS" --max-time "$CURL_MAX_TIME_SECONDS" \
     "$APPROVAL_API_URL" >"$approval_response"
 [[ "$(jq -r '.id' "$approval_response")" == "$APPROVAL_COMMENT_ID" ]] || die "approval comment id did not match"
 [[ "$(jq -r '.user.login' "$approval_response")" == "$APPROVAL_AUTHOR" ]] || die "approval comment author did not match"
@@ -142,6 +152,15 @@ jq -n -S \
     --argjson mutation_timeout "$MUTATION_TIMEOUT_SECONDS" \
     --argjson jobs "$MUTATION_JOBS" \
     --argjson outer_timeout "$OUTER_TIMEOUT_SECONDS" \
+    --argjson curl_connect_timeout "$CURL_CONNECT_TIMEOUT_SECONDS" \
+    --argjson curl_max_time "$CURL_MAX_TIME_SECONDS" \
+    --argjson target_clone_timeout "$TARGET_CLONE_TIMEOUT_SECONDS" \
+    --argjson target_checkout_timeout "$TARGET_CHECKOUT_TIMEOUT_SECONDS" \
+    --argjson dependency_fetch_timeout "$DEPENDENCY_FETCH_TIMEOUT_SECONDS" \
+    --argjson preflight_timeout "$PREFLIGHT_TIMEOUT_SECONDS" \
+    --argjson dry_run_timeout "$DRY_RUN_TIMEOUT_SECONDS" \
+    --argjson cleanup_timeout "$CLEANUP_TIMEOUT_SECONDS" \
+    --argjson workflow_timeout_minutes "$WORKFLOW_TIMEOUT_MINUTES" \
     '{schema_version: 1,
       case: "mitigrid-v0.4.1-pack",
       workflow_source_revision: $workflow_source_revision,
@@ -155,7 +174,11 @@ jq -n -S \
                build_command: ["cargo", "check", "--locked", "--workspace"],
                togi_toml_max_per_run: 0},
       limits: {generated_mutant_ceiling: $ceiling, per_mutation_timeout_seconds: $mutation_timeout,
-               jobs: $jobs, outer_timeout_seconds: $outer_timeout}}' >"$output_dir/case.json"
+               jobs: $jobs, curl_connect_timeout_seconds: $curl_connect_timeout, curl_max_time_seconds: $curl_max_time,
+               target_clone_timeout_seconds: $target_clone_timeout, target_checkout_timeout_seconds: $target_checkout_timeout,
+               dependency_fetch_timeout_seconds: $dependency_fetch_timeout, preflight_timeout_seconds: $preflight_timeout,
+               dry_run_timeout_seconds: $dry_run_timeout, outer_timeout_seconds: $outer_timeout,
+               cleanup_timeout_seconds: $cleanup_timeout, workflow_timeout_minutes: $workflow_timeout_minutes}}' >"$output_dir/case.json"
 
 release_dir="$work_root/release"
 extract_dir="$work_root/extract"
@@ -164,8 +187,10 @@ mkdir -p "$release_dir" "$extract_dir" "$install_dir"
 archive_path="$release_dir/$TOGI_ARCHIVE"
 release_base="https://github.com/Darkroom4364/togi/releases/download/${TOGI_VERSION}"
 curl -fsSL --proto '=https' --tlsv1.2 --retry 3 --retry-delay 1 \
+    --connect-timeout "$CURL_CONNECT_TIMEOUT_SECONDS" --max-time "$CURL_MAX_TIME_SECONDS" \
     -o "$archive_path" "$release_base/$TOGI_ARCHIVE"
 curl -fsSL --proto '=https' --tlsv1.2 --retry 3 --retry-delay 1 \
+    --connect-timeout "$CURL_CONNECT_TIMEOUT_SECONDS" --max-time "$CURL_MAX_TIME_SECONDS" \
     -o "$output_dir/release-checksums.txt" "$release_base/checksums.txt"
 manifest_matches=()
 while IFS= read -r manifest_match; do
@@ -198,8 +223,8 @@ jq -n -S \
       actual_sha256: $actual_sha256, version: $version}' >"$output_dir/release-verification.json"
 
 target_dir="$work_root/target"
-GIT_TERMINAL_PROMPT=0 git clone --filter=blob:none --no-checkout "$TARGET_REPOSITORY" "$target_dir"
-GIT_TERMINAL_PROMPT=0 git -C "$target_dir" checkout --detach "$TARGET_REVISION"
+GIT_TERMINAL_PROMPT=0 timeout --preserve-status "${TARGET_CLONE_TIMEOUT_SECONDS}s" git clone --no-checkout "$TARGET_REPOSITORY" "$target_dir"
+GIT_TERMINAL_PROMPT=0 timeout --preserve-status "${TARGET_CHECKOUT_TIMEOUT_SECONDS}s" git -C "$target_dir" checkout --detach "$TARGET_REVISION"
 [[ "$(git -C "$target_dir" rev-parse HEAD)" == "$TARGET_REVISION" ]] || die "target checkout revision did not match"
 git -C "$target_dir" cat-file -e "${TARGET_BASE}^{commit}"
 [[ "$(git -C "$target_dir" rev-parse "${TARGET_REVISION}^")" == "$TARGET_BASE" ]] || die "approved base is not the target revision's direct parent"
@@ -237,7 +262,7 @@ runtime_env=(
 set +e
 (
     cd "$target_dir"
-    env -i "${runtime_env[@]}" cargo fetch --locked
+    timeout --preserve-status "${DEPENDENCY_FETCH_TIMEOUT_SECONDS}s" env -i "${runtime_env[@]}" cargo fetch --locked
 ) >"$output_dir/cargo-fetch.stdout" 2>"$output_dir/cargo-fetch.stderr"
 fetch_status=$?
 set -e
@@ -247,7 +272,7 @@ printf '%s\n' "$fetch_status" >"$output_dir/cargo-fetch-status.txt"
 set +e
 (
     cd "$target_dir"
-    env -i "${runtime_env[@]}" CARGO_NET_OFFLINE=true cargo test --locked --workspace
+    timeout --preserve-status "${PREFLIGHT_TIMEOUT_SECONDS}s" env -i "${runtime_env[@]}" CARGO_NET_OFFLINE=true cargo test --locked --workspace
 ) >"$output_dir/preflight.stdout" 2>"$output_dir/preflight.stderr"
 preflight_status=$?
 set -e
@@ -255,15 +280,23 @@ printf '%s\n' "$preflight_status" >"$output_dir/preflight-status.txt"
 [[ "$preflight_status" -eq 0 ]] || die "target preflight failed"
 
 printf '%s\n' \
-    'preflight: cargo test --locked --workspace' \
-    "dry-run: togi check --dry-run --format json --base $TARGET_BASE --test-cmd 'cargo test --locked --workspace' --build-cmd 'cargo check --locked --workspace'" \
-    "execution: timeout --preserve-status 35m togi check --format json --base $TARGET_BASE --test-cmd 'cargo test --locked --workspace' --build-cmd 'cargo check --locked --workspace' --timeout $MUTATION_TIMEOUT_SECONDS --jobs $MUTATION_JOBS --force-rerun --no-incremental-history" \
+    "workflow-deadline: timeout-minutes $WORKFLOW_TIMEOUT_MINUTES" \
+    "approval-fetch: curl --connect-timeout $CURL_CONNECT_TIMEOUT_SECONDS --max-time $CURL_MAX_TIME_SECONDS" \
+    "release-archive-download: curl --connect-timeout $CURL_CONNECT_TIMEOUT_SECONDS --max-time $CURL_MAX_TIME_SECONDS" \
+    "release-checksums-download: curl --connect-timeout $CURL_CONNECT_TIMEOUT_SECONDS --max-time $CURL_MAX_TIME_SECONDS" \
+    "target-clone: timeout --preserve-status ${TARGET_CLONE_TIMEOUT_SECONDS}s git clone --no-checkout $TARGET_REPOSITORY" \
+    "target-checkout: timeout --preserve-status ${TARGET_CHECKOUT_TIMEOUT_SECONDS}s git checkout --detach $TARGET_REVISION" \
+    "dependency-fetch: timeout --preserve-status ${DEPENDENCY_FETCH_TIMEOUT_SECONDS}s cargo fetch --locked" \
+    "preflight: timeout --preserve-status ${PREFLIGHT_TIMEOUT_SECONDS}s cargo test --locked --workspace" \
+    "dry-run: timeout --preserve-status ${DRY_RUN_TIMEOUT_SECONDS}s togi check --dry-run --format json --base $TARGET_BASE --test-cmd 'cargo test --locked --workspace' --build-cmd 'cargo check --locked --workspace'" \
+    "execution: timeout --preserve-status ${OUTER_TIMEOUT_SECONDS}s togi check --format json --base $TARGET_BASE --test-cmd 'cargo test --locked --workspace' --build-cmd 'cargo check --locked --workspace' --timeout $MUTATION_TIMEOUT_SECONDS --jobs $MUTATION_JOBS --force-rerun --no-incremental-history" \
+    "cleanup: timeout --preserve-status ${CLEANUP_TIMEOUT_SECONDS}s togi clean" \
     >"$output_dir/commands.txt"
 
 set +e
 (
     cd "$target_dir"
-    env -i "${runtime_env[@]}" CARGO_NET_OFFLINE=true "$togi_bin" check \
+    timeout --preserve-status "${DRY_RUN_TIMEOUT_SECONDS}s" env -i "${runtime_env[@]}" CARGO_NET_OFFLINE=true "$togi_bin" check \
         --dry-run --format json --base "$TARGET_BASE" \
         --test-cmd "cargo test --locked --workspace" \
         --build-cmd "cargo check --locked --workspace"
@@ -289,7 +322,7 @@ start_ns=$(date -u +%s%N)
 set +e
 (
     cd "$target_dir"
-    env -i "${runtime_env[@]}" CARGO_NET_OFFLINE=true timeout --preserve-status 35m "$togi_bin" check \
+    env -i "${runtime_env[@]}" CARGO_NET_OFFLINE=true timeout --preserve-status "${OUTER_TIMEOUT_SECONDS}s" "$togi_bin" check \
         --format json --base "$TARGET_BASE" \
         --test-cmd "cargo test --locked --workspace" \
         --build-cmd "cargo check --locked --workspace" \
@@ -312,7 +345,7 @@ jq -n -S --argjson wall_time_ms "$wall_time_ms" '{wall_time_ms: $wall_time_ms}' 
 set +e
 (
     cd "$target_dir"
-    env -i "${runtime_env[@]}" CARGO_NET_OFFLINE=true "$togi_bin" clean
+    timeout --preserve-status "${CLEANUP_TIMEOUT_SECONDS}s" env -i "${runtime_env[@]}" CARGO_NET_OFFLINE=true "$togi_bin" clean
 ) >"$work_root/togi-clean.stdout" 2>"$work_root/togi-clean.stderr"
 clean_status=$?
 set -e
