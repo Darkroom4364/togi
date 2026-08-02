@@ -207,7 +207,8 @@ fn init_generates_all_supported_root_routes() {
         .arg("init")
         .current_dir(dir.path())
         .assert()
-        .success();
+        .success()
+        .stderr(predicate::str::contains("multiple build systems detected").not());
     let config = fs::read_to_string(dir.path().join("togi.toml")).unwrap();
     for language in [
         "go",
@@ -348,7 +349,7 @@ fn init_routes_non_primary_languages_over_cargo() {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
-        let log_content = fs::read_to_string(&log).unwrap();
+        let log_content = fs::read_to_string(&log).unwrap_or_default();
         let commands: Vec<_> = log_content.lines().collect();
         assert!(!commands.is_empty(), "{source} ran no test command");
         assert!(

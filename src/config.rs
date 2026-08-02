@@ -420,6 +420,10 @@ fn select_test_command(detected: &[DetectedTestRoute]) -> Vec<String> {
         );
     }
 
+    select_primary_test_command(detected)
+}
+
+fn select_primary_test_command(detected: &[DetectedTestRoute]) -> Vec<String> {
     if let Some(route) = detected.first() {
         route.command.clone()
     } else {
@@ -767,7 +771,7 @@ impl Config {
         let inspection = ProjectInspection::scan(project_root);
         let routes = inspection.detected_test_routes();
         validate_init_language_routes(&routes)?;
-        let test_cmd = select_test_command(&routes);
+        let test_cmd = select_primary_test_command(&routes);
         let build_cmd = inspection.detect_build_command();
         let base_toml = toml::Value::String(crate::diff::init_diff_base(project_root)).to_string();
 
@@ -818,8 +822,11 @@ impl Config {
 
         let mut lang_sections: Vec<String> = Vec::new();
         for route in routes.iter().skip(1) {
-            let command_toml: Vec<String> =
-                route.command.iter().map(|s| format!("\"{}\"", s)).collect();
+            let command_toml: Vec<String> = route
+                .command
+                .iter()
+                .map(|command| toml::Value::String(command.clone()).to_string())
+                .collect();
             for language in route.languages {
                 lang_sections.push(format!(
                     "[test.languages.{language}]\ncommand = [{}]\n",

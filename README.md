@@ -777,8 +777,8 @@ your configured `[test] command`, and remove `base` when your `[diff].base`
 should select it instead. Output format is CLI-only, so `togi.toml` has no
 format setting. For a polyglot repo, commit the `togi init`-generated
 `togi.toml` and omit the Action `test-cmd` input so language-specific routes
-apply; the example's explicit `test-cmd` is a single-language override. For
-example:
+apply; the example's explicit `test-cmd` is a single-language override. The
+following TOML is a single-language example:
 
 ```toml
 [diff]
