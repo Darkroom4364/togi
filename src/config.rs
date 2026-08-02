@@ -1186,6 +1186,7 @@ sandbox_command = ["bwrap", "--ro-bind", "/", "/", "--"]
         assert!(err.to_string().contains("[projects.*.test]"));
     }
 
+    #[cfg(not(windows))] // Git cannot create quote-containing refs on Windows.
     #[test]
     fn write_template_escapes_quoted_origin_head_target() {
         let dir = tempfile::tempdir().unwrap();
