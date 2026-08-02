@@ -158,6 +158,7 @@ fn init_uses_head_for_root_commit_in_no_remote_repo() {
         .success();
 }
 
+#[cfg(not(windows))] // Git cannot create quote-containing refs on Windows.
 #[test]
 fn init_escapes_quoted_origin_head_target_in_relative_config() {
     let dir = setup_git_repo();
