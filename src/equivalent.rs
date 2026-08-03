@@ -63,9 +63,10 @@ pub(crate) fn advisories_for(report: &MutationReport) -> BTreeMap<u32, LikelyEqu
         let parsed = sources
             .entry(mutation.file.clone())
             .or_insert_with(|| ParsedSource::load(&mutation.file));
-        if let Some(parsed) = parsed.as_ref()
-            && let Some(reason) = likely_equivalent_reason(mutation, parsed)
-        {
+        let Some(parsed) = parsed.as_ref() else {
+            continue;
+        };
+        if let Some(reason) = likely_equivalent_reason(mutation, parsed) {
             advisories.insert(mutation.id, reason);
         }
     }
