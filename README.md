@@ -290,7 +290,7 @@ mutant source, command context, and relevant covering tests are unchanged.
 
 Optional. togi auto-detects a test command where supported; see [Before first run](#before-first-run) for its exact scope, prerequisites, and support boundaries.
 
-Run `togi init` to auto-detect your language, test runner (including pnpm/yarn/bun), and generate a `togi.toml`. For polyglot repos it creates per-language sections automatically.
+Run `togi init` to auto-detect your language, test runner (including pnpm/yarn/bun), and generate a `togi.toml`. It uses a locally resolvable `[diff].base` when one is available, otherwise retains the `origin/main` fallback; review that setting for CI or your PR base. For polyglot repos with distinct root markers it creates per-language sections automatically; if two markers select different commands for one language, configure an explicit `[test]` command or `[projects.*.test]` routes.
 
 Create a `togi.toml` for customization:
 
@@ -775,7 +775,10 @@ The Action passes `--base`, `--timeout`, `--format`, and `--test-cmd` only for
 non-empty inputs. Those inputs override `togi.toml`; remove `test-cmd` to use
 your configured `[test] command`, and remove `base` when your `[diff].base`
 should select it instead. Output format is CLI-only, so `togi.toml` has no
-format setting. For example:
+format setting. For a polyglot repo, commit the `togi init`-generated
+`togi.toml` and omit the Action `test-cmd` input so language-specific routes
+apply; the example's explicit `test-cmd` is a single-language override. The
+following TOML is a single-language example:
 
 ```toml
 [diff]

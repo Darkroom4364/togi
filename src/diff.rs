@@ -4,6 +4,60 @@ use crate::{ChangedFile, LineRange};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+pub(crate) const DEFAULT_DIFF_BASE: &str = "origin/main";
+
+/// Select a locally resolvable base for a newly generated configuration.
+pub(crate) fn init_diff_base(project_root: &Path) -> String {
+    if let Some(reference) = origin_head(project_root) {
+        return reference;
+    }
+
+    for reference in [DEFAULT_DIFF_BASE, "HEAD~1", "HEAD"] {
+        if git_ref_is_commit(project_root, reference) {
+            return reference.into();
+        }
+    }
+
+    DEFAULT_DIFF_BASE.into()
+}
+
+fn origin_head(project_root: &Path) -> Option<String> {
+    let output = Command::new("git")
+        .args([
+            "symbolic-ref",
+            "--quiet",
+            "--short",
+            "refs/remotes/origin/HEAD",
+        ])
+        .current_dir(project_root)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let reference = String::from_utf8(output.stdout)
+        .ok()?
+        .trim_end_matches(&['\r', '\n'][..])
+        .to_owned();
+    (!reference.is_empty() && git_ref_is_commit(project_root, &reference)).then_some(reference)
+}
+
+/// Verifies a candidate resolves to a commit before it reaches `git diff`.
+fn git_ref_is_commit(project_root: &Path, reference: &str) -> bool {
+    Command::new("git")
+        .args([
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("{reference}^{{commit}}"),
+        ])
+        .current_dir(project_root)
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
 /// Build ChangedFile entries for every supported file in the project tree.
 /// Respects `.gitignore` rules. Skips test/migration/seed files by default.
 pub fn collect_all_supported_files(
@@ -100,14 +154,7 @@ pub fn collect_changed_since(
     skip_noisy: bool,
     exclude_globs: &[String],
 ) -> anyhow::Result<Vec<ChangedFile>> {
-    // Validate the ref before using it in git commands to prevent
-    // arbitrary strings from being passed to git diff.
-    let ref_valid = Command::new("git")
-        .args(["rev-parse", "--verify", &format!("{since}^{{commit}}")])
-        .current_dir(project_root)
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
+    let ref_valid = git_ref_is_commit(project_root, since);
 
     // Try as a commit ref first (SHA, branch, tag).
     let output = if ref_valid {
@@ -414,6 +461,135 @@ index 1111111..2222222 100644
 +pub mod mapper;
  pub mod runner;
 "#;
+
+    fn git(root: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .env("GIT_AUTHOR_NAME", "test")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "test")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn init_base_test_repo(with_parent: bool) -> tempfile::TempDir {
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path();
+        git(root, &["init"]);
+        std::fs::write(root.join("main.rs"), "fn main() {}\n").unwrap();
+        git(root, &["add", "."]);
+        git(root, &["commit", "-m", "initial"]);
+        if with_parent {
+            std::fs::write(root.join("main.rs"), "fn main() { println!(\"hi\"); }\n").unwrap();
+            git(root, &["add", "."]);
+            git(root, &["commit", "-m", "second"]);
+        }
+        repo
+    }
+
+    #[test]
+    fn init_diff_base_prefers_verified_origin_head() {
+        let repo = init_base_test_repo(true);
+        let root = repo.path();
+        git(root, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        git(
+            root,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/main",
+            ],
+        );
+        assert_eq!(init_diff_base(root), "origin/main");
+    }
+
+    #[test]
+    fn init_diff_base_prefers_non_main_origin_head_target() {
+        let repo = init_base_test_repo(true);
+        let root = repo.path();
+        git(root, &["update-ref", "refs/remotes/origin/trunk", "HEAD"]);
+        git(
+            root,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/trunk",
+            ],
+        );
+        assert_eq!(init_diff_base(root), "origin/trunk");
+    }
+
+    #[test]
+    fn init_diff_base_ignores_unresolved_origin_head() {
+        let repo = init_base_test_repo(true);
+        let root = repo.path();
+        git(
+            root,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/missing",
+            ],
+        );
+        assert_eq!(init_diff_base(root), "HEAD~1");
+    }
+
+    #[test]
+    fn init_diff_base_uses_origin_main_when_origin_head_is_stale() {
+        let repo = init_base_test_repo(true);
+        let root = repo.path();
+        git(root, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        git(
+            root,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/missing",
+            ],
+        );
+        assert_eq!(init_diff_base(root), "origin/main");
+    }
+
+    #[test]
+    fn init_diff_base_uses_origin_main_without_origin_head() {
+        let repo = init_base_test_repo(true);
+        let root = repo.path();
+        git(root, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        assert_eq!(init_diff_base(root), "origin/main");
+    }
+
+    #[test]
+    fn init_diff_base_uses_head_parent_without_remote() {
+        let repo = init_base_test_repo(true);
+        assert_eq!(init_diff_base(repo.path()), "HEAD~1");
+    }
+
+    #[test]
+    fn init_diff_base_uses_head_for_root_commit() {
+        let repo = init_base_test_repo(false);
+        assert_eq!(init_diff_base(repo.path()), "HEAD");
+    }
+
+    #[test]
+    fn init_diff_base_falls_back_outside_git() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(init_diff_base(dir.path()), DEFAULT_DIFF_BASE);
+    }
+
+    #[test]
+    fn init_diff_base_falls_back_for_unborn_git_repository() {
+        let repo = tempfile::tempdir().unwrap();
+        git(repo.path(), &["init"]);
+        assert_eq!(init_diff_base(repo.path()), DEFAULT_DIFF_BASE);
+    }
 
     #[test]
     fn parses_multiple_files() {
