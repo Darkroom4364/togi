@@ -10,9 +10,12 @@ A maintainer may publish version `X.Y.Z` only when all of these conditions are
 recorded in the tracking issue or its merged release-record PR:
 
 1. The release tag `vX.Y.Z` is protected against moves and deletions. The clean
-   source checkout uses its peeled commit, which is recorded and matches both
-   the GitHub release target and the successful release-workflow head. Recheck
-   all three immediately before upload and after publication. Its
+   source checkout uses its peeled commit, which matches the successful
+   release-workflow head. The published GitHub release identifies the same tag.
+   Record its `target_commitish` as metadata only; the protected tag's peeled
+   commit and matching successful release-workflow head establish source identity.
+   Recheck the tag, release association, and workflow relationship immediately
+   before upload and after publication. Its
    [`Cargo.toml`](../Cargo.toml) declares exactly `X.Y.Z`.
 2. The matching GitHub release is published, not a draft or prerelease, and its
    release workflow completed successfully.
@@ -28,20 +31,22 @@ recorded in the tracking issue or its merged release-record PR:
 
 ## Procedure
 
-1. Verify release-tag protection, then resolve and record the tag's peeled
-   commit, the GitHub release target, and the successful release-workflow head.
-   Stop on any mismatch.
+1. Verify release-tag protection, then record the tag's peeled commit, the
+   GitHub release tag and `target_commitish`, and the successful release-workflow
+   head. Stop if the release tag is not `vX.Y.Z` or the workflow head does not
+   match the peeled commit.
 2. At the decision time, record the registry-name result and the dry-run
    evidence in the tracking issue.
-3. Immediately before upload, re-resolve the three source identities and repeat
-   the dry-run from the clean tagged checkout. Record that final timestamp,
-   command/output, package summary, and peeled commit in the tracking issue
-   before `cargo publish`.
+3. Immediately before upload, re-verify tag protection and the release/tag
+   association, then repeat the dry-run from the clean tagged checkout. Record
+   that final timestamp, command/output, package summary, and peeled commit in
+   the tracking issue before `cargo publish`.
 4. Publish from that checkout with `cargo publish --locked`; never publish a
    package whose source has moved past its release tag.
-5. After Cargo accepts the upload, re-resolve and record the three source
-   identities. Any change is a release-integrity failure: do not update public
-   installation guidance until it is investigated and recorded.
+5. After Cargo accepts the upload, re-resolve and record the protected tag, the
+   GitHub release association, and the workflow relationship. Any change is a
+   release-integrity failure: do not update public installation guidance until it
+   is investigated and recorded.
 6. Record the crates.io URL and version returned by Cargo, then update public
    installation guidance in a reviewed PR.
 
