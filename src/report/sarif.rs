@@ -153,6 +153,8 @@ struct SarifResultProperties {
     test_selection_mode: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     selection_confirmation: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    likely_equivalent: Option<&'static str>,
 }
 
 #[derive(Serialize)]
@@ -195,13 +197,17 @@ fn result_for_with_baseline(
     execution: MutationExecution,
     status: Option<crate::baseline::SurvivorBaselineStatus>,
     selection: Option<TestSelectionProvenance>,
+    advisory: Option<&'static str>,
 ) -> SarifResult {
+    let advisory_suffix = advisory
+        .map(|reason| format!(" Likely equivalent (advisory): {reason}."))
+        .unwrap_or_default();
     SarifResult {
         rule_id: mutation.operator.clone(),
         level: "warning",
         message: SarifMessage {
             text: format!(
-                "Survived mutation: {} ({} → {})",
+                "Survived mutation: {} ({} → {}){advisory_suffix}",
                 mutation.description, mutation.original, mutation.replacement
             ),
         },
@@ -218,17 +224,20 @@ fn result_for_with_baseline(
                 },
             },
         }],
-        properties: (!execution.is_tested() || status.is_some() || selection.is_some()).then(
-            || SarifResultProperties {
-                execution: execution.state_name(),
-                nonexecution_reason: execution.reason().map(|reason| reason.name()),
-                baseline_status: status.map(|status| status.as_str()),
-                test_selection_mode: selection.map(|selection| selection.mode_name()),
-                selection_confirmation: selection
-                    .and_then(|selection| selection.confirmation())
-                    .map(|confirmation| confirmation.name()),
-            },
-        ),
+        properties: (!execution.is_tested()
+            || status.is_some()
+            || selection.is_some()
+            || advisory.is_some())
+        .then(|| SarifResultProperties {
+            execution: execution.state_name(),
+            nonexecution_reason: execution.reason().map(|reason| reason.name()),
+            baseline_status: status.map(|status| status.as_str()),
+            test_selection_mode: selection.map(|selection| selection.mode_name()),
+            selection_confirmation: selection
+                .and_then(|selection| selection.confirmation())
+                .map(|confirmation| confirmation.name()),
+            likely_equivalent: advisory,
+        }),
     }
 }
 
@@ -270,6 +279,7 @@ pub fn to_sarif_string_with_baseline(
     comparison: Option<&crate::baseline::SurvivorBaselineComparison>,
 ) -> Result<String> {
     let registry = registry_descriptions();
+    let equivalent_advisories = crate::equivalent::advisories_for(report);
     let surviving: Vec<(&Mutation, MutationExecution)> = report
         .results
         .iter()
@@ -330,6 +340,9 @@ pub fn to_sarif_string_with_baseline(
                         *execution,
                         comparison.and_then(|comparison| comparison.status_for(mutation.id)),
                         report.selection_for(mutation.id),
+                        equivalent_advisories
+                            .get(&mutation.id)
+                            .map(|reason| reason.message()),
                     )
                 })
                 .collect(),

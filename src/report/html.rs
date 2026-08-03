@@ -37,6 +37,7 @@ struct MutationEntry {
     result: &'static str,
     execution: String,
     baseline_status: Option<&'static str>,
+    likely_equivalent: Option<&'static str>,
 }
 
 pub fn generate_report(report: &MutationReport) -> Result<String> {
@@ -47,6 +48,7 @@ pub fn generate_report_with_baseline(
     report: &MutationReport,
     comparison: Option<&crate::baseline::SurvivorBaselineComparison>,
 ) -> Result<String> {
+    let equivalent_advisories = crate::equivalent::advisories_for(report);
     let mut files: BTreeMap<String, FileStats> = BTreeMap::new();
 
     for (mutation, result) in &report.results {
@@ -100,6 +102,9 @@ pub fn generate_report_with_baseline(
                 .then(|| comparison.and_then(|comparison| comparison.status_for(mutation.id)))
                 .flatten()
                 .map(|status| status.as_str()),
+            likely_equivalent: equivalent_advisories
+                .get(&mutation.id)
+                .map(|reason| reason.message()),
         });
     }
 
@@ -293,6 +298,15 @@ pub fn generate_report_with_baseline(
                 "subsumed" => "result-subsumed",
                 _ => "result-build-error",
             };
+            let advisory = m
+                .likely_equivalent
+                .map(|reason| {
+                    format!(
+                        "<br><small>Likely equivalent (advisory): {}</small>",
+                        html_escape(reason)
+                    )
+                })
+                .unwrap_or_default();
             if comparison.is_some() {
                 let baseline_status = m.baseline_status.map(html_escape).unwrap_or_default();
                 write!(
@@ -300,7 +314,7 @@ pub fn generate_report_with_baseline(
                     "<tr class=\"{}\"><td>{}</td><td><code>{}</code></td><td>{}</td>\
                      <td><code class=\"orig\">{}</code></td>\
                      <td><code class=\"repl\">{}</code></td>\
-                     <td>{}</td><td>{}</td><td>{}</td></tr>",
+                     <td>{}{}</td><td>{}</td><td>{}</td></tr>",
                     result_class,
                     m.line,
                     html_escape(&m.operator),
@@ -308,6 +322,7 @@ pub fn generate_report_with_baseline(
                     html_escape(&m.original),
                     html_escape(&m.replacement),
                     m.result,
+                    advisory,
                     baseline_status,
                     html_escape(&m.execution)
                 )?;
@@ -317,7 +332,7 @@ pub fn generate_report_with_baseline(
                     "<tr class=\"{}\"><td>{}</td><td><code>{}</code></td><td>{}</td>\
                      <td><code class=\"orig\">{}</code></td>\
                      <td><code class=\"repl\">{}</code></td>\
-                     <td>{}</td><td>{}</td></tr>",
+                     <td>{}{}</td><td>{}</td></tr>",
                     result_class,
                     m.line,
                     html_escape(&m.operator),
@@ -325,6 +340,7 @@ pub fn generate_report_with_baseline(
                     html_escape(&m.original),
                     html_escape(&m.replacement),
                     m.result,
+                    advisory,
                     html_escape(&m.execution)
                 )?;
             }

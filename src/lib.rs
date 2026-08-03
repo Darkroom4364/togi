@@ -4,6 +4,7 @@ pub mod cli;
 pub mod config;
 pub mod coverage;
 pub mod diff;
+mod equivalent;
 pub mod languages;
 pub mod learned;
 pub mod lock;
