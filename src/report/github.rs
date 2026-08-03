@@ -6,6 +6,7 @@ fn format_annotation_with_baseline(
     execution: MutationExecution,
     status: Option<crate::baseline::SurvivorBaselineStatus>,
     selection: Option<TestSelectionProvenance>,
+    advisory: Option<&str>,
 ) -> String {
     let provenance = match execution {
         MutationExecution::Executed => String::new(),
@@ -19,8 +20,11 @@ fn format_annotation_with_baseline(
     let selection = selection
         .map(|selection| format!(" [selection: {selection}]"))
         .unwrap_or_default();
+    let advisory = advisory
+        .map(|reason| format!(" [likely equivalent (advisory): {reason}]"))
+        .unwrap_or_default();
     let message = format!(
-        "Survived mutation: {} ({}){provenance}{baseline}{selection}",
+        "Survived mutation: {} ({}){provenance}{baseline}{selection}{advisory}",
         mutation.operator, mutation.description
     );
     format!(
@@ -47,6 +51,7 @@ fn annotations_with_baseline(
     report: &MutationReport,
     comparison: Option<&crate::baseline::SurvivorBaselineComparison>,
 ) -> Vec<String> {
+    let advisories = crate::equivalent::advisories_for(report);
     report
         .results
         .iter()
@@ -57,6 +62,7 @@ fn annotations_with_baseline(
                 report.execution_for(mutation.id, *result),
                 comparison.and_then(|comparison| comparison.status_for(mutation.id)),
                 report.selection_for(mutation.id),
+                advisories.get(&mutation.id).map(|reason| reason.message()),
             )
         })
         .collect()
@@ -131,6 +137,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::path::PathBuf;
     use std::time::Duration;
+    use tempfile::TempDir;
 
     fn mutation(file: &str, line: usize, operator: &str, description: &str) -> Mutation {
         Mutation {
@@ -179,11 +186,28 @@ mod tests {
     #[test]
     fn annotation_format_for_survived_mutation() {
         let m = mutation("src/auth.rs", 47, "lt_to_lte", "changed < to <=");
-        let line = format_annotation_with_baseline(&m, MutationExecution::Executed, None, None);
+        let line =
+            format_annotation_with_baseline(&m, MutationExecution::Executed, None, None, None);
         assert_eq!(
             line,
             "::warning file=src/auth.rs,line=47::Survived mutation: lt_to_lte (changed < to <=)"
         );
+    }
+
+    #[test]
+    fn annotation_marks_likely_equivalent_survivors_as_advisory() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("fixture.rs");
+        std::fs::write(&path, crate::test_helpers::CAPACITY_HINT_SOURCE).unwrap();
+        let report = report_with(vec![(
+            crate::test_helpers::capacity_hint_mutation(path),
+            MutationResult::Survived,
+        )]);
+
+        let annotations = annotations_with_baseline(&report, None);
+
+        assert_eq!(annotations.len(), 1);
+        assert!(annotations[0].contains("likely equivalent (advisory): changes only a Vec/String preallocation capacity hint under normal allocation behavior"));
     }
 
     #[test]
@@ -286,6 +310,7 @@ mod tests {
             &m,
             MutationExecution::Executed,
             Some(crate::baseline::SurvivorBaselineStatus::Historic),
+            None,
             None,
         );
         assert_eq!(

@@ -125,6 +125,8 @@ struct JsonMutation {
     #[serde(skip_serializing_if = "Option::is_none")]
     baseline_status: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    likely_equivalent: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     language: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     source_path: Option<String>,
@@ -389,6 +391,7 @@ fn to_json_string_with_baseline_and_replay_optional(
         .iter()
         .map(|diagnostic| (diagnostic.mutation_id, diagnostic))
         .collect();
+    let equivalent_advisories = crate::equivalent::advisories_for(report);
     let mutations: Vec<JsonMutation> = report
         .results
         .iter()
@@ -446,6 +449,9 @@ fn to_json_string_with_baseline_and_replay_optional(
                     .then(|| comparison.and_then(|comparison| comparison.status_for(m.id)))
                     .flatten()
                     .map(|status| status.as_str()),
+                likely_equivalent: equivalent_advisories
+                    .get(&m.id)
+                    .map(|reason| reason.message()),
                 language: replay_fields.as_ref().map(|fields| fields.language.clone()),
                 source_path: replay_fields
                     .as_ref()

@@ -422,6 +422,11 @@ togi check --base origin/main --format github
 togi check --base origin/main --pr-comment togi-pr-comment.md
 ```
 
+Survivors can carry a **likely equivalent (advisory)** reason when a narrow Rust syntax rule
+matches: standard `Vec`/`String` capacity hints or a stricter `&&` bound that already excludes
+the changed endpoint. They remain `survived` and continue to count toward scores and gates; JSON
+uses `likely_equivalent`, and every report format displays the same advisory reason.
+
 ### Parallel CI shards
 
 ```bash

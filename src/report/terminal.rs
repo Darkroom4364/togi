@@ -70,6 +70,7 @@ fn format_report(
     let mut out = String::new();
     writeln!(out).unwrap();
     let execution_counts = report.execution_counts();
+    let equivalent_advisories = crate::equivalent::advisories_for(report);
 
     for (mutation, result) in &report.results {
         let file = mutation.file.display().to_string();
@@ -97,6 +98,13 @@ fn format_report(
                     }
                 )
                 .unwrap();
+                if let Some(reason) = equivalent_advisories.get(&mutation.id) {
+                    let _ = writeln!(
+                        detail,
+                        "              Likely equivalent (advisory): {}",
+                        reason.message()
+                    );
+                }
                 if let Some(status) =
                     comparison.and_then(|comparison| comparison.status_for(mutation.id))
                 {

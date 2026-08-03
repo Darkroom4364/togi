@@ -347,6 +347,7 @@ pub fn format_pr_comment_with_baseline(
     }
     writeln!(md).unwrap();
 
+    let equivalent_advisories = crate::equivalent::advisories_for(report);
     let survived: Vec<_> = report
         .results
         .iter()
@@ -384,6 +385,10 @@ pub fn format_pr_comment_with_baseline(
                 .map(|selection| format!(" (selection: {selection})"))
                 .unwrap_or_default();
             let provenance = format!("{provenance}{selection}");
+            let advisory = equivalent_advisories
+                .get(&mutation.id)
+                .map(|reason| format!(" Likely equivalent (advisory): {}", reason.message()))
+                .unwrap_or_default();
             if let Some(comparison) = comparison {
                 let baseline_status = comparison
                     .status_for(mutation.id)
@@ -391,23 +396,25 @@ pub fn format_pr_comment_with_baseline(
                     .unwrap_or_default();
                 let _ = writeln!(
                     md,
-                    "| `{}` | {} | `{}` | {}{} | {} |",
+                    "| `{}` | {} | `{}` | {}{}{} | {} |",
                     escape_md_cell(&mutation.file.display().to_string()),
                     mutation.line,
                     escape_md_cell(&mutation.operator),
                     escape_md_cell(&mutation.description),
                     provenance,
+                    advisory,
                     baseline_status,
                 );
             } else {
                 let _ = writeln!(
                     md,
-                    "| `{}` | {} | `{}` | {}{} |",
+                    "| `{}` | {} | `{}` | {}{}{} |",
                     escape_md_cell(&mutation.file.display().to_string()),
                     mutation.line,
                     escape_md_cell(&mutation.operator),
                     escape_md_cell(&mutation.description),
                     provenance,
+                    advisory,
                 );
             }
         }
@@ -552,6 +559,32 @@ mod tests {
             },
             result,
         )
+    }
+
+    #[test]
+    fn likely_equivalent_advisory_is_rendered_without_changing_survivor_semantics() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("fixture.rs");
+        std::fs::write(&path, crate::test_helpers::CAPACITY_HINT_SOURCE).unwrap();
+        let mut mutation = crate::test_helpers::capacity_hint_mutation(path);
+        mutation.id = 1;
+        let mut report = crate::test_helpers::sample_report();
+        report.results[1] = (mutation, MutationResult::Survived);
+
+        let reason = "changes only a Vec/String preallocation capacity hint under normal allocation behavior";
+        let terminal = crate::report::terminal::format_report_plain(&report);
+        let json = crate::report::json::to_json_string(&report).unwrap();
+        let html = crate::report::html::generate_report(&report).unwrap();
+        let sarif = crate::report::sarif::to_sarif_string(&report).unwrap();
+        let comment = format_pr_comment(&report, None);
+
+        assert!(terminal.contains(&format!("Likely equivalent (advisory): {reason}")));
+        assert!(terminal.contains("SURVIVED"));
+        assert!(json.contains(&format!("\"likely_equivalent\": \"{reason}\"")));
+        assert!(html.contains(&format!("Likely equivalent (advisory): {reason}")));
+        assert!(sarif.contains(&format!("\"likely_equivalent\": \"{reason}\"")));
+        assert!(comment.contains(&format!("Likely equivalent (advisory): {reason}")));
+        assert_eq!(report.survived, 1);
     }
 
     #[test]
