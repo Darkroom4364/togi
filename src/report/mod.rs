@@ -565,13 +565,13 @@ mod tests {
     fn likely_equivalent_advisory_is_rendered_without_changing_survivor_semantics() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("fixture.rs");
-        std::fs::write(&path, crate::test_helpers::CAPACITY_HINT_SOURCE).unwrap();
-        let mut mutation = crate::test_helpers::capacity_hint_mutation(path);
+        std::fs::write(&path, crate::test_helpers::BOOLEAN_LITERAL_SOURCE).unwrap();
+        let mut mutation = crate::test_helpers::boolean_literal_mutation(path);
         mutation.id = 1;
         let mut report = crate::test_helpers::sample_report();
         report.results[1] = (mutation, MutationResult::Survived);
 
-        let reason = "changes only a Vec/String preallocation capacity hint under normal allocation behavior";
+        let reason = "both operands are the same boolean literal, so either logical operator produces the same value";
         let terminal = crate::report::terminal::format_report_plain(&report);
         let json = crate::report::json::to_json_string(&report).unwrap();
         let html = crate::report::html::generate_report(&report).unwrap();

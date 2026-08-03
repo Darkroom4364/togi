@@ -59,22 +59,22 @@ pub fn sample_report() -> MutationReport {
 }
 
 /// Rust source and mutation used to exercise likely-equivalent report annotations.
-pub const CAPACITY_HINT_SOURCE: &str = "fn make() { let _items = Vec::with_capacity(16); }\n";
+pub const BOOLEAN_LITERAL_SOURCE: &str = "pub fn always() -> bool { true && true }\n";
 
-pub fn capacity_hint_mutation(path: PathBuf) -> Mutation {
-    let start = CAPACITY_HINT_SOURCE
-        .find("16")
-        .expect("capacity hint fixture contains its literal");
+pub fn boolean_literal_mutation(path: PathBuf) -> Mutation {
+    let start = BOOLEAN_LITERAL_SOURCE
+        .find("&&")
+        .expect("boolean literal fixture contains its operator");
     Mutation {
         id: 0,
         file: path,
         language: "rust".into(),
         line: 1,
         column: start + 1,
-        operator: "increment_numeric".into(),
-        description: "Replace n with n+1".into(),
-        original: "16".into(),
-        replacement: "17".into(),
+        operator: "and_to_or".into(),
+        description: "Replace && with ||".into(),
+        original: "&&".into(),
+        replacement: "||".into(),
         byte_range: start..start + 2,
     }
 }

@@ -198,16 +198,16 @@ mod tests {
     fn annotation_marks_likely_equivalent_survivors_as_advisory() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("fixture.rs");
-        std::fs::write(&path, crate::test_helpers::CAPACITY_HINT_SOURCE).unwrap();
+        std::fs::write(&path, crate::test_helpers::BOOLEAN_LITERAL_SOURCE).unwrap();
         let report = report_with(vec![(
-            crate::test_helpers::capacity_hint_mutation(path),
+            crate::test_helpers::boolean_literal_mutation(path),
             MutationResult::Survived,
         )]);
 
         let annotations = annotations_with_baseline(&report, None);
 
         assert_eq!(annotations.len(), 1);
-        assert!(annotations[0].contains("likely equivalent (advisory): changes only a Vec/String preallocation capacity hint under normal allocation behavior"));
+        assert!(annotations[0].contains("likely equivalent (advisory): both operands are the same boolean literal, so either logical operator produces the same value"));
     }
 
     #[test]

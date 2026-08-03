@@ -13,15 +13,15 @@ use tree_sitter::{Node, Tree};
 /// Why a surviving mutant is likely equivalent under a narrow syntax-only rule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LikelyEquivalentReason {
-    CapacityHint,
+    SameBooleanLiterals,
     RedundantBoundary,
 }
 
 impl LikelyEquivalentReason {
     pub(crate) fn message(self) -> &'static str {
         match self {
-            Self::CapacityHint => {
-                "changes only a Vec/String preallocation capacity hint under normal allocation behavior"
+            Self::SameBooleanLiterals => {
+                "both operands are the same boolean literal, so either logical operator produces the same value"
             }
             Self::RedundantBoundary => {
                 "a stricter `&&` sibling check already excludes the changed boundary"
@@ -88,8 +88,8 @@ fn likely_equivalent_reason(
         return None;
     }
 
-    if changes_capacity_hint(mutation, parsed) {
-        return Some(LikelyEquivalentReason::CapacityHint);
+    if has_identical_boolean_literals(mutation, parsed) {
+        return Some(LikelyEquivalentReason::SameBooleanLiterals);
     }
     if has_redundant_boundary(mutation, parsed) {
         return Some(LikelyEquivalentReason::RedundantBoundary);
@@ -97,62 +97,37 @@ fn likely_equivalent_reason(
     None
 }
 
-fn changes_capacity_hint(mutation: &Mutation, parsed: &ParsedSource) -> bool {
-    if !matches!(
-        mutation.operator.as_str(),
-        "zero_to_one" | "increment_numeric" | "decrement_numeric"
-    ) || !is_unsigned_decimal(&mutation.original)
-        || !is_unsigned_decimal(&mutation.replacement)
-    {
+fn has_identical_boolean_literals(mutation: &Mutation, parsed: &ParsedSource) -> bool {
+    let expected_operator = match mutation.operator.as_str() {
+        "and_to_or" => "&&",
+        "or_to_and" => "||",
+        _ => return false,
+    };
+    if mutation.original != expected_operator {
         return false;
     }
 
-    let Some(mut node) = parsed
-        .tree
-        .root_node()
-        .descendant_for_byte_range(mutation.byte_range.start, mutation.byte_range.end)
-    else {
+    let Some(binary) = binary_mutation_node(mutation, parsed) else {
+        return false;
+    };
+    let source = parsed.source.as_bytes();
+    let Some((left, _, right)) = binary_parts(binary, source) else {
+        return false;
+    };
+    let (Some(left), Some(right)) = (
+        source
+            .get(left.byte_range())
+            .and_then(|value| std::str::from_utf8(value).ok())
+            .map(str::trim),
+        source
+            .get(right.byte_range())
+            .and_then(|value| std::str::from_utf8(value).ok())
+            .map(str::trim),
+    ) else {
         return false;
     };
 
-    loop {
-        if node.kind() == "call_expression"
-            && let (Some(function), Some(arguments)) = (
-                node.child_by_field_name("function"),
-                node.child_by_field_name("arguments"),
-            )
-            && function
-                .utf8_text(parsed.source.as_bytes())
-                .ok()
-                .is_some_and(is_standard_capacity_constructor)
-            && arguments.named_child_count() == 1
-            && arguments
-                .named_child(0)
-                .is_some_and(|argument| argument.byte_range() == mutation.byte_range)
-        {
-            return true;
-        }
-        let Some(parent) = node.parent() else {
-            return false;
-        };
-        node = parent;
-    }
-}
-
-fn is_standard_capacity_constructor(function: &str) -> bool {
-    matches!(
-        function,
-        "Vec::with_capacity"
-            | "String::with_capacity"
-            | "std::vec::Vec::with_capacity"
-            | "std::string::String::with_capacity"
-            | "alloc::vec::Vec::with_capacity"
-            | "alloc::string::String::with_capacity"
-    )
-}
-
-fn is_unsigned_decimal(value: &str) -> bool {
-    !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
+    left == right && matches!(left, "true" | "false")
 }
 
 fn has_redundant_boundary(mutation: &Mutation, parsed: &ParsedSource) -> bool {
@@ -208,7 +183,76 @@ fn has_redundant_boundary(mutation: &Mutation, parsed: &ParsedSource) -> bool {
         return false;
     };
 
-    mutated.subject == sibling.subject && sibling_excludes_changed_boundary(mutated, sibling)
+    mutated.subject == sibling.subject
+        && is_direct_primitive_parameter_bound(logical_and, mutated.subject, parsed)
+        && sibling_excludes_changed_boundary(mutated, sibling)
+}
+
+fn is_direct_primitive_parameter_bound(
+    logical_and: Node<'_>,
+    subject: &str,
+    parsed: &ParsedSource,
+) -> bool {
+    let Some(block) = logical_and.parent() else {
+        return false;
+    };
+    if block.kind() != "block"
+        || block.named_child_count() != 1
+        || block
+            .named_child(0)
+            .is_none_or(|child| child.byte_range() != logical_and.byte_range())
+    {
+        return false;
+    }
+    let Some(function) = block.parent() else {
+        return false;
+    };
+    if function.kind() != "function_item" {
+        return false;
+    }
+    let Some(parameters) = function.child_by_field_name("parameters") else {
+        return false;
+    };
+
+    let source = parsed.source.as_bytes();
+    let mut cursor = parameters.walk();
+    for parameter in parameters.named_children(&mut cursor) {
+        if parameter.kind() != "parameter" {
+            continue;
+        }
+        let (Some(pattern), Some(type_name)) = (
+            parameter.child_by_field_name("pattern"),
+            parameter.child_by_field_name("type"),
+        ) else {
+            continue;
+        };
+        if source.get(pattern.byte_range()) == Some(subject.as_bytes())
+            && source
+                .get(type_name.byte_range())
+                .and_then(|value| std::str::from_utf8(value).ok())
+                .is_some_and(is_primitive_integer)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_primitive_integer(type_name: &str) -> bool {
+    matches!(
+        type_name,
+        "i8" | "i16"
+            | "i32"
+            | "i64"
+            | "i128"
+            | "isize"
+            | "u8"
+            | "u16"
+            | "u32"
+            | "u64"
+            | "u128"
+            | "usize"
+    )
 }
 
 fn binary_mutation_node<'tree>(
@@ -344,8 +388,9 @@ mod tests {
             replacement: match operator {
                 "lt_to_lte" => "<=".into(),
                 "gt_to_gte" => ">=".into(),
-                "decrement_numeric" => "15".into(),
-                _ => "17".into(),
+                "and_to_or" => "||".into(),
+                "or_to_and" => "&&".into(),
+                _ => String::new(),
             },
             byte_range: start..start + original.len(),
         }
@@ -364,18 +409,18 @@ mod tests {
     }
 
     #[test]
-    fn marks_standard_collection_capacity_literal_mutations() {
-        let source = "fn make() { let _items = Vec::with_capacity(16); }";
+    fn marks_identical_boolean_literals() {
+        let source = "fn always() -> bool { true && true }";
         assert_eq!(
-            reason(source, "increment_numeric", "16"),
-            Some(LikelyEquivalentReason::CapacityHint)
+            reason(source, "and_to_or", "&&"),
+            Some(LikelyEquivalentReason::SameBooleanLiterals)
         );
     }
 
     #[test]
-    fn leaves_nonstandard_capacity_calls_unannotated() {
-        let source = "fn make() { let _items = Buffer::with_capacity(16); }";
-        assert_eq!(reason(source, "increment_numeric", "16"), None);
+    fn leaves_different_boolean_literals_unannotated() {
+        let source = "fn sometimes() -> bool { true && false }";
+        assert_eq!(reason(source, "and_to_or", "&&"), None);
     }
 
     #[test]
@@ -390,6 +435,12 @@ mod tests {
     #[test]
     fn leaves_equal_sibling_bound_unannotated() {
         let source = "fn valid(value: i32) -> bool { value < 10 && value <= 10 }";
+        assert_eq!(reason(source, "lt_to_lte", "<"), None);
+    }
+
+    #[test]
+    fn leaves_custom_comparison_types_unannotated() {
+        let source = "fn valid(value: Wrapped) -> bool { value < 10 && value <= 9 }";
         assert_eq!(reason(source, "lt_to_lte", "<"), None);
     }
 }
