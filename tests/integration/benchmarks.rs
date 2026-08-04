@@ -3668,8 +3668,9 @@ fn pr_loop_comparator_provenance_drift_warns_without_failing() {
         return;
     }
     let (_tools, fixture) = build_gate_fixture();
-    // Volatile execution provenance (Go/Git/kernel/togi versions) is
-    // observational: drift warns but never changes the exit code.
+    // Volatile execution provenance (Git/kernel/togi versions) is
+    // observational: drift warns but never changes the exit code. The pinned
+    // Go toolchain is NOT volatile and is covered by a separate hard check.
     let dir = fixture.samples_dir.join("provenance-drift");
     fs::create_dir(&dir).unwrap();
     let results: Vec<PathBuf> = fixture
@@ -3680,8 +3681,8 @@ fn pr_loop_comparator_provenance_drift_warns_without_failing() {
             let copied = dir.join(format!("result-{index}.json"));
             if index == 1 {
                 let mut doc = read_json(result);
-                doc["provenance"]["go_version"] = serde_json::json!("go version go9.9.9 test/test");
                 doc["provenance"]["git_version"] = serde_json::json!("git version 9.9.9");
+                doc["provenance"]["togi_version"] = serde_json::json!("togi 0.0.0-drift");
                 fs::write(&copied, serde_json::to_vec_pretty(&doc).unwrap()).unwrap();
             } else {
                 fs::copy(result, &copied).unwrap();
@@ -3699,12 +3700,56 @@ fn pr_loop_comparator_provenance_drift_warns_without_failing() {
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("volatile execution provenance drift: go_version"),
-        "expected go_version drift warning: {stdout}"
-    );
-    assert!(
         stdout.contains("volatile execution provenance drift: git_version"),
         "expected git_version drift warning: {stdout}"
+    );
+    assert!(
+        stdout.contains("volatile execution provenance drift: togi_version"),
+        "expected togi_version drift warning: {stdout}"
+    );
+}
+
+#[test]
+fn pr_loop_comparator_pins_the_go_toolchain() {
+    if !harness_tools_available() || !tool_on_path("python3") {
+        eprintln!("skipping: harness or Python tools unavailable");
+        return;
+    }
+    let (_tools, fixture) = build_gate_fixture();
+    // Go is a pinned comparable dimension: any result measured under a Go
+    // toolchain different from the baseline's is incomparable, never a
+    // warning.
+    let dir = fixture.samples_dir.join("go-version-drift");
+    fs::create_dir(&dir).unwrap();
+    let results: Vec<PathBuf> = fixture
+        .results
+        .iter()
+        .enumerate()
+        .map(|(index, result)| {
+            let copied = dir.join(format!("result-{index}.json"));
+            if index == 2 {
+                let mut doc = read_json(result);
+                doc["provenance"]["go_version"] =
+                    serde_json::json!("go version go1.25.0 linux/amd64");
+                fs::write(&copied, serde_json::to_vec_pretty(&doc).unwrap()).unwrap();
+            } else {
+                fs::copy(result, &copied).unwrap();
+            }
+            copied
+        })
+        .collect();
+    let rejected = run_comparator(&fixture.baseline, &results, None);
+    assert_eq!(
+        rejected.status.code(),
+        Some(2),
+        "a Go toolchain mismatch must fail closed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&rejected.stdout),
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr).contains("go version"),
+        "expected a Go toolchain mismatch error: {}",
+        String::from_utf8_lossy(&rejected.stderr)
     );
 }
 
@@ -3989,6 +4034,30 @@ fn pr_loop_checked_in_baseline_is_a_valid_durable_promoted_artifact() {
 }
 
 #[test]
+fn codeowners_protects_the_gate_corpus_workflows_and_itself() {
+    let contents =
+        fs::read_to_string(repo_root().join(".github/CODEOWNERS")).expect("CODEOWNERS must exist");
+    for pattern in [
+        "/benchmarks/pr-loop/",
+        "/.github/workflows/pr-loop-regression-gate.yml",
+        "/.github/workflows/pr-loop-calibration.yml",
+        "/.github/CODEOWNERS",
+    ] {
+        let line = contents
+            .lines()
+            .filter(|line| !line.trim_start().starts_with('#'))
+            .find(|line| line.split_whitespace().next() == Some(pattern))
+            .unwrap_or_else(|| panic!("CODEOWNERS must cover {pattern}"));
+        let owners: Vec<&str> = line.split_whitespace().skip(1).collect();
+        assert_eq!(
+            owners,
+            ["@Darkroom4364"],
+            "{pattern} must be owned exactly by @Darkroom4364"
+        );
+    }
+}
+
+#[test]
 fn docs_and_readme_record_the_gate_enforcement_contract() {
     // Observable identifiers only: job/workflow names, the workflow path,
     // and the ruleset id — not prose.
@@ -4090,6 +4159,11 @@ fn pr_loop_regression_gate_workflow_is_fail_closed_and_comparator_driven() {
         checkout["with"]["persist-credentials"].as_bool(),
         Some(false)
     );
+    assert_eq!(
+        checkout["with"]["fetch-depth"].as_u64(),
+        Some(0),
+        "gate must fetch full history so the trusted base commit is available"
+    );
     let toolchain = steps
         .iter()
         .find(|item| {
@@ -4150,11 +4224,14 @@ fn pr_loop_regression_gate_workflow_is_fail_closed_and_comparator_driven() {
 
     let (warmup_index, warmup) = step("Warm Go build cache");
     let (acquisition_index, acquisition) = step("Acquire three primed samples");
-    let (_, compare) = step("Compare against durable baseline");
+    let (select_index, select) = step("Select trusted baseline");
+    let (compare_index, compare) = step("Compare against durable baseline");
     let (upload_index, upload) = step("Upload regression gate evidence");
     assert!(create_index < warmup_index);
     assert!(warmup_index < acquisition_index);
-    assert!(acquisition_index < upload_index);
+    assert!(acquisition_index < select_index);
+    assert!(select_index < compare_index);
+    assert!(compare_index < upload_index);
     for (name, item) in [("warmup", warmup), ("acquisition", acquisition)] {
         assert_eq!(
             item["env"]["GOCACHE"].as_str(),
@@ -4194,11 +4271,51 @@ fn pr_loop_regression_gate_workflow_is_fail_closed_and_comparator_driven() {
         "acquisition must emit one output directory per sample"
     );
 
+    // Trusted-base selection: on pull_request the comparator must run
+    // against the base SHA's baseline (never the PR head's copy); the only
+    // head fallback is the explicit one-time bootstrap when the base
+    // genuinely carries no baseline. Invalid or unavailable base SHAs fail
+    // closed with no permissive fallback.
+    assert_eq!(select["shell"].as_str(), Some("bash"));
+    assert_eq!(
+        select["env"]["EVENT_NAME"].as_str(),
+        Some("${{ github.event_name }}")
+    );
+    assert_eq!(
+        select["env"]["PR_BASE_SHA"].as_str(),
+        Some("${{ github.event.pull_request.base.sha }}")
+    );
+    let select_run = select["run"].as_str().expect("select run");
+    for required in [
+        "=~ ^[0-9a-f]{40}$",
+        "git cat-file -e \"$BASE_SHA^{commit}\"",
+        "git cat-file -e \"$BASE_SHA:benchmarks/pr-loop/baseline.json\"",
+        "git show \"$BASE_SHA:benchmarks/pr-loop/baseline.json\" > \"$GATE_OUTPUT/baseline.json\"",
+        "one-time bootstrap",
+        "cp benchmarks/pr-loop/baseline.json \"$GATE_OUTPUT/baseline.json\"",
+        "test -s \"$GATE_OUTPUT/baseline.json\"",
+    ] {
+        assert!(
+            select_run.contains(required),
+            "baseline selection must contain `{required}`"
+        );
+    }
+    for forbidden in ["|| true", "continue"] {
+        assert!(
+            !select_run.contains(forbidden),
+            "baseline selection must not contain permissive fallback `{forbidden}`"
+        );
+    }
+
     // The comparison step alone performs the timing exit behavior: it must
-    // invoke the comparator against the durable checked-in baseline.
+    // invoke the comparator against the selected trusted baseline.
     let compare_run = compare["run"].as_str().expect("compare run");
     assert!(compare_run.contains("benchmarks/pr-loop/compare-baseline.py"));
-    assert!(compare_run.contains("--baseline benchmarks/pr-loop/baseline.json"));
+    assert!(compare_run.contains("--baseline \"$GATE_OUTPUT/baseline.json\""));
+    assert!(
+        !compare_run.contains("--baseline benchmarks/pr-loop/baseline.json"),
+        "compare step must not read the PR head's baseline directly"
+    );
     assert!(compare_run.contains("--output \"$GATE_OUTPUT/pr-loop-regression-comparison.json\""));
     for sample in 1..=3 {
         assert!(

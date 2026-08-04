@@ -10,10 +10,10 @@ durable baseline produced by promote-baseline.py. Exit codes:
 
 The comparator parses JSON data only; it never shells out or evaluates input.
 Comparable identity is the semantic workload identity, per-scenario mutation
-digest, runner class, measurement cache state/policy, and the recorded
-manifest/patch/fixture digests. Volatile execution provenance (Go, Git,
-kernel, image, togi version) is never comparable identity: drift there only
-produces observational warnings.
+digest, runner class, the pinned Go toolchain, measurement cache
+state/policy, and the recorded manifest/patch/fixture digests. The remaining
+volatile execution provenance (Git, kernel, image, togi version) is never
+comparable identity: drift there only produces observational warnings.
 
 Timing rule (fixed tolerance_policy v1): for every workload and both metrics
 (wall_ms and reported_duration_ms), M is the integer middle of exactly three
@@ -376,8 +376,9 @@ def main(argv):
         if actual != expected:
             fail(f"current {key} digest does not match the baseline; the corpus drifted since calibration")
 
-    # Comparable identity: semantic workload identity, runner class, and
-    # measurement cache state/policy must all match the baseline exactly.
+    # Comparable identity: semantic workload identity, runner class, the
+    # pinned Go toolchain, and measurement cache state/policy must all match
+    # the baseline exactly.
     first_identity = result_semantic_identity(results[0], resolved_results[0])
     if first_identity != baseline["semantic_identity"]:
         fail(f"{resolved_results[0]}: semantic identity mismatch with the baseline")
@@ -387,11 +388,17 @@ def main(argv):
     for path, result in zip(resolved_results, results):
         if result_runner_class(result) != baseline["runner_class"]:
             fail(f"{path}: runner class mismatch with the baseline")
+        result_go = result["provenance"]["go_version"]
+        baseline_go = baseline["execution_provenance"]["go_version"]
+        if result_go != baseline_go:
+            fail(f"{path}: go version {result_go!r} does not match the baseline's pinned Go toolchain {baseline_go!r}")
 
     warnings = []
     for path, result in zip(resolved_results, results):
         provenance = result["provenance"]
         for key, expected in baseline["execution_provenance"].items():
+            if key == "go_version":
+                continue
             if provenance.get(key) != expected:
                 warnings.append(f"{path.name}: volatile execution provenance drift: {key} is {provenance.get(key)!r}, baseline recorded {expected!r}")
 

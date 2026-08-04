@@ -74,14 +74,19 @@ to force the regular runner for all mutations.
   ([`pr-loop-regression-gate.yml`](../.github/workflows/pr-loop-regression-gate.yml),
   Linux x86_64 only on `ubuntu-24.04` with the same fail-closed native
   target/arch assertion): on every PR and every push to `main`, measures
-  exactly three primed harness samples against the durable checked-in
-  baseline `benchmarks/pr-loop/baseline.json` under the fixed
+  exactly three primed harness samples against the durable baseline
+  `benchmarks/pr-loop/baseline.json` under the fixed
   `tolerance_policy` v1 (median of three; hard failure when any
   workload/metric median exceeds 1.5x the baseline median plus the absolute
-  floor of 250 ms wall / 100 ms reported). A missing, stale, or incomparable
-  baseline fails the workflow run closed; merge blocking applies while the
+  floor of 250 ms wall / 100 ms reported). On pull requests the baseline is
+  read from the validated trusted base commit, not the PR head; the pinned
+  Go toolchain must match the baseline's. A missing, stale, or incomparable
+  baseline fails the workflow run closed. Merge blocking applies while the
   `PR-loop Regression Gate` context is required by the active `main`
-  ruleset.
+  ruleset; the corpus, both PR-loop workflows, and CODEOWNERS itself are
+  owned by `@Darkroom4364` in
+  [`.github/CODEOWNERS`](../.github/CODEOWNERS), so gate inputs cannot be
+  rewritten by an ordinary PR without code-owner review.
 
 ### Auto-detection fallback
 

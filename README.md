@@ -396,27 +396,48 @@ fails the comparison. A single high raw sample whose median stays under the
 cap (one spike in three) is recorded and warned about observationally; it
 never fails the gate. A missing, malformed, stale, or incomparable baseline
 or sample fails closed: the **PR-loop Regression Gate** workflow run itself
-fails, with no skip or bypass path inside the workflow. Merge blocking is a
+fails, with no skip or bypass path inside the workflow. On `pull_request` the
+gate never trusts the PR head's copies: it checks out full history, validates
+the event's base SHA as a 40-hex commit that is locally available, and
+compares against `benchmarks/pr-loop/baseline.json` read from that trusted
+base commit. The single exception is the one-time bootstrap: when the base
+genuinely carries no baseline yet, the gate says so explicitly and uses the
+PR-head baseline; an invalid or unavailable base SHA is never a fallback and
+fails the run. On `push` to `main` the checked-out head baseline is used.
+The Go toolchain is a pinned comparable dimension: a result measured under a
+different Go version than the baseline recorded is incomparable (exit 2),
+while truly volatile provenance (Git, kernel, image, togi versions) only
+warns. Merge blocking is a
 separate enforcement layer: it applies only while the exact check context
-`PR-loop Regression Gate` is required by the active `main` ruleset (see the
-activation runbook below). Warm/cold wall-ratio drift beyond 25%,
+`PR-loop Regression Gate` is required by the active `main` ruleset and the
+protected paths are code-owner reviewed (see the activation runbook below).
+`.github/CODEOWNERS` assigns the entire PR-loop corpus, the gate and
+calibration workflows, and CODEOWNERS itself to `@Darkroom4364`, so an
+ordinary PR cannot self-authorize by rewriting its own baseline, comparator,
+or gate definition. Warm/cold wall-ratio drift beyond 25%,
 schemata-versus-cold wall-delta sign changes, and volatile
-execution-provenance drift (Go, Git, kernel, or image versions) print
-observational warnings but never fail the gate.
+execution-provenance drift print observational warnings but never fail the
+gate.
 
 Activation runbook: a maintainer dispatches **PR-loop Calibration** from
 `main`, downloads the fresh calibration artifact ZIP with its positive GitHub
 artifact ID and normalized SHA-256, and runs the promoter with the activation
 metadata. The promoter writes the durable `benchmarks/pr-loop/baseline.json`
 deterministically; the separately reviewed activation PR adds exactly that
-generated file together with the gate workflow, atomically. Once that PR's
-own **PR-loop Regression Gate** check is green, a repository admin performs
-the final activation step: add the exact context `PR-loop Regression Gate`
-as a required status check to ruleset 15308939 (the active `main` ruleset)
-and verify it is enforced as required before considering the gate live. The
-current durable baseline was promoted from calibration run 30928964359
-(GitHub artifact 8900358130, measured 2026-08-04T16:26:18Z on `af02876`)
-with activation recorded as PR #497 by Darkroom4364 at 2026-08-04T16:43:25Z.
+generated file together with the gate workflow, atomically. That bootstrap
+PR is a reviewed one-time exception: it merges before ruleset enforcement is
+enabled, so its gate run necessarily uses the bootstrap path (the base has no
+baseline yet). Once the bootstrap PR's own **PR-loop Regression Gate** check
+is green and it merges, a repository admin performs the final activation
+step: enable required code-owner review and add the exact context
+`PR-loop Regression Gate` as a required status check to ruleset 15308939
+(the active `main` ruleset), then verify both are enforced before
+considering the gate live. From that point, ordinary PRs compare against the
+trusted base baseline and cannot modify gate inputs without code-owner
+review. The current durable baseline was promoted from calibration run
+30928964359 (GitHub artifact 8900358130, measured 2026-08-04T16:26:18Z on
+`af02876`) with activation recorded as PR #497 by Darkroom4364 at
+2026-08-04T16:43:25Z.
 
 ### Corpus changes and recalibration
 
