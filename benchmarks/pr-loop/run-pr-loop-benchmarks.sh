@@ -268,6 +268,17 @@ GIT_VERSION=$(git --version)
 OS_NAME=$(uname -s)
 ARCH_NAME=$(uname -m)
 STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+BENCH_RUNNER_LABEL=${BENCH_RUNNER_LABEL:-local}
+if command -v getconf >/dev/null 2>&1; then
+  LOGICAL_CPU_COUNT=$(getconf _NPROCESSORS_ONLN)
+elif command -v sysctl >/dev/null 2>&1; then
+  LOGICAL_CPU_COUNT=$(sysctl -n hw.logicalcpu)
+else
+  LOGICAL_CPU_COUNT=$(nproc)
+fi
+KERNEL_RELEASE=$(uname -r)
+IMAGE_OS=${ImageOS:-}
+IMAGE_VERSION=${ImageVersion:-}
 
 # jq filter for each named invariant. Manifest values are injected as
 # $expected_mutations, $changed_file, $line_min, and $line_max.
@@ -518,6 +529,11 @@ jq -n \
   --arg git_version "$GIT_VERSION" \
   --arg os "$OS_NAME" \
   --arg arch "$ARCH_NAME" \
+  --arg runner_label "$BENCH_RUNNER_LABEL" \
+  --argjson logical_cpu_count "$LOGICAL_CPU_COUNT" \
+  --arg kernel_release "$KERNEL_RELEASE" \
+  --arg image_os "$IMAGE_OS" \
+  --arg image_version "$IMAGE_VERSION" \
   --arg started_at "$STARTED_AT" \
   --arg fixture_source "$FIXTURE_SOURCE_DIR" \
   --arg patch_sha "$ACTUAL_PATCH_SHA" \
@@ -539,6 +555,11 @@ jq -n \
       os: $os,
       arch: $arch,
       go_version: $go_version,
+      runner_label: $runner_label,
+      logical_cpu_count: $logical_cpu_count,
+      kernel_release: $kernel_release,
+      image_os: (if $image_os == "" then null else $image_os end),
+      image_version: (if $image_version == "" then null else $image_version end),
       git_version: $git_version,
       fixture_source_dir: $fixture_source,
       fixture_patch: "benchmarks/pr-loop/fixture-change.patch",
