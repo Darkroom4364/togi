@@ -64,7 +64,6 @@ fn run_fixture(case: FixtureCase) -> togi::MutationReport {
 
     let runner = togi::runner::TestRunner {
         commands: togi::runner::CommandConfig {
-            confirm_survivors: false,
             command: vec!["bash".into(), "run-tests.sh".into()],
             force_default_command: false,
             force_default_timeout: false,

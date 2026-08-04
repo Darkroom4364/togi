@@ -1,0 +1,6 @@
+# Frozen final-v0.5 configuration using the pre-v1 `confirm_survivors`
+# setting removed by #488. Loading this under v1 must fail with the clear
+# migration diagnostic (#484 contract exception).
+
+[mutations]
+confirm_survivors = true

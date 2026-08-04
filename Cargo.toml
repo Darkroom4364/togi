@@ -10,6 +10,10 @@ readme = "README.md"
 keywords = ["mutation-testing", "testing", "diff", "tree-sitter", "code-quality"]
 categories = ["development-tools::testing", "command-line-utilities"]
 
+[features]
+# Narrowly exposes the libFuzzer execution harness; normal builds have no fuzz API.
+fuzzing = []
+
 [dependencies]
 # CLI
 clap = { version = "4", features = ["derive"] }
@@ -66,3 +70,4 @@ strip = true
 [dev-dependencies]
 assert_cmd = "2"
 predicates = "3"
+serde_yaml = "0.9.34"

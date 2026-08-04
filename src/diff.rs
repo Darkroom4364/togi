@@ -159,11 +159,16 @@ pub fn collect_changed_since(
     // Try as a commit ref first (SHA, branch, tag).
     let output = if ref_valid {
         let o = Command::new("git")
-            .args(["diff", &format!("{since}..HEAD")])
+            .args([
+                "-c",
+                "core.quotePath=false",
+                "diff",
+                &format!("{since}..HEAD"),
+            ])
             .current_dir(project_root)
             .output()?;
         if o.status.success() {
-            Some(String::from_utf8(o.stdout)?)
+            Some(o.stdout)
         } else {
             None
         }
@@ -191,7 +196,12 @@ pub fn collect_changed_since(
             // against the well-known empty tree SHA.
             let tree_sha = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
             let out = Command::new("git")
-                .args(["diff", &format!("{tree_sha}..HEAD")])
+                .args([
+                    "-c",
+                    "core.quotePath=false",
+                    "diff",
+                    &format!("{tree_sha}..HEAD"),
+                ])
                 .current_dir(project_root)
                 .output()?;
             if !out.status.success() {
@@ -200,20 +210,25 @@ pub fn collect_changed_since(
                     String::from_utf8_lossy(&out.stderr)
                 );
             }
-            String::from_utf8(out.stdout)?
+            out.stdout
         } else {
             let out = Command::new("git")
-                .args(["diff", &format!("{base}..HEAD")])
+                .args([
+                    "-c",
+                    "core.quotePath=false",
+                    "diff",
+                    &format!("{base}..HEAD"),
+                ])
                 .current_dir(project_root)
                 .output()?;
             if !out.status.success() {
                 anyhow::bail!("git diff failed: {}", String::from_utf8_lossy(&out.stderr));
             }
-            String::from_utf8(out.stdout)?
+            out.stdout
         }
     };
 
-    let all = parse_diff(&diff_output);
+    let all = parse_diff_bytes(&diff_output);
     Ok(all
         .into_iter()
         .filter(|f| !skip_noisy || !is_noisy_file(&f.path))
@@ -307,21 +322,70 @@ pub fn is_noisy_file(path: &Path) -> bool {
 
 /// Parse unified diff output (from `git diff`) into a list of changed files
 /// with their modified line ranges. Only tracks added/modified lines.
+///
+/// Parsing fails closed per file: an unsafe post-image path, a malformed or
+/// truncated hunk, or inconsistent hunk line counts drop the whole file
+/// instead of emitting partially parsed data. Emitted hunks are normalized
+/// to sorted, non-overlapping, 1-based ranges, as `mapper::overlaps` requires.
+/// Parse raw unified diff bytes. Valid UTF-8 takes the zero-allocation string
+/// parser path; invalid post-image header lines are treated as deletions so an
+/// unsafe filename can never be mapped through lossy decoding.
+pub fn parse_diff_bytes(input: &[u8]) -> Vec<ChangedFile> {
+    if let Ok(input) = std::str::from_utf8(input) {
+        return parse_diff(input);
+    }
+
+    let mut decoded = String::with_capacity(input.len());
+    for physical_line in input.split_inclusive(|byte| *byte == b'\n') {
+        if physical_line.starts_with(b"+++ ") && std::str::from_utf8(physical_line).is_err() {
+            decoded.push_str("+++ /dev/null");
+            if physical_line.ends_with(b"\n") {
+                decoded.push('\n');
+            }
+        } else {
+            decoded.push_str(&String::from_utf8_lossy(physical_line));
+        }
+    }
+    parse_diff(&decoded)
+}
+
 pub fn parse_diff(input: &str) -> Vec<ChangedFile> {
     let mut files: Vec<ChangedFile> = Vec::new();
     let mut current_path: Option<PathBuf> = None;
     let mut current_hunks: Vec<LineRange> = Vec::new();
+    let mut file_poisoned = false;
     let mut saw_old_file_header = false;
 
     // Per-hunk state
     let mut in_hunk = false;
     let mut new_line: usize = 0; // current line number in the new file
+    let mut remaining_old: usize = 0; // old-side lines left in the hunk
+    let mut remaining_new: usize = 0; // new-side lines left in the hunk
     let mut range_start: Option<usize> = None;
     let mut range_end: usize = 0;
 
     for line in input.lines() {
         if line.starts_with("diff --git ") {
+            // Structural boundary: finalize the previous file now, according
+            // to its poison/completion state, so a headerless or malformed
+            // following section can never be attributed to it.
             flush_range(&mut current_hunks, &mut range_start, range_end);
+            if in_hunk {
+                // Previous file's hunk was cut short — its counts were never
+                // satisfied, so drop the file rather than trust partial data.
+                file_poisoned = true;
+            }
+            if let Some(path) = current_path.take() {
+                if !file_poisoned && !current_hunks.is_empty() {
+                    normalize_hunks(&mut current_hunks);
+                    files.push(ChangedFile {
+                        path,
+                        hunks: current_hunks,
+                    });
+                }
+            }
+            current_hunks = Vec::new();
+            file_poisoned = false;
             in_hunk = false;
             saw_old_file_header = false;
             continue;
@@ -345,7 +409,8 @@ pub fn parse_diff(input: &str) -> Vec<ChangedFile> {
 
                     // Flush previous file
                     if let Some(path) = current_path.take() {
-                        if !current_hunks.is_empty() {
+                        if !file_poisoned && !current_hunks.is_empty() {
+                            normalize_hunks(&mut current_hunks);
                             files.push(ChangedFile {
                                 path,
                                 hunks: current_hunks,
@@ -353,14 +418,9 @@ pub fn parse_diff(input: &str) -> Vec<ChangedFile> {
                         }
                     }
                     current_hunks = Vec::new();
+                    file_poisoned = false;
 
-                    // Extract path, stripping the `b/` prefix
-                    let path = if let Some(stripped) = path_str.strip_prefix("b/") {
-                        PathBuf::from(stripped)
-                    } else {
-                        PathBuf::from(path_str)
-                    };
-                    current_path = Some(path);
+                    current_path = post_image_path(path_str);
                     continue;
                 }
             }
@@ -371,38 +431,95 @@ pub fn parse_diff(input: &str) -> Vec<ChangedFile> {
         if line.starts_with("@@ ") {
             // Flush any open range from a previous hunk
             flush_range(&mut current_hunks, &mut range_start, range_end);
-            in_hunk = true;
+            if in_hunk {
+                // Previous hunk's counts were never satisfied — fail closed.
+                file_poisoned = true;
+            }
+            in_hunk = false;
             saw_old_file_header = false;
 
             // Parse `@@ -old_start,old_count +new_start,new_count @@`
-            if let Some(new_spec) = parse_hunk_header(line) {
-                new_line = new_spec;
+            match parse_hunk_header(line) {
+                Some(header) => {
+                    new_line = header.new_start;
+                    remaining_old = header.old_count;
+                    remaining_new = header.new_count;
+                    in_hunk = remaining_old > 0 || remaining_new > 0;
+                }
+                None => {
+                    // Malformed hunk header — fail closed for this file.
+                    file_poisoned = true;
+                }
             }
         } else if in_hunk && line.starts_with("\\ ") {
             // Diff metadata such as "\ No newline at end of file" is not a source line.
         } else if in_hunk {
+            let mut counts_holds = true;
             if line.starts_with('+') {
                 // Added line — track it
-                if range_start.is_none() {
-                    range_start = Some(new_line);
+                if remaining_new == 0 {
+                    counts_holds = false;
+                } else {
+                    remaining_new -= 1;
+                    if range_start.is_none() {
+                        range_start = Some(new_line);
+                    }
+                    range_end = new_line;
+                    match new_line.checked_add(1) {
+                        Some(next) => new_line = next,
+                        None => counts_holds = false,
+                    }
                 }
-                range_end = new_line;
-                new_line += 1;
             } else if line.starts_with('-') {
                 // Deleted line — flush any open range, don't advance new_line
-                flush_range(&mut current_hunks, &mut range_start, range_end);
+                if remaining_old == 0 {
+                    counts_holds = false;
+                } else {
+                    remaining_old -= 1;
+                    flush_range(&mut current_hunks, &mut range_start, range_end);
+                }
             } else {
                 // Context line
-                flush_range(&mut current_hunks, &mut range_start, range_end);
-                new_line += 1;
+                if remaining_old == 0 || remaining_new == 0 {
+                    counts_holds = false;
+                } else {
+                    remaining_old -= 1;
+                    remaining_new -= 1;
+                    flush_range(&mut current_hunks, &mut range_start, range_end);
+                    match new_line.checked_add(1) {
+                        Some(next) => new_line = next,
+                        None => counts_holds = false,
+                    }
+                }
             }
+            if !counts_holds {
+                // Hunk content contradicts the header counts — fail closed.
+                file_poisoned = true;
+                in_hunk = false;
+            } else if remaining_old == 0 && remaining_new == 0 {
+                in_hunk = false;
+            }
+        } else if current_path.is_some()
+            && (line.starts_with('+') || line.starts_with('-') || line.starts_with(' '))
+        {
+            // Source-shaped content outside any active hunk: the preceding
+            // hunk's declared counts are already exhausted, so this file
+            // section is malformed. Legitimate out-of-hunk lines (metadata
+            // such as `index`, `rename from`, `Binary files ...`, and the
+            // `\ No newline` marker) never start with '+', '-', or ' '.
+            file_poisoned = true;
         }
     }
 
     // Flush final state
     flush_range(&mut current_hunks, &mut range_start, range_end);
+    if in_hunk {
+        // Input ended before the final hunk's counts were satisfied.
+        file_poisoned = true;
+    }
     if let Some(path) = current_path.take() {
-        if !current_hunks.is_empty() {
+        if !file_poisoned && !current_hunks.is_empty() {
+            normalize_hunks(&mut current_hunks);
             files.push(ChangedFile {
                 path,
                 hunks: current_hunks,
@@ -413,20 +530,82 @@ pub fn parse_diff(input: &str) -> Vec<ChangedFile> {
     files
 }
 
+/// Extract the post-image path from a `+++` header line, or `None` when the
+/// file was deleted (`/dev/null`) or the path is unsafe to use. Git diff
+/// commands run with `core.quotePath=false`, so paths arrive as raw UTF-8;
+/// C-quoted headers (control characters, quotes, backslashes) are rejected
+/// outright instead of being partially decoded.
+fn post_image_path(header: &str) -> Option<PathBuf> {
+    if header == "/dev/null" {
+        return None;
+    }
+    if header.starts_with('"') {
+        return None;
+    }
+    let stripped = header.strip_prefix("b/").unwrap_or(header);
+    if stripped.chars().any(char::is_control) {
+        return None;
+    }
+    if !crate::source_identity::is_normalized_project_relative_path(stripped) {
+        return None;
+    }
+    Some(Path::new(stripped).to_path_buf())
+}
+
+/// Sort ranges and merge overlaps so downstream mapping can rely on
+/// deterministic, sorted, non-overlapping, 1-based line ranges.
+fn normalize_hunks(hunks: &mut Vec<LineRange>) {
+    hunks.retain(|r| r.start >= 1 && r.start <= r.end);
+    hunks.sort_by_key(|r| (r.start, r.end));
+    let mut merged: Vec<LineRange> = Vec::with_capacity(hunks.len());
+    for range in hunks.drain(..) {
+        if let Some(last) = merged.last_mut() {
+            if range.start <= last.end {
+                last.end = last.end.max(range.end);
+                continue;
+            }
+        }
+        merged.push(range);
+    }
+    *hunks = merged;
+}
+
 fn flush_range(hunks: &mut Vec<LineRange>, start: &mut Option<usize>, end: usize) {
     if let Some(s) = start.take() {
         hunks.push(LineRange { start: s, end });
     }
 }
 
-/// Parse `@@ ... +new_start,new_count @@` → new_start
-fn parse_hunk_header(line: &str) -> Option<usize> {
-    // Find the `+` part after the first `@@`
-    let after_at = line.strip_prefix("@@ ")?;
-    let plus_idx = after_at.find('+')?;
-    let rest = &after_at[plus_idx + 1..];
-    let end = rest.find(|c: char| !c.is_ascii_digit())?;
-    rest[..end].parse().ok()
+struct HunkHeader {
+    new_start: usize,
+    old_count: usize,
+    new_count: usize,
+}
+
+/// Parse `@@ -old_start[,old_count] +new_start[,new_count @@ ...`.
+/// Rejects unparseable numbers and 1-based line starts of zero.
+fn parse_hunk_header(line: &str) -> Option<HunkHeader> {
+    let body = line.strip_prefix("@@ ")?;
+    let ranges = body.find(" @@").map(|idx| &body[..idx])?;
+    let (old, new) = ranges.split_once(' ')?;
+    let (old_start, old_count) = parse_range_spec(old.strip_prefix('-')?)?;
+    let (new_start, new_count) = parse_range_spec(new.strip_prefix('+')?)?;
+    if (old_count > 0 && old_start == 0) || (new_count > 0 && new_start == 0) {
+        return None;
+    }
+    Some(HunkHeader {
+        new_start,
+        old_count,
+        new_count,
+    })
+}
+
+/// Parse `start,count` or bare `start` (implicit count of 1).
+fn parse_range_spec(spec: &str) -> Option<(usize, usize)> {
+    match spec.split_once(',') {
+        Some((start, count)) => Some((start.parse().ok()?, count.parse().ok()?)),
+        None => Some((spec.parse().ok()?, 1)),
+    }
 }
 
 #[cfg(test)]
@@ -437,7 +616,7 @@ mod tests {
 index 1234567..abcdefg 100644
 --- a/src/main.rs
 +++ b/src/main.rs
-@@ -1,6 +1,7 @@
+@@ -1,6 +1,8 @@
  use std::io;
 
  fn main() {
@@ -446,7 +625,7 @@ index 1234567..abcdefg 100644
      let y = 2;
 +    let z = x + y;
  }
-@@ -10,3 +11,5 @@ fn other() {
+@@ -10,2 +11,4 @@ fn other() {
      foo();
 +    bar();
 +    baz();
@@ -455,7 +634,7 @@ diff --git a/src/lib.rs b/src/lib.rs
 index 1111111..2222222 100644
 --- a/src/lib.rs
 +++ b/src/lib.rs
-@@ -5,4 +5,6 @@ pub mod config;
+@@ -5,2 +5,4 @@ pub mod config;
  pub mod diff;
 +pub mod languages;
 +pub mod mapper;
@@ -600,6 +779,24 @@ index 1111111..2222222 100644
     }
 
     #[test]
+    fn drops_invalid_post_image_path_and_keeps_following_valid_file() {
+        let diff = b"diff --git a/bad.rs b/bad-\xff.rs\n\
+--- a/bad.rs\n\
++++ b/bad-\xff.rs\n\
+@@ -0,0 +1 @@\n\
++bad\n\
+diff --git a/src/good.rs b/src/good.rs\n\
+--- a/src/good.rs\n\
++++ b/src/good.rs\n\
+@@ -0,0 +1 @@\n\
++good\n";
+        let files = parse_diff_bytes(diff);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, PathBuf::from("src/good.rs"));
+        assert_eq!(files[0].hunks, vec![LineRange { start: 1, end: 1 }]);
+    }
+
+    #[test]
     fn parses_hunks_correctly() {
         let files = parse_diff(SAMPLE_DIFF);
         let main_rs = &files[0];
@@ -651,7 +848,7 @@ Binary files a/image.png and b/image.png differ
 diff --git a/src/main.rs b/src/main.rs
 --- a/src/main.rs
 +++ b/src/main.rs
-@@ -1,3 +1,4 @@
+@@ -1,2 +1,3 @@
  fn main() {
 +    println!("hi");
  }
@@ -685,7 +882,7 @@ diff --git a/src/main.rs b/src/main.rs
         let diff = r#"diff --git a/path/to/file.rs b/path/to/file.rs
 --- a/path/to/file.rs
 +++ b/path/to/file.rs
-@@ -1,3 +1,4 @@
+@@ -1,2 +1,3 @@
  existing
 +new_line
  end
@@ -729,6 +926,419 @@ index 3333333..4444444 100644
         );
         assert_eq!(files[1].path, PathBuf::from("src/next.rs"));
         assert_eq!(files[1].hunks, vec![LineRange { start: 11, end: 11 }]);
+    }
+
+    #[test]
+    fn rejects_malformed_hunk_header() {
+        let diff = r#"diff --git a/src/main.rs b/src/main.rs
+--- a/src/main.rs
++++ b/src/main.rs
+@@ this is not a hunk header @@
+ fn main() {
++    println!("hi");
+ }
+"#;
+        let files = parse_diff(diff);
+        assert!(
+            files.is_empty(),
+            "file with malformed hunk header must be dropped, got {files:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_hunk_with_zero_new_start_and_additions() {
+        let diff = r#"diff --git a/src/main.rs b/src/main.rs
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -1,2 +0,3 @@
+ fn main() {
++    println!("hi");
++    println!("again");
+ }
+"#;
+        let files = parse_diff(diff);
+        assert!(
+            files.is_empty(),
+            "new_start 0 with nonzero new_count is not a valid 1-based range"
+        );
+    }
+
+    #[test]
+    fn rejects_hunk_with_more_added_lines_than_declared() {
+        let diff = r#"diff --git a/src/main.rs b/src/main.rs
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -1,1 +1,1 @@
++first
++second
+"#;
+        let files = parse_diff(diff);
+        assert!(
+            files.is_empty(),
+            "hunk content contradicting the header counts must drop the file"
+        );
+    }
+
+    #[test]
+    fn rejects_source_content_after_declared_counts() {
+        // Counts are satisfied by ` ctx` + `+added`; the surplus source line
+        // afterwards must invalidate the file, not be silently ignored.
+        let diff = r#"diff --git a/src/x.rs b/src/x.rs
+--- a/src/x.rs
++++ b/src/x.rs
+@@ -1,1 +1,2 @@
+ ctx
++added
++surplus
+"#;
+        let files = parse_diff(diff);
+        assert!(
+            files.is_empty(),
+            "content after the declared counts must drop the file, got {files:?}"
+        );
+
+        // Same for a surplus context-shaped line.
+        let diff = r#"diff --git a/src/x.rs b/src/x.rs
+--- a/src/x.rs
++++ b/src/x.rs
+@@ -1,1 +1,2 @@
+ ctx
++added
+ surplus
+"#;
+        let files = parse_diff(diff);
+        assert!(files.is_empty());
+    }
+
+    #[test]
+    fn boundary_finalizes_previous_file_before_headerless_section() {
+        // The second file section has no `---`/`+++` headers; its hunk must
+        // not be attributed to the previous, completed file.
+        let diff = r#"diff --git a/src/good.rs b/src/good.rs
+--- a/src/good.rs
++++ b/src/good.rs
+@@ -1,1 +1,2 @@
+ ctx
++added
+diff --git a/src/headerless.rs b/src/headerless.rs
+@@ -5,1 +5,2 @@
+ ctx
++stray
+"#;
+        let files = parse_diff(diff);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, PathBuf::from("src/good.rs"));
+        assert_eq!(
+            files[0].hunks,
+            vec![LineRange { start: 2, end: 2 }],
+            "headerless section must not leak ranges into the previous file"
+        );
+    }
+
+    #[test]
+    fn metadata_lines_after_completed_hunk_do_not_poison() {
+        // `index`/`\ No newline`-style lines legitimately appear outside
+        // hunks and must not invalidate an otherwise well-formed file.
+        let diff = "diff --git a/src/x.rs b/src/x.rs\n\
+index 1234567..abcdefg 100644\n\
+--- a/src/x.rs\n\
++++ b/src/x.rs\n\
+@@ -1 +1 @@\n\
+-old\n\
+\\ No newline at end of file\n\
++new\n\
+\\ No newline at end of file\n";
+        let files = parse_diff(diff);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].hunks, vec![LineRange { start: 1, end: 1 }]);
+    }
+
+    #[test]
+    fn drops_file_with_truncated_hunk_but_keeps_next_file() {
+        // First file's hunk declares 3 new lines but the next `diff --git`
+        // arrives after 1 — the file is dropped, the next file still parses.
+        let diff = r#"diff --git a/src/truncated.rs b/src/truncated.rs
+--- a/src/truncated.rs
++++ b/src/truncated.rs
+@@ -1,3 +1,3 @@
+ ctx
++only_one_addition
+diff --git a/src/ok.rs b/src/ok.rs
+--- a/src/ok.rs
++++ b/src/ok.rs
+@@ -1,1 +1,2 @@
+ ctx
++added
+"#;
+        let files = parse_diff(diff);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, PathBuf::from("src/ok.rs"));
+        assert_eq!(files[0].hunks, vec![LineRange { start: 2, end: 2 }]);
+    }
+
+    #[test]
+    fn drops_file_when_input_ends_mid_hunk() {
+        let diff = r#"diff --git a/src/main.rs b/src/main.rs
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -1,2 +1,3 @@
+ ctx
++added
+"#;
+        let files = parse_diff(diff);
+        assert!(files.is_empty(), "truncated final hunk must drop the file");
+    }
+
+    #[test]
+    fn rejects_hunk_header_with_oversized_numbers() {
+        let diff = r#"diff --git a/src/main.rs b/src/main.rs
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -1 +99999999999999999999999999 @@
++added
+"#;
+        let files = parse_diff(diff);
+        assert!(
+            files.is_empty(),
+            "numbers that do not fit usize must not wrap into valid ranges"
+        );
+    }
+
+    #[test]
+    fn rejects_unsafe_post_image_paths() {
+        for header in [
+            "+++ /etc/passwd",
+            "+++ b/../escape.rs",
+            "+++ b//double.rs",
+            "+++ b/./dot.rs",
+            "+++ b/a\\b.rs",
+            "+++ \"b/quoted\\ttab.rs\"",
+            "+++ ",
+        ] {
+            let diff = format!(
+                "diff --git a/x.rs b/x.rs\n--- a/x.rs\n{header}\n@@ -1,1 +1,2 @@\n ctx\n+added\n"
+            );
+            let files = parse_diff(&diff);
+            assert!(
+                files.is_empty(),
+                "unsafe post-image path {header:?} must drop the file, got {files:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn skips_deleted_file_via_dev_null_post_image() {
+        let diff = r#"diff --git a/removed.rs b/removed.rs
+deleted file mode 100644
+--- a/removed.rs
++++ /dev/null
+@@ -1,2 +1,0 @@
+-fn gone() {
+-}
+"#;
+        let files = parse_diff(diff);
+        assert!(files.is_empty());
+    }
+
+    #[test]
+    fn accepts_unicode_post_image_path() {
+        // With `core.quotePath=false`, git emits non-ASCII paths as raw UTF-8.
+        let diff = "diff --git a/src/\u{fc}n\u{ef}code.rs b/src/\u{fc}n\u{ef}code.rs\n\
+--- a/src/\u{fc}n\u{ef}code.rs\n\
++++ b/src/\u{fc}n\u{ef}code.rs\n\
+@@ -1,1 +1,2 @@\n\
+ ctx\n\
++added\n";
+        let files = parse_diff(diff);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, PathBuf::from("src/\u{fc}n\u{ef}code.rs"));
+        assert_eq!(files[0].hunks, vec![LineRange { start: 2, end: 2 }]);
+    }
+
+    #[test]
+    fn rename_uses_post_image_path() {
+        let diff = r#"diff --git a/old/name.rs b/new/name.rs
+similarity index 90%
+rename from old/name.rs
+rename to new/name.rs
+--- a/old/name.rs
++++ b/new/name.rs
+@@ -1,1 +1,2 @@
+ ctx
++added
+"#;
+        let files = parse_diff(diff);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, PathBuf::from("new/name.rs"));
+        assert_eq!(files[0].hunks, vec![LineRange { start: 2, end: 2 }]);
+    }
+
+    #[test]
+    fn crlf_hunk_content_tracks_lines_like_lf() {
+        // Diff of a CRLF file: content lines carry a trailing \r, which must
+        // not disturb added-line tracking.
+        let diff = "diff --git a/win.rs b/win.rs\n\
+--- a/win.rs\n\
++++ b/win.rs\n\
+@@ -1,2 +1,3 @@\n\
+ fn main() {\r\n\
++    println!(\"hi\");\r\n\
+ }\r\n";
+        let files = parse_diff(diff);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].hunks, vec![LineRange { start: 2, end: 2 }]);
+    }
+
+    #[test]
+    fn merges_overlapping_ranges_deterministically() {
+        // Two hunks whose new-side ranges overlap (git never emits this, but
+        // adversarial input must still normalize to sorted, non-overlapping
+        // ranges).
+        let diff = r#"diff --git a/x.rs b/x.rs
+--- a/x.rs
++++ b/x.rs
+@@ -1,1 +2,3 @@
+ ctx
++a
++b
+@@ -2,1 +4,3 @@
+ ctx
++c
++d
+"#;
+        let files = parse_diff(diff);
+        assert_eq!(files.len(), 1);
+        // First hunk adds {3,4}; second adds {5,6} — adjacent, not merged.
+        assert_eq!(
+            files[0].hunks,
+            vec![
+                LineRange { start: 3, end: 4 },
+                LineRange { start: 5, end: 6 }
+            ]
+        );
+
+        let overlapping = r#"diff --git a/x.rs b/x.rs
+--- a/x.rs
++++ b/x.rs
+@@ -1,1 +2,3 @@
+ ctx
++a
++b
+@@ -2,1 +3,2 @@
+ ctx
++c
+"#;
+        let files = parse_diff(overlapping);
+        assert_eq!(files.len(), 1);
+        // {3,4} and {4,4} overlap → merged.
+        assert_eq!(files[0].hunks, vec![LineRange { start: 3, end: 4 }]);
+    }
+
+    #[test]
+    fn parse_diff_output_invariants_hold_for_arbitrary_input() {
+        // Deterministic xorshift PRNG — no external dependency, stable in CI.
+        let mut state: u64 = 0x9E3779B97F4A7C15;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        const FRAGMENTS: &[&str] = &[
+            "diff --git a/x.rs b/x.rs",
+            "diff --git a/../evil.rs b/../evil.rs",
+            "--- a/x.rs",
+            "+++ b/x.rs",
+            "+++ b/sub dir/y.rs",
+            "+++ \"b/quoted.rs\"",
+            "+++ /dev/null",
+            "@@ -1,2 +1,2 @@",
+            "@@ -0,0 +1,3 @@",
+            "@@ -1 +1 @@ fn()",
+            "@@ garbage @@",
+            "@@ -1,5 +0,1 @@",
+            "+added",
+            "++double",
+            "-removed",
+            " context",
+            "",
+            "\\ No newline at end of file",
+            "garbage line",
+            "Binary files a/x and b/x differ",
+        ];
+
+        for _ in 0..2_000 {
+            let line_count = (next() % 24) as usize;
+            let mut input = String::new();
+            for _ in 0..line_count {
+                input.push_str(FRAGMENTS[(next() as usize) % FRAGMENTS.len()]);
+                input.push('\n');
+            }
+            for file in parse_diff(&input) {
+                let path = file.path.to_string_lossy();
+                assert!(
+                    crate::source_identity::is_normalized_project_relative_path(&path),
+                    "emitted path must be a safe project-relative path: {path:?}"
+                );
+                assert!(!file.hunks.is_empty(), "emitted file must have hunks");
+                for (i, range) in file.hunks.iter().enumerate() {
+                    assert!(range.start >= 1, "ranges are 1-based: {range:?}");
+                    assert!(range.start <= range.end, "range inverted: {range:?}");
+                    if let Some(prev) = i.checked_sub(1).map(|p| &file.hunks[p]) {
+                        assert!(
+                            prev.end < range.start,
+                            "ranges must be sorted and non-overlapping: {prev:?} then {range:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn collect_changed_since_preserves_unicode_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        let run = |args: &[&str]| {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .env("GIT_AUTHOR_NAME", "test")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "test")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+            out
+        };
+
+        run(&["init"]);
+        // Force quotePath on in the repo config — togi's diff invocation must
+        // still produce deterministic raw UTF-8 paths.
+        run(&["config", "core.quotePath", "true"]);
+        let name = "\u{fc}n\u{ef}code.rs";
+        std::fs::write(root.join(name), "fn a() {}\n").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-m", "initial"]);
+
+        let out = run(&["rev-parse", "HEAD"]);
+        let base = String::from_utf8(out.stdout).unwrap().trim().to_string();
+
+        std::fs::write(root.join(name), "fn a() {\n    1\n}\n").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-m", "edit"]);
+
+        let files = collect_changed_since(root, &base, true, &[]).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, PathBuf::from(name));
+        assert!(!files[0].hunks.is_empty());
     }
 
     #[test]

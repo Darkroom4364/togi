@@ -7,10 +7,10 @@ set -euo pipefail
 : "${GITHUB_PATH:?GITHUB_PATH is required}"
 : "${RUNNER_TEMP:?RUNNER_TEMP is required}"
 
-case "$(uname -m)" in
-  x86_64 | amd64) ;;
+case "$(uname -s)" in
+  Linux) ;;
   *)
-    echo "Released-binary smoke requires x86_64, got $(uname -m)" >&2
+    echo "Released-binary smoke requires Linux, got $(uname -s)" >&2
     exit 1
     ;;
 esac
@@ -20,29 +20,14 @@ if command -v togi >/dev/null 2>&1; then
   exit 1
 fi
 
-eval "$(TOGI_OS=Linux TOGI_ARCH=x86_64 bash "${GITHUB_WORKSPACE}/.github/scripts/resolve-togi-asset.sh")"
-if [ "$TOGI_ARCHIVE" != "togi-linux-x86_64.tar.gz" ] || [ "$TOGI_BINARY" != "togi" ]; then
-  echo "Unexpected Linux release asset: ${TOGI_ARCHIVE} (${TOGI_BINARY})" >&2
-  exit 1
-fi
+binding=$(bash "${GITHUB_WORKSPACE}/.github/scripts/assert-release-target.sh")
+eval "$binding"
 
-release_base="https://github.com/Darkroom4364/togi/releases/download/${TOGI_VERSION}"
-archive_path="${RUNNER_TEMP}/${TOGI_ARCHIVE}"
-checksums_path="${RUNNER_TEMP}/togi-release-checksums.txt"
-curl -fsSLo "$archive_path" "${release_base}/${TOGI_ARCHIVE}"
-curl -fsSLo "$checksums_path" "${release_base}/checksums.txt"
-expected_sha=$(awk -v file="$TOGI_ARCHIVE" '$2 == file || $2 == "./" file { print $1 }' "$checksums_path")
-if [ -z "$expected_sha" ]; then
-  echo "No checksum found for ${TOGI_ARCHIVE}" >&2
-  exit 1
-fi
-actual_sha=$(sha256sum "$archive_path" | awk '{print $1}')
-if [ "$actual_sha" != "$expected_sha" ]; then
-  echo "Checksum mismatch for ${TOGI_ARCHIVE}" >&2
-  exit 1
-fi
+fetched=$(TOGI_VERSION="$TOGI_VERSION" TOGI_ARCHIVE="$TOGI_ARCHIVE" \
+  bash "${GITHUB_WORKSPACE}/.github/scripts/fetch-togi-release-asset.sh")
+eval "$fetched"
 
-TOGI_ARCHIVE="$TOGI_ARCHIVE" TOGI_BINARY="$TOGI_BINARY" TOGI_ARCHIVE_PATH="$archive_path" \
+TOGI_ARCHIVE="$TOGI_ARCHIVE" TOGI_BINARY="$TOGI_BINARY" TOGI_ARCHIVE_PATH="$TOGI_ARCHIVE_PATH" \
   bash "${GITHUB_WORKSPACE}/.github/scripts/install-togi-archive.sh"
 install_dir="${RUNNER_TEMP}/togi-bin"
 export PATH="${install_dir}:${PATH}"

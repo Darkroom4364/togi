@@ -1067,6 +1067,59 @@ fn check_format_json_dry_run_outputs_a_single_preview_document() {
 }
 
 #[test]
+fn check_json_dry_run_ignores_non_utf8_diff_payload() {
+    let dir = setup_git_repo();
+    let payload = dir.path().join("payload.txt");
+    fs::write(&payload, b"before\n").unwrap();
+    assert_command_success(
+        std::process::Command::new("git")
+            .args(["add", "payload.txt"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap(),
+        "stage payload",
+    );
+    assert_command_success(
+        std::process::Command::new("git")
+            .args(["commit", "-m", "add payload"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap(),
+        "commit payload",
+    );
+    fs::write(payload, b"\xff\n").unwrap();
+
+    let output = togi()
+        .args([
+            "check",
+            "--base",
+            "HEAD",
+            "--format",
+            "json",
+            "--dry-run",
+            "--test-cmd",
+            "true",
+        ])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let mutations = value["mutations"].as_array().unwrap();
+    assert!(!mutations.is_empty());
+    assert!(
+        mutations
+            .iter()
+            .all(|mutation| mutation["file"] == "main.go")
+    );
+}
+
+#[test]
 fn check_format_json_no_mutations_outputs_an_empty_report() {
     let dir = setup_git_repo();
     assert_command_success(
@@ -3131,13 +3184,12 @@ fn read_log(path: &Path) -> String {
 }
 
 #[test]
-fn check_help_lists_test_selection_confirmation_flags() {
+fn check_help_lists_test_selection_flags() {
     togi()
         .args(["check", "--help"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("--test-selection-file"))
-        .stdout(predicate::str::contains("--confirm-survivors"));
+        .stdout(predicate::str::contains("--test-selection-file"));
 }
 
 fn jq_available() -> bool {
@@ -3903,7 +3955,8 @@ fn before_first_run_documents_zero_config_contract() {
         "The [compatibility contract](docs/COMPATIBILITY.md) contains the supported marker defaults.",
         "When no supported marker is present, togi's best-effort fallback is `make test`, which requires a `Makefile` with a `test` target.",
         "run `togi init` and review or edit the generated `togi.toml`, configure `togi.toml` directly, or use one-shot `--test-cmd`.",
-        "The compatibility contract remains the authoritative support matrix: Tier 1 is end-to-end CI-verified, Tier 2 is build- and unit-test-verified only, and not supported has no CI guarantee.",
+        "The compatibility contract remains the authoritative support matrix: Tier 1 is end-to-end CI-verified, Tier 2 is build- and unit-test-verified, and not supported has no CI guarantee.",
+        "the Tier 1 Linux x86_64 archive passes checksum, install, version, and a real Go mutation smoke, while the Tier 2 macOS arm64 and Windows x86_64 archives pass checksum, install, and version smoke.",
         "Linux and Windows ARM64 (aarch64) are not supported.",
     ] {
         assert!(
@@ -3929,12 +3982,23 @@ fn github_action_asset_resolver_matches_release_assets() {
         action_asset("togi-macos-arm64.tar.gz", "togi")
     );
     assert_eq!(
-        resolve_action_asset("Darwin", "x86_64"),
-        action_asset("togi-macos-x86_64.tar.gz", "togi")
-    );
-    assert_eq!(
         resolve_action_asset("MINGW64_NT-10.0", "AMD64"),
         action_asset("togi-windows-x86_64.zip", "togi.exe")
+    );
+
+    // macOS x86_64 (Intel) is no longer shipped: the resolver must reject it
+    // explicitly instead of resolving a removed asset.
+    let output = run_action_resolver("Darwin", "x86_64");
+    assert!(
+        !output.status.success(),
+        "resolver must reject macOS x86_64\nstdout:\n{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("unsupported release target: macos-x86_64"),
+        "resolver rejection must name the unsupported target\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
     );
 }
 
@@ -3952,6 +4016,1370 @@ fn github_action_install_steps_place_binary_and_update_github_path() {
     );
 }
 
+#[test]
+fn release_verification_workflow_uses_triggering_tag() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let ci = fs::read_to_string(root.join(".github/workflows/ci.yml")).unwrap();
+    assert!(
+        !ci.contains("TOGI_VERSION"),
+        "ci.yml must not pin a released-binary smoke version"
+    );
+
+    let release = fs::read_to_string(root.join(".github/workflows/release.yml")).unwrap();
+    for expected in [
+        "TOGI_VERSION: ${{ github.ref_name }}",
+        "TOGI_WORKFLOW_HEAD: ${{ github.sha }}",
+        "needs: release",
+        "run-released-binary-smoke.sh",
+        "run-released-binary-install-smoke.sh",
+        "verify-release-identity.sh",
+        "TOGI_EXPECTED_ARCH: ${{ matrix.arch }}",
+        "TOGI_EXPECTED_ARCHIVE: ${{ matrix.archive }}",
+        "TOGI_EXPECTED_BINARY: ${{ matrix.binary }}",
+    ] {
+        assert!(
+            release.contains(expected),
+            "release.yml is missing `{expected}`"
+        );
+    }
+    assert!(
+        !release.contains("v0.4.1"),
+        "release.yml must not pin a stale release version"
+    );
+}
+
+#[test]
+fn verify_release_matrix_binds_exact_runner_targets() {
+    if !bash_available() {
+        eprintln!("skipping verify-release matrix test because bash is unavailable");
+        return;
+    }
+
+    let release = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join(".github/workflows/release.yml"),
+    )
+    .unwrap()
+    .replace("\r\n", "\n");
+    let section_start = release
+        .find("\n  verify-release:\n")
+        .expect("release.yml must contain a verify-release job");
+    let section = &release[section_start..];
+
+    // Each leg's expected archive/binary must equal what the asset resolver
+    // selects for that platform, so a moving runner label cannot verify the
+    // wrong archive under the right name.
+    for (asset, os, arch, expected) in [
+        (
+            "linux-x86_64",
+            "ubuntu-24.04",
+            "x86_64",
+            resolve_action_asset("Linux", "x86_64"),
+        ),
+        (
+            "macos-arm64",
+            "macos-15",
+            "arm64",
+            resolve_action_asset("Darwin", "arm64"),
+        ),
+        (
+            "windows-x86_64",
+            "windows-2022",
+            "x86_64",
+            resolve_action_asset("MINGW64_NT-10.0", "AMD64"),
+        ),
+    ] {
+        for expected_line in [
+            format!("- asset: {asset}"),
+            format!("os: {os}"),
+            format!("arch: {arch}"),
+            format!("archive: {}", expected.archive),
+            format!("binary: {}", expected.binary),
+        ] {
+            assert!(
+                section.contains(&expected_line),
+                "verify-release matrix is missing `{expected_line}`"
+            );
+        }
+    }
+    assert!(
+        !section.contains("macos-latest"),
+        "verify-release must pin an explicit arm64 macOS runner, not macos-latest"
+    );
+}
+
+// Semantic support-contract validation (#485): the documented support table
+// in docs/COMPATIBILITY.md, the CI/release workflow matrices, the per-tier
+// evidence steps, and the asset resolver must all describe exactly the same
+// target set. Structured YAML/table parsing (not prose substring matching)
+// rejects an extra release target, a wrong runner arch, a Tier-1 row without
+// its required evidence, or a Tier-2 row without its prescribed evidence.
+#[derive(Debug, PartialEq, Eq, Clone)]
+struct SupportRow {
+    os: &'static str,
+    arch: &'static str,
+    tier: u32,
+    target: &'static str,
+    asset: &'static str,
+    archive: &'static str,
+    binary: &'static str,
+    uname_s: &'static str,
+    uname_m: &'static str,
+}
+
+// The canonical support matrix the v1 decision pins. The documented support
+// table must describe exactly this set — nothing aspirational, nothing
+// removed.
+const SUPPORT_CONTRACT: &[SupportRow] = &[
+    SupportRow {
+        os: "Linux",
+        arch: "x86_64",
+        tier: 1,
+        target: "x86_64-unknown-linux-gnu",
+        asset: "linux-x86_64",
+        archive: "togi-linux-x86_64.tar.gz",
+        binary: "togi",
+        uname_s: "Linux",
+        uname_m: "x86_64",
+    },
+    SupportRow {
+        os: "macOS",
+        arch: "arm64",
+        tier: 2,
+        target: "aarch64-apple-darwin",
+        asset: "macos-arm64",
+        archive: "togi-macos-arm64.tar.gz",
+        binary: "togi",
+        uname_s: "Darwin",
+        uname_m: "arm64",
+    },
+    SupportRow {
+        os: "Windows",
+        arch: "x86_64",
+        tier: 2,
+        target: "x86_64-pc-windows-msvc",
+        asset: "windows-x86_64",
+        archive: "togi-windows-x86_64.zip",
+        binary: "togi.exe",
+        uname_s: "MINGW64_NT-10.0",
+        uname_m: "AMD64",
+    },
+];
+
+// Runner-label -> required host architecture. A runner image that changes
+// architecture must fail the contract here (and at runtime via the workflow's
+// own assertion step), never silently prove the wrong target.
+const RUNNER_ARCH: &[(&str, &str)] = &[
+    ("ubuntu-24.04", "x86_64"),
+    ("macos-15", "arm64"),
+    ("windows-2022", "x86_64"),
+];
+
+fn runner_arch(label: &str) -> Option<&'static str> {
+    RUNNER_ARCH
+        .iter()
+        .find(|(runner, _)| *runner == label)
+        .map(|(_, arch)| *arch)
+}
+
+fn documented_support_rows() -> Vec<(String, String, u32)> {
+    let doc =
+        fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/COMPATIBILITY.md"))
+            .unwrap()
+            .replace("\r\n", "\n");
+    let section_start = doc
+        .find("## Operating System and Architecture Matrix\n")
+        .expect("COMPATIBILITY must contain the OS/architecture matrix section");
+    let section = &doc[section_start..];
+    let mut rows = Vec::new();
+    let mut in_table = false;
+    for line in section.lines().skip(1) {
+        if in_table {
+            if !line.starts_with('|') {
+                break;
+            }
+            if line.contains("---") || line.contains("| OS |") {
+                continue;
+            }
+            let cells: Vec<&str> = line.split('|').map(str::trim).collect();
+            // Leading/trailing '|' produce empty edge cells.
+            let [_, os, arch, tier, ..] = cells.as_slice() else {
+                panic!("malformed support table row: {line}");
+            };
+            let tier = tier
+                .strip_prefix("Tier ")
+                .and_then(|value| value.parse::<u32>().ok())
+                .unwrap_or_else(|| panic!("unparseable tier in row: {line}"));
+            rows.push((os.to_string(), arch.to_string(), tier));
+        } else if line.starts_with("| OS | Arch | Tier |") {
+            in_table = true;
+        }
+    }
+    assert!(!rows.is_empty(), "support table has no rows");
+    rows
+}
+
+fn matrix_include(workflow: &serde_yaml::Value, job: &str) -> Vec<serde_yaml::Value> {
+    workflow
+        .get("jobs")
+        .and_then(|jobs| jobs.get(job))
+        .unwrap_or_else(|| panic!("workflow is missing job `{job}`"))
+        .get("strategy")
+        .and_then(|strategy| strategy.get("matrix"))
+        .and_then(|matrix| matrix.get("include"))
+        .and_then(|include| include.as_sequence())
+        .unwrap_or_else(|| panic!("job `{job}` must use an explicit matrix include list"))
+        .clone()
+}
+
+fn matrix_field<'a>(leg: &'a serde_yaml::Value, job: &str, field: &str) -> &'a str {
+    leg.get(field)
+        .and_then(|value| value.as_str())
+        .unwrap_or_else(|| panic!("job `{job}` leg is missing `{field}`: {leg:?}"))
+}
+
+fn matrix_tier(leg: &serde_yaml::Value, job: &str) -> u32 {
+    let value = leg
+        .get("tier")
+        .unwrap_or_else(|| panic!("job `{job}` leg is missing `tier`: {leg:?}"));
+    value
+        .as_u64()
+        .or_else(|| value.as_str().and_then(|tier| tier.parse::<u64>().ok()))
+        .unwrap_or_else(|| panic!("job `{job}` leg has a non-numeric tier: {leg:?}")) as u32
+}
+
+fn job_steps<'a>(workflow: &'a serde_yaml::Value, job: &str) -> &'a [serde_yaml::Value] {
+    workflow
+        .get("jobs")
+        .and_then(|jobs| jobs.get(job))
+        .and_then(|job| job.get("steps"))
+        .and_then(|steps| steps.as_sequence())
+        .unwrap_or_else(|| panic!("job `{job}` must have steps"))
+}
+
+fn step_invokes_exactly(step: &serde_yaml::Value, invocation: &str) -> bool {
+    step.get("run")
+        .and_then(|run| run.as_str())
+        .is_some_and(|run| run.trim() == invocation)
+}
+
+fn step_gated_on_tier(step: &serde_yaml::Value, tier: u32) -> bool {
+    step.get("if")
+        .and_then(|condition| condition.as_str())
+        .is_some_and(|condition| {
+            condition == format!("${{{{ matrix.tier == {tier} }}}}")
+                || condition == format!("matrix.tier == {tier}")
+        })
+}
+
+// Requires an exact `assert-native-target.sh` invocation whose environment
+// binds the required target/arch exactly — a lookalike inline `echo` or a
+// substring match must not satisfy the contract.
+fn assert_native_target_step(
+    steps: &[serde_yaml::Value],
+    job: &str,
+    expected_target: &str,
+    expected_arch: &str,
+) {
+    let step = steps
+        .iter()
+        .find(|step| step_invokes_exactly(step, "bash ./.github/scripts/assert-native-target.sh"))
+        .unwrap_or_else(|| panic!("job `{job}` must invoke assert-native-target.sh exactly"));
+    for (key, expected) in [
+        ("TOGI_EXPECTED_TARGET", expected_target),
+        ("TOGI_EXPECTED_ARCH", expected_arch),
+    ] {
+        let actual = step
+            .get("env")
+            .and_then(|env| env.get(key))
+            .and_then(|value| value.as_str())
+            .unwrap_or_else(|| panic!("job `{job}` assertion step is missing env `{key}`"));
+        assert_eq!(
+            actual, expected,
+            "job `{job}` assertion step must bind {key} to `{expected}`"
+        );
+    }
+}
+
+#[test]
+fn support_contract_binds_docs_workflows_and_resolver() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let ci: serde_yaml::Value =
+        serde_yaml::from_str(&fs::read_to_string(root.join(".github/workflows/ci.yml")).unwrap())
+            .expect("ci.yml must parse as YAML");
+    let release: serde_yaml::Value = serde_yaml::from_str(
+        &fs::read_to_string(root.join(".github/workflows/release.yml")).unwrap(),
+    )
+    .expect("release.yml must parse as YAML");
+
+    // 1. The documented support table must describe exactly the canonical
+    //    target set — no removed target lingering, no aspirational row.
+    let documented = documented_support_rows();
+    let expected: Vec<(String, String, u32)> = SUPPORT_CONTRACT
+        .iter()
+        .map(|row| (row.os.to_string(), row.arch.to_string(), row.tier))
+        .collect();
+    assert_eq!(
+        documented, expected,
+        "documented support table must equal the canonical support set"
+    );
+
+    // 2. Native build/unit matrices (ci.yml and release.yml `check` jobs):
+    //    exactly the canonical targets, on runners whose architecture matches
+    //    the target, each leg named by tier/target and guarded by an exact
+    //    fail-closed native target/arch assertion.
+    for (workflow, workflow_name) in [(&ci, "ci.yml"), (&release, "release.yml")] {
+        let check_legs = matrix_include(workflow, "check");
+        assert_eq!(
+            check_legs.len(),
+            SUPPORT_CONTRACT.len(),
+            "{workflow_name} check matrix must cover exactly the supported targets"
+        );
+        for row in SUPPORT_CONTRACT {
+            let leg = check_legs
+                .iter()
+                .find(|leg| matrix_field(leg, "check", "target") == row.target)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{workflow_name} check matrix is missing target {}",
+                        row.target
+                    )
+                });
+            let os = matrix_field(leg, "check", "os");
+            let arch = matrix_field(leg, "check", "arch");
+            assert_eq!(
+                runner_arch(os),
+                Some(row.arch),
+                "{workflow_name} check runner `{os}` has the wrong architecture for {}",
+                row.target
+            );
+            assert_eq!(arch, row.arch, "check leg {} arch mismatch", row.target);
+            assert_eq!(
+                matrix_tier(leg, "check"),
+                row.tier,
+                "check leg {} must be named by tier {}",
+                row.target,
+                row.tier
+            );
+        }
+        assert_native_target_step(
+            job_steps(workflow, "check"),
+            "check",
+            "${{ matrix.target }}",
+            "${{ matrix.arch }}",
+        );
+    }
+
+    // 3. Release build matrix: exactly the canonical targets/assets — an
+    //    extra release target (e.g. a re-added macOS x86_64) fails here.
+    let build_legs = matrix_include(&release, "build");
+    assert_eq!(
+        build_legs.len(),
+        SUPPORT_CONTRACT.len(),
+        "release build matrix must ship exactly the supported targets"
+    );
+    for row in SUPPORT_CONTRACT {
+        let leg = build_legs
+            .iter()
+            .find(|leg| matrix_field(leg, "build", "target") == row.target)
+            .unwrap_or_else(|| panic!("release build matrix is missing target {}", row.target));
+        let os = matrix_field(leg, "build", "os");
+        assert_eq!(
+            runner_arch(os),
+            Some(row.arch),
+            "release build runner `{os}` has the wrong architecture for {}",
+            row.target
+        );
+        assert_eq!(
+            matrix_field(leg, "build", "arch"),
+            row.arch,
+            "release build leg {} arch mismatch",
+            row.target
+        );
+        assert_eq!(
+            matrix_field(leg, "build", "name"),
+            format!("togi-{}", row.asset),
+            "release build leg {} must package the documented asset",
+            row.target
+        );
+    }
+    assert_native_target_step(
+        job_steps(&release, "build"),
+        "build",
+        "${{ matrix.target }}",
+        "${{ matrix.arch }}",
+    );
+
+    // 4. Post-publication verification: every canonical asset has a
+    //    target-bound verify leg, and each tier gets its prescribed evidence.
+    let verify_legs = matrix_include(&release, "verify-release");
+    assert_eq!(
+        verify_legs.len(),
+        SUPPORT_CONTRACT.len(),
+        "verify-release matrix must verify exactly the shipped assets"
+    );
+    for row in SUPPORT_CONTRACT {
+        let leg = verify_legs
+            .iter()
+            .find(|leg| matrix_field(leg, "verify-release", "asset") == row.asset)
+            .unwrap_or_else(|| panic!("verify-release matrix is missing asset {}", row.asset));
+        let os = matrix_field(leg, "verify-release", "os");
+        assert_eq!(
+            runner_arch(os),
+            Some(row.arch),
+            "verify-release runner `{os}` has the wrong architecture for {}",
+            row.asset
+        );
+        assert_eq!(matrix_field(leg, "verify-release", "arch"), row.arch);
+        assert_eq!(matrix_field(leg, "verify-release", "archive"), row.archive);
+        assert_eq!(matrix_field(leg, "verify-release", "binary"), row.binary);
+        assert_eq!(
+            matrix_tier(leg, "verify-release"),
+            row.tier,
+            "verify-release leg {} must carry its documented tier",
+            row.asset
+        );
+    }
+    let verify_steps = job_steps(&release, "verify-release");
+    for tier in [1u32, 2] {
+        let (script, evidence) = if tier == 1 {
+            (
+                "run-released-binary-smoke.sh",
+                "Tier 1 must run the released-binary mutation smoke",
+            )
+        } else {
+            (
+                "run-released-binary-install-smoke.sh",
+                "Tier 2 must run the released-archive install/version smoke",
+            )
+        };
+        assert!(
+            verify_steps.iter().any(|step| {
+                step_invokes_exactly(step, &format!("bash ./.github/scripts/{script}"))
+                    && step_gated_on_tier(step, tier)
+            }),
+            "{evidence} (an exact `{script}` step gated on matrix.tier == {tier})"
+        );
+    }
+    // Tier 1 keeps its build/toolchain/full-language evidence, bound to the
+    // Linux x86_64 Tier-1 row: pinned runner, fail-closed native target/arch
+    // assertion, and the exact ignored-test invocation.
+    let tier1 = SUPPORT_CONTRACT
+        .iter()
+        .find(|row| row.tier == 1)
+        .expect("support contract must contain a Tier 1 row");
+    for (workflow, workflow_name) in [(&ci, "ci.yml"), (&release, "release.yml")] {
+        for job in ["integration", "dogfood", "msrv"] {
+            let runs_on = workflow
+                .get("jobs")
+                .and_then(|jobs| jobs.get(job))
+                .and_then(|job| job.get("runs-on"))
+                .and_then(|runs_on| runs_on.as_str())
+                .unwrap_or_else(|| panic!("{workflow_name} job `{job}` must pin runs-on"));
+            assert_eq!(
+                runner_arch(runs_on),
+                Some(tier1.arch),
+                "{workflow_name} job `{job}` runner `{runs_on}` has the wrong architecture \
+                 for the {} Tier 1 row",
+                tier1.target
+            );
+            assert_ne!(
+                runs_on, "ubuntu-latest",
+                "{workflow_name} job `{job}` must not run Tier 1 evidence on a moving alias"
+            );
+            assert_native_target_step(job_steps(workflow, job), job, tier1.target, tier1.arch);
+        }
+    }
+    let integration_steps = job_steps(&ci, "integration");
+    assert!(
+        integration_steps.iter().any(|step| {
+            step.get("run")
+                .and_then(|run| run.as_str())
+                .is_some_and(|run| run.trim() == "cargo test --locked -- --ignored")
+        }),
+        "Tier 1 must retain the full ignored integration-test evidence"
+    );
+
+    // 5. The asset resolver must resolve each canonical target to its
+    //    documented archive and reject macOS x86_64 explicitly.
+    if bash_available() {
+        for row in SUPPORT_CONTRACT {
+            assert_eq!(
+                resolve_action_asset(row.uname_s, row.uname_m),
+                action_asset(row.archive, row.binary),
+                "resolver must bind {} to {}",
+                row.asset,
+                row.archive
+            );
+        }
+        let output = run_action_resolver("Darwin", "x86_64");
+        assert!(
+            !output.status.success(),
+            "resolver must reject the removed macOS x86_64 target"
+        );
+    }
+
+    // 6. No workflow may reference the removed macOS x86_64 target or fall
+    //    back to moving OS aliases in the native matrices.
+    let ci_text = fs::read_to_string(root.join(".github/workflows/ci.yml")).unwrap();
+    let release_text = fs::read_to_string(root.join(".github/workflows/release.yml")).unwrap();
+    for stale in ["x86_64-apple-darwin", "macos-x86_64", "togi-macos-x86_64"] {
+        assert!(
+            !release_text.contains(stale) && !ci_text.contains(stale),
+            "workflows must not reference removed target `{stale}`"
+        );
+    }
+    for (workflow, job) in [
+        (&ci, "check"),
+        (&release, "check"),
+        (&release, "build"),
+        (&release, "verify-release"),
+    ] {
+        for leg in matrix_include(workflow, job) {
+            let os = matrix_field(&leg, job, "os");
+            assert!(
+                !["ubuntu-latest", "macos-latest", "windows-latest"].contains(&os),
+                "{job} must pin an explicit runner, not moving alias `{os}`"
+            );
+        }
+    }
+}
+
+#[test]
+fn pr_loop_benchmark_workflow_collects_observational_evidence() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let ci: serde_yaml::Value =
+        serde_yaml::from_str(&fs::read_to_string(root.join(".github/workflows/ci.yml")).unwrap())
+            .expect("ci.yml must parse as YAML");
+    let job = ci
+        .get("jobs")
+        .and_then(|jobs| jobs.get("pr-loop-benchmarks"))
+        .expect("ci.yml must define an isolated pr-loop-benchmarks job");
+    assert_eq!(
+        job.get("runs-on").and_then(|value| value.as_str()),
+        Some("ubuntu-24.04")
+    );
+    assert_eq!(
+        job.get("permissions")
+            .and_then(|permissions| permissions.get("contents"))
+            .and_then(|value| value.as_str()),
+        Some("read")
+    );
+    assert!(
+        job.get("continue-on-error").is_none(),
+        "benchmark evidence must not mask job failure"
+    );
+    let steps = job_steps(&ci, "pr-loop-benchmarks");
+    let checkout = steps
+        .iter()
+        .find(|step| {
+            step.get("uses").and_then(|value| value.as_str()) == Some("actions/checkout@v7")
+        })
+        .expect("benchmark job must checkout");
+    assert_eq!(
+        checkout
+            .get("with")
+            .and_then(|with| with.get("persist-credentials"))
+            .and_then(|value| value.as_bool()),
+        Some(false),
+        "benchmark checkout must not retain credentials"
+    );
+    assert_native_target_step(
+        steps,
+        "pr-loop-benchmarks",
+        "x86_64-unknown-linux-gnu",
+        "x86_64",
+    );
+    for (action, toolchain) in [
+        (
+            "dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8",
+            Some("stable"),
+        ),
+        ("actions/setup-go@v7", Some("stable")),
+    ] {
+        let step = steps
+            .iter()
+            .find(|step| step.get("uses").and_then(|value| value.as_str()) == Some(action))
+            .unwrap_or_else(|| panic!("benchmark job must use `{action}`"));
+        assert_eq!(
+            step.get("with")
+                .and_then(|with| with.get(if action.starts_with("dtolnay") {
+                    "toolchain"
+                } else {
+                    "go-version"
+                }))
+                .and_then(|value| value.as_str()),
+            toolchain
+        );
+    }
+    let cache = steps
+        .iter()
+        .find(|step| {
+            step.get("uses").and_then(|value| value.as_str())
+                == Some("Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32")
+        })
+        .expect("benchmark job must use the project Rust cache");
+    assert_eq!(
+        cache
+            .get("with")
+            .and_then(|with| with.get("cache-bin"))
+            .and_then(|value| value.as_bool()),
+        Some(false)
+    );
+
+    let prerequisite = steps
+        .iter()
+        .find(|step| {
+            step.get("name").and_then(|value| value.as_str())
+                == Some("Check benchmark prerequisites")
+        })
+        .expect("benchmark job must check harness prerequisites");
+    let prerequisite_run = prerequisite
+        .get("run")
+        .and_then(|value| value.as_str())
+        .unwrap();
+    for tool in ["bash", "git", "go", "jq", "sed", "sha256sum", "python3"] {
+        assert!(
+            prerequisite_run.contains(tool),
+            "prerequisite step must check `{tool}`"
+        );
+    }
+    assert!(prerequisite_run.contains("apt-get install --yes --no-install-recommends"));
+
+    assert!(
+        steps.iter().any(|step| {
+            step.get("run").and_then(|value| value.as_str())
+                == Some("cargo build --locked --release")
+        }),
+        "benchmark job must build the release binary"
+    );
+    let harness = steps
+        .iter()
+        .find(|step| {
+            step.get("name").and_then(|value| value.as_str())
+                == Some("Run PR-loop benchmark harness")
+        })
+        .expect("benchmark job must invoke the real harness");
+    assert_eq!(
+        harness
+            .get("env")
+            .and_then(|env| env.get("TOGI_BIN"))
+            .and_then(|value| value.as_str()),
+        Some("${{ github.workspace }}/target/release/togi")
+    );
+    assert_eq!(
+        harness
+            .get("env")
+            .and_then(|env| env.get("BENCHMARK_OUTPUT"))
+            .and_then(|value| value.as_str()),
+        Some("${{ runner.temp }}/togi-pr-loop-benchmarks")
+    );
+    assert_eq!(
+        harness
+            .get("run")
+            .and_then(|value| value.as_str())
+            .map(str::trim),
+        Some("bash benchmarks/pr-loop/run-pr-loop-benchmarks.sh --output \"$BENCHMARK_OUTPUT\"")
+    );
+
+    let upload = steps
+        .iter()
+        .find(|step| {
+            step.get("uses").and_then(|value| value.as_str())
+                == Some("actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02")
+        })
+        .expect("benchmark job must upload evidence with a pinned action");
+    assert_eq!(
+        upload.get("if").and_then(|value| value.as_str()),
+        Some("${{ always() }}")
+    );
+    assert_eq!(
+        upload
+            .get("with")
+            .and_then(|with| with.get("path"))
+            .and_then(|value| value.as_str()),
+        Some("${{ runner.temp }}/togi-pr-loop-benchmarks")
+    );
+    assert_eq!(
+        upload
+            .get("with")
+            .and_then(|with| with.get("if-no-files-found"))
+            .and_then(|value| value.as_str()),
+        Some("warn")
+    );
+    assert_eq!(
+        upload
+            .get("with")
+            .and_then(|with| with.get("name"))
+            .and_then(|value| value.as_str()),
+        Some("pr-loop-benchmarks-${{ github.run_id }}-${{ github.run_attempt }}")
+    );
+
+    let serialized = serde_yaml::to_string(job).unwrap();
+    for forbidden in [
+        "continue-on-error",
+        "|| true",
+        "baseline",
+        "threshold",
+        "score",
+        "gate",
+    ] {
+        assert!(
+            !serialized.contains(forbidden),
+            "observational benchmark job must not add `{forbidden}`"
+        );
+    }
+    let compatibility = fs::read_to_string(root.join("docs/COMPATIBILITY.md"))
+        .unwrap()
+        .replace("\r\n", "\n");
+    assert!(
+        compatibility.contains("PR-loop Benchmark Evidence")
+            && compatibility.contains("Linux x86_64 only")
+            && compatibility.contains("Timing is observational only")
+            && compatibility.contains("there is no\n  current baseline, threshold, or merge gate"),
+        "compatibility contract must describe Linux-only observational benchmark evidence"
+    );
+}
+fn write_fake_rustc(bin_dir: &Path, host: &str) {
+    let fake_rustc = bin_dir.join("rustc");
+    fs::write(
+        &fake_rustc,
+        format!(
+            "#!/usr/bin/env bash\nprintf 'rustc 1.90.0 (fake 2026-01-01)\nbinary: rustc\nhost: {host}\nrelease: 1.90.0\nLLVM version: 20.1.0\n'\n"
+        ),
+    )
+    .unwrap();
+    chmod_executable(&fake_rustc);
+}
+
+fn run_assert_native_target(bin_dir: &Path, env: &[(&str, &str)]) -> std::process::Output {
+    let mut command = std::process::Command::new("bash");
+    command
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join(".github/scripts/assert-native-target.sh"))
+        .env("PATH", format!("{}:/usr/bin:/bin", bin_dir.display()))
+        .env_remove("TOGI_EXPECTED_TARGET")
+        .env_remove("TOGI_EXPECTED_ARCH");
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    command.output().unwrap()
+}
+
+// Behavioral coverage for the native target/arch assertion: mocked rustc and
+// uname prove the script executes both probes, normalizes uname output, and
+// fails closed with a clear diagnostic on each mismatch or missing binding.
+#[test]
+fn assert_native_target_matches_mismatches_and_requires_env() {
+    if !bash_available() {
+        eprintln!("skipping native target assertion test because bash is unavailable");
+        return;
+    }
+    let dir = TempDir::new().unwrap();
+    let bin_dir = dir.path().join("fake-bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+
+    // Positive: a matching native Linux x86_64 runner passes.
+    write_fake_rustc(&bin_dir, "x86_64-unknown-linux-gnu");
+    write_fake_uname(&bin_dir, "Linux", "x86_64");
+    let output = run_assert_native_target(
+        &bin_dir,
+        &[
+            ("TOGI_EXPECTED_TARGET", "x86_64-unknown-linux-gnu"),
+            ("TOGI_EXPECTED_ARCH", "x86_64"),
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "native target assertion failed on a matching runner\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Positive: Darwin arm64 uname output is accepted for the arm64 target.
+    write_fake_rustc(&bin_dir, "aarch64-apple-darwin");
+    write_fake_uname(&bin_dir, "Darwin", "arm64");
+    let output = run_assert_native_target(
+        &bin_dir,
+        &[
+            ("TOGI_EXPECTED_TARGET", "aarch64-apple-darwin"),
+            ("TOGI_EXPECTED_ARCH", "arm64"),
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "native target assertion failed on a matching arm64 macOS runner\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Target mismatch: a different Rust host must fail closed.
+    let output = run_assert_native_target(
+        &bin_dir,
+        &[
+            ("TOGI_EXPECTED_TARGET", "x86_64-unknown-linux-gnu"),
+            ("TOGI_EXPECTED_ARCH", "x86_64"),
+        ],
+    );
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains(
+            "Rust host aarch64-apple-darwin does not match required target \
+             x86_64-unknown-linux-gnu"
+        ),
+        "stderr must name the host/target mismatch\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Arch mismatch: the right host triple with the wrong uname architecture
+    // (aarch64 normalized to arm64) must fail closed.
+    write_fake_rustc(&bin_dir, "x86_64-unknown-linux-gnu");
+    write_fake_uname(&bin_dir, "Linux", "aarch64");
+    let output = run_assert_native_target(
+        &bin_dir,
+        &[
+            ("TOGI_EXPECTED_TARGET", "x86_64-unknown-linux-gnu"),
+            ("TOGI_EXPECTED_ARCH", "x86_64"),
+        ],
+    );
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("Runner architecture arm64 does not match expected x86_64"),
+        "stderr must name the normalized arch mismatch\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Missing env: each required binding fails closed with a clear error.
+    let output = run_assert_native_target(&bin_dir, &[("TOGI_EXPECTED_ARCH", "x86_64")]);
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("TOGI_EXPECTED_TARGET is required"),
+        "stderr must name the missing target binding\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let output = run_assert_native_target(
+        &bin_dir,
+        &[("TOGI_EXPECTED_TARGET", "x86_64-unknown-linux-gnu")],
+    );
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("TOGI_EXPECTED_ARCH is required"),
+        "stderr must name the missing arch binding\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn release_asset_fetch_verifies_checksum_manifest() {
+    if !bash_available() {
+        eprintln!("skipping release asset fetch test because bash is unavailable");
+        return;
+    }
+
+    let archive = "togi-linux-x86_64.tar.gz";
+    let archive_bytes = b"fake togi release archive payload";
+    let sha = sha256_hex_bytes(archive_bytes);
+    let dir = setup_fake_release(archive, archive_bytes, &format!("{sha}  ./{archive}\n"));
+
+    let output = run_release_asset_fetch(&dir, "v9.9.9", archive);
+    assert!(
+        output.status.success(),
+        "release asset fetch failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let path_line = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("TOGI_ARCHIVE_PATH="))
+        .expect("fetch did not emit TOGI_ARCHIVE_PATH");
+    let fetched = dir.path().join("out").join(archive);
+    assert_eq!(Path::new(path_line), fetched.as_path());
+    assert_eq!(fs::read(&fetched).unwrap(), archive_bytes);
+}
+
+#[test]
+fn release_asset_fetch_rejects_missing_duplicate_and_mismatched_checksums() {
+    if !bash_available() {
+        eprintln!("skipping release asset fetch test because bash is unavailable");
+        return;
+    }
+
+    let archive = "togi-linux-x86_64.tar.gz";
+    let archive_bytes = b"fake togi release archive payload";
+    let sha = sha256_hex_bytes(archive_bytes);
+
+    for (checksums, expected_error) in [
+        // Renamed asset: the manifest only names a different archive.
+        (
+            format!("{sha}  ./togi-linux-amd64.tar.gz\n"),
+            "No checksum found",
+        ),
+        // Duplicate entries for the same archive.
+        (
+            format!("{sha}  {archive}\n{sha}  ./{archive}\n"),
+            "Duplicate checksum entries",
+        ),
+        // Checksum does not match the downloaded archive.
+        (
+            format!("{}  ./{archive}\n", "0".repeat(64)),
+            "Checksum mismatch",
+        ),
+        // Malformed checksum value.
+        (format!("not-a-sha  ./{archive}\n"), "Malformed checksum"),
+    ] {
+        let dir = setup_fake_release(archive, archive_bytes, &checksums);
+        let output = run_release_asset_fetch(&dir, "v9.9.9", archive);
+        assert!(
+            !output.status.success(),
+            "release asset fetch unexpectedly succeeded for {expected_error}"
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(expected_error),
+            "expected `{expected_error}` in stderr, got:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
+fn released_archive_install_smoke_verifies_published_asset() {
+    if !bash_available() {
+        eprintln!("skipping released-archive install smoke test because bash is unavailable");
+        return;
+    }
+    if command_succeeds("command -v togi") {
+        eprintln!("skipping released-archive install smoke test because togi is already on PATH");
+        return;
+    }
+
+    let asset = host_action_asset();
+    let dir = TempDir::new().unwrap();
+
+    let payload_dir = dir.path().join("payload");
+    fs::create_dir_all(&payload_dir).unwrap();
+    let payload_binary = payload_dir.join(&asset.binary);
+    fs::write(
+        &payload_binary,
+        "#!/usr/bin/env bash\nprintf 'togi 9.9.9\\n'\n",
+    )
+    .unwrap();
+    chmod_executable(&payload_binary);
+
+    let release_dir = dir.path().join("release");
+    fs::create_dir_all(&release_dir).unwrap();
+    let archive_path = release_dir.join(&asset.archive);
+    create_action_archive(&asset, &payload_dir, &archive_path);
+    let sha = sha256_hex(&archive_path);
+    fs::write(
+        release_dir.join("checksums.txt"),
+        format!("{sha}  ./{}\n", asset.archive),
+    )
+    .unwrap();
+
+    let bin_dir = dir.path().join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    write_fake_curl(&bin_dir);
+
+    let runner_temp = dir.path().join("runner-temp");
+    fs::create_dir_all(&runner_temp).unwrap();
+    let github_path = dir.path().join("github_path");
+    fs::write(&github_path, "").unwrap();
+
+    let mut paths = vec![bin_dir];
+    paths.extend(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    ));
+    let host_arch = match std::env::consts::ARCH {
+        "x86_64" => "x86_64",
+        "aarch64" => "arm64",
+        other => panic!("unsupported test host architecture: {other}"),
+    };
+    let output = std::process::Command::new("bash")
+        .arg(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join(".github/scripts/run-released-binary-install-smoke.sh"),
+        )
+        .env("TOGI_VERSION", "v9.9.9")
+        .env("TOGI_EXPECTED_ARCH", host_arch)
+        .env("TOGI_EXPECTED_ARCHIVE", &asset.archive)
+        .env("TOGI_EXPECTED_BINARY", &asset.binary)
+        .env("RUNNER_TEMP", &runner_temp)
+        .env("GITHUB_PATH", &github_path)
+        .env("FAKE_RELEASE_DIR", &release_dir)
+        .env("PATH", std::env::join_paths(paths).unwrap())
+        .env_remove("TOGI_OS")
+        .env_remove("TOGI_ARCH")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "released-archive install smoke failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("togi 9.9.9"),
+        "smoke did not report the installed version\nstdout:\n{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        runner_temp.join("togi-bin").join(&asset.binary).exists(),
+        "missing installed binary for {}",
+        asset.binary
+    );
+    let github_path_entry = fs::read_to_string(&github_path).unwrap();
+    assert!(
+        github_path_entry.contains("togi-bin"),
+        "GITHUB_PATH did not gain the install dir: {github_path_entry}"
+    );
+}
+
+#[test]
+fn release_target_binding_rejects_mismatched_host_and_asset() {
+    if !bash_available() {
+        eprintln!("skipping release target binding test because bash is unavailable");
+        return;
+    }
+
+    // Success: host matches the expected arm64 macOS target exactly.
+    let output = run_assert_release_target(
+        "Darwin",
+        "arm64",
+        "arm64",
+        "togi-macos-arm64.tar.gz",
+        "togi",
+    );
+    assert!(
+        output.status.success(),
+        "target binding failed on a matching host\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("TOGI_ARCHIVE=togi-macos-arm64.tar.gz"));
+    assert!(stdout.contains("TOGI_BINARY=togi"));
+
+    for (sys, machine, arch, archive, binary, expected_error) in [
+        // Intel host must not pass as an arm64 leg.
+        (
+            "Darwin",
+            "x86_64",
+            "arm64",
+            "togi-macos-arm64.tar.gz",
+            "togi",
+            "Runner architecture x86_64 does not match expected arm64",
+        ),
+        // Intel macOS is not a shipped target: the resolver must reject the
+        // host explicitly before any archive binding is emitted.
+        (
+            "Darwin",
+            "x86_64",
+            "x86_64",
+            "togi-macos-arm64.tar.gz",
+            "togi",
+            "unsupported release target: macos-x86_64",
+        ),
+        // Binary name must match the expected target too.
+        (
+            "Linux",
+            "x86_64",
+            "x86_64",
+            "togi-linux-x86_64.tar.gz",
+            "togi.exe",
+            "Resolved binary togi does not match expected togi.exe",
+        ),
+    ] {
+        let output = run_assert_release_target(sys, machine, arch, archive, binary);
+        assert!(
+            !output.status.success(),
+            "target binding unexpectedly succeeded for {expected_error}"
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(expected_error),
+            "expected `{expected_error}` in stderr, got:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
+fn release_identity_verification_enforces_tag_head_and_release_association() {
+    if !bash_available() {
+        eprintln!("skipping release identity test because bash is unavailable");
+        return;
+    }
+    if !jq_available() {
+        eprintln!("skipping release identity test because jq is unavailable");
+        return;
+    }
+
+    let version = "v9.9.9";
+    let tag_sha = "a".repeat(40);
+    let peeled_sha = "b".repeat(40);
+    let release_json =
+        r#"{"tag_name":"v9.9.9","draft":false,"prerelease":false,"target_commitish":"main"}"#;
+
+    // Annotated tag: peeled commit establishes source identity.
+    let ls_remote =
+        format!("{tag_sha}\trefs/tags/{version}\n{peeled_sha}\trefs/tags/{version}^{{}}");
+    let output = run_release_identity(version, &peeled_sha, &ls_remote, Some(release_json));
+    assert!(
+        output.status.success(),
+        "release identity verification failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains(&format!("tag {version} resolves to commit {peeled_sha}")));
+    assert!(stdout.contains("target_commitish metadata: main"));
+
+    // Lightweight tag: the tag ref itself is the commit.
+    let output = run_release_identity(
+        version,
+        &tag_sha,
+        &format!("{tag_sha}\trefs/tags/{version}"),
+        Some(release_json),
+    );
+    assert!(
+        output.status.success(),
+        "lightweight tag verification failed\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Moved tag: peeled commit no longer matches the workflow head.
+    let output = run_release_identity(version, &tag_sha, &ls_remote, Some(release_json));
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("does not match workflow head"),
+        "moved tag was not rejected: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Missing tag.
+    let output = run_release_identity(version, &peeled_sha, "", Some(release_json));
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("does not resolve"),
+        "missing tag was not rejected: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Missing public release association.
+    let output = run_release_identity(version, &peeled_sha, &ls_remote, None);
+    assert!(
+        !output.status.success(),
+        "missing release association unexpectedly succeeded"
+    );
+
+    for (json, expected_error) in [
+        (
+            r#"{"tag_name":"v9.9.8","draft":false,"prerelease":false,"target_commitish":"main"}"#,
+            "does not match v9.9.9",
+        ),
+        (
+            r#"{"tag_name":"v9.9.9","draft":true,"prerelease":false,"target_commitish":"main"}"#,
+            "is a draft",
+        ),
+        (
+            r#"{"tag_name":"v9.9.9","draft":false,"prerelease":true,"target_commitish":"main"}"#,
+            "is a prerelease",
+        ),
+    ] {
+        let output = run_release_identity(version, &peeled_sha, &ls_remote, Some(json));
+        assert!(
+            !output.status.success(),
+            "release identity unexpectedly succeeded for {expected_error}"
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(expected_error),
+            "expected `{expected_error}` in stderr, got:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+fn run_assert_release_target(
+    sys: &str,
+    machine: &str,
+    arch: &str,
+    archive: &str,
+    binary: &str,
+) -> std::process::Output {
+    let dir = TempDir::new().unwrap();
+    let bin_dir = dir.path().join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    write_fake_uname(&bin_dir, sys, machine);
+    let mut paths = vec![bin_dir];
+    paths.extend(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    ));
+    std::process::Command::new("bash")
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join(".github/scripts/assert-release-target.sh"))
+        .env("TOGI_EXPECTED_ARCH", arch)
+        .env("TOGI_EXPECTED_ARCHIVE", archive)
+        .env("TOGI_EXPECTED_BINARY", binary)
+        .env("PATH", std::env::join_paths(paths).unwrap())
+        .env_remove("TOGI_OS")
+        .env_remove("TOGI_ARCH")
+        .output()
+        .unwrap()
+}
+
+fn run_release_identity(
+    version: &str,
+    head: &str,
+    ls_remote: &str,
+    release_json: Option<&str>,
+) -> std::process::Output {
+    let dir = TempDir::new().unwrap();
+    let bin_dir = dir.path().join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    let fake_git = bin_dir.join("git");
+    fs::write(&fake_git, FAKE_GIT).unwrap();
+    chmod_executable(&fake_git);
+    write_fake_curl(&bin_dir);
+
+    let release_dir = dir.path().join("release");
+    fs::create_dir_all(&release_dir).unwrap();
+    if let Some(json) = release_json {
+        fs::write(release_dir.join(version), json).unwrap();
+    }
+
+    let mut paths = vec![bin_dir];
+    paths.extend(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    ));
+    std::process::Command::new("bash")
+        .arg(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join(".github/scripts/verify-release-identity.sh"),
+        )
+        .env("TOGI_VERSION", version)
+        .env("TOGI_WORKFLOW_HEAD", head)
+        .env("FAKE_LS_REMOTE", ls_remote)
+        .env("FAKE_RELEASE_DIR", &release_dir)
+        .env("PATH", std::env::join_paths(paths).unwrap())
+        .output()
+        .unwrap()
+}
+
+const FAKE_GIT: &str = r#"#!/usr/bin/env bash
+set -euo pipefail
+if [ "${1:-}" = "ls-remote" ]; then
+  if [ -n "${FAKE_LS_REMOTE:-}" ]; then
+    printf '%s\n' "$FAKE_LS_REMOTE"
+  fi
+  exit 0
+fi
+echo "fake git: unexpected arguments: $*" >&2
+exit 1
+"#;
+
+fn write_fake_uname(bin_dir: &Path, sys: &str, machine: &str) {
+    let fake_uname = bin_dir.join("uname");
+    fs::write(
+        &fake_uname,
+        format!(
+            "#!/usr/bin/env bash\ncase \"${{1:-}}\" in\n  -s) printf '%s\\n' '{sys}' ;;\n  -m) printf '%s\\n' '{machine}' ;;\n  *) printf '%s\\n' '{sys}' ;;\nesac\n"
+        ),
+    )
+    .unwrap();
+    chmod_executable(&fake_uname);
+}
+
+const FAKE_CURL: &str = r#"#!/usr/bin/env bash
+set -euo pipefail
+: "${FAKE_RELEASE_DIR:?FAKE_RELEASE_DIR is required}"
+out=""
+url=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -*o)
+      out="$2"
+      shift 2
+      ;;
+    -*)
+      shift
+      ;;
+    *)
+      url="$1"
+      shift
+      ;;
+  esac
+done
+[ -n "$url" ] || exit 2
+src="${FAKE_RELEASE_DIR}/$(basename "$url")"
+if [ ! -f "$src" ]; then
+  echo "fake curl: no such release asset: $url" >&2
+  exit 22
+fi
+if [ -n "$out" ]; then
+  cp "$src" "$out"
+else
+  cat "$src"
+fi
+"#;
+
+fn write_fake_curl(bin_dir: &Path) {
+    let fake_curl = bin_dir.join("curl");
+    fs::write(&fake_curl, FAKE_CURL).unwrap();
+    chmod_executable(&fake_curl);
+}
+
+fn setup_fake_release(archive: &str, archive_bytes: &[u8], checksums: &str) -> TempDir {
+    let dir = TempDir::new().unwrap();
+    let release_dir = dir.path().join("release");
+    let bin_dir = dir.path().join("bin");
+    fs::create_dir_all(&release_dir).unwrap();
+    fs::create_dir_all(&bin_dir).unwrap();
+    fs::write(release_dir.join(archive), archive_bytes).unwrap();
+    fs::write(release_dir.join("checksums.txt"), checksums).unwrap();
+    write_fake_curl(&bin_dir);
+    dir
+}
+
+fn run_release_asset_fetch(dir: &TempDir, version: &str, archive: &str) -> std::process::Output {
+    let mut paths = vec![dir.path().join("bin")];
+    paths.extend(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    ));
+    std::process::Command::new("bash")
+        .arg(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join(".github/scripts/fetch-togi-release-asset.sh"),
+        )
+        .env("TOGI_VERSION", version)
+        .env("TOGI_ARCHIVE", archive)
+        .env("TOGI_FETCH_DIR", dir.path().join("out"))
+        .env("FAKE_RELEASE_DIR", dir.path().join("release"))
+        .env("PATH", std::env::join_paths(paths).unwrap())
+        .output()
+        .unwrap()
+}
+
+fn command_succeeds(command: &str) -> bool {
+    std::process::Command::new("bash")
+        .arg("-c")
+        .arg(command)
+        .output()
+        .unwrap()
+        .status
+        .success()
+}
+
+fn sha256_hex(path: &Path) -> String {
+    sha256_hex_bytes(&fs::read(path).unwrap())
+}
+
+fn sha256_hex_bytes(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    use std::fmt::Write;
+    let digest = sha2::Sha256::digest(bytes);
+    let mut hex = String::with_capacity(64);
+    for byte in digest.as_slice() {
+        write!(hex, "{byte:02x}").unwrap();
+    }
+    hex
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct ActionAsset {
     archive: String,
@@ -3965,16 +5393,34 @@ fn action_asset(archive: &str, binary: &str) -> ActionAsset {
     }
 }
 
-fn resolve_action_asset(os: &str, arch: &str) -> ActionAsset {
+fn run_action_resolver(os: &str, arch: &str) -> std::process::Output {
     let helper =
         Path::new(env!("CARGO_MANIFEST_DIR")).join(".github/scripts/resolve-togi-asset.sh");
-    let output = std::process::Command::new("bash")
+    std::process::Command::new("bash")
         .arg(helper)
         .env("TOGI_OS", os)
         .env("TOGI_ARCH", arch)
         .output()
-        .unwrap();
+        .unwrap()
+}
 
+fn resolve_action_asset(os: &str, arch: &str) -> ActionAsset {
+    parse_action_asset(&run_action_resolver(os, arch))
+}
+
+fn host_action_asset() -> ActionAsset {
+    let helper =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join(".github/scripts/resolve-togi-asset.sh");
+    let output = std::process::Command::new("bash")
+        .arg(helper)
+        .env_remove("TOGI_OS")
+        .env_remove("TOGI_ARCH")
+        .output()
+        .unwrap();
+    parse_action_asset(&output)
+}
+
+fn parse_action_asset(output: &std::process::Output) -> ActionAsset {
     assert!(
         output.status.success(),
         "resolver failed\nstdout:\n{}\nstderr:\n{}",

@@ -256,7 +256,7 @@ struct ReplayReportV1 {
     kind: String,
     schema_version: u32,
     generator: String,
-    source_revision: String,
+    source_revision: Option<String>,
     mutations: Vec<ReplayMutationV1>,
 }
 
@@ -421,7 +421,12 @@ fn read_v1_report(report_path: &Path) -> anyhow::Result<ReplayReportV1> {
     if report.generator.trim().is_empty() {
         anyhow::bail!("report generator is empty; regenerate a v1 JSON report");
     }
-    if !is_valid_git_revision(&report.source_revision) {
+    let Some(source_revision) = report.source_revision.as_deref() else {
+        anyhow::bail!(
+            "report was generated without a Git source revision and cannot be replayed; rerun `togi check` from a Git worktree"
+        );
+    };
+    if !is_valid_git_revision(source_revision) {
         anyhow::bail!("report source revision is invalid; regenerate a v1 JSON report");
     }
     Ok(report)
@@ -434,7 +439,11 @@ fn validate_report_mutation(
     if mutant_id == 0 {
         anyhow::bail!("mutation id must be a 1-based report-local id");
     }
-    let source_revision = report.source_revision;
+    let source_revision = report.source_revision.ok_or_else(|| {
+        anyhow::anyhow!(
+            "report was generated without a Git source revision and cannot be replayed; rerun `togi check` from a Git worktree"
+        )
+    })?;
     let mut matching = report
         .mutations
         .into_iter()
@@ -710,7 +719,7 @@ mod tests {
             kind: REPORT_KIND.into(),
             schema_version: REPORT_SCHEMA_VERSION,
             generator: "togi/test".into(),
-            source_revision: "a".repeat(40),
+            source_revision: Some("a".repeat(40)),
             mutations: vec![ReplayMutationV1 {
                 id: 1,
                 line: 1,
@@ -761,6 +770,17 @@ mod tests {
         reset_replay_source_read_count();
         assert!(validate_report_mutation(static_test_report("src/lib.rs", vec![]), 1).is_err());
         assert_eq!(replay_source_read_count(), 0);
+    }
+
+    #[test]
+    fn missing_source_revision_is_not_a_panic() {
+        let mut report = static_test_report("src/lib.rs", vec!["true".into()]);
+        report.source_revision = None;
+        let error = match validate_report_mutation(report, 1) {
+            Ok(_) => panic!("report without a source revision must fail"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("without a Git source revision"));
     }
 
     #[cfg(unix)]

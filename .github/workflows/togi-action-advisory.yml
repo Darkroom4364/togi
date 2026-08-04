@@ -15,7 +15,6 @@ jobs:
   mutation-test:
     name: Togi Action Advisory
     if: github.event.pull_request.head.repo.full_name == github.repository
-    continue-on-error: true
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -33,6 +32,7 @@ jobs:
         run: cargo fetch --locked
       - name: Run Togi action (advisory)
         id: togi
+        continue-on-error: true
         uses: Darkroom4364/togi@a1503b2ebac4c63d377b015c4825b97cab25ec68 # v0.4.1 release action source
         with:
           version: v0.4.1

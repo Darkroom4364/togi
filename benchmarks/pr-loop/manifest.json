@@ -1,0 +1,66 @@
+{
+  "schema_version": 1,
+  "name": "togi-pr-loop-benchmarks",
+  "description": "PR-loop benchmark workloads for togi: the Go fixture is copied into a disposable temp project, committed as the base revision, modified by one fixed working-tree patch, and measured through `togi check --base HEAD` so every run represents a PR diff, never --all.",
+  "notes": [
+    "Timing is observational only: no tracked baseline, no timing threshold, no score judgment, and no CI gate is defined by this manifest.",
+    "Semantic and provenance invariants are hard failures; the harness exits non-zero when any invariant fails.",
+    "expected_mutation_count and the changed-line range pin the mutation surface of fixture-change.patch; operator or fixture drift must be resolved by updating this manifest deliberately.",
+    "Workloads run in declaration order. warm-exact-cache reuses the .togi-cache seeded by cold-regular.",
+    "The harness requires bash, git, go, jq, sha256sum or shasum, and python3 (monotonic high-resolution wall clock)."
+  ],
+  "fixture": {
+    "source_dir": "tests/fixtures/go",
+    "patch_file": "benchmarks/pr-loop/fixture-change.patch",
+    "patch_sha256": "f2a0c45c7606dca549c339400e40a2c845c64e9535f3d7c48b8d9d3170f90104",
+    "changed_file": "calc.go",
+    "changed_line_range": [30, 37],
+    "base_ref": "HEAD",
+    "expected_mutation_count": 4
+  },
+  "togi": {
+    "binary_env": "TOGI_BIN",
+    "default_binary": "target/release/togi",
+    "common_args": [
+      "check",
+      "--base", "HEAD",
+      "--jobs", "1",
+      "--timeout", "60",
+      "--max-per-run", "25",
+      "--test-cmd", "go test ./...",
+      "--format", "json"
+    ]
+  },
+  "workloads": [
+    {
+      "name": "cold-regular",
+      "description": "Cold per-mutant runner on the PR diff: fresh cache, schemata disabled, every mutation re-executed.",
+      "extra_args": ["--no-schemata", "--force-rerun"],
+      "cache": "fresh",
+      "seeds_cache": true,
+      "invariants": ["report-well-formed", "full-fresh-execution"]
+    },
+    {
+      "name": "warm-exact-cache",
+      "description": "Identical second run reusing the cache seeded by cold-regular; every verdict must come from the exact cache.",
+      "extra_args": ["--no-schemata"],
+      "cache": "reuse",
+      "expects_cache_from": "cold-regular",
+      "invariants": ["report-well-formed", "full-exact-cache-reuse"]
+    },
+    {
+      "name": "cold-schemata",
+      "description": "Cold schemata run on the PR diff: fresh cache; the patch guarantees at least one schema fast-path mutant and at least one fallback mutant.",
+      "extra_args": ["--schemata", "--force-rerun"],
+      "cache": "fresh",
+      "invariants": ["report-well-formed", "schemata-fast-path-and-fallback"]
+    },
+    {
+      "name": "pr-diff-default",
+      "description": "Default invocation on the PR diff (no cache or schemata flags), representing out-of-the-box PR-loop behavior; mutations must target only the patched lines.",
+      "extra_args": [],
+      "cache": "fresh",
+      "invariants": ["report-well-formed", "pr-diff-targeting"]
+    }
+  ]
+}

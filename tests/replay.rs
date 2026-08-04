@@ -216,6 +216,105 @@ fn assert_rejected_without_invocation(fixture: &ReplayFixture, contents: &[u8], 
     );
 }
 
+#[cfg(windows)]
+fn non_git_fixture_test_cmd() -> &'static str {
+    "cmd /C test.cmd"
+}
+
+#[cfg(not(windows))]
+fn non_git_fixture_test_cmd() -> &'static str {
+    "sh test.sh"
+}
+
+#[test]
+fn non_git_all_schema_v1_report_is_valid_but_not_replayable() {
+    let project = TempDir::new().unwrap();
+    let root = project.path();
+    let report_dir = TempDir::new().unwrap();
+    let report_path = report_dir.path().join("report.json");
+    let log_path = report_dir.path().join("invocations.log");
+
+    fs::write(
+        root.join("main.go"),
+        "package main\n\nfunc add(a, b int) int {\n\treturn a + b\n}\n",
+    )
+    .unwrap();
+    #[cfg(windows)]
+    fs::write(
+        root.join("test.cmd"),
+        "@echo off\r\n>>\"%TOGI_REPLAY_LOG%\" echo x\r\nexit /b 0\r\n",
+    )
+    .unwrap();
+    #[cfg(not(windows))]
+    fs::write(
+        root.join("test.sh"),
+        "#!/bin/sh\nprintf x >> \"$TOGI_REPLAY_LOG\"\nexit 0\n",
+    )
+    .unwrap();
+
+    let check = togi()
+        .args([
+            "check",
+            "--all",
+            "--format",
+            "json",
+            "--test-cmd",
+            non_git_fixture_test_cmd(),
+            "--no-schemata",
+            "--max-per-run",
+            "1",
+        ])
+        .current_dir(root)
+        .env("TOGI_REPLAY_LOG", &log_path)
+        .output()
+        .unwrap();
+    assert_eq!(
+        check.status.code(),
+        Some(1),
+        "surviving fixture should emit a JSON report\nstderr:\n{}",
+        String::from_utf8_lossy(&check.stderr)
+    );
+    let report: Value = serde_json::from_slice(&check.stdout).unwrap_or_else(|error| {
+        panic!(
+            "check did not emit one JSON report: {error}\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&check.stdout),
+            String::from_utf8_lossy(&check.stderr)
+        )
+    });
+    assert_eq!(report["kind"], "mutation_report");
+    assert_eq!(report["schema_version"], 1);
+    assert!(
+        report["generator"]
+            .as_str()
+            .is_some_and(|generator| !generator.is_empty())
+    );
+    assert!(report.get("source_revision").is_none());
+    let id = report["mutations"][0]["id"].as_u64().unwrap().to_string();
+    fs::write(&report_path, &check.stdout).unwrap();
+    fs::write(&log_path, []).unwrap();
+
+    let replay = togi()
+        .args(["replay", &id, "--report", report_path.to_str().unwrap()])
+        .current_dir(root)
+        .env("TOGI_REPLAY_LOG", &log_path)
+        .output()
+        .unwrap();
+    assert!(!replay.status.success());
+    let stderr = String::from_utf8_lossy(&replay.stderr);
+    assert!(
+        stderr.contains("generated without a Git source revision"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("rerun `togi check` from a Git worktree"),
+        "{stderr}"
+    );
+    assert!(
+        fs::read(&log_path).unwrap().is_empty(),
+        "replay spawned the test command for a non-replayable report"
+    );
+}
+
 #[test]
 fn replay_forces_a_real_direct_execution_without_source_or_cache_residue() {
     let fixture = setup_replay_fixture();

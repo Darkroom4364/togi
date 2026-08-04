@@ -109,11 +109,6 @@ coverage_file = "coverage/lcov.info"
 # Default: unset
 test_selection_file = "coverage/test-selection.json"
 
-# Re-run narrowed survivors against their original full test route before reporting them.
-# Type: boolean
-# Default: false
-confirm_survivors = false
-
 # Reuse structured incremental history when the mutant source, command context,
 # and relevant covering tests have not changed.
 # Type: boolean

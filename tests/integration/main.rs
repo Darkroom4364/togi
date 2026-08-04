@@ -1,3 +1,4 @@
+mod benchmarks;
 mod mutations;
 mod smoke;
 mod verify;

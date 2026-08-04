@@ -31,16 +31,35 @@ jobs:
           upload-sarif: "true"
 
   check:
-    name: Build & Test
+    name: Build & Test ${{ matrix.target }} (Tier ${{ matrix.tier }})
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-24.04
+            arch: x86_64
+            tier: 1
+          - target: aarch64-apple-darwin
+            os: macos-15
+            arch: arm64
+            tier: 2
+          - target: x86_64-pc-windows-msvc
+            os: windows-2022
+            arch: x86_64
+            tier: 2
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
         with:
           toolchain: stable
+          targets: ${{ matrix.target }}
+      - name: Assert runner matches the required target
+        shell: bash
+        env:
+          TOGI_EXPECTED_TARGET: ${{ matrix.target }}
+          TOGI_EXPECTED_ARCH: ${{ matrix.arch }}
+        run: bash ./.github/scripts/assert-native-target.sh
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
         with:
           cache-bin: false
@@ -51,12 +70,18 @@ jobs:
 
   msrv:
     name: MSRV
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
         with:
           toolchain: 1.87
+      - name: Assert runner matches the required target
+        shell: bash
+        env:
+          TOGI_EXPECTED_TARGET: x86_64-unknown-linux-gnu
+          TOGI_EXPECTED_ARCH: x86_64
+        run: bash ./.github/scripts/assert-native-target.sh
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
         with:
           cache-bin: false
@@ -110,12 +135,18 @@ jobs:
 
   integration:
     name: Integration Tests
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
         with:
           toolchain: stable
+      - name: Assert runner matches the required target
+        shell: bash
+        env:
+          TOGI_EXPECTED_TARGET: x86_64-unknown-linux-gnu
+          TOGI_EXPECTED_ARCH: x86_64
+        run: bash ./.github/scripts/assert-native-target.sh
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
         with:
           cache-bin: false
@@ -134,7 +165,7 @@ jobs:
 
   dogfood:
     name: Dogfood (togi on togi)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
         with:
@@ -142,6 +173,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
         with:
           toolchain: stable
+      - name: Assert runner matches the required target
+        shell: bash
+        env:
+          TOGI_EXPECTED_TARGET: x86_64-unknown-linux-gnu
+          TOGI_EXPECTED_ARCH: x86_64
+        run: bash ./.github/scripts/assert-native-target.sh
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
         with:
           cache-bin: false
@@ -151,23 +188,26 @@ jobs:
         run: ./.github/scripts/run-dogfood-smoke.sh
 
   build:
-    name: Build ${{ matrix.target }}
+    name: Build ${{ matrix.target }} (Tier ${{ matrix.tier }}, release)
     needs: [foxguard, check, msrv, supply-chain, lint, vscode, integration, dogfood]
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
+            os: ubuntu-24.04
+            arch: x86_64
+            tier: 1
             name: togi-linux-x86_64
           - target: aarch64-apple-darwin
-            os: macos-latest
+            os: macos-15
+            arch: arm64
+            tier: 2
             name: togi-macos-arm64
-          - target: x86_64-apple-darwin
-            os: macos-latest
-            name: togi-macos-x86_64
           - target: x86_64-pc-windows-msvc
-            os: windows-latest
+            os: windows-2022
+            arch: x86_64
+            tier: 2
             name: togi-windows-x86_64
     steps:
       - uses: actions/checkout@v7
@@ -175,6 +215,12 @@ jobs:
         with:
           toolchain: stable
           targets: ${{ matrix.target }}
+      - name: Assert runner matches the required target
+        shell: bash
+        env:
+          TOGI_EXPECTED_TARGET: ${{ matrix.target }}
+          TOGI_EXPECTED_ARCH: ${{ matrix.arch }}
+        run: bash ./.github/scripts/assert-native-target.sh
       - name: Build
         run: cargo build --locked --release --target ${{ matrix.target }}
       - name: Package (unix)
@@ -218,3 +264,70 @@ jobs:
             *.zip
             checksums.txt
           generate_release_notes: true
+
+  verify-release-identity:
+    name: Verify Release Identity
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      TOGI_VERSION: ${{ github.ref_name }}
+      TOGI_WORKFLOW_HEAD: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Verify tag commit, workflow head, and release association
+        run: bash ./.github/scripts/verify-release-identity.sh
+
+  verify-release:
+    name: Verify Published Release (${{ matrix.asset }})
+    needs: release
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - asset: linux-x86_64
+            os: ubuntu-24.04
+            arch: x86_64
+            archive: togi-linux-x86_64.tar.gz
+            binary: togi
+            tier: 1
+          - asset: macos-arm64
+            os: macos-15
+            arch: arm64
+            archive: togi-macos-arm64.tar.gz
+            binary: togi
+            tier: 2
+          - asset: windows-x86_64
+            os: windows-2022
+            arch: x86_64
+            archive: togi-windows-x86_64.zip
+            binary: togi.exe
+            tier: 2
+    env:
+      TOGI_VERSION: ${{ github.ref_name }}
+      TOGI_EXPECTED_ARCH: ${{ matrix.arch }}
+      TOGI_EXPECTED_ARCHIVE: ${{ matrix.archive }}
+      TOGI_EXPECTED_BINARY: ${{ matrix.binary }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v7
+        if: ${{ matrix.tier == 1 }}
+        with:
+          go-version: stable
+          cache: false
+      - name: Tier 1 released-binary mutation smoke
+        if: ${{ matrix.tier == 1 }}
+        shell: bash
+        run: bash ./.github/scripts/run-released-binary-smoke.sh
+      - name: Tier 2 released-archive install smoke
+        if: ${{ matrix.tier == 2 }}
+        shell: bash
+        run: bash ./.github/scripts/run-released-binary-install-smoke.sh
