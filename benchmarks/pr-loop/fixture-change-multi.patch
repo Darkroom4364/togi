@@ -1,0 +1,24 @@
+diff --git a/calc.go b/calc.go
+index 078eb1a..bfbc93a 100644
+--- a/calc.go
++++ b/calc.go
+@@ -2,7 +2,7 @@ package calc
+ 
+ // Add returns the sum of a and b.
+ func Add(a, b int) int {
+-	return a + b
++	return Sum(a, b) + 0
+ }
+ 
+ // IsPositive returns true if n > 0.
+diff --git a/numbers.go b/numbers.go
+index 7021adb..b5a2f83 100644
+--- a/numbers.go
++++ b/numbers.go
+@@ -2,5 +2,5 @@ package calc
+ 
+ // Sum returns the sum of a and b.
+ func Sum(a, b int) int {
+-	return a + b
++	return a + (b + 0)
+ }

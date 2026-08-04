@@ -66,7 +66,10 @@ to force the regular runner for all mutations.
   `pr-loop-benchmarks` job, Linux x86_64 only on `ubuntu-24.04` with the same
   fail-closed native target/arch assertion): builds the release binary and
   uploads the complete PR-loop harness output, including raw files and
-  `pr-loop-benchmark-result.json`. Timing is observational only: there is no
+  `pr-loop-benchmark-result.json`. Go is pinned to 1.26.5 and every harness
+  invocation binds one job-private `GOCACHE` (created empty, warmed before
+  measurement) so cache provenance is explicit. Timing is observational only:
+  there is no
   current baseline, threshold, or merge gate.
 
 ### Auto-detection fallback

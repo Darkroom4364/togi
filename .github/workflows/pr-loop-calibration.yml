@@ -13,6 +13,8 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       contents: read
+    env:
+      BENCH_GOCACHE: ${{ runner.temp }}/togi-pr-loop-gocache
     steps:
       - uses: actions/checkout@v7
         with:
@@ -28,7 +30,18 @@ jobs:
         run: bash ./.github/scripts/assert-native-target.sh
       - uses: actions/setup-go@v7
         with:
-          go-version: stable
+          go-version: '1.26.5'
+      - name: Create job-private Go build cache
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -e "$BENCH_GOCACHE" ] && [ -n "$(ls -A "$BENCH_GOCACHE" 2>/dev/null)" ]; then
+            echo "job-private Go build cache $BENCH_GOCACHE must start empty" >&2
+            exit 1
+          fi
+          mkdir -p "$BENCH_GOCACHE"
+          test -d "$BENCH_GOCACHE"
+          test -z "$(ls -A "$BENCH_GOCACHE")"
       - name: Check benchmark prerequisites
         shell: bash
         run: |
@@ -47,6 +60,7 @@ jobs:
           TOGI_BIN: ${{ github.workspace }}/target/release/togi
           BENCH_RUNNER_LABEL: github-actions-ubuntu-24.04-linux-x86_64
           BENCH_GO_BUILD_CACHE_STATE: warmup
+          GOCACHE: ${{ env.BENCH_GOCACHE }}
           CALIBRATION_OUTPUT: ${{ runner.temp }}/togi-pr-loop-calibration/warmup
         run: bash benchmarks/pr-loop/run-pr-loop-benchmarks.sh --output "$CALIBRATION_OUTPUT"
       - name: Acquire five independent samples
@@ -55,6 +69,7 @@ jobs:
           TOGI_BIN: ${{ github.workspace }}/target/release/togi
           BENCH_RUNNER_LABEL: github-actions-ubuntu-24.04-linux-x86_64
           BENCH_GO_BUILD_CACHE_STATE: primed
+          GOCACHE: ${{ env.BENCH_GOCACHE }}
           CALIBRATION_OUTPUT: ${{ runner.temp }}/togi-pr-loop-calibration
         run: |
           set -euo pipefail

@@ -290,16 +290,91 @@ matching older `.togi-cache` entries. Structured incremental history is stored
 under `.togi-cache/history.json`; it can reuse killed/survived results when the
 mutant source, command context, and relevant covering tests are unchanged.
 
+## PR-loop performance evidence
+
+The PR-loop benchmark harness measures togi on versioned PR-shaped corpus
+scenarios. Reproduce it locally:
+
+```bash
+cargo build --locked --release && bash benchmarks/pr-loop/run-pr-loop-benchmarks.sh
+```
+
+Prerequisites: bash, git, go, jq, sed, sha256sum or shasum, and python3 (for
+the monotonic wall clock). The harness copies `tests/fixtures/go` into one
+disposable temp project per scenario, applies the scenario's fixed patch, and
+runs each workload through `togi check --base HEAD` (never `--all`). Semantic
+and provenance invariants fail the run; wall time is observational only.
+Local runs are `unclassified`: they make no Go build cache requirement and
+their timings are evidence for the reader, not comparable measurements.
+
+To exercise the calibration cache protocol locally (not to produce a
+comparable baseline), use exactly Go 1.26.5 and a fresh absolute private cache:
+
+```bash
+cargo build --locked --release
+test "$(go version | awk '{print $3}')" = go1.26.5
+GOCACHE="$(mktemp -d "${TMPDIR:-/tmp}/.togi-pr-loop-gocache.XXXXXX")"
+OUTPUT="$(mktemp -d "${TMPDIR:-/tmp}/.togi-pr-loop-calibration.XXXXXX")"
+trap 'rm -rf "$GOCACHE" "$OUTPUT"' EXIT
+BENCH_GO_BUILD_CACHE_STATE=warmup GOCACHE="$GOCACHE" \
+  bash benchmarks/pr-loop/run-pr-loop-benchmarks.sh --output "$OUTPUT/warmup"
+for sample in 1 2 3 4 5; do
+  BENCH_GO_BUILD_CACHE_STATE=primed GOCACHE="$GOCACHE" \
+    bash benchmarks/pr-loop/run-pr-loop-benchmarks.sh --output "$OUTPUT/sample-$sample"
+done
+```
+
+This verifies the same empty-private-cache, warmup, and primed-acquisition
+protocol, but remains **not GHA baseline-comparable**: a local runner has a
+different runner class.
+
+The corpus (`benchmarks/pr-loop/manifest.json`, schema v2) declares two
+scenarios:
+
+- `single-file` — `fixture-change.patch` appends `Clamp` to `calc.go`
+  (4 mutations). Workloads: `cold-regular` (per-mutant, fresh cache),
+  `warm-exact-cache` (exact-cache reuse of `cold-regular`), `cold-schemata`
+  (fast-path + fallback), and `pr-diff-default` (out-of-the-box defaults).
+- `multi-file` — `fixture-change-multi.patch` rewrites `Add` in `calc.go`
+  through `Sum` and changes the `Sum` body in `numbers.go` (9 mutations
+  across both files). Workloads: `multi-file-regular` and
+  `multi-file-default`.
+
+Each scenario gets its own disposable project and `.togi-cache`; cache reuse
+never crosses scenarios, and mutation identity is compared within a scenario,
+never between them. Every workload records its scenario, runner mode
+(regular/schemata/default), resolved test command, cache policy, wall time,
+and machine/runner provenance.
+
+The metric that will support the PR-loop speed claim is the warm-exact-cache
+versus cold-regular wall-clock median, computed from a reviewed, activated
+baseline. No baseline, comparator, or timing gate exists yet; benchmark
+evidence in CI is strictly telemetry.
+
 ## PR-loop calibration acquisition
 
-Maintainers may manually dispatch **PR-loop Calibration** from `main`. An
-unmeasured warmup primes the runner-wide Go build cache, then five independent,
-observational-only Linux x86_64 harness samples run with fresh Togi `.togi-cache`
-and a primed Go build cache. The 14-day artifact contains warmup and measured
-raw outputs plus a candidate calibration JSON. It does
-not create a baseline, compare results, or gate CI. A later, separately reviewed
-baseline-activation PR must inspect that artifact and explicitly define any
-comparison policy; do not copy or invent a candidate baseline by hand.
+Maintainers may manually dispatch **PR-loop Calibration** from `main`. The
+job pins Go to 1.26.5 and creates a job-private Go build cache under
+`runner.temp`, proven empty before use. An unmeasured warmup primes that
+cache, then five independent, observational-only Linux x86_64 harness samples
+run against the identical `GOCACHE` with fresh Togi `.togi-cache` and a
+primed Go build cache; the harness refuses warmup/primed measurements whose
+`GOCACHE` is not absolute and identical to `go env GOCACHE`. The 14-day
+artifact contains warmup and measured raw outputs plus a candidate
+calibration JSON. It does not create a baseline, compare results, or gate CI.
+
+Baseline promotion is a deliberately reviewed flow: a maintainer downloads
+the calibration artifact ZIP plus its positive GitHub artifact ID and
+normalized SHA-256 digest to
+`python3 benchmarks/pr-loop/promote-baseline.py`, which fail-closed re-verifies
+the archive and extracted artifact (contained regular files, sample digests,
+manifest/fixture/patch digests, five distinct primed v2 samples, cache-policy
+identity, complete sample data, and no wall sample above 3x its per-workload
+median) before writing a deterministic baseline document. The volatile cache
+path is kept only as calibration evidence, never as cross-run identity. A
+later, separately reviewed baseline-activation PR supplies the activation
+metadata via the promoter's CLI and explicitly defines any comparison policy;
+do not copy or invent a candidate baseline by hand.
 
 ## Configuration
 
