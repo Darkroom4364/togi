@@ -1152,3 +1152,234 @@ fn ci_pr_loop_benchmark_contract_rejects_missing_or_wrong_evidence_validation() 
         "the validation step must use the approved normalized-result and raw paths"
     );
 }
+
+fn collector_path() -> PathBuf {
+    repo_root().join("benchmarks/pr-loop/collect-calibration.py")
+}
+
+fn run_collector(output: &Path, results: &[PathBuf]) -> Output {
+    let mut command = Command::new("python3");
+    command
+        .arg(collector_path())
+        .arg("--output")
+        .arg(output)
+        .arg("--source-commit")
+        .arg("test-commit")
+        .arg("--source-run")
+        .arg("test-run")
+        .arg("--source-attempt")
+        .arg("1")
+        .arg("--source-utc")
+        .arg("2026-08-04T00:00:00Z");
+    for result in results {
+        command.arg(result);
+    }
+    command.output().expect("spawn collector")
+}
+
+#[test]
+fn pr_loop_calibration_collector_fails_closed_and_preserves_samples() {
+    if !harness_tools_available() || !tool_on_path("python3") {
+        eprintln!("skipping: harness or Python tools unavailable");
+        return;
+    }
+    let tools = install_fake_tools();
+    let samples = tempfile::tempdir().expect("sample tempdir");
+    let mut results = Vec::new();
+    for sample in 1..=5 {
+        let output = samples.path().join(format!("sample-{sample}"));
+        assert!(run_harness(&tools, &output, None, &[]).status.success());
+        results.push(output.join("pr-loop-benchmark-result.json"));
+    }
+    let candidate = samples.path().join("candidate.json");
+    let output = run_collector(&candidate, &results);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&candidate).expect("candidate")).expect("JSON");
+    assert_eq!(value["kind"], "togi_pr_loop_calibration_candidate");
+    assert_eq!(value["source"]["commit"], "test-commit");
+    assert_eq!(
+        value["samples"]["cold-regular"]["wall_ms"]
+            .as_array()
+            .unwrap()
+            .len(),
+        5
+    );
+    assert!(value["samples"]["cold-regular"]["wall_ms_median"].is_number());
+    assert!(value["samples"]["cold-regular"]["wall_ms_mad"].is_number());
+
+    let wrong_count = run_collector(&samples.path().join("wrong-count.json"), &results[..4]);
+    assert!(!wrong_count.status.success());
+    let duplicate_candidate = samples.path().join("duplicate.json");
+    let duplicates = vec![results[0].clone(); 5];
+    assert!(
+        !run_collector(&duplicate_candidate, &duplicates)
+            .status
+            .success()
+    );
+    assert!(
+        !duplicate_candidate.exists(),
+        "duplicate inputs must not create a candidate"
+    );
+    let copied_duplicate_dir = samples.path().join("copied-duplicates");
+    fs::create_dir(&copied_duplicate_dir).unwrap();
+    let copied_duplicates: Vec<PathBuf> = (1..=5)
+        .map(|index| {
+            let copied = copied_duplicate_dir.join(format!("copy-{index}.json"));
+            fs::copy(&results[0], &copied).unwrap();
+            copied
+        })
+        .collect();
+    let copied_duplicate_candidate = samples.path().join("copied-duplicate.json");
+    let copied_duplicate = run_collector(&copied_duplicate_candidate, &copied_duplicates);
+    assert_eq!(copied_duplicate.status.code(), Some(2));
+    assert!(
+        !copied_duplicate_candidate.exists(),
+        "byte-identical copied inputs must not create a candidate"
+    );
+
+    let portable_dir = samples.path().join("different-leading-location");
+    fs::create_dir(&portable_dir).unwrap();
+    let portable_results: Vec<PathBuf> = results
+        .iter()
+        .enumerate()
+        .map(|(index, result)| {
+            let copied = portable_dir.join(format!("result-{index}.json"));
+            fs::copy(result, &copied).unwrap();
+            copied
+        })
+        .collect();
+    let portable_candidate = samples.path().join("portable.json");
+    assert!(
+        run_collector(&portable_candidate, &portable_results)
+            .status
+            .success()
+    );
+    let portable: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(portable_candidate).unwrap()).unwrap();
+    assert_eq!(portable["semantic_identity"], value["semantic_identity"]);
+    assert!(
+        portable["source_file_digests"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .all(|key| !key.starts_with('/'))
+    );
+
+    for (field, replacement, output_name) in [
+        (
+            "/provenance/logical_cpu_count",
+            serde_json::Value::Bool(true),
+            "boolean-cpu",
+        ),
+        (
+            "/workloads/0/timing/wall_ms",
+            serde_json::Value::Bool(false),
+            "boolean-timing",
+        ),
+        (
+            "/provenance/fixture_source_dir",
+            serde_json::Value::String("../outside".to_string()),
+            "fixture-escape",
+        ),
+        (
+            "/provenance/togi_version",
+            serde_json::Value::String("different-togi".to_string()),
+            "execution",
+        ),
+    ] {
+        let altered = samples.path().join(format!("{output_name}.json"));
+        let mut result: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&results[4]).unwrap()).unwrap();
+        *result.pointer_mut(field).unwrap() = replacement;
+        fs::write(&altered, serde_json::to_vec(&result).unwrap()).unwrap();
+        let mut mismatched = results.clone();
+        mismatched[4] = altered;
+        let rejected = run_collector(
+            &samples.path().join(format!("{output_name}-out.json")),
+            &mismatched,
+        );
+        assert!(!rejected.status.success());
+        assert!(
+            !String::from_utf8_lossy(&rejected.stderr).contains("Traceback"),
+            "malformed input must have a collector error, not a traceback"
+        );
+    }
+
+    let diagnostic = samples.path().join("diagnostic.json");
+    let mut diagnostic_result: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&results[4]).unwrap()).unwrap();
+    *diagnostic_result
+        .pointer_mut("/provenance/kernel_release")
+        .unwrap() = serde_json::Value::String("different-kernel".to_string());
+    let mut diagnostic_results = results.clone();
+    fs::write(&diagnostic, serde_json::to_vec(&diagnostic_result).unwrap()).unwrap();
+    diagnostic_results[4] = diagnostic;
+    let diagnostic_candidate = samples.path().join("diagnostic-out.json");
+    assert!(
+        run_collector(&diagnostic_candidate, &diagnostic_results)
+            .status
+            .success()
+    );
+    let diagnostics: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(diagnostic_candidate).unwrap()).unwrap();
+    assert_eq!(
+        diagnostics["runner_diagnostics"][4]["kernel_release"],
+        "different-kernel"
+    );
+
+    let malformed = samples.path().join("malformed.json");
+    fs::write(&malformed, "{").expect("malformed result");
+    let mut malformed_results = results.clone();
+    malformed_results[4] = malformed;
+    assert!(
+        !run_collector(
+            &samples.path().join("malformed-out.json"),
+            &malformed_results
+        )
+        .status
+        .success()
+    );
+
+    for (field, output_name) in [
+        ("/workloads/0/cache_policy", "semantic"),
+        ("/provenance/runner_label", "runner"),
+    ] {
+        let altered = samples.path().join(format!("{output_name}.json"));
+        let mut result: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&results[4]).unwrap()).unwrap();
+        *result.pointer_mut(field).unwrap() = serde_json::Value::String("mismatch".to_string());
+        fs::write(&altered, serde_json::to_vec(&result).unwrap()).unwrap();
+        let mut mismatched = results.clone();
+        mismatched[4] = altered;
+        assert!(
+            !run_collector(
+                &samples.path().join(format!("{output_name}-out.json")),
+                &mismatched
+            )
+            .status
+            .success()
+        );
+    }
+}
+
+#[test]
+fn pr_loop_calibration_workflow_is_manual_read_only_and_retained() {
+    let workflow =
+        fs::read_to_string(repo_root().join(".github/workflows/pr-loop-calibration.yml"))
+            .expect("calibration workflow");
+    let _: serde_yaml::Value = serde_yaml::from_str(&workflow).expect("workflow YAML");
+    assert!(workflow.contains("workflow_dispatch:"));
+    assert!(workflow.contains("if: github.ref == 'refs/heads/main'"));
+    assert!(workflow.contains("permissions:\n  contents: read"));
+    assert!(workflow.contains("runs-on: ubuntu-24.04"));
+    assert!(workflow.contains("BENCH_RUNNER_LABEL: github-actions-ubuntu-24.04-linux-x86_64"));
+    assert!(workflow.contains("for sample in 1 2 3 4 5; do"));
+    assert!(workflow.contains("retention-days: 14"));
+    assert!(!workflow.contains("pull_request:"));
+    assert!(!workflow.contains("permissions: write"));
+}

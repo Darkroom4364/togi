@@ -290,6 +290,15 @@ matching older `.togi-cache` entries. Structured incremental history is stored
 under `.togi-cache/history.json`; it can reuse killed/survived results when the
 mutant source, command context, and relevant covering tests are unchanged.
 
+## PR-loop calibration acquisition
+
+Maintainers may manually dispatch **PR-loop Calibration** from `main`. It runs five
+independent, observational-only Linux x86_64 harness samples and uploads a
+14-day artifact containing raw outputs and a candidate calibration JSON. It does
+not create a baseline, compare results, or gate CI. A later, separately reviewed
+baseline-activation PR must inspect that artifact and explicitly define any
+comparison policy; do not copy or invent a candidate baseline by hand.
+
 ## Configuration
 
 Optional. togi auto-detects a test command where supported; see [Before first run](#before-first-run) for its exact scope, prerequisites, and support boundaries.
