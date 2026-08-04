@@ -232,7 +232,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: Compress-Archive -Path target/${{ matrix.target }}/release/togi.exe -DestinationPath ${{ matrix.name }}.zip
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@v7.0.1
         with:
           name: ${{ matrix.name }}
           path: |

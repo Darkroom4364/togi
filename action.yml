@@ -129,7 +129,7 @@ runs:
 
     - name: Upload replayable report
       if: ${{ always() && inputs.upload-report == 'true' && steps.run-togi.outputs.report-path != '' }}
-      uses: actions/upload-artifact@v7
+      uses: actions/upload-artifact@v7.0.1
       with:
         name: ${{ inputs.report-artifact-name }}
         path: ${{ runner.temp }}/togi-report.json
