@@ -244,16 +244,18 @@ fn harness_tools_available() -> bool {
 /// Content digest helper mirroring the harness's sha256sum/shasum fallback,
 /// used to re-digest artifact files after deliberate test tampering.
 fn sha256_file(path: &Path) -> String {
-    let (program, args): (&str, &[&str]) = if tool_on_path("sha256sum") {
-        ("sha256sum", &[])
+    let output = if tool_on_path("sha256sum") {
+        Command::new("sha256sum")
+            .arg(path)
+            .output()
+            .expect("spawn sha256sum")
     } else {
-        ("shasum", &["-a", "256"])
+        Command::new("shasum")
+            .args(["-a", "256"])
+            .arg(path)
+            .output()
+            .expect("spawn shasum")
     };
-    let output = Command::new(program)
-        .args(args)
-        .arg(path)
-        .output()
-        .expect("spawn sha256 tool");
     assert!(output.status.success(), "sha256 tool failed for {path:?}");
     String::from_utf8_lossy(&output.stdout)
         .split_whitespace()

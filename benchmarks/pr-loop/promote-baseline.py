@@ -20,13 +20,13 @@ it is never part of cross-run measurement identity.
 """
 import argparse
 import hashlib
+import importlib.util
 import json
 import stat
 import tempfile
 import zipfile
 from datetime import datetime
 from pathlib import Path
-import subprocess
 import statistics
 import sys
 
@@ -140,13 +140,19 @@ def verify_archive(archive_path, expected_digest, artifact_files):
 
 
 def recollect_candidate(candidate, sample_paths):
-    collector = ROOT / "benchmarks/pr-loop/collect-calibration.py"
+    collector_path = ROOT / "benchmarks/pr-loop/collect-calibration.py"
+    spec = importlib.util.spec_from_file_location("_togi_collect_calibration", collector_path)
+    if spec is None or spec.loader is None:
+        fail("checkout collector could not be loaded")
+    collector = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(collector)
+    except (ImportError, OSError) as error:
+        fail(f"checkout collector could not be imported: {error}")
     with tempfile.TemporaryDirectory(prefix="togi-pr-loop-recollect-") as temporary:
         output = Path(temporary) / "candidate.json"
         source = candidate["source"]
-        command = [
-            sys.executable,
-            str(collector),
+        arguments = [
             "--output", str(output),
             "--source-commit", source["commit"],
             "--source-run", source["run"],
@@ -154,9 +160,10 @@ def recollect_candidate(candidate, sample_paths):
             "--source-utc", source["utc"],
             *map(str, sample_paths),
         ]
-        completed = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
-        if completed.returncode != 0:
-            fail(f"canonical candidate re-collection failed: {completed.stderr.strip()}")
+        try:
+            collector.main(arguments)
+        except ValueError as error:
+            fail(f"canonical candidate re-collection failed: {error}")
         return load_json(output)
 
 
