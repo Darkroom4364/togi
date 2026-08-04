@@ -1287,7 +1287,7 @@ fn collect_files(
         return Ok(vec![]);
     }
 
-    let mut files = togi::diff::parse_diff(&diff_output);
+    let mut files = togi::diff::parse_diff_bytes(&diff_output);
     if skip_noisy {
         files.retain(|f| !togi::diff::is_noisy_file(&f.path));
     }
@@ -1943,7 +1943,7 @@ fn get_project_root() -> anyhow::Result<PathBuf> {
     Ok(PathBuf::from(path))
 }
 
-fn get_git_diff(base: &str) -> anyhow::Result<String> {
+fn get_git_diff(base: &str) -> anyhow::Result<Vec<u8>> {
     validate_diff_base(base)?;
     let output = std::process::Command::new("git")
         .args(["-c", "core.quotePath=false", "diff", "--no-ext-diff", base])
@@ -1954,7 +1954,7 @@ fn get_git_diff(base: &str) -> anyhow::Result<String> {
             "Could not diff against '{base}'. Is the branch up to date? Try running 'git fetch' first.\n\nDetails: {stderr}"
         );
     }
-    Ok(String::from_utf8(output.stdout)?)
+    Ok(output.stdout)
 }
 
 fn validate_diff_base(base: &str) -> anyhow::Result<()> {

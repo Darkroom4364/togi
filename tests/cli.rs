@@ -1067,6 +1067,59 @@ fn check_format_json_dry_run_outputs_a_single_preview_document() {
 }
 
 #[test]
+fn check_json_dry_run_ignores_non_utf8_diff_payload() {
+    let dir = setup_git_repo();
+    let payload = dir.path().join("payload.txt");
+    fs::write(&payload, b"before\n").unwrap();
+    assert_command_success(
+        std::process::Command::new("git")
+            .args(["add", "payload.txt"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap(),
+        "stage payload",
+    );
+    assert_command_success(
+        std::process::Command::new("git")
+            .args(["commit", "-m", "add payload"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap(),
+        "commit payload",
+    );
+    fs::write(payload, b"\xff\n").unwrap();
+
+    let output = togi()
+        .args([
+            "check",
+            "--base",
+            "HEAD",
+            "--format",
+            "json",
+            "--dry-run",
+            "--test-cmd",
+            "true",
+        ])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let mutations = value["mutations"].as_array().unwrap();
+    assert!(!mutations.is_empty());
+    assert!(
+        mutations
+            .iter()
+            .all(|mutation| mutation["file"] == "main.go")
+    );
+}
+
+#[test]
 fn check_format_json_no_mutations_outputs_an_empty_report() {
     let dir = setup_git_repo();
     assert_command_success(

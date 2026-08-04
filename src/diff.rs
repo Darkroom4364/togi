@@ -168,7 +168,7 @@ pub fn collect_changed_since(
             .current_dir(project_root)
             .output()?;
         if o.status.success() {
-            Some(String::from_utf8(o.stdout)?)
+            Some(o.stdout)
         } else {
             None
         }
@@ -210,7 +210,7 @@ pub fn collect_changed_since(
                     String::from_utf8_lossy(&out.stderr)
                 );
             }
-            String::from_utf8(out.stdout)?
+            out.stdout
         } else {
             let out = Command::new("git")
                 .args([
@@ -224,11 +224,11 @@ pub fn collect_changed_since(
             if !out.status.success() {
                 anyhow::bail!("git diff failed: {}", String::from_utf8_lossy(&out.stderr));
             }
-            String::from_utf8(out.stdout)?
+            out.stdout
         }
     };
 
-    let all = parse_diff(&diff_output);
+    let all = parse_diff_bytes(&diff_output);
     Ok(all
         .into_iter()
         .filter(|f| !skip_noisy || !is_noisy_file(&f.path))
@@ -327,6 +327,28 @@ pub fn is_noisy_file(path: &Path) -> bool {
 /// truncated hunk, or inconsistent hunk line counts drop the whole file
 /// instead of emitting partially parsed data. Emitted hunks are normalized
 /// to sorted, non-overlapping, 1-based ranges, as `mapper::overlaps` requires.
+/// Parse raw unified diff bytes. Valid UTF-8 takes the zero-allocation string
+/// parser path; invalid post-image header lines are treated as deletions so an
+/// unsafe filename can never be mapped through lossy decoding.
+pub fn parse_diff_bytes(input: &[u8]) -> Vec<ChangedFile> {
+    if let Ok(input) = std::str::from_utf8(input) {
+        return parse_diff(input);
+    }
+
+    let mut decoded = String::with_capacity(input.len());
+    for physical_line in input.split_inclusive(|byte| *byte == b'\n') {
+        if physical_line.starts_with(b"+++ ") && std::str::from_utf8(physical_line).is_err() {
+            decoded.push_str("+++ /dev/null");
+            if physical_line.ends_with(b"\n") {
+                decoded.push('\n');
+            }
+        } else {
+            decoded.push_str(&String::from_utf8_lossy(physical_line));
+        }
+    }
+    parse_diff(&decoded)
+}
+
 pub fn parse_diff(input: &str) -> Vec<ChangedFile> {
     let mut files: Vec<ChangedFile> = Vec::new();
     let mut current_path: Option<PathBuf> = None;
@@ -527,7 +549,7 @@ fn post_image_path(header: &str) -> Option<PathBuf> {
     if !crate::source_identity::is_normalized_project_relative_path(stripped) {
         return None;
     }
-    Some(PathBuf::from(stripped))
+    Some(Path::new(stripped).to_path_buf())
 }
 
 /// Sort ranges and merge overlaps so downstream mapping can rely on
@@ -754,6 +776,24 @@ index 1111111..2222222 100644
         assert_eq!(files.len(), 2);
         assert_eq!(files[0].path, PathBuf::from("src/main.rs"));
         assert_eq!(files[1].path, PathBuf::from("src/lib.rs"));
+    }
+
+    #[test]
+    fn drops_invalid_post_image_path_and_keeps_following_valid_file() {
+        let diff = b"diff --git a/bad.rs b/bad-\xff.rs\n\
+--- a/bad.rs\n\
++++ b/bad-\xff.rs\n\
+@@ -0,0 +1 @@\n\
++bad\n\
+diff --git a/src/good.rs b/src/good.rs\n\
+--- a/src/good.rs\n\
++++ b/src/good.rs\n\
+@@ -0,0 +1 @@\n\
++good\n";
+        let files = parse_diff_bytes(diff);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, PathBuf::from("src/good.rs"));
+        assert_eq!(files[0].hunks, vec![LineRange { start: 1, end: 1 }]);
     }
 
     #[test]
