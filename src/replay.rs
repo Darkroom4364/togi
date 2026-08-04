@@ -439,9 +439,11 @@ fn validate_report_mutation(
     if mutant_id == 0 {
         anyhow::bail!("mutation id must be a 1-based report-local id");
     }
-    let source_revision = report
-        .source_revision
-        .expect("read_v1_report rejects reports without a Git source revision");
+    let source_revision = report.source_revision.ok_or_else(|| {
+        anyhow::anyhow!(
+            "report was generated without a Git source revision and cannot be replayed; rerun `togi check` from a Git worktree"
+        )
+    })?;
     let mut matching = report
         .mutations
         .into_iter()
@@ -768,6 +770,17 @@ mod tests {
         reset_replay_source_read_count();
         assert!(validate_report_mutation(static_test_report("src/lib.rs", vec![]), 1).is_err());
         assert_eq!(replay_source_read_count(), 0);
+    }
+
+    #[test]
+    fn missing_source_revision_is_not_a_panic() {
+        let mut report = static_test_report("src/lib.rs", vec!["true".into()]);
+        report.source_revision = None;
+        let error = match validate_report_mutation(report, 1) {
+            Ok(_) => panic!("report without a source revision must fail"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("without a Git source revision"));
     }
 
     #[cfg(unix)]

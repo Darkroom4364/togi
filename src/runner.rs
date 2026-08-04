@@ -3790,47 +3790,57 @@ fn run_queued_mutation(
         .unwrap_or_else(|| MutationExecution::for_result(outcome.result));
     let mut direct_recipe = primary_direct_recipe;
     let confirmation = if needs_survivor_confirmation(&prepared.selected_test, primary_result) {
-        let full_argv = prepared
-            .selected_test
-            .unnarrowed_argv()
-            .expect("narrowed test command must retain its full route");
-        outcome = match workspace_slot.reset(shared.project_root, shared.respect_workspace_ignores)
-        {
-            Ok(()) => {
-                let workspace_target = ResolvedMutation::new_for_execution(
-                    shared.project_root,
-                    &workspace_root,
-                    &mutation,
-                );
-                run_single_mutation(
+        match prepared.selected_test.unnarrowed_argv() {
+            Some(full_argv) => {
+                outcome = match workspace_slot
+                    .reset(shared.project_root, shared.respect_workspace_ignores)
+                {
+                    Ok(()) => {
+                        let workspace_target = ResolvedMutation::new_for_execution(
+                            shared.project_root,
+                            &workspace_root,
+                            &mutation,
+                        );
+                        run_single_mutation(
+                            full_argv,
+                            shared.commands.sandbox_command.as_slice(),
+                            BuildCommand {
+                                argv: shared.build_command,
+                                explicit: shared.build_command_explicit,
+                            },
+                            prepared.selected_test.timeout,
+                            &workspace_root,
+                            workspace_target,
+                            shared.show_output,
+                            shared.env,
+                            shared.cancelled,
+                        )
+                    }
+                    Err(error) => confirmation_workspace_reset_error(&workspace_root, error),
+                };
+                if outcome.cancelled {
+                    return None;
+                }
+                execution = MutationExecution::for_result(outcome.result);
+                direct_recipe = prepared.direct_recipe_for(
                     full_argv,
-                    shared.commands.sandbox_command.as_slice(),
-                    BuildCommand {
-                        argv: shared.build_command,
-                        explicit: shared.build_command_explicit,
-                    },
-                    prepared.selected_test.timeout,
-                    &workspace_root,
-                    workspace_target,
-                    shared.show_output,
+                    shared.commands,
                     shared.env,
-                    shared.cancelled,
-                )
+                    shared.respect_workspace_ignores,
+                    DirectRecipeOrigin::Executed,
+                );
+                confirmation_from_result(outcome.result)
             }
-            Err(error) => confirmation_workspace_reset_error(&workspace_root, error),
-        };
-        if outcome.cancelled {
-            return None;
+            None => {
+                outcome = MutationOutcome::build_error_with(
+                    "confirmation_full_route",
+                    vec![],
+                    "narrowed test command is missing its full route",
+                );
+                execution = MutationExecution::for_result(outcome.result);
+                confirmation_from_result(outcome.result)
+            }
         }
-        execution = MutationExecution::for_result(outcome.result);
-        direct_recipe = prepared.direct_recipe_for(
-            full_argv,
-            shared.commands,
-            shared.env,
-            shared.respect_workspace_ignores,
-            DirectRecipeOrigin::Executed,
-        );
-        confirmation_from_result(outcome.result)
     } else {
         SurvivorConfirmation::NotNeeded
     };
@@ -4790,46 +4800,55 @@ impl TestRunner {
                 &prepared.selected_test,
                 primary_result,
             ) {
-                let full_argv = prepared
-                    .selected_test
-                    .unnarrowed_argv()
-                    .expect("narrowed test command must retain its full argv");
-                let full_argv = if language == "go" {
-                    force_go_no_test_cache(full_argv.to_vec())
-                } else {
-                    full_argv.to_vec()
-                };
-                let mut confirmation_cacheable = true;
-                let confirmed = match workspace
-                    .reset(&self.project_root, self.respect_workspace_ignores)
-                {
-                    Ok(()) => {
-                        workspace_needs_reset = true;
-                        run_schema_workspace_mutation(
-                            self,
-                            workspace.root(),
-                            &rewrites,
-                            &full_argv,
-                            prepared.selected_test.timeout,
-                            &env,
-                            &mut confirmation_cacheable,
-                        )
+                match prepared.selected_test.unnarrowed_argv() {
+                    Some(full_argv) => {
+                        let full_argv = if language == "go" {
+                            force_go_no_test_cache(full_argv.to_vec())
+                        } else {
+                            full_argv.to_vec()
+                        };
+                        let mut confirmation_cacheable = true;
+                        let confirmed = match workspace
+                            .reset(&self.project_root, self.respect_workspace_ignores)
+                        {
+                            Ok(()) => {
+                                workspace_needs_reset = true;
+                                run_schema_workspace_mutation(
+                                    self,
+                                    workspace.root(),
+                                    &rewrites,
+                                    &full_argv,
+                                    prepared.selected_test.timeout,
+                                    &env,
+                                    &mut confirmation_cacheable,
+                                )
+                            }
+                            Err(error) => MutationOutcome::build_error_with(
+                                "confirmation_workspace_reset",
+                                vec![],
+                                format!(
+                                    "could not reset schema workspace {} before full-suite confirmation: {error}",
+                                    workspace.root().display()
+                                ),
+                            ),
+                        };
+                        if confirmed.cancelled {
+                            break;
+                        }
+                        execution = MutationExecution::Executed;
+                        final_outcome = confirmed;
+                        confirmation_from_result(final_outcome.result)
                     }
-                    Err(error) => MutationOutcome::build_error_with(
-                        "confirmation_workspace_reset",
-                        vec![],
-                        format!(
-                            "could not reset schema workspace {} before full-suite confirmation: {error}",
-                            workspace.root().display()
-                        ),
-                    ),
-                };
-                if confirmed.cancelled {
-                    break;
+                    None => {
+                        final_outcome = MutationOutcome::build_error_with(
+                            "confirmation_full_route",
+                            vec![],
+                            "narrowed test command is missing its full route",
+                        );
+                        execution = MutationExecution::for_result(final_outcome.result);
+                        confirmation_from_result(final_outcome.result)
+                    }
                 }
-                execution = MutationExecution::Executed;
-                final_outcome = confirmed;
-                confirmation_from_result(final_outcome.result)
             } else {
                 SurvivorConfirmation::NotNeeded
             };

@@ -131,8 +131,8 @@ fn manifest_path() -> PathBuf {
     repo_root().join("benchmarks/pr-loop/manifest.json")
 }
 
-fn tool_available(tool: &str) -> bool {
-    Command::new(tool)
+fn command_available(mut command: Command) -> bool {
+    command
         .arg("--version")
         .output()
         .map(|output| output.status.success())
@@ -156,9 +156,10 @@ fn tool_on_path(tool: &str) -> bool {
 /// The harness requires bash, git, jq, sed, sha256sum or shasum, and
 /// python3; the `go` prerequisite is satisfied by the stub in FakeTools.
 fn harness_tools_available() -> bool {
-    ["bash", "git", "jq", "python3"]
-        .iter()
-        .all(|tool| tool_available(tool))
+    command_available(Command::new("bash"))
+        && command_available(Command::new("git"))
+        && command_available(Command::new("jq"))
+        && command_available(Command::new("python3"))
         && tool_on_path("sed")
         && (tool_on_path("sha256sum") || tool_on_path("shasum"))
 }
@@ -646,7 +647,7 @@ fn pr_loop_harness_fails_when_mutation_records_are_truncated() {
 
 #[test]
 fn pr_loop_harness_rejects_output_flag_without_value() {
-    if !tool_available("bash") {
+    if !command_available(Command::new("bash")) {
         eprintln!("skipping: bash unavailable");
         return;
     }
