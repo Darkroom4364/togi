@@ -53,13 +53,21 @@ to force the regular runner for all mutations.
 ### CI evidence
 
 - **Integration Tests** ([`ci.yml`](../.github/workflows/ci.yml) `integration`
-  job, `ubuntu-latest`): runs `cargo test --locked -- --ignored`, which
+  job, `ubuntu-24.04` with a fail-closed native target/arch assertion): runs
+  `cargo test --locked -- --ignored`, which
   executes the end-to-end fixture for every language listed above. The job
   provisions Go (stable), Node.js 24.14.1, and .NET 8.0.x; Python, Ruby, Java,
   C, and C++ toolchains are provided by the standard Ubuntu runner image.
 - **Dogfood** ([`ci.yml`](../.github/workflows/ci.yml) `dogfood` job,
-  `ubuntu-latest`): runs togi on togi itself, exercising Rust end-to-end on
+  `ubuntu-24.04` with a fail-closed native target/arch assertion): runs togi
+  on togi itself, exercising Rust end-to-end on
   every push to `main` and every PR.
+- **PR-loop Benchmark Evidence** ([`ci.yml`](../.github/workflows/ci.yml)
+  `pr-loop-benchmarks` job, Linux x86_64 only on `ubuntu-24.04` with the same
+  fail-closed native target/arch assertion): builds the release binary and
+  uploads the complete PR-loop harness output, including raw files and
+  `pr-loop-benchmark-result.json`. Timing is observational only: there is no
+  current baseline, threshold, or merge gate.
 
 ### Auto-detection fallback
 
@@ -74,14 +82,18 @@ This is a best-effort default; projects without a `Makefile` that defines a
 
 | OS | Arch | Tier | CI leg | Notes |
 |----|------|------|--------|-------|
-| Linux | x86_64 | Tier 1 | Build & Test, MSRV, Integration Tests, Dogfood | Primary development target. All features including replay are supported. |
+| Linux | x86_64 | Tier 1 | Build & Test, MSRV, Integration Tests, Dogfood, PR-loop Benchmark Evidence | Primary development target. All features including replay are supported. |
 | macOS | arm64 | Tier 2 | Build & Test | Binary compiles and passes unit tests. End-to-end language mutation tests are not run on macOS in CI. |
 | Windows | x86_64 | Tier 2 | Build & Test | Binary compiles and passes unit tests. **Replay is file-only on Windows when its temp root is a normal path on the Windows system volume; directory overlays stay fail-closed** — see below. |
 
-macOS CI runs on **arm64** (CI's `macos-latest` runners are arm64), which is
-the macOS arm64 Tier 2 row above. **ARM64 (aarch64) on Linux and Windows is not
-covered by CI and is not claimed as supported.** It may work incidentally but
-is not guaranteed.
+macOS runs on **arm64** only: macOS x86_64 (Intel) is not supported and has
+no release asset ([#485](https://github.com/Darkroom4364/togi/issues/485)).
+Every CI and release leg for the matrix above runs on an explicit,
+arch-pinned runner (`ubuntu-24.04`, `macos-15`, `windows-2022`) and asserts
+the Rust host target and runner architecture at runtime, so a runner-image
+change fails the leg instead of silently proving the wrong target. **ARM64
+(aarch64) on Linux and Windows is not covered by CI and is not claimed as
+supported.** It may work incidentally but is not guaranteed.
 
 ### Windows replay: file-only, directory overlays fail-closed
 
@@ -118,15 +130,32 @@ removals are supported
 Implemented in [#449](https://github.com/Darkroom4364/togi/issues/449).
 Beyond replay, the Windows guarantee is the Tier 2 scope in the matrix above:
 the binary compiles and the non-ignored unit test suite passes in the
-Build & Test `windows-latest` leg; the end-to-end language mutation fixtures
+Build & Test `windows-2022` leg; the end-to-end language mutation fixtures
 (Integration Tests leg) are not exercised on Windows in CI.
 
 ### CI evidence
 
 - **Build & Test** ([`ci.yml`](../.github/workflows/ci.yml) `check` job,
-  matrix: `ubuntu-latest`, `macos-latest`, `windows-latest`): runs
-  `cargo build --locked` and `cargo test --locked` on every push to `main` and
-  every PR.
+  matrix: `ubuntu-24.04` (x86_64, Tier 1), `macos-15` (arm64, Tier 2),
+  `windows-2022` (x86_64, Tier 2)): runs `cargo build --locked` and
+  `cargo test --locked` natively for each supported target on every push to
+  `main` and every PR.
+- **Release build** ([`release.yml`](../.github/workflows/release.yml) `build`
+  job, same target/runner matrix): on every release tag, builds and packages
+  exactly three archives — `togi-linux-x86_64.tar.gz`,
+  `togi-macos-arm64.tar.gz`, and `togi-windows-x86_64.zip` — plus
+  `checksums.txt`.
+- **Verify Published Release** ([`release.yml`](../.github/workflows/release.yml)
+  `verify-release` job, matrix: `ubuntu-24.04`, `macos-15`,
+  `windows-2022`): on every release tag, after the GitHub Release is
+  published, downloads the public release archives and verifies each archive's
+  checksum, install, and `--version` against the tag. The Linux x86_64 (Tier 1)
+  archive additionally passes the real Go mutation smoke; the macOS arm64 and
+  Windows x86_64 (Tier 2) archives get checksum/install/version smoke only.
+  The `verify-release-identity` job re-resolves the triggering tag to its
+  peeled commit, requires it to match the successful release-workflow head, and
+  verifies the public release association for that exact tag, per the
+  [publishing policy](PUBLISHING.md).
 
 ---
 
@@ -140,8 +169,9 @@ togi's MSRV is **Rust 1.87**, as declared in [`Cargo.toml`](../Cargo.toml)
 - The MSRV is the minimum Rust version that togi is guaranteed to compile and
   pass its test suite with.
 - The MSRV is tested in the dedicated **MSRV** CI job
-  ([`ci.yml`](../.github/workflows/ci.yml) `msrv` job, `ubuntu-latest`,
-  toolchain `1.87`), which runs `cargo test --locked`.
+  ([`ci.yml`](../.github/workflows/ci.yml) `msrv` job, `ubuntu-24.04` with a
+  fail-closed native target/arch assertion, toolchain `1.87`), which runs
+  `cargo test --locked`.
 - MSRV bumps are a breaking-change decision and must be documented in the
   release notes and in this contract.
 
@@ -160,7 +190,7 @@ compatibility:
 - **Current report kind**: `"mutation_report"` (`REPORT_KIND`)
 - **Generator**: `"togi/<cargo-pkg-version>"` (e.g. `"togi/<version>"`)
 
-A versioned report envelope looks like:
+A replayable Git-based versioned report envelope looks like:
 
 ```json
 {
@@ -172,11 +202,20 @@ A versioned report envelope looks like:
 }
 ```
 
+Git-based schema-1 reports include `source_revision`; a mutation with a direct
+replay recipe can be replayed. A non-Git `togi check --all --format json`
+report is also a valid schema-1 mutation report, but omits `source_revision`
+and is non-replayable. `togi replay` reports that it was generated without a
+Git source revision; rerun `togi check` from a Git worktree to create a
+replayable report.
+
 ### Compatibility guarantees
 
 - `togi replay` rejects reports whose `schema_version` does not match the
   current `REPORT_SCHEMA_VERSION`. There is no silent best-effort replay across
   schema versions.
+- `togi replay` rejects a schema-1 mutation report without `source_revision`
+  before invoking any command because it was generated outside a Git worktree.
 - The cache subsystem uses its own internal schema versions
   (`CACHE_SCHEMA_VERSION = "3"`, `HISTORY_SCHEMA_VERSION = 2`) to invalidate
   stale cache and history entries on upgrade. These are internal
@@ -188,6 +227,13 @@ A versioned report envelope looks like:
   mutations: a versioned mutation report can contain individual mutations
   whose replay recipe is unavailable (`replay: {"kind": "unavailable", ...}`,
   e.g. capture failure, schemata execution, or a mutation that never ran).
+
+### SARIF and human-readable output
+
+- SARIF output stays at SARIF **2.1.0**. Extensions are additive properties
+  only; no existing SARIF field is removed, renamed, or retyped in v1.
+- Terminal, HTML, and GitHub output layouts are **not** stability guarantees
+  and may change in any release.
 
 ### Stability policy
 
@@ -229,8 +275,16 @@ togi exposes these subcommands:
 
 ### Deprecation policy
 
-There is currently no formal deprecation window. CLI flags and subcommands may
-be removed in a minor version bump with notice in the release notes.
+From v1, a configuration key, CLI flag or subcommand, or documented JSON
+report field may be deprecated only together with migration instructions and
+a notice in the release notes and in this contract. Deprecated surface
+remains usable until v2.
+
+**Accepted exception:** `mutations.confirm_survivors` was removed before v1
+([#488](https://github.com/Darkroom4364/togi/issues/488)) and is not covered
+by this policy. A configuration that still sets it fails with a migration
+diagnostic: narrowed survivors are now always re-run through their full test
+route before they are reported, and the setting must be deleted.
 
 ### Exit codes
 
@@ -245,8 +299,35 @@ Exit codes are stable and will not change within a major version.
 
 ---
 
+## Configuration Stability
+
+- `togi.toml` parsing is strict: unknown keys are rejected, and that behavior
+  is retained for v1.
+- Documented configuration keys, value types, and defaults are stable for v1.
+  New configuration is optional and additive only.
+- With the single `mutations.confirm_survivors` exception above, the
+  documented final-0.5 configuration surface parses under v1 (frozen fixture:
+  [`tests/fixtures/togi-v0.5.toml`](../tests/fixtures/togi-v0.5.toml)).
+  Configurations that set the removed key do not load unchanged; they fail
+  with the migration diagnostic.
+
+---
+
+## Security Support
+
+Security fixes are applied on a best-effort basis to the current `main`
+branch and the latest tagged v1 release only. Older v1 releases and
+maintenance branches are not supported. Support for the final 0.5 release
+ends when v1 is released. togi provides no sandboxing or response-time
+guarantee; see [SECURITY.md](../SECURITY.md) for the security model and
+vulnerability reporting.
+
+---
+
 ## Version History
 
 | Date | Change |
 |------|--------|
 | 2026-07-28 | Initial compatibility contract. |
+| 2026-08-04 | Removed the macOS x86_64 (Intel) release target; pinned explicit per-target runners with runtime target/arch assertions; named native build/unit legs by tier and target; pinned the Tier-1 Integration Tests and Dogfood evidence jobs to `ubuntu-24.04` with the same assertion ([#485](https://github.com/Darkroom4364/togi/issues/485)). |
+| 2026-08-04 | Stated the v1 stability and deprecation policy: strict configuration parsing with stable documented keys (except the pre-v1 `confirm_survivors` removal), additive-only JSON schema 1 and SARIF 2.1.0 evolution, deprecation with migration instructions until v2, and v1 security-support scope ([#484](https://github.com/Darkroom4364/togi/issues/484)). |

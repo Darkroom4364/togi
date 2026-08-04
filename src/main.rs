@@ -341,7 +341,13 @@ fn run_check(cfg: togi::cli::CheckArgs, cancelled: Arc<AtomicBool>) -> anyhow::R
         has_cli_timeout,
         profile,
     } = resolved;
-    let project_root = get_project_root()?;
+    let project_root = match get_project_root() {
+        Ok(project_root) => project_root,
+        Err(_) if all => {
+            std::env::current_dir().context("could not determine project directory")?
+        }
+        Err(error) => return Err(error),
+    };
     let ambiguous_test_command = match config.resolve_test_command(&project_root) {
         togi::config::TestCommandResolution::Resolved => None,
         togi::config::TestCommandResolution::Ambiguous(ambiguity) => Some(ambiguity),
@@ -781,9 +787,6 @@ fn resolve_config(cfg: togi::cli::CheckArgs) -> anyhow::Result<ResolvedCheckConf
     }
     if let Some(path) = cfg.test_selection_file {
         config.mutations.test_selection_file = Some(path);
-    }
-    if cfg.confirm_survivors {
-        config.mutations.confirm_survivors = true;
     }
     if cfg.no_incremental_history {
         config.mutations.incremental_history = false;
@@ -1553,7 +1556,6 @@ fn command_config(
             config.mutations.test_selection_file.as_deref(),
             project_root,
         ),
-        confirm_survivors: config.mutations.confirm_survivors,
     }
 }
 
@@ -1944,7 +1946,7 @@ fn get_project_root() -> anyhow::Result<PathBuf> {
 fn get_git_diff(base: &str) -> anyhow::Result<String> {
     validate_diff_base(base)?;
     let output = std::process::Command::new("git")
-        .args(["diff", "--no-ext-diff", base])
+        .args(["-c", "core.quotePath=false", "diff", "--no-ext-diff", base])
         .output()?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1999,7 +2001,6 @@ mod tests {
             min_diff_coverage: None,
             fail_on_uncovered_diff: false,
             test_selection_file: None,
-            confirm_survivors: false,
             no_incremental_history: false,
             learned_selection: false,
             force_rerun: false,
@@ -2031,18 +2032,19 @@ mod tests {
     }
 
     #[test]
-    fn resolve_config_cli_confirmation_enables_survivor_confirmation() {
+    fn resolve_config_rejects_removed_confirm_survivors_setting() {
         let dir = tempfile::tempdir().expect("tempdir should be created");
         let config_path = dir.path().join("togi.toml");
-        std::fs::write(&config_path, "[mutations]\nconfirm_survivors = false\n")
+        std::fs::write(&config_path, "[mutations]\nconfirm_survivors = true\n")
             .expect("config should be written");
         let mut cfg = check_config();
         cfg.config = Some(config_path);
-        cfg.confirm_survivors = true;
 
-        let resolved = resolve_config(cfg).expect("config should resolve");
+        let error = resolve_config(cfg).expect_err("stale setting should fail");
 
-        assert!(resolved.config.mutations.confirm_survivors);
+        let message = format!("{error:#}");
+        assert!(message.contains("confirm_survivors"), "{message}");
+        assert!(message.contains("removed"), "{message}");
     }
 
     #[test]

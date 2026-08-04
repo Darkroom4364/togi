@@ -1,0 +1,15 @@
+diff --git a/../escape.rs b/../escape.rs
+--- a/../escape.rs
++++ b/..›scape.rs
+@@d
++++ b//etc/passwd
+@@ -1,1 +1,2 @@
+ ctx
++added
+diff --git "a/we\ttab.rs" "b/we\ttab.rs"
+--- "a/we\ttab.r--git a/src/safe.rs b/src/safe.rs
+--- a/src/safe.rs
++++ b/src/safe.rs
+@@ -1,1 +1,2 @@
+ ctx
++added

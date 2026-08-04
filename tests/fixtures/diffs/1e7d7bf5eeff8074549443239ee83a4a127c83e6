@@ -1,0 +1,6 @@
+diff --git a/old/name.rs b/new/name.rs
+similarity new/name.rs
+--- a/old/name.rs
++++ b/new/name.{
+›+    renamed();
+ }

@@ -161,8 +161,6 @@ pub struct MutationConfig {
     pub coverage_command: Vec<String>,
     pub test_selection_file: Option<PathBuf>,
     #[serde(default)]
-    pub confirm_survivors: bool,
-    #[serde(default)]
     pub min_line_coverage: Option<f64>,
     #[serde(default)]
     pub min_diff_coverage: Option<f64>,
@@ -611,7 +609,6 @@ impl Default for MutationConfig {
             coverage_file: None,
             coverage_command: vec![],
             test_selection_file: None,
-            confirm_survivors: false,
             min_line_coverage: None,
             min_diff_coverage: None,
             fail_on_uncovered_diff: false,
@@ -638,8 +635,21 @@ impl Config {
             Some(p) => {
                 let content = std::fs::read_to_string(&p)
                     .with_context(|| format!("could not read {}", p.display()))?;
-                let config: Config = toml::from_str(&content)
-                    .with_context(|| format!("invalid togi.toml at {}", p.display()))?;
+                let config: Config = match toml::from_str(&content) {
+                    Ok(config) => config,
+                    Err(error) if error.message().contains("confirm_survivors") => {
+                        anyhow::bail!(
+                            "invalid togi.toml at {}: `mutations.confirm_survivors` was removed; \
+                             narrowed survivors are now always re-run through their full test \
+                             route before they are reported. Delete the setting from your config.",
+                            p.display()
+                        );
+                    }
+                    Err(error) => {
+                        return Err(error)
+                            .with_context(|| format!("invalid togi.toml at {}", p.display()));
+                    }
+                };
                 Ok(config)
             }
             None => Ok(Config::default()),
@@ -897,7 +907,6 @@ base = "origin/develop"
 [mutations]
 max_per_run = 50
 schemata = true
-confirm_survivors = true
 "#;
         let config: Config = toml::from_str(toml_str).unwrap();
         assert_eq!(config.test.profile, Some(ResourceProfile::Ci));
@@ -912,7 +921,114 @@ confirm_survivors = true
         assert_eq!(config.diff.base, "origin/develop");
         assert_eq!(config.mutations.max_per_run, 50);
         assert!(config.mutations.schemata);
-        assert!(config.mutations.confirm_survivors);
+    }
+
+    #[test]
+    fn rejects_removed_confirm_survivors_setting() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("togi.toml");
+        std::fs::write(&config_path, "[mutations]\nconfirm_survivors = true\n").unwrap();
+
+        let error = Config::load(Some(&config_path)).unwrap_err();
+
+        let message = format!("{error:#}");
+        assert!(message.contains("confirm_survivors"), "{message}");
+        assert!(message.contains("removed"), "{message}");
+        assert!(message.contains("Delete the setting"), "{message}");
+    }
+
+    // #484: the frozen final-v0.5 documented configuration surface must parse
+    // under v1 with unchanged types and semantics.
+    #[test]
+    fn final_v0_5_config_fixture_parses_under_v1() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/togi-v0.5.toml");
+        let config = Config::load(Some(&path)).unwrap();
+
+        assert_eq!(config.test.profile, Some(ResourceProfile::Balanced));
+        assert_eq!(config.test.command, vec!["cargo", "test"]);
+        assert_eq!(config.test.build_command, vec!["cargo", "build"]);
+        assert_eq!(config.test.timeout, 45);
+        assert!(config.test.calibrate_timeout);
+        assert_eq!(config.test.timeout_multiplier, 3.0);
+        assert_eq!(config.test.timeout_slack, 5);
+        assert_eq!(config.test.jobs, 4);
+        assert_eq!(
+            config.test.sandbox_command,
+            vec![
+                "bwrap",
+                "--ro-bind",
+                "/",
+                "/",
+                "--dev",
+                "/dev",
+                "--proc",
+                "/proc",
+                "--"
+            ]
+        );
+        assert_eq!(
+            config.test.languages["go"].command,
+            vec!["go", "test", "./..."]
+        );
+        assert_eq!(config.test.languages["go"].timeout, Some(60));
+
+        assert_eq!(config.diff.base, "origin/main");
+
+        assert_eq!(config.mutations.max_per_run, 25);
+        assert_eq!(config.mutations.max_per_file, 10);
+        assert!(!config.mutations.schemata);
+        assert_eq!(config.mutations.coverage, Some(CoverageMode::Auto));
+        assert_eq!(
+            config.mutations.coverage_command,
+            vec!["./scripts/collect-coverage.sh"]
+        );
+        assert_eq!(
+            config.mutations.coverage_file,
+            Some("coverage/lcov.info".into())
+        );
+        assert_eq!(config.mutations.min_line_coverage, Some(80.0));
+        assert_eq!(config.mutations.min_diff_coverage, Some(90.0));
+        assert!(config.mutations.fail_on_uncovered_diff);
+        assert_eq!(
+            config.mutations.test_selection_file,
+            Some("coverage/test-selection.json".into())
+        );
+        assert!(!config.mutations.incremental_history);
+        assert_eq!(config.mutations.exclude_paths, vec!["vendor/**"]);
+        assert!(!config.mutations.skip_noisy_files);
+        assert!(!config.mutations.respect_workspace_ignores);
+        assert_eq!(
+            config.mutations.operators,
+            vec!["binary", "-string_to_empty"]
+        );
+
+        let project = &config.projects["api"];
+        assert_eq!(project.path, PathBuf::from("services/api"));
+        assert_eq!(project.language.as_deref(), Some("go"));
+        let project_test = project.test.as_ref().unwrap();
+        assert_eq!(
+            project_test.command,
+            Some(vec![
+                "go".to_string(),
+                "test".to_string(),
+                "./services/api/...".to_string()
+            ])
+        );
+        assert_eq!(project_test.timeout, Some(120));
+    }
+
+    // #484 contract exception: a final-0.5 config using the pre-v1
+    // `confirm_survivors` setting must fail with the migration diagnostic.
+    #[test]
+    fn final_v0_5_confirm_survivors_fixture_yields_migration_error() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/togi-v0.5-confirm-survivors.toml");
+        let error = Config::load(Some(&path)).unwrap_err();
+
+        let message = format!("{error:#}");
+        assert!(message.contains("confirm_survivors"), "{message}");
+        assert!(message.contains("removed"), "{message}");
+        assert!(message.contains("Delete the setting"), "{message}");
     }
 
     #[test]
@@ -964,7 +1080,6 @@ commnad = ["cargo", "test"]
             config.mutations.test_selection_file,
             Some("coverage/test-selection.json".into())
         );
-        assert!(!config.mutations.confirm_survivors);
         assert!(config.mutations.min_line_coverage.is_none());
         assert!(config.mutations.min_diff_coverage.is_none());
         assert!(!config.mutations.fail_on_uncovered_diff);
@@ -998,7 +1113,6 @@ commnad = ["cargo", "test"]
         assert!(config.mutations.operators.is_empty());
         assert!(config.mutations.coverage_file.is_none());
         assert!(config.mutations.test_selection_file.is_none());
-        assert!(!config.mutations.confirm_survivors);
         assert!(config.mutations.min_line_coverage.is_none());
         assert!(config.mutations.min_diff_coverage.is_none());
         assert!(!config.mutations.fail_on_uncovered_diff);

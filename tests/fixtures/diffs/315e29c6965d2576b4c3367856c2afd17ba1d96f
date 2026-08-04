@@ -1,0 +1,23 @@
+diff --git a/../escape.rs b/../escape.rs
+--- a/../escape.rs
++++ ÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿb/../escape.rs
+@@ -1,1 +1,2 @@
+ ctx
++added
+diff --git a//etc/passwd b//etc/passwd
+--- a//etc/passwd
++++ b//etc/passwd
+@@ -1,1 +1,2 @@
+ ctx
++addedrs
+--- a/../escape.rs
++++ b/../escape.rs
+@@ -1,1 +1,2 @@
+ ctx
++added
+diff --git/src/safe.rs
+--- a/src/safe.rs
++++ b/src/›fe.rs
+@@ -1,1 +1,2 @@
+ ctx
++added

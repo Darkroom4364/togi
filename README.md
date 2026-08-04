@@ -153,9 +153,13 @@ generated `togi.toml`, configure `togi.toml` directly, or use one-shot
 `--test-cmd`.
 
 The compatibility contract remains the authoritative support matrix: Tier 1 is
-end-to-end CI-verified, Tier 2 is build- and unit-test-verified only, and not
-supported has no CI guarantee. Linux and Windows ARM64 (aarch64) are not
-supported.
+end-to-end CI-verified, Tier 2 is build- and unit-test-verified, and not
+supported has no CI guarantee. On every release tag, the published archives are
+verified after publication: the Tier 1 Linux x86_64 archive passes checksum,
+install, version, and a real Go mutation smoke, while the Tier 2 macOS arm64
+and Windows x86_64 archives pass checksum, install, and version smoke. Linux
+and Windows ARM64 (aarch64) are not supported. macOS x86_64 (Intel) is not
+supported and has no release asset: the only macOS target is arm64.
 
 
 ## Usage
@@ -469,15 +473,13 @@ fail the run when LCOV coverage is below a threshold:
 - `--min-diff-coverage 90` fails when changed-line coverage is below 90%
 - `--fail-on-uncovered-diff` fails when any changed line is uncovered
 - `togi test-map` generates a Go line-to-test map from per-test coverage
-- `--test-selection-file coverage/test-selection.json` narrows each mutant to tests that cover that line when the configured runner supports test selection
-- `--confirm-survivors` re-runs only narrowed survivors through their original full route; a full-suite kill is reported as `killed`, not as an actionable survivor.
+- `--test-selection-file coverage/test-selection.json` narrows each mutant to tests that cover that line when the configured runner supports test selection; narrowed survivors are always re-run through their original full route, so a full-suite kill is reported as `killed`, not as an actionable survivor.
 
 ```bash
 togi check --coverage auto
 togi check --coverage-cmd ./scripts/collect-coverage.sh --coverage-file coverage/lcov.info
 togi test-map --path . --output coverage/test-selection.json
 togi check --coverage-file coverage/lcov.info --test-selection-file coverage/test-selection.json
-togi check --test-selection-file coverage/test-selection.json --confirm-survivors
 togi check --coverage-file coverage/lcov.info --min-line-coverage 80 --min-diff-coverage 90
 ```
 

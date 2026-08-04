@@ -1,0 +1,28 @@
+[package]
+name = "togi-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Standalone crate: requires nightly + cargo-fuzz to build/run and is never
+# part of the default `cargo test --locked` build. Seed corpus is the
+# checked-in regression corpus: pass `tests/fixtures/diffs` as an extra
+# libFuzzer corpus directory (see fuzz_targets/diff_pipeline.rs).
+[dependencies]
+libfuzzer-sys = "0.4"
+tempfile = "3"
+
+[dependencies.togi]
+path = ".."
+features = ["fuzzing"]
+
+[[bin]]
+name = "diff_pipeline"
+path = "fuzz_targets/diff_pipeline.rs"
+test = false
+doc = false
+
+[workspace]

@@ -1,0 +1,24 @@
+diff --git a/src/bad-header.rs b/src/bad-header.rs
+--- a/src/bad-header.rs
++++ b/src/bad-header.rs
+@@ not a hunk header @@
+ fn f() {
++    bad();
+ }
+diff --git a/src/truncated.rsgit a/src/safe.rs b/src/s/src/truncated.rs
++++ b/src/truncated.rs
+@@ -1,2 +1,4 @@
+ ctx
++only_oneIof_two
+diff --git a/src/overruE.rs b/src/overrun.rç
+--- a/src/overrun.rs
++++ b/src/overrun.rs
+@@ -1,1 +1,1 @@
++first
++second
+diff --git a/src/good.rs b/src/good.rs
+--- a/src/good.rs
++++ b/src/good.rs
+@@ -1,1 +1,2 @@
+ ctx
++added

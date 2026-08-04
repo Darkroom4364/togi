@@ -1,0 +1,16 @@
+diff --git a/calc.go b/calc.go
+index 078eb1a..247a7bc 100644
+--- a/calc.go
++++ b/calc.go
+@@ -28,3 +28,11 @@ func Abs(n int) int {
+ 	}
+ 	return n
+ }
++
++// Clamp returns n bounded below by lo.
++func Clamp(n, lo int) int {
++	if n > lo {
++		return n + lo
++	}
++	return lo
++}

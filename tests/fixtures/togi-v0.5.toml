@@ -1,0 +1,47 @@
+# Frozen final-v0.5 configuration surface (#484). Every documented key here
+# must keep parsing under v1 with the same types and default semantics.
+# The only accepted exception is `mutations.confirm_survivors`, removed
+# pre-v1 by #488 (see togi-v0.5-confirm-survivors.toml).
+
+[test]
+profile = "balanced"
+command = ["cargo", "test"]
+build_command = ["cargo", "build"]
+timeout = 45
+calibrate_timeout = true
+timeout_multiplier = 3.0
+timeout_slack = 5
+jobs = 4
+sandbox_command = ["bwrap", "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--"]
+
+[test.languages.go]
+command = ["go", "test", "./..."]
+timeout = 60
+
+[diff]
+base = "origin/main"
+
+[mutations]
+max_per_run = 25
+max_per_file = 10
+schemata = false
+coverage = "auto"
+coverage_command = ["./scripts/collect-coverage.sh"]
+coverage_file = "coverage/lcov.info"
+min_line_coverage = 80.0
+min_diff_coverage = 90.0
+fail_on_uncovered_diff = true
+test_selection_file = "coverage/test-selection.json"
+incremental_history = false
+exclude_paths = ["vendor/**"]
+skip_noisy_files = false
+respect_workspace_ignores = false
+operators = ["binary", "-string_to_empty"]
+
+[projects.api]
+path = "services/api"
+language = "go"
+
+[projects.api.test]
+command = ["go", "test", "./services/api/..."]
+timeout = 120

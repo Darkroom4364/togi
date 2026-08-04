@@ -1,0 +1,10 @@
+--- a/old/name.go
++++ b/new/name.go/name.go
+@@ -0,4 +1,5 @@
+ package main
+ 
+ func 4 b/new/name.rs
+@@ -1,2 +1,@ @f 3
+n f() {
++    rrn 1 + 2
+ }

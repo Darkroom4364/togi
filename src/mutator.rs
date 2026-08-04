@@ -3,7 +3,7 @@
 use crate::mapper::find_mutable_nodes;
 use crate::operators::{self};
 use crate::{ChangedFile, Mutation};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::path::Path;
 
 /// Convert a byte offset in source to (line, column), both 1-indexed.
@@ -45,12 +45,42 @@ pub fn generate_mutations(
     let mut parser = tree_sitter::Parser::new();
 
     for changed_file in changed_files {
-        let file_path = project_root.join(&changed_file.path);
-        if !file_path.exists() {
+        // Resolve through the shared source-identity helpers so only paths
+        // contained in the project root (after symlink resolution) are read.
+        let Some(normalized) = crate::source_identity::normalized_project_relative_path(
+            project_root,
+            &changed_file.path,
+        ) else {
+            eprintln!(
+                "warning: skipping {} — path is not project-relative",
+                changed_file.path.display()
+            );
+            continue;
+        };
+        let Some(file_path) = crate::source_identity::resolve_normalized_project_relative_path(
+            project_root,
+            &normalized,
+        ) else {
+            eprintln!(
+                "warning: skipping {} — path does not resolve inside the project root",
+                changed_file.path.display()
+            );
+            continue;
+        };
+
+        if file_path.is_dir() {
+            eprintln!(
+                "warning: skipping {} — path is a directory",
+                changed_file.path.display()
+            );
             continue;
         }
-
-        let source = std::fs::read(&file_path)?;
+        let source = std::fs::read(&file_path).with_context(|| {
+            format!(
+                "could not read mutation source {}",
+                changed_file.path.display()
+            )
+        })?;
         let (tree, lang) =
             match crate::parser::parse_file_with_parser(&mut parser, &changed_file.path, &source) {
                 Ok(result) => result,
@@ -86,8 +116,13 @@ pub fn generate_mutations(
                     // so that mutation_diff() renders correctly.
                     let (line, column) =
                         byte_offset_to_line_col(&source, candidate.byte_range.start);
-                    let original =
-                        String::from_utf8_lossy(&source[candidate.byte_range.clone()]).to_string();
+                    // The original bytes must survive losslessly; reject
+                    // candidates whose range is not valid UTF-8 (e.g. splits a
+                    // multi-byte character) instead of lossy conversion.
+                    let Ok(original) = std::str::from_utf8(&source[candidate.byte_range.clone()])
+                    else {
+                        continue;
+                    };
 
                     file_mutations.push(Mutation {
                         id: 0,
@@ -97,7 +132,7 @@ pub fn generate_mutations(
                         column,
                         operator: candidate.operator_id,
                         description: candidate.description,
-                        original,
+                        original: original.to_string(),
                         replacement: candidate.replacement,
                         byte_range: candidate.byte_range,
                     });
@@ -296,6 +331,80 @@ mod tests {
             "string_to_empty should be allowed in function bodies, got: {:?}",
             mutations.iter().map(|m| &m.operator).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn skips_changed_files_escaping_project_root() {
+        let tmp = TempDir::new().unwrap();
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let outside_src = "package main\n\nfunc f() int {\n\treturn 1 + 2\n}\n";
+        let outside = tmp.path().join("outside.go");
+        std::fs::write(&outside, outside_src).unwrap();
+
+        let changed = vec![ChangedFile {
+            path: PathBuf::from("../outside.go"),
+            hunks: vec![LineRange { start: 4, end: 4 }],
+        }];
+        let mutations = generate_mutations(&changed, &project, 100, 0, &[]).unwrap();
+
+        assert!(
+            mutations.is_empty(),
+            "path escaping the project root must be skipped before any read"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&outside).unwrap(),
+            outside_src,
+            "outside file must remain untouched"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn skips_changed_files_resolving_through_symlink_escape() {
+        let tmp = TempDir::new().unwrap();
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let outside_src = "package main\n\nfunc f() int {\n\treturn 1 + 2\n}\n";
+        let outside = tmp.path().join("outside.go");
+        std::fs::write(&outside, outside_src).unwrap();
+        std::os::unix::fs::symlink(&outside, project.join("link.go")).unwrap();
+
+        let changed = vec![ChangedFile {
+            path: PathBuf::from("link.go"),
+            hunks: vec![LineRange { start: 4, end: 4 }],
+        }];
+        let mutations = generate_mutations(&changed, &project, 100, 0, &[]).unwrap();
+
+        assert!(
+            mutations.is_empty(),
+            "symlink resolving outside the project root must be skipped"
+        );
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), outside_src);
+    }
+
+    #[test]
+    fn mutation_originals_match_source_bytes_losslessly() {
+        // Unicode and CRLF content: every emitted `original` must be the exact
+        // source slice for its byte range — never a lossy conversion.
+        let tmp = TempDir::new().unwrap();
+        let src = "package main\r\n\r\nfunc f() string {\r\n\tname := \"héllo wörld\"\r\n\tif name == \"x\" {\r\n\t\treturn name\r\n\t}\r\n\treturn \"\"\r\n}\r\n";
+        let rel = write_test_file(tmp.path(), "main.go", src);
+
+        let changed = vec![ChangedFile {
+            path: rel,
+            hunks: vec![LineRange { start: 1, end: 9 }],
+        }];
+        let mutations = generate_mutations(&changed, tmp.path(), 100, 0, &[]).unwrap();
+
+        assert!(!mutations.is_empty(), "expected mutations for {src:?}");
+        for m in &mutations {
+            assert_eq!(
+                &src.as_bytes()[m.byte_range.clone()],
+                m.original.as_bytes(),
+                "original must be the lossless source slice for {m:?}"
+            );
+        }
     }
 
     #[test]

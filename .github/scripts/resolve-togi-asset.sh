@@ -26,7 +26,7 @@ case "$arch_lc" in
 esac
 
 case "${os}-${arch}" in
-  linux-x86_64 | macos-x86_64 | macos-arm64)
+  linux-x86_64 | macos-arm64)
     ext="tar.gz"
     binary="togi"
     ;;

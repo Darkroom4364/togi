@@ -1,0 +1,11 @@
+--- a/old/name.go
++++ b/new/name.go/name.go
+@@ -0,4 +1,5 @@
+ package main
+ 
+ func 4 +1,5 @@
+ package main
+ 
+ func f() int {
++	return 1 + 2
+ }

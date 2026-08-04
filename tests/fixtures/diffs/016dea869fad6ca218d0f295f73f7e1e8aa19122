@@ -1,0 +1,11 @@
+diff --git a/../escape.rs b/../escape.rs
+--- a/../escape.rs
++++ b/../escapediff --git a/...rs
+@@ -1,1 +1,2 @@
+ ctx
++added
+diff --git a//etc/passwd b//etc/passwd
+--- a//etc/pass/escape.rs b/../escape.rs
+. a-/--./escape.rs
++++ wd
++++ b/b//et..c/

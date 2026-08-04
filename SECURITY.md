@@ -2,14 +2,18 @@
 
 ## Supported Versions
 
-togi is still pre-1.0. Security fixes are applied on a best-effort basis to the
-latest tagged release and the current `main` branch.
+Security fixes are applied on a best-effort basis to the current `main`
+branch and the latest tagged v1 release only.
 
 | Version | Supported |
 | --- | --- |
-| Latest tagged release | Yes |
 | Current `main` branch | Yes |
-| Older tags and maintenance branches | No |
+| Latest tagged v1 release | Yes |
+| Older v1 releases | No |
+| Maintenance branches | No |
+| 0.5 and earlier | No — support ends at the v1 release |
+
+There is no response-time SLA.
 
 ## Reporting a Vulnerability
 
