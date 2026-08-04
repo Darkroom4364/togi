@@ -68,9 +68,25 @@ to force the regular runner for all mutations.
   uploads the complete PR-loop harness output, including raw files and
   `pr-loop-benchmark-result.json`. Go is pinned to 1.26.5 and every harness
   invocation binds one job-private `GOCACHE` (created empty, warmed before
-  measurement) so cache provenance is explicit. Timing is observational only:
-  there is no
-  current baseline, threshold, or merge gate.
+  measurement) so cache provenance is explicit. This job is telemetry only:
+  it compares nothing and gates nothing.
+- **PR-loop Regression Gate**
+  ([`pr-loop-regression-gate.yml`](../.github/workflows/pr-loop-regression-gate.yml),
+  Linux x86_64 only on `ubuntu-24.04` with the same fail-closed native
+  target/arch assertion): on every PR and every push to `main`, measures
+  exactly three primed harness samples against the durable baseline
+  `benchmarks/pr-loop/baseline.json` under the fixed
+  `tolerance_policy` v1 (median of three; hard failure when any
+  workload/metric median exceeds 1.5x the baseline median plus the absolute
+  floor of 250 ms wall / 100 ms reported). On pull requests the baseline is
+  read from the validated trusted base commit, not the PR head; the pinned
+  Go toolchain must match the baseline's. A missing, stale, or incomparable
+  baseline fails the workflow run closed. Merge blocking applies while the
+  `PR-loop Regression Gate` context is required by the active `main`
+  ruleset; the corpus, both PR-loop workflows, and CODEOWNERS itself are
+  owned by `@Darkroom4364` in
+  [`.github/CODEOWNERS`](../.github/CODEOWNERS), so gate inputs cannot be
+  rewritten by an ordinary PR without code-owner review.
 
 ### Auto-detection fallback
 
@@ -85,7 +101,7 @@ This is a best-effort default; projects without a `Makefile` that defines a
 
 | OS | Arch | Tier | CI leg | Notes |
 |----|------|------|--------|-------|
-| Linux | x86_64 | Tier 1 | Build & Test, MSRV, Integration Tests, Dogfood, PR-loop Benchmark Evidence | Primary development target. All features including replay are supported. |
+| Linux | x86_64 | Tier 1 | Build & Test, MSRV, Integration Tests, Dogfood, PR-loop Benchmark Evidence, PR-loop Regression Gate | Primary development target. All features including replay are supported. |
 | macOS | arm64 | Tier 2 | Build & Test | Binary compiles and passes unit tests. End-to-end language mutation tests are not run on macOS in CI. |
 | Windows | x86_64 | Tier 2 | Build & Test | Binary compiles and passes unit tests. **Replay is file-only on Windows when its temp root is a normal path on the Windows system volume; directory overlays stay fail-closed** — see below. |
 

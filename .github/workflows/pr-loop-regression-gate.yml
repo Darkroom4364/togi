@@ -1,0 +1,134 @@
+name: PR-loop Regression Gate
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  regression-gate:
+    name: PR-loop Regression Gate
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+        with:
+          cache-bin: false
+      - name: Assert native Linux x86_64 runner
+        shell: bash
+        env:
+          TOGI_EXPECTED_TARGET: x86_64-unknown-linux-gnu
+          TOGI_EXPECTED_ARCH: x86_64
+        run: bash ./.github/scripts/assert-native-target.sh
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.26.5'
+      - name: Create job-private Go build cache
+        shell: bash
+        env:
+          BENCH_GOCACHE: ${{ runner.temp }}/togi-pr-loop-gocache
+        run: |
+          set -euo pipefail
+          if [ -e "$BENCH_GOCACHE" ] && [ -n "$(ls -A "$BENCH_GOCACHE" 2>/dev/null)" ]; then
+            echo "job-private Go build cache $BENCH_GOCACHE must start empty" >&2
+            exit 1
+          fi
+          mkdir -p "$BENCH_GOCACHE"
+          test -d "$BENCH_GOCACHE"
+          test -z "$(ls -A "$BENCH_GOCACHE")"
+      - name: Check benchmark prerequisites
+        shell: bash
+        run: |
+          set -euo pipefail
+          for tool in bash git go jq sed sha256sum python3; do
+            command -v "$tool" >/dev/null 2>&1 || {
+              echo "missing regression gate prerequisite: $tool" >&2
+              exit 1
+            }
+          done
+      - name: Build release binary
+        run: cargo build --locked --release
+      - name: Warm Go build cache
+        shell: bash
+        env:
+          TOGI_BIN: ${{ github.workspace }}/target/release/togi
+          BENCH_RUNNER_LABEL: github-actions-ubuntu-24.04-linux-x86_64
+          BENCH_GO_BUILD_CACHE_STATE: warmup
+          GOCACHE: ${{ runner.temp }}/togi-pr-loop-gocache
+          GATE_OUTPUT: ${{ runner.temp }}/togi-pr-loop-gate/warmup
+        run: bash benchmarks/pr-loop/run-pr-loop-benchmarks.sh --output "$GATE_OUTPUT"
+      - name: Acquire three primed samples
+        shell: bash
+        env:
+          TOGI_BIN: ${{ github.workspace }}/target/release/togi
+          BENCH_RUNNER_LABEL: github-actions-ubuntu-24.04-linux-x86_64
+          BENCH_GO_BUILD_CACHE_STATE: primed
+          GOCACHE: ${{ runner.temp }}/togi-pr-loop-gocache
+          GATE_OUTPUT: ${{ runner.temp }}/togi-pr-loop-gate
+        run: |
+          set -euo pipefail
+          mkdir -p "$GATE_OUTPUT"
+          for sample in 1 2 3; do
+            bash benchmarks/pr-loop/run-pr-loop-benchmarks.sh --output "$GATE_OUTPUT/sample-$sample"
+          done
+      - name: Select trusted baseline
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          GATE_OUTPUT: ${{ runner.temp }}/togi-pr-loop-gate
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            BASE_SHA="$PR_BASE_SHA"
+            if ! [[ "$BASE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "pull_request base SHA '$BASE_SHA' is not a 40-hex commit" >&2
+              exit 1
+            fi
+            if ! git cat-file -e "$BASE_SHA^{commit}"; then
+              echo "base commit $BASE_SHA is not locally available" >&2
+              exit 1
+            fi
+            if git cat-file -e "$BASE_SHA:benchmarks/pr-loop/baseline.json" 2>/dev/null; then
+              git show "$BASE_SHA:benchmarks/pr-loop/baseline.json" > "$GATE_OUTPUT/baseline.json"
+              echo "comparing against the trusted base baseline from $BASE_SHA"
+            else
+              echo "base $BASE_SHA carries no baseline: one-time bootstrap, using the PR-head baseline"
+              cp benchmarks/pr-loop/baseline.json "$GATE_OUTPUT/baseline.json"
+            fi
+          else
+            cp benchmarks/pr-loop/baseline.json "$GATE_OUTPUT/baseline.json"
+            echo "push event: comparing against the checked-out head baseline"
+          fi
+          test -s "$GATE_OUTPUT/baseline.json"
+      - name: Compare against durable baseline
+        shell: bash
+        env:
+          GATE_OUTPUT: ${{ runner.temp }}/togi-pr-loop-gate
+        run: |
+          set -euo pipefail
+          python3 benchmarks/pr-loop/compare-baseline.py \
+            --baseline "$GATE_OUTPUT/baseline.json" \
+            --output "$GATE_OUTPUT/pr-loop-regression-comparison.json" \
+            "$GATE_OUTPUT/sample-1/pr-loop-benchmark-result.json" \
+            "$GATE_OUTPUT/sample-2/pr-loop-benchmark-result.json" \
+            "$GATE_OUTPUT/sample-3/pr-loop-benchmark-result.json"
+      - name: Upload regression gate evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: pr-loop-regression-gate-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/togi-pr-loop-gate
+          if-no-files-found: warn
+          retention-days: 14

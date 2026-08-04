@@ -2271,10 +2271,35 @@ with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as archive:
     );
 }
 
+const PROMOTER_ACTIVATION: [&str; 6] = [
+    "--activation-pr",
+    "487",
+    "--activation-actor",
+    "octocat",
+    "--activation-utc",
+    "2026-08-04T00:00:00Z",
+];
+
 fn run_promoter(
     artifact_dir: &Path,
     output: &Path,
     expected_commit: &str,
+    extra: &[&str],
+) -> Output {
+    run_promoter_with(
+        artifact_dir,
+        output,
+        expected_commit,
+        &PROMOTER_ACTIVATION,
+        extra,
+    )
+}
+
+fn run_promoter_with(
+    artifact_dir: &Path,
+    output: &Path,
+    expected_commit: &str,
+    activation: &[&str],
     extra: &[&str],
 ) -> Output {
     let archive = output.with_extension("artifact.zip");
@@ -2296,6 +2321,9 @@ fn run_promoter(
         .arg(output)
         .arg("--expected-source-commit")
         .arg(expected_commit);
+    for arg in activation {
+        command.arg(arg);
+    }
     for arg in extra {
         command.arg(arg);
     }
@@ -2334,19 +2362,7 @@ fn pr_loop_promote_baseline_happy_path_is_deterministic_and_never_overwrites() {
     build_calibration_artifact(&tools, &artifact, gocache.path());
 
     let baseline = workspace.path().join("baseline.json");
-    let promoted = run_promoter(
-        &artifact,
-        &baseline,
-        "test-commit",
-        &[
-            "--activation-pr",
-            "487",
-            "--activation-actor",
-            "octocat",
-            "--activation-utc",
-            "2026-08-04T00:00:00Z",
-        ],
-    );
+    let promoted = run_promoter(&artifact, &baseline, "test-commit", &[]);
     assert!(
         promoted.status.success(),
         "promotion must succeed\nstderr: {}",
@@ -2355,7 +2371,25 @@ fn pr_loop_promote_baseline_happy_path_is_deterministic_and_never_overwrites() {
     let value = read_json(&baseline);
     assert_eq!(value["kind"], "togi_pr_loop_baseline");
     assert_eq!(value["schema_version"], 1);
-    assert_eq!(value["status"], "pending-activation");
+    assert_eq!(value["status"], "durable");
+    assert_eq!(
+        value["tolerance_policy"],
+        serde_json::json!({
+            "policy_version": 1,
+            "repetitions": 3,
+            "aggregation": "median",
+            "wall_ms": {"relative_numerator": 3, "relative_denominator": 2, "absolute_floor_ms": 250},
+            "reported_duration_ms": {"relative_numerator": 3, "relative_denominator": 2, "absolute_floor_ms": 100}
+        }),
+        "the promoter must pin the fixed tolerance policy, never hand-authored thresholds"
+    );
+    assert!(
+        value["comparison_policy"]
+            .as_str()
+            .expect("comparison policy")
+            .contains("median of three"),
+        "the durable baseline must describe the fixed comparison policy"
+    );
     assert_eq!(value["activation"]["pr"], 487);
     assert_eq!(value["activation"]["actor"], "octocat");
     assert_eq!(value["activation"]["utc"], "2026-08-04T00:00:00Z");
@@ -2380,26 +2414,26 @@ fn pr_loop_promote_baseline_happy_path_is_deterministic_and_never_overwrites() {
             5,
             "baseline must carry five wall samples for {name}"
         );
+        assert_eq!(
+            value["samples"][name]["reported_duration_ms"]
+                .as_array()
+                .unwrap()
+                .len(),
+            5,
+            "baseline must carry five reported-duration samples for {name}"
+        );
+        assert_eq!(
+            value["samples"][name]["reported_duration_ms_median"], 42,
+            "the fake report pins duration_ms to 42 for {name}"
+        );
     }
 
     // Deterministic: identical inputs and metadata produce identical bytes.
     let second = workspace.path().join("baseline-second.json");
     assert!(
-        run_promoter(
-            &artifact,
-            &second,
-            "test-commit",
-            &[
-                "--activation-pr",
-                "487",
-                "--activation-actor",
-                "octocat",
-                "--activation-utc",
-                "2026-08-04T00:00:00Z",
-            ],
-        )
-        .status
-        .success()
+        run_promoter(&artifact, &second, "test-commit", &[])
+            .status
+            .success()
     );
     assert_eq!(
         fs::read(&baseline).unwrap(),
@@ -2412,11 +2446,9 @@ fn pr_loop_promote_baseline_happy_path_is_deterministic_and_never_overwrites() {
     assert_eq!(third.status.code(), Some(2));
     let overwritten = run_promoter(&artifact, &baseline, "test-commit", &["--overwrite"]);
     assert!(overwritten.status.success());
-    let without_activation = read_json(&baseline);
-    assert_eq!(
-        without_activation["activation"]["pr"],
-        serde_json::Value::Null
-    );
+    let durable = read_json(&baseline);
+    assert_eq!(durable["status"], "durable");
+    assert_eq!(durable["activation"]["pr"], 487);
 }
 
 #[test]
@@ -2710,6 +2742,1617 @@ fn copy_dir(source: &Path, target: &Path) {
             copy_dir(&path, &destination);
         } else {
             fs::copy(&path, &destination).unwrap();
+        }
+    }
+}
+
+#[test]
+fn pr_loop_promote_baseline_requires_durable_activation_metadata() {
+    if !harness_tools_available() || !tool_on_path("python3") {
+        eprintln!("skipping: harness or Python tools unavailable");
+        return;
+    }
+    let tools = install_fake_tools();
+    let gocache = tempfile::tempdir().expect("gocache tempdir");
+    let workspace = tempfile::tempdir().expect("workspace");
+    let artifact = workspace.path().join("artifact");
+    fs::create_dir(&artifact).unwrap();
+    build_calibration_artifact(&tools, &artifact, gocache.path());
+
+    // No activation metadata at all: a durable baseline is never written.
+    let missing = workspace.path().join("missing-activation.json");
+    let rejected = run_promoter_with(&artifact, &missing, "test-commit", &[], &[]);
+    assert_eq!(rejected.status.code(), Some(2));
+    assert!(!missing.exists());
+
+    // Invalid activation metadata (extra args override the defaults).
+    for (name, override_args) in [
+        ("zero-pr", vec!["--activation-pr", "0"]),
+        ("blank-actor", vec!["--activation-actor", "   "]),
+        ("not-utc", vec!["--activation-utc", "yesterday"]),
+        (
+            "offset-utc",
+            vec!["--activation-utc", "2026-08-04T00:00:00+00:00"],
+        ),
+    ] {
+        let output = workspace.path().join(format!("{name}.json"));
+        let rejected = run_promoter_with(
+            &artifact,
+            &output,
+            "test-commit",
+            &PROMOTER_ACTIVATION,
+            &override_args,
+        );
+        assert_eq!(
+            rejected.status.code(),
+            Some(2),
+            "{name} must fail closed\nstderr: {}",
+            String::from_utf8_lossy(&rejected.stderr)
+        );
+        assert!(!output.exists(), "{name} must not write a baseline");
+    }
+
+    // The fixed tolerance policy is not a CLI surface: there is no way to
+    // pass hand-authored thresholds through promotion.
+    let help = Command::new("python3")
+        .arg(promoter_path())
+        .arg("--help")
+        .output()
+        .expect("promoter help");
+    let help_text = String::from_utf8_lossy(&help.stdout);
+    for flag in ["--tolerance", "--threshold", "--floor", "--policy"] {
+        assert!(
+            !help_text.contains(flag),
+            "promoter must not accept hand-authored policy flag {flag}"
+        );
+    }
+}
+
+#[test]
+fn pr_loop_promote_baseline_rejects_reported_duration_outlier() {
+    if !harness_tools_available() || !tool_on_path("python3") {
+        eprintln!("skipping: harness or Python tools unavailable");
+        return;
+    }
+    let tools = install_fake_tools();
+    let gocache = tempfile::tempdir().expect("gocache tempdir");
+    let workspace = tempfile::tempdir().expect("workspace");
+    let artifact = workspace.path().join("artifact");
+    fs::create_dir(&artifact).unwrap();
+    let results = run_primed_samples(&tools, &artifact, gocache.path());
+
+    // Poison the last sample's cold-regular reported duration to 12x the
+    // median of the others: the collector accepts it, the promoter must not.
+    let poisoned = artifact.join("sample-5/pr-loop-benchmark-result.json");
+    let mut result = read_json(&poisoned);
+    let median = result["workloads"][0]["timing"]["reported_duration_ms"]
+        .as_u64()
+        .unwrap()
+        .max(1);
+    result["workloads"][0]["timing"]["reported_duration_ms"] = serde_json::json!(12 * median);
+    fs::write(&poisoned, serde_json::to_vec_pretty(&result).unwrap()).unwrap();
+
+    let candidate = artifact.join("pr-loop-calibration-candidate.json");
+    let collected = run_collector(&candidate, &results);
+    assert!(
+        collected.status.success(),
+        "collector has no outlier policy and must still collect\nstderr: {}",
+        String::from_utf8_lossy(&collected.stderr)
+    );
+    let promoted = run_promoter(
+        &artifact,
+        &workspace.path().join("baseline.json"),
+        "test-commit",
+        &[],
+    );
+    assert_eq!(promoted.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&promoted.stderr).contains("median"),
+        "expected an outlier rejection, got: {}",
+        String::from_utf8_lossy(&promoted.stderr)
+    );
+}
+
+fn comparator_path() -> PathBuf {
+    repo_root().join("benchmarks/pr-loop/compare-baseline.py")
+}
+
+fn run_comparator(baseline: &Path, results: &[PathBuf], output: Option<&Path>) -> Output {
+    let mut command = Command::new("python3");
+    command
+        .arg(comparator_path())
+        .arg("--baseline")
+        .arg(baseline);
+    if let Some(output) = output {
+        command.arg("--output").arg(output);
+    }
+    for result in results {
+        command.arg(result);
+    }
+    command.output().expect("spawn comparator")
+}
+
+/// Runs `count` primed samples bound to one explicit GOCACHE, mirroring the
+/// regression gate's measured acquisition.
+fn run_gate_samples(
+    tools: &FakeTools,
+    samples_dir: &Path,
+    gocache: &Path,
+    count: usize,
+) -> Vec<PathBuf> {
+    let cache_path = gocache.to_str().expect("gocache path");
+    let mut results = Vec::new();
+    for sample in 1..=count {
+        let output = samples_dir.join(format!("sample-{sample}"));
+        let run = run_harness(
+            tools,
+            &output,
+            None,
+            &[
+                ("BENCH_GO_BUILD_CACHE_STATE", "primed"),
+                ("GOCACHE", cache_path),
+            ],
+        );
+        assert!(
+            run.status.success(),
+            "sample {sample} harness run failed\nstderr: {}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        results.push(output.join("pr-loop-benchmark-result.json"));
+    }
+    results
+}
+
+struct GateFixture {
+    _workspace: tempfile::TempDir,
+    baseline: PathBuf,
+    samples_dir: PathBuf,
+    results: Vec<PathBuf>,
+}
+
+/// Builds the durable baseline end to end (harness -> collector -> promoter)
+/// plus three fresh primed comparison samples on the same runner class.
+fn build_gate_fixture() -> (FakeTools, GateFixture) {
+    let tools = install_fake_tools();
+    let gocache = tempfile::tempdir().expect("gocache tempdir");
+    let workspace = tempfile::tempdir().expect("workspace");
+    let artifact = workspace.path().join("artifact");
+    fs::create_dir(&artifact).unwrap();
+    build_calibration_artifact(&tools, &artifact, gocache.path());
+    let baseline = workspace.path().join("baseline.json");
+    let promoted = run_promoter(&artifact, &baseline, "test-commit", &[]);
+    assert!(
+        promoted.status.success(),
+        "gate fixture promotion failed\nstderr: {}",
+        String::from_utf8_lossy(&promoted.stderr)
+    );
+    let samples_dir = workspace.path().join("gate-samples");
+    fs::create_dir(&samples_dir).unwrap();
+    let results = run_gate_samples(&tools, &samples_dir, gocache.path(), 3);
+    (
+        tools,
+        GateFixture {
+            _workspace: workspace,
+            baseline,
+            samples_dir,
+            results,
+        },
+    )
+}
+
+/// Overwrites one workload/metric timing value in each of the three result
+/// files; values map to samples in order and the middle value after sorting
+/// is the median M seen by the comparator.
+fn set_result_metric(results: &[PathBuf], workload: &str, metric: &str, values: [u64; 3]) {
+    assert_eq!(results.len(), 3);
+    for (path, value) in results.iter().zip(values) {
+        let mut result = read_json(path);
+        let mut found = false;
+        for item in result["workloads"].as_array_mut().unwrap() {
+            if item["name"] == workload {
+                item["timing"][metric] = serde_json::json!(value);
+                found = true;
+            }
+        }
+        assert!(found, "workload {workload} missing from {path:?}");
+        fs::write(path, serde_json::to_vec_pretty(&result).unwrap()).unwrap();
+    }
+}
+
+/// Rewrites one baseline workload/metric with five raw values and the
+/// matching stored median (B) so the comparator's internal check holds.
+fn set_baseline_metric(baseline: &Path, workload: &str, metric: &str, values: [u64; 5]) {
+    let mut sorted = values;
+    sorted.sort_unstable();
+    let median = sorted[2];
+    let mut doc = read_json(baseline);
+    doc["samples"][workload][metric] = serde_json::json!(values);
+    doc["samples"][workload][format!("{metric}_median")] = serde_json::json!(median);
+    fs::write(baseline, serde_json::to_vec_pretty(&doc).unwrap()).unwrap();
+}
+
+#[test]
+fn pr_loop_comparator_passes_fresh_samples_and_writes_summary() {
+    if !harness_tools_available() || !tool_on_path("python3") {
+        eprintln!("skipping: harness or Python tools unavailable");
+        return;
+    }
+    let (_tools, fixture) = build_gate_fixture();
+    let summary_path = fixture.samples_dir.join("comparison.json");
+    let output = run_comparator(&fixture.baseline, &fixture.results, Some(&summary_path));
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "fresh comparable samples must pass\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("comparison result: PASS"));
+    let summary = read_json(&summary_path);
+    assert_eq!(summary["kind"], "togi_pr_loop_comparison");
+    assert_eq!(summary["result"], "pass");
+    assert_eq!(summary["regressions"], serde_json::json!([]));
+    for name in WORKLOAD_NAMES {
+        for metric in ["wall_ms", "reported_duration_ms"] {
+            assert_eq!(
+                summary["workloads"][name][metric]["exceeds_tolerance"], false,
+                "{name}/{metric} must be inside tolerance"
+            );
+        }
+    }
+    // The machine-readable summary is the stdout JSON document.
+    let written = fs::read_to_string(&summary_path).unwrap();
+    assert!(stdout.contains(written.trim_end()));
+
+    // The comparator refuses to clobber an existing summary.
+    let rerun = run_comparator(&fixture.baseline, &fixture.results, Some(&summary_path));
+    assert_eq!(rerun.status.code(), Some(2));
+}
+
+#[test]
+fn pr_loop_comparator_exact_boundary_passes_and_plus_one_fails() {
+    if !harness_tools_available() || !tool_on_path("python3") {
+        eprintln!("skipping: harness or Python tools unavailable");
+        return;
+    }
+    let (_tools, fixture) = build_gate_fixture();
+    // Wall: cap = (3*B + 2*250)/2 with B=1000 -> 1750ms exactly.
+    // 2*M > 3*B + 2*floor is strict: M=1750 passes, M=1751 exceeds.
+    set_baseline_metric(&fixture.baseline, "cold-regular", "wall_ms", [1000; 5]);
+    set_baseline_metric(&fixture.baseline, "pr-diff-default", "wall_ms", [1000; 5]);
+
+    let boundary_dir = fixture.samples_dir.join("boundary");
+    fs::create_dir(&boundary_dir).unwrap();
+    let boundary_results: Vec<PathBuf> = fixture
+        .results
+        .iter()
+        .enumerate()
+        .map(|(index, result)| {
+            let copied = boundary_dir.join(format!("result-{index}.json"));
+            fs::copy(result, &copied).unwrap();
+            copied
+        })
+        .collect();
+    set_result_metric(&boundary_results, "cold-regular", "wall_ms", [1750; 3]);
+    set_result_metric(&boundary_results, "pr-diff-default", "wall_ms", [1750; 3]);
+    let boundary = run_comparator(&fixture.baseline, &boundary_results, None);
+    assert_eq!(
+        boundary.status.code(),
+        Some(0),
+        "median exactly at the tolerance cap must pass\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&boundary.stdout),
+        String::from_utf8_lossy(&boundary.stderr)
+    );
+
+    let plus_one_dir = fixture.samples_dir.join("plus-one");
+    fs::create_dir(&plus_one_dir).unwrap();
+    let plus_one_results: Vec<PathBuf> = fixture
+        .results
+        .iter()
+        .enumerate()
+        .map(|(index, result)| {
+            let copied = plus_one_dir.join(format!("result-{index}.json"));
+            fs::copy(result, &copied).unwrap();
+            copied
+        })
+        .collect();
+    set_result_metric(&plus_one_results, "cold-regular", "wall_ms", [1751; 3]);
+    set_result_metric(&plus_one_results, "pr-diff-default", "wall_ms", [1751; 3]);
+    let plus_one = run_comparator(&fixture.baseline, &plus_one_results, None);
+    assert_eq!(
+        plus_one.status.code(),
+        Some(1),
+        "one millisecond over the cap on two workload/metrics must fail\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&plus_one.stdout),
+        String::from_utf8_lossy(&plus_one.stderr)
+    );
+    assert!(String::from_utf8_lossy(&plus_one.stdout).contains("comparison result: FAIL"));
+}
+
+#[test]
+fn pr_loop_comparator_sample_spikes_warn_and_any_median_over_fails() {
+    if !harness_tools_available() || !tool_on_path("python3") {
+        eprintln!("skipping: harness or Python tools unavailable");
+        return;
+    }
+    let (_tools, fixture) = build_gate_fixture();
+    // Wall: cap = (3*B + 2*250)/2 with B=1000 -> 1750ms. Reported duration:
+    // cap = (3*B + 2*100)/2 with B=100 -> 250ms.
+    set_baseline_metric(&fixture.baseline, "cold-regular", "wall_ms", [1000; 5]);
+    set_baseline_metric(
+        &fixture.baseline,
+        "cold-regular",
+        "reported_duration_ms",
+        [100; 5],
+    );
+
+    let copy_results = |name: &str| {
+        let dir = fixture.samples_dir.join(name);
+        fs::create_dir(&dir).unwrap();
+        fixture
+            .results
+            .iter()
+            .enumerate()
+            .map(|(index, result)| {
+                let copied = dir.join(format!("result-{index}.json"));
+                fs::copy(result, &copied).unwrap();
+                copied
+            })
+            .collect::<Vec<_>>()
+    };
+
+    // (a) One high raw wall sample: the median stays under the cap, so the
+    // spike is recorded and warned observationally but passes.
+    let spike = copy_results("wall-single-spike");
+    set_result_metric(&spike, "cold-regular", "wall_ms", [1751, 1000, 1000]);
+    let output = run_comparator(&fixture.baseline, &spike, None);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "one raw wall spike must pass observationally\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("sample-level exceedance (observational): cold-regular wall_ms"),
+        "expected a wall sample-exceedance warning: {stdout}"
+    );
+    assert!(stdout.contains("comparison result: PASS"));
+
+    // (b) Two high raw wall samples push the median over the cap: any median
+    // over the cap is a hard regression.
+    let spikes = copy_results("wall-two-spikes");
+    set_result_metric(&spikes, "cold-regular", "wall_ms", [1751, 1751, 1000]);
+    let output = run_comparator(&fixture.baseline, &spikes, None);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "two raw wall spikes move the median over the cap and must fail\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // (c) One high raw reported-duration sample: observational pass.
+    let spike = copy_results("reported-single-spike");
+    set_result_metric(
+        &spike,
+        "cold-regular",
+        "reported_duration_ms",
+        [300, 100, 100],
+    );
+    let output = run_comparator(&fixture.baseline, &spike, None);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "one raw reported-duration spike must pass observationally\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout
+            .contains("sample-level exceedance (observational): cold-regular reported_duration_ms"),
+        "expected a reported-duration sample-exceedance warning: {stdout}"
+    );
+
+    // (d) Two high raw reported-duration samples: the median crosses, exit 1.
+    let spikes = copy_results("reported-two-spikes");
+    set_result_metric(
+        &spikes,
+        "cold-regular",
+        "reported_duration_ms",
+        [300, 300, 100],
+    );
+    let output = run_comparator(&fixture.baseline, &spikes, None);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "two raw reported-duration spikes move the median over the cap and must fail\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // (e) A single median-over metric fails even though the other metric is
+    // normal: "one spike passes" never makes a median regression advisory.
+    let median_over = copy_results("wall-median-over");
+    set_result_metric(&median_over, "cold-regular", "wall_ms", [1751; 3]);
+    let output = run_comparator(&fixture.baseline, &median_over, None);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "a single median-over metric must fail\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("cold-regular reported_duration_ms: median 42ms"));
+    assert!(stdout.contains("comparison result: FAIL"));
+}
+
+#[test]
+fn pr_loop_comparator_rejects_wrong_count_missing_and_malformed_inputs() {
+    if !harness_tools_available() || !tool_on_path("python3") {
+        eprintln!("skipping: harness or Python tools unavailable");
+        return;
+    }
+    let (_tools, fixture) = build_gate_fixture();
+    for (label, count) in [("two", 2), ("four", 4)] {
+        let mut results = fixture.results.clone();
+        while results.len() < count {
+            results.push(fixture.results[0].clone());
+        }
+        results.truncate(count);
+        let rejected = run_comparator(&fixture.baseline, &results, None);
+        assert_eq!(
+            rejected.status.code(),
+            Some(2),
+            "{label} results must fail closed\nstderr: {}",
+            String::from_utf8_lossy(&rejected.stderr)
+        );
+    }
+    // Duplicate paths are not three independent measurements.
+    let duplicates = vec![fixture.results[0].clone(); 3];
+    let rejected = run_comparator(&fixture.baseline, &duplicates, None);
+    assert_eq!(rejected.status.code(), Some(2));
+
+    // Missing baseline file.
+    let missing = fixture.samples_dir.join("no-such-baseline.json");
+    let rejected = run_comparator(&missing, &fixture.results, None);
+    assert_eq!(rejected.status.code(), Some(2));
+
+    // Malformed baseline JSON.
+    let malformed = fixture.samples_dir.join("malformed-baseline.json");
+    fs::write(&malformed, "{").unwrap();
+    let rejected = run_comparator(&malformed, &fixture.results, None);
+    assert_eq!(rejected.status.code(), Some(2));
+
+    // Malformed result JSON.
+    let malformed_result = fixture.samples_dir.join("malformed-result.json");
+    fs::write(&malformed_result, "{").unwrap();
+    let mut results = fixture.results.clone();
+    results[2] = malformed_result;
+    let rejected = run_comparator(&fixture.baseline, &results, None);
+    assert_eq!(rejected.status.code(), Some(2));
+
+    // A directory in place of the baseline document is missing input, not a
+    // baseline.
+    let directory = fixture.samples_dir.join("baseline-dir");
+    fs::create_dir(&directory).unwrap();
+    let rejected = run_comparator(&directory, &fixture.results, None);
+    assert_eq!(rejected.status.code(), Some(2));
+}
+
+#[test]
+fn pr_loop_comparator_rejects_stale_or_hand_authored_baselines() {
+    if !harness_tools_available() || !tool_on_path("python3") {
+        eprintln!("skipping: harness or Python tools unavailable");
+        return;
+    }
+    let (_tools, fixture) = build_gate_fixture();
+    let rewrite_baseline = |name: &str, mutate: &dyn Fn(&mut serde_json::Value)| {
+        let mut doc = read_json(&fixture.baseline);
+        mutate(&mut doc);
+        let path = fixture.samples_dir.join(format!("{name}.json"));
+        fs::write(&path, serde_json::to_vec_pretty(&doc).unwrap()).unwrap();
+        path
+    };
+
+    // A non-durable (pending-activation) document is not a baseline.
+    let pending = rewrite_baseline("pending", &|doc| {
+        doc["status"] = serde_json::json!("pending-activation");
+    });
+    assert_eq!(
+        run_comparator(&pending, &fixture.results, None)
+            .status
+            .code(),
+        Some(2)
+    );
+
+    // Hand-authored tolerance thresholds never replace the fixed policy.
+    let custom_policy = rewrite_baseline("custom-policy", &|doc| {
+        doc["tolerance_policy"]["wall_ms"]["absolute_floor_ms"] = serde_json::json!(10_000);
+    });
+    assert_eq!(
+        run_comparator(&custom_policy, &fixture.results, None)
+            .status
+            .code(),
+        Some(2)
+    );
+
+    // A stored median disagreeing with the five raw values is corrupt.
+    let bad_median = rewrite_baseline("bad-median", &|doc| {
+        doc["samples"]["cold-regular"]["wall_ms_median"] = serde_json::json!(1);
+    });
+    let rejected = run_comparator(&bad_median, &fixture.results, None);
+    assert_eq!(rejected.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr).contains("median"),
+        "expected a median verification error: {}",
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+
+    // Dropped raw reported-duration samples are malformed.
+    let dropped = rewrite_baseline("dropped-duration", &|doc| {
+        doc["samples"]["cold-regular"]
+            .as_object_mut()
+            .unwrap()
+            .remove("reported_duration_ms");
+    });
+    assert_eq!(
+        run_comparator(&dropped, &fixture.results, None)
+            .status
+            .code(),
+        Some(2)
+    );
+
+    // A baseline pinned to a different corpus generation is stale.
+    let stale_digests = rewrite_baseline("stale-digests", &|doc| {
+        doc["source_file_digests"]["benchmarks/pr-loop/manifest.json"] =
+            serde_json::json!("0".repeat(64));
+    });
+    let rejected = run_comparator(&stale_digests, &fixture.results, None);
+    assert_eq!(rejected.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr).contains("digest"),
+        "expected a digest mismatch: {}",
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+
+    // The digest key set must be complete and exact: deleting any required
+    // key (manifest, scenario patch, fixture tree, or one of the five sample
+    // results) or adding any extra key is incomparable before values matter.
+    for (name, key) in [
+        ("deleted-manifest-key", "benchmarks/pr-loop/manifest.json"),
+        (
+            "deleted-patch-key",
+            "benchmarks/pr-loop/fixture-change-multi.patch",
+        ),
+        ("deleted-fixture-key", "tests/fixtures/go/"),
+        (
+            "deleted-sample-key",
+            "sample-5/pr-loop-benchmark-result.json",
+        ),
+    ] {
+        let deleted = rewrite_baseline(name, &|doc| {
+            doc["source_file_digests"]
+                .as_object_mut()
+                .unwrap()
+                .remove(key);
+        });
+        let rejected = run_comparator(&deleted, &fixture.results, None);
+        assert_eq!(
+            rejected.status.code(),
+            Some(2),
+            "{name} must fail closed\nstderr: {}",
+            String::from_utf8_lossy(&rejected.stderr)
+        );
+    }
+    let extra = rewrite_baseline("extra-digest-key", &|doc| {
+        doc["source_file_digests"]["benchmarks/pr-loop/extra.json"] =
+            serde_json::json!("0".repeat(64));
+    });
+    let rejected = run_comparator(&extra, &fixture.results, None);
+    assert_eq!(
+        rejected.status.code(),
+        Some(2),
+        "an extra digest key must fail closed\nstderr: {}",
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+}
+
+#[test]
+fn pr_loop_comparator_rejects_non_integer_or_negative_median_data() {
+    if !harness_tools_available() || !tool_on_path("python3") {
+        eprintln!("skipping: harness or Python tools unavailable");
+        return;
+    }
+    let (_tools, fixture) = build_gate_fixture();
+    let rewrite_baseline = |name: &str, mutate: &dyn Fn(&mut serde_json::Value)| {
+        let mut doc = read_json(&fixture.baseline);
+        mutate(&mut doc);
+        let path = fixture.samples_dir.join(format!("{name}.json"));
+        fs::write(&path, serde_json::to_vec_pretty(&doc).unwrap()).unwrap();
+        path
+    };
+
+    // A stored median that is a float, bool, or negative is corrupt even
+    // when it would compare equal to the integer median numerically.
+    let true_median = read_json(&fixture.baseline)["samples"]["cold-regular"]["wall_ms_median"]
+        .as_u64()
+        .expect("integer median");
+    for (name, replacement) in [
+        ("float-median", serde_json::json!(true_median as f64)),
+        ("bool-median", serde_json::json!(true)),
+        ("negative-median", serde_json::json!(-1)),
+    ] {
+        let corrupt = rewrite_baseline(name, &|doc| {
+            doc["samples"]["cold-regular"]["wall_ms_median"] = replacement.clone();
+        });
+        let rejected = run_comparator(&corrupt, &fixture.results, None);
+        assert_eq!(
+            rejected.status.code(),
+            Some(2),
+            "{name} must fail closed\nstderr: {}",
+            String::from_utf8_lossy(&rejected.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&rejected.stderr).contains("median"),
+            "{name} must report the median verification: {}",
+            String::from_utf8_lossy(&rejected.stderr)
+        );
+    }
+
+    // Float, bool, and negative raw sample values are corrupt too.
+    for (name, replacement) in [
+        ("float-raw", serde_json::json!(true_median as f64 + 0.5)),
+        ("bool-raw", serde_json::json!(false)),
+        ("negative-raw", serde_json::json!(-5)),
+    ] {
+        let corrupt = rewrite_baseline(name, &|doc| {
+            doc["samples"]["cold-regular"]["wall_ms"][0] = replacement.clone();
+        });
+        let rejected = run_comparator(&corrupt, &fixture.results, None);
+        assert_eq!(
+            rejected.status.code(),
+            Some(2),
+            "{name} must fail closed\nstderr: {}",
+            String::from_utf8_lossy(&rejected.stderr)
+        );
+    }
+
+    // A stored float median equal to the true integer median still fails:
+    // JSON 1000.0 is not the integer 1000 even though Python `==` would say so.
+    let float_equal = rewrite_baseline("float-equal-median", &|doc| {
+        doc["samples"]["cold-regular"]["wall_ms"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .for_each(|value| *value = serde_json::json!(true_median));
+        doc["samples"]["cold-regular"]["wall_ms_median"] = serde_json::json!(true_median as f64);
+    });
+    let rejected = run_comparator(&float_equal, &fixture.results, None);
+    assert_eq!(
+        rejected.status.code(),
+        Some(2),
+        "a float stored median must fail even when numerically equal\nstderr: {}",
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+}
+
+#[test]
+fn pr_loop_comparator_rejects_invalid_baseline_provenance() {
+    if !harness_tools_available() || !tool_on_path("python3") {
+        eprintln!("skipping: harness or Python tools unavailable");
+        return;
+    }
+    let (_tools, fixture) = build_gate_fixture();
+    let rewrite_baseline = |name: &str, mutate: &dyn Fn(&mut serde_json::Value)| {
+        let mut doc = read_json(&fixture.baseline);
+        mutate(&mut doc);
+        let path = fixture.samples_dir.join(format!("{name}.json"));
+        fs::write(&path, serde_json::to_vec_pretty(&doc).unwrap()).unwrap();
+        path
+    };
+
+    // Activation UTC must be strict RFC 3339 Z, mirroring the promoter.
+    for (name, utc) in [
+        ("activation-utc-garbage", "yesterday"),
+        ("activation-utc-offset", "2026-08-04T00:00:00+00:00"),
+        ("activation-utc-date-only", "2026-08-04"),
+    ] {
+        let corrupt = rewrite_baseline(name, &|doc| {
+            doc["activation"]["utc"] = serde_json::json!(utc);
+        });
+        let rejected = run_comparator(&corrupt, &fixture.results, None);
+        assert_eq!(
+            rejected.status.code(),
+            Some(2),
+            "{name} must fail closed\nstderr: {}",
+            String::from_utf8_lossy(&rejected.stderr)
+        );
+    }
+    let missing_activation_utc = rewrite_baseline("activation-utc-missing", &|doc| {
+        doc["activation"].as_object_mut().unwrap().remove("utc");
+    });
+    assert_eq!(
+        run_comparator(&missing_activation_utc, &fixture.results, None)
+            .status
+            .code(),
+        Some(2)
+    );
+
+    // Source run must be a non-empty string.
+    for (name, run) in [
+        ("source-run-blank", serde_json::json!("   ")),
+        ("source-run-nonstring", serde_json::json!(30928964359u64)),
+    ] {
+        let corrupt = rewrite_baseline(name, &|doc| {
+            doc["source"]["run"] = run.clone();
+        });
+        let rejected = run_comparator(&corrupt, &fixture.results, None);
+        assert_eq!(
+            rejected.status.code(),
+            Some(2),
+            "{name} must fail closed\nstderr: {}",
+            String::from_utf8_lossy(&rejected.stderr)
+        );
+    }
+    let missing_run = rewrite_baseline("source-run-missing", &|doc| {
+        doc["source"].as_object_mut().unwrap().remove("run");
+    });
+    assert_eq!(
+        run_comparator(&missing_run, &fixture.results, None)
+            .status
+            .code(),
+        Some(2)
+    );
+
+    // Source attempt must be a positive exact integer: zero, bool, and float
+    // are all corrupt.
+    for (name, attempt) in [
+        ("source-attempt-zero", serde_json::json!(0)),
+        ("source-attempt-bool", serde_json::json!(true)),
+        ("source-attempt-float", serde_json::json!(1.0)),
+    ] {
+        let corrupt = rewrite_baseline(name, &|doc| {
+            doc["source"]["attempt"] = attempt.clone();
+        });
+        let rejected = run_comparator(&corrupt, &fixture.results, None);
+        assert_eq!(
+            rejected.status.code(),
+            Some(2),
+            "{name} must fail closed\nstderr: {}",
+            String::from_utf8_lossy(&rejected.stderr)
+        );
+    }
+
+    // Source UTC must exist and be strict RFC 3339 Z.
+    let missing_source_utc = rewrite_baseline("source-utc-missing", &|doc| {
+        doc["source"].as_object_mut().unwrap().remove("utc");
+    });
+    assert_eq!(
+        run_comparator(&missing_source_utc, &fixture.results, None)
+            .status
+            .code(),
+        Some(2)
+    );
+    let invalid_source_utc = rewrite_baseline("source-utc-invalid", &|doc| {
+        doc["source"]["utc"] = serde_json::json!("2026-08-04 16:26:18");
+    });
+    assert_eq!(
+        run_comparator(&invalid_source_utc, &fixture.results, None)
+            .status
+            .code(),
+        Some(2)
+    );
+
+    // The untouched durable baseline still validates after all corruptions.
+    let accepted = run_comparator(&fixture.baseline, &fixture.results, None);
+    assert_eq!(
+        accepted.status.code(),
+        Some(0),
+        "pristine baseline must still compare\nstderr: {}",
+        String::from_utf8_lossy(&accepted.stderr)
+    );
+}
+
+#[test]
+fn pr_loop_comparator_fails_closed_on_identity_runner_and_cache_mismatch() {
+    if !harness_tools_available() || !tool_on_path("python3") {
+        eprintln!("skipping: harness or Python tools unavailable");
+        return;
+    }
+    let (_tools, fixture) = build_gate_fixture();
+    let tampered_results = |name: &str, pointer: &str, replacement: serde_json::Value| {
+        let dir = fixture.samples_dir.join(name);
+        fs::create_dir(&dir).unwrap();
+        fixture
+            .results
+            .iter()
+            .enumerate()
+            .map(|(index, result)| {
+                let copied = dir.join(format!("result-{index}.json"));
+                if index == 0 {
+                    let mut doc = read_json(result);
+                    *doc.pointer_mut(pointer).expect("tamper field") = replacement.clone();
+                    fs::write(&copied, serde_json::to_vec_pretty(&doc).unwrap()).unwrap();
+                } else {
+                    fs::copy(result, &copied).unwrap();
+                }
+                copied
+            })
+            .collect::<Vec<_>>()
+    };
+
+    for (label, pointer, replacement) in [
+        // Semantic identity: normalized workload command args.
+        (
+            "command-args",
+            "/workloads/0/command/1",
+            serde_json::json!("mutate"),
+        ),
+        // Semantic identity: selected test command.
+        (
+            "test-command",
+            "/workloads/0/semantics/selected_test_command/2",
+            serde_json::json!("./only"),
+        ),
+        // Semantic identity: test selection.
+        (
+            "test-selection",
+            "/workloads/0/semantics/test_selection/mode",
+            serde_json::json!("narrowed"),
+        ),
+        // Per-scenario mutation digest.
+        (
+            "mutation-digest",
+            "/cross_workload/scenarios/single-file/mutation_identity_sha256",
+            serde_json::json!("0".repeat(64)),
+        ),
+        // Runner class.
+        (
+            "runner-label",
+            "/provenance/runner_label",
+            serde_json::json!("other-runner"),
+        ),
+        (
+            "logical-cpu",
+            "/provenance/logical_cpu_count",
+            serde_json::json!(1),
+        ),
+        // Measurement cache state/policy.
+        (
+            "cache-state",
+            "/provenance/go_build_cache_state",
+            serde_json::json!("warmup"),
+        ),
+        (
+            "cache-policy",
+            "/provenance/go_build_cache_policy",
+            serde_json::json!("unenforced"),
+        ),
+        // Non-successful results are never comparable evidence.
+        ("not-ok", "/ok", serde_json::json!(false)),
+        (
+            "failed-invariant",
+            "/workloads/0/invariants/0/ok",
+            serde_json::json!(false),
+        ),
+    ] {
+        let results = tampered_results(label, pointer, replacement);
+        let rejected = run_comparator(&fixture.baseline, &results, None);
+        assert_eq!(
+            rejected.status.code(),
+            Some(2),
+            "{label} must fail closed\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&rejected.stdout),
+            String::from_utf8_lossy(&rejected.stderr)
+        );
+    }
+
+    // Baseline-side semantic drift is incomparable too.
+    let mut doc = read_json(&fixture.baseline);
+    doc["semantic_identity"]["workloads"][0]["runner_mode"] = serde_json::json!("forged");
+    let forged = fixture.samples_dir.join("forged-identity-baseline.json");
+    fs::write(&forged, serde_json::to_vec_pretty(&doc).unwrap()).unwrap();
+    let rejected = run_comparator(&forged, &fixture.results, None);
+    assert_eq!(rejected.status.code(), Some(2));
+}
+
+#[test]
+fn pr_loop_comparator_provenance_drift_warns_without_failing() {
+    if !harness_tools_available() || !tool_on_path("python3") {
+        eprintln!("skipping: harness or Python tools unavailable");
+        return;
+    }
+    let (_tools, fixture) = build_gate_fixture();
+    // Volatile execution provenance (Git/kernel/togi versions) is
+    // observational: drift warns but never changes the exit code. The pinned
+    // Go toolchain is NOT volatile and is covered by a separate hard check.
+    let dir = fixture.samples_dir.join("provenance-drift");
+    fs::create_dir(&dir).unwrap();
+    let results: Vec<PathBuf> = fixture
+        .results
+        .iter()
+        .enumerate()
+        .map(|(index, result)| {
+            let copied = dir.join(format!("result-{index}.json"));
+            if index == 1 {
+                let mut doc = read_json(result);
+                doc["provenance"]["git_version"] = serde_json::json!("git version 9.9.9");
+                doc["provenance"]["togi_version"] = serde_json::json!("togi 0.0.0-drift");
+                fs::write(&copied, serde_json::to_vec_pretty(&doc).unwrap()).unwrap();
+            } else {
+                fs::copy(result, &copied).unwrap();
+            }
+            copied
+        })
+        .collect();
+    let output = run_comparator(&fixture.baseline, &results, None);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "provenance drift must not fail the gate\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("volatile execution provenance drift: git_version"),
+        "expected git_version drift warning: {stdout}"
+    );
+    assert!(
+        stdout.contains("volatile execution provenance drift: togi_version"),
+        "expected togi_version drift warning: {stdout}"
+    );
+}
+
+#[test]
+fn pr_loop_comparator_pins_the_go_toolchain() {
+    if !harness_tools_available() || !tool_on_path("python3") {
+        eprintln!("skipping: harness or Python tools unavailable");
+        return;
+    }
+    let (_tools, fixture) = build_gate_fixture();
+    // Go is a pinned comparable dimension: any result measured under a Go
+    // toolchain different from the baseline's is incomparable, never a
+    // warning.
+    let dir = fixture.samples_dir.join("go-version-drift");
+    fs::create_dir(&dir).unwrap();
+    let results: Vec<PathBuf> = fixture
+        .results
+        .iter()
+        .enumerate()
+        .map(|(index, result)| {
+            let copied = dir.join(format!("result-{index}.json"));
+            if index == 2 {
+                let mut doc = read_json(result);
+                doc["provenance"]["go_version"] =
+                    serde_json::json!("go version go1.25.0 linux/amd64");
+                fs::write(&copied, serde_json::to_vec_pretty(&doc).unwrap()).unwrap();
+            } else {
+                fs::copy(result, &copied).unwrap();
+            }
+            copied
+        })
+        .collect();
+    let rejected = run_comparator(&fixture.baseline, &results, None);
+    assert_eq!(
+        rejected.status.code(),
+        Some(2),
+        "a Go toolchain mismatch must fail closed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&rejected.stdout),
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr).contains("go version"),
+        "expected a Go toolchain mismatch error: {}",
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+}
+
+#[test]
+fn pr_loop_comparator_ratio_and_sign_drift_are_observational_only() {
+    if !harness_tools_available() || !tool_on_path("python3") {
+        eprintln!("skipping: harness or Python tools unavailable");
+        return;
+    }
+    let (_tools, fixture) = build_gate_fixture();
+    let copy_results = |name: &str| {
+        let dir = fixture.samples_dir.join(name);
+        fs::create_dir(&dir).unwrap();
+        fixture
+            .results
+            .iter()
+            .enumerate()
+            .map(|(index, result)| {
+                let copied = dir.join(format!("result-{index}.json"));
+                fs::copy(result, &copied).unwrap();
+                copied
+            })
+            .collect::<Vec<_>>()
+    };
+
+    // Warm/cold wall ratio drifting more than 25% below the recorded
+    // baseline ratio warns but still exits 0.
+    set_baseline_metric(&fixture.baseline, "cold-regular", "wall_ms", [1000; 5]);
+    set_baseline_metric(&fixture.baseline, "warm-exact-cache", "wall_ms", [1000; 5]);
+    let ratio = copy_results("ratio-drift");
+    set_result_metric(&ratio, "cold-regular", "wall_ms", [1000; 3]);
+    set_result_metric(&ratio, "warm-exact-cache", "wall_ms", [100; 3]);
+    let output = run_comparator(&fixture.baseline, &ratio, None);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "ratio drift must stay observational\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("wall ratio drifted"),
+        "expected ratio drift warning: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    // Schemata minus cold-regular wall delta changing sign warns but exits 0.
+    set_baseline_metric(&fixture.baseline, "cold-schemata", "wall_ms", [900; 5]);
+    let sign = copy_results("sign-drift");
+    set_result_metric(&sign, "cold-regular", "wall_ms", [1000; 3]);
+    set_result_metric(&sign, "cold-schemata", "wall_ms", [1100; 3]);
+    let output = run_comparator(&fixture.baseline, &sign, None);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "sign drift must stay observational\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("changed sign"),
+        "expected sign-change warning: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+/// SHA-256 hex of one file, mirroring the Python tooling's digest_file.
+fn digest_file_hex(path: &Path) -> String {
+    use sha2::{Digest, Sha256};
+    let mut digest = Sha256::new();
+    digest.update(fs::read(path).expect("read file to digest"));
+    digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>()
+}
+
+/// SHA-256 hex of a fixture tree, mirroring the Python tooling's digest_tree
+/// (sorted relative POSIX paths, each followed by a NUL and the content).
+fn digest_tree_hex(root: &Path) -> String {
+    use sha2::{Digest, Sha256};
+    fn collect(root: &Path, dir: &Path, files: &mut Vec<String>) {
+        for entry in fs::read_dir(dir).expect("list fixture tree") {
+            let path = entry.expect("fixture entry").path();
+            if path.is_dir() {
+                collect(root, &path, files);
+            } else if path.is_file() {
+                files.push(
+                    path.strip_prefix(root)
+                        .expect("fixture path prefix")
+                        .to_str()
+                        .expect("UTF-8 fixture path")
+                        .replace('\\', "/"),
+                );
+            }
+        }
+    }
+    let mut files = Vec::new();
+    collect(root, root, &mut files);
+    files.sort_unstable();
+    let mut digest = Sha256::new();
+    for relative in files {
+        digest.update(relative.as_bytes());
+        digest.update(b"\0");
+        digest.update(fs::read(root.join(&relative)).expect("read fixture file"));
+    }
+    digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>()
+}
+
+#[test]
+fn pr_loop_checked_in_baseline_is_a_valid_durable_promoted_artifact() {
+    let baseline = read_json(&repo_root().join("benchmarks/pr-loop/baseline.json"));
+    assert_eq!(baseline["kind"], "togi_pr_loop_baseline");
+    assert_eq!(baseline["schema_version"], 1);
+    assert_eq!(baseline["status"], "durable");
+    assert!(
+        baseline["comparison_policy"]
+            .as_str()
+            .expect("comparison policy")
+            .contains("median of three")
+    );
+    assert_eq!(
+        baseline["tolerance_policy"],
+        serde_json::json!({
+            "policy_version": 1,
+            "repetitions": 3,
+            "aggregation": "median",
+            "wall_ms": {"relative_numerator": 3, "relative_denominator": 2, "absolute_floor_ms": 250},
+            "reported_duration_ms": {"relative_numerator": 3, "relative_denominator": 2, "absolute_floor_ms": 100}
+        }),
+        "the checked-in baseline must pin the fixed tolerance policy"
+    );
+    let activation = &baseline["activation"];
+    assert!(activation["pr"].as_u64().expect("activation PR") >= 1);
+    assert!(
+        !activation["actor"]
+            .as_str()
+            .expect("actor")
+            .trim()
+            .is_empty()
+    );
+    let utc = activation["utc"].as_str().expect("activation UTC");
+    assert!(
+        utc.len() == 20 && utc.ends_with('Z') && &utc[10..11] == "T",
+        "activation UTC must be RFC 3339 Z form, got {utc}"
+    );
+    let source = &baseline["source"];
+    assert!(!source["commit"].as_str().expect("source commit").is_empty());
+    assert!(source["github_artifact_id"].as_u64().expect("artifact id") >= 1);
+    let artifact_digest = source["github_artifact_sha256"]
+        .as_str()
+        .expect("artifact digest");
+    assert!(
+        artifact_digest.len() == 64
+            && artifact_digest
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+        "artifact digest must be normalized lowercase 64-hex"
+    );
+    let runner_class = &baseline["runner_class"];
+    for key in ["runner_label", "os", "arch"] {
+        assert!(!runner_class[key].as_str().expect(key).is_empty());
+    }
+    assert!(runner_class["logical_cpu_count"].as_u64().expect("cpus") >= 1);
+    assert_eq!(
+        baseline["measurement_identity"],
+        serde_json::json!({
+            "go_build_cache_state": "primed",
+            "go_build_cache_policy": "job-private-explicit-gocache"
+        })
+    );
+
+    // Samples: every declared workload, five raw values per metric, stored
+    // medians internally correct, promoter's 3x outlier bound intact.
+    let samples = baseline["samples"].as_object().expect("samples");
+    let mut sample_names: Vec<&str> = samples.keys().map(String::as_str).collect();
+    sample_names.sort_unstable();
+    let mut expected_names = WORKLOAD_NAMES;
+    expected_names.sort_unstable();
+    assert_eq!(sample_names, expected_names);
+    for name in WORKLOAD_NAMES {
+        for metric in ["wall_ms", "reported_duration_ms"] {
+            let raw: Vec<u64> = baseline["samples"][name][metric]
+                .as_array()
+                .expect("raw metric array")
+                .iter()
+                .map(|value| value.as_u64().expect("integer raw value"))
+                .collect();
+            assert_eq!(raw.len(), 5, "{name}/{metric} must carry five raw values");
+            let mut sorted = raw.clone();
+            sorted.sort_unstable();
+            let stored = baseline["samples"][name][format!("{metric}_median")]
+                .as_u64()
+                .expect("integer stored median");
+            assert_eq!(stored, sorted[2], "{name}/{metric} stored median mismatch");
+            assert!(stored > 0, "{name}/{metric} median must be positive");
+            for value in &raw {
+                assert!(
+                    *value <= 3 * stored,
+                    "{name}/{metric} raw value {value} exceeds the promoter's 3x bound"
+                );
+            }
+        }
+    }
+
+    // Digest completeness: exactly the manifest, every declared scenario
+    // patch, the fixture tree, and the five sample result digests — and the
+    // recorded digests match this checkout.
+    let manifest = read_json(&repo_root().join("benchmarks/pr-loop/manifest.json"));
+    let mut expected_keys: Vec<String> = vec!["benchmarks/pr-loop/manifest.json".to_string()];
+    for scenario in manifest["scenarios"].as_array().expect("scenarios") {
+        expected_keys.push(
+            scenario["patch_file"]
+                .as_str()
+                .expect("patch file")
+                .to_string(),
+        );
+    }
+    let fixture_dir = manifest["fixture"]["source_dir"]
+        .as_str()
+        .expect("fixture source dir");
+    expected_keys.push(format!("{}/", fixture_dir.trim_end_matches('/')));
+    for index in 1..=5 {
+        expected_keys.push(format!("sample-{index}/pr-loop-benchmark-result.json"));
+    }
+    expected_keys.sort_unstable();
+    expected_keys.dedup();
+    let digests = baseline["source_file_digests"]
+        .as_object()
+        .expect("source file digests");
+    let mut actual_keys: Vec<&str> = digests.keys().map(String::as_str).collect();
+    actual_keys.sort_unstable();
+    assert_eq!(
+        actual_keys,
+        expected_keys.iter().map(String::as_str).collect::<Vec<_>>(),
+        "baseline digest key set must exactly match the current corpus"
+    );
+    for (key, value) in digests {
+        let recorded = value.as_str().expect("digest string");
+        assert!(
+            recorded.len() == 64
+                && recorded
+                    .chars()
+                    .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            "{key} digest must be normalized lowercase 64-hex"
+        );
+        if key.starts_with("sample-") {
+            continue;
+        }
+        let actual = if let Some(dir) = key.strip_suffix('/') {
+            digest_tree_hex(&repo_root().join(dir))
+        } else {
+            digest_file_hex(&repo_root().join(key))
+        };
+        assert_eq!(
+            actual, recorded,
+            "current {key} digest must match the baseline"
+        );
+    }
+
+    // Semantic identity pins the v2 manifest and the exact workload order.
+    assert_eq!(
+        baseline["semantic_identity"]["manifest"],
+        serde_json::json!({
+            "name": "togi-pr-loop-benchmarks",
+            "schema_version": 2,
+            "path": "benchmarks/pr-loop/manifest.json"
+        })
+    );
+    let identity_names: Vec<&str> = baseline["semantic_identity"]["workloads"]
+        .as_array()
+        .expect("identity workloads")
+        .iter()
+        .map(|workload| workload["name"].as_str().expect("workload name"))
+        .collect();
+    assert_eq!(identity_names, WORKLOAD_NAMES);
+}
+
+#[test]
+fn codeowners_protects_the_gate_corpus_workflows_and_itself() {
+    let contents =
+        fs::read_to_string(repo_root().join(".github/CODEOWNERS")).expect("CODEOWNERS must exist");
+    for pattern in [
+        "/benchmarks/pr-loop/",
+        "/.github/workflows/pr-loop-regression-gate.yml",
+        "/.github/workflows/pr-loop-calibration.yml",
+        "/.github/CODEOWNERS",
+    ] {
+        let line = contents
+            .lines()
+            .filter(|line| !line.trim_start().starts_with('#'))
+            .find(|line| line.split_whitespace().next() == Some(pattern))
+            .unwrap_or_else(|| panic!("CODEOWNERS must cover {pattern}"));
+        let owners: Vec<&str> = line.split_whitespace().skip(1).collect();
+        assert_eq!(
+            owners,
+            ["@Darkroom4364"],
+            "{pattern} must be owned exactly by @Darkroom4364"
+        );
+    }
+}
+
+#[test]
+fn docs_and_readme_record_the_gate_enforcement_contract() {
+    // Observable identifiers only: job/workflow names, the workflow path,
+    // and the ruleset id — not prose.
+    let docs =
+        fs::read_to_string(repo_root().join("docs/COMPATIBILITY.md")).expect("compatibility docs");
+    assert!(
+        docs.contains("PR-loop Benchmark Evidence"),
+        "COMPATIBILITY must keep documenting the telemetry job"
+    );
+    assert!(
+        docs.contains("telemetry only"),
+        "COMPATIBILITY must mark the evidence job as telemetry only"
+    );
+    assert!(
+        docs.contains("PR-loop Regression Gate"),
+        "COMPATIBILITY must document the regression gate"
+    );
+    assert!(
+        docs.contains(".github/workflows/pr-loop-regression-gate.yml"),
+        "COMPATIBILITY must link the gate workflow"
+    );
+    assert!(
+        !docs.contains("no\n  current baseline, threshold, or merge gate"),
+        "COMPATIBILITY must not claim the gate does not exist"
+    );
+    let readme = fs::read_to_string(repo_root().join("README.md")).expect("README");
+    assert!(
+        readme.contains("15308939"),
+        "README must name the main ruleset id used for required-check activation"
+    );
+    assert!(
+        readme.contains("`PR-loop Regression Gate`"),
+        "README must name the exact required check context"
+    );
+}
+
+#[test]
+fn pr_loop_regression_gate_workflow_is_fail_closed_and_comparator_driven() {
+    let workflow =
+        fs::read_to_string(repo_root().join(".github/workflows/pr-loop-regression-gate.yml"))
+            .expect("regression gate workflow");
+    let parsed: serde_yaml::Value = serde_yaml::from_str(&workflow).expect("gate workflow YAML");
+    assert_eq!(parsed["name"].as_str(), Some("PR-loop Regression Gate"));
+    assert_eq!(
+        parsed["permissions"]["contents"].as_str(),
+        Some("read"),
+        "gate must be read-only"
+    );
+
+    // Triggers: every PR and every push to main, with no paths filters,
+    // so the gate can never be bypassed by file selection.
+    assert!(workflow.contains("pull_request:"));
+    assert!(workflow.contains("push:"));
+    assert!(workflow.contains("branches: [main]"));
+    assert!(!workflow.contains("paths:"), "gate must not filter paths");
+    assert!(!workflow.contains("workflow_dispatch:"));
+
+    let job = &parsed["jobs"]["regression-gate"];
+    assert_eq!(job["name"].as_str(), Some("PR-loop Regression Gate"));
+    assert_eq!(
+        parsed["name"].as_str(),
+        job["name"].as_str(),
+        "workflow and job names must coincide so the required check context is unambiguous"
+    );
+    assert_eq!(job["runs-on"].as_str(), Some("ubuntu-24.04"));
+    assert_eq!(job["permissions"]["contents"].as_str(), Some("read"));
+    for field in ["if", "needs", "continue-on-error"] {
+        assert!(
+            job.get(field).is_none(),
+            "gate job must not define `{field}`: the gate can never be skipped or masked"
+        );
+    }
+    // runner.temp is not available in job-level env; the gate must bind the
+    // job-private GOCACHE with step-level literals only.
+    let job_env = job.get("env").and_then(|env| env.as_mapping());
+    if let Some(env) = job_env {
+        for (key, value) in env {
+            assert!(
+                !value.as_str().unwrap_or_default().contains("runner.temp"),
+                "job-level env {key:?} must not reference runner.temp"
+            );
+        }
+    }
+
+    let steps = job["steps"].as_sequence().expect("gate must have steps");
+    let step = |name| {
+        steps
+            .iter()
+            .position(|item| item["name"].as_str() == Some(name))
+            .map(|index| (index, &steps[index]))
+            .unwrap_or_else(|| panic!("missing gate step {name}"))
+    };
+
+    let checkout = steps
+        .iter()
+        .find(|item| item["uses"].as_str() == Some("actions/checkout@v7"))
+        .expect("gate must check out the repository");
+    assert_eq!(
+        checkout["with"]["persist-credentials"].as_bool(),
+        Some(false)
+    );
+    assert_eq!(
+        checkout["with"]["fetch-depth"].as_u64(),
+        Some(0),
+        "gate must fetch full history so the trusted base commit is available"
+    );
+    let toolchain = steps
+        .iter()
+        .find(|item| {
+            item["uses"].as_str()
+                == Some("dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8")
+        })
+        .expect("gate must pin the Rust toolchain action");
+    assert_eq!(toolchain["with"]["toolchain"].as_str(), Some("stable"));
+    assert!(
+        steps.iter().any(|item| {
+            item["uses"].as_str()
+                == Some("Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32")
+        }),
+        "gate must use the pinned rust cache"
+    );
+    let native = step("Assert native Linux x86_64 runner").1;
+    assert_eq!(
+        native["run"].as_str(),
+        Some("bash ./.github/scripts/assert-native-target.sh")
+    );
+    for (key, expected) in [
+        ("TOGI_EXPECTED_TARGET", "x86_64-unknown-linux-gnu"),
+        ("TOGI_EXPECTED_ARCH", "x86_64"),
+    ] {
+        assert_eq!(native["env"][key].as_str(), Some(expected));
+    }
+    let setup_go = steps
+        .iter()
+        .find(|item| item["uses"].as_str() == Some("actions/setup-go@v7"))
+        .expect("gate must set up Go");
+    assert_eq!(
+        setup_go["with"]["go-version"].as_str(),
+        Some("1.26.5"),
+        "gate must pin Go to exactly 1.26.5"
+    );
+
+    let (create_index, create) = step("Create job-private Go build cache");
+    assert_eq!(create["shell"].as_str(), Some("bash"));
+    assert_eq!(create["run"].as_str(), Some(APPROVED_GO_CACHE_CREATION));
+    assert_eq!(
+        create["env"]["BENCH_GOCACHE"].as_str(),
+        Some("${{ runner.temp }}/togi-pr-loop-gocache"),
+        "cache creation must bind the step-level runner.temp GOCACHE literal"
+    );
+    let (_, prerequisites) = step("Check benchmark prerequisites");
+    let prerequisite_run = prerequisites["run"].as_str().expect("prerequisite run");
+    for tool in ["bash", "git", "go", "jq", "sed", "sha256sum", "python3"] {
+        assert!(
+            prerequisite_run.contains(tool),
+            "gate prerequisites must check {tool}"
+        );
+    }
+    let (_, build) = step("Build release binary");
+    assert_eq!(
+        build["run"].as_str(),
+        Some("cargo build --locked --release")
+    );
+
+    let (warmup_index, warmup) = step("Warm Go build cache");
+    let (acquisition_index, acquisition) = step("Acquire three primed samples");
+    let (select_index, select) = step("Select trusted baseline");
+    let (compare_index, compare) = step("Compare against durable baseline");
+    let (upload_index, upload) = step("Upload regression gate evidence");
+    assert!(create_index < warmup_index);
+    assert!(warmup_index < acquisition_index);
+    assert!(acquisition_index < select_index);
+    assert!(select_index < compare_index);
+    assert!(compare_index < upload_index);
+    for (name, item) in [("warmup", warmup), ("acquisition", acquisition)] {
+        assert_eq!(
+            item["env"]["GOCACHE"].as_str(),
+            Some("${{ runner.temp }}/togi-pr-loop-gocache"),
+            "{name} must bind the identical step-level runner.temp GOCACHE literal"
+        );
+        assert_eq!(
+            item["env"]["TOGI_BIN"].as_str(),
+            Some("${{ github.workspace }}/target/release/togi")
+        );
+        assert_eq!(
+            item["env"]["BENCH_RUNNER_LABEL"].as_str(),
+            Some("github-actions-ubuntu-24.04-linux-x86_64"),
+            "{name} must record the gate runner class"
+        );
+    }
+    assert_eq!(
+        warmup["env"]["BENCH_GO_BUILD_CACHE_STATE"].as_str(),
+        Some("warmup")
+    );
+    assert_eq!(
+        acquisition["env"]["BENCH_GO_BUILD_CACHE_STATE"].as_str(),
+        Some("primed")
+    );
+    let acquisition_run = acquisition["run"].as_str().expect("acquisition run");
+    assert!(
+        acquisition_run.contains("for sample in 1 2 3; do"),
+        "the gate must acquire exactly three primed samples in one loop"
+    );
+    assert_eq!(
+        acquisition_run.matches("run-pr-loop-benchmarks.sh").count(),
+        1,
+        "the acquisition loop must contain exactly one harness invocation"
+    );
+    assert!(
+        acquisition_run.contains("$GATE_OUTPUT/sample-$sample"),
+        "acquisition must emit one output directory per sample"
+    );
+
+    // Trusted-base selection: on pull_request the comparator must run
+    // against the base SHA's baseline (never the PR head's copy); the only
+    // head fallback is the explicit one-time bootstrap when the base
+    // genuinely carries no baseline. Invalid or unavailable base SHAs fail
+    // closed with no permissive fallback.
+    assert_eq!(select["shell"].as_str(), Some("bash"));
+    assert_eq!(
+        select["env"]["EVENT_NAME"].as_str(),
+        Some("${{ github.event_name }}")
+    );
+    assert_eq!(
+        select["env"]["PR_BASE_SHA"].as_str(),
+        Some("${{ github.event.pull_request.base.sha }}")
+    );
+    let select_run = select["run"].as_str().expect("select run");
+    for required in [
+        "=~ ^[0-9a-f]{40}$",
+        "git cat-file -e \"$BASE_SHA^{commit}\"",
+        "git cat-file -e \"$BASE_SHA:benchmarks/pr-loop/baseline.json\"",
+        "git show \"$BASE_SHA:benchmarks/pr-loop/baseline.json\" > \"$GATE_OUTPUT/baseline.json\"",
+        "one-time bootstrap",
+        "cp benchmarks/pr-loop/baseline.json \"$GATE_OUTPUT/baseline.json\"",
+        "test -s \"$GATE_OUTPUT/baseline.json\"",
+    ] {
+        assert!(
+            select_run.contains(required),
+            "baseline selection must contain `{required}`"
+        );
+    }
+    for forbidden in ["|| true", "continue"] {
+        assert!(
+            !select_run.contains(forbidden),
+            "baseline selection must not contain permissive fallback `{forbidden}`"
+        );
+    }
+
+    // The comparison step alone performs the timing exit behavior: it must
+    // invoke the comparator against the selected trusted baseline.
+    let compare_run = compare["run"].as_str().expect("compare run");
+    assert!(compare_run.contains("benchmarks/pr-loop/compare-baseline.py"));
+    assert!(compare_run.contains("--baseline \"$GATE_OUTPUT/baseline.json\""));
+    assert!(
+        !compare_run.contains("--baseline benchmarks/pr-loop/baseline.json"),
+        "compare step must not read the PR head's baseline directly"
+    );
+    assert!(compare_run.contains("--output \"$GATE_OUTPUT/pr-loop-regression-comparison.json\""));
+    for sample in 1..=3 {
+        assert!(
+            compare_run.contains(&format!("sample-{sample}/pr-loop-benchmark-result.json")),
+            "compare step must pass sample-{sample}"
+        );
+    }
+    assert_eq!(compare["shell"].as_str(), Some("bash"));
+
+    assert_eq!(upload["if"].as_str(), Some("${{ always() }}"));
+    assert_eq!(
+        upload["uses"].as_str(),
+        Some("actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02")
+    );
+    assert_eq!(
+        upload["with"]["name"].as_str(),
+        Some("pr-loop-regression-gate-${{ github.run_id }}-${{ github.run_attempt }}")
+    );
+    assert_eq!(
+        upload["with"]["path"].as_str(),
+        Some("${{ runner.temp }}/togi-pr-loop-gate")
+    );
+    assert_eq!(upload["with"]["if-no-files-found"].as_str(), Some("warn"));
+    assert_eq!(upload["with"]["retention-days"].as_u64(), Some(14));
+
+    // No step other than the artifact upload may be conditional or masked:
+    // the gate blocks when the baseline is missing or incomparable.
+    for (index, item) in steps.iter().enumerate() {
+        assert!(
+            item.get("continue-on-error").is_none(),
+            "gate step {index} must not mask failure"
+        );
+        if index != upload_index {
+            assert!(
+                item.get("if").is_none(),
+                "gate step {index} must not be conditional"
+            );
         }
     }
 }

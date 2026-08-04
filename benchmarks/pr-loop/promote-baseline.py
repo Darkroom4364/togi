@@ -1,21 +1,24 @@
 #!/usr/bin/env python3
-"""Fail-closed promoter turning a calibration artifact into a future baseline.
+"""Fail-closed promoter turning a calibration artifact into a durable baseline.
 
 Reads a downloaded PR-loop calibration artifact directory (the five measured
-samples plus the collector's candidate JSON) and writes a deterministic
-baseline document. The document carries no comparator, tolerance, or gate:
-the separately reviewed activation PR defines those. Promotion verifies the
-artifact end to end instead of trusting it:
+samples plus the collector's candidate JSON) and writes the deterministic
+durable baseline consumed by compare-baseline.py and the PR-loop regression
+gate. The tolerance policy is fixed (policy_version 1): the promoter never
+accepts hand-authored thresholds. Promotion verifies the artifact end to end
+instead of trusting it:
 
 * every path under the artifact directory is a contained regular file
 * the candidate's kind, schema, source commit, and sample digests hold
 * current manifest, fixture, and patch digests match the candidate
 * five distinct, valid, primed v2 result inputs back the candidate
 * semantic, runner, and cache-policy identity match across the samples
-* per-workload sample data is complete and no wall sample exceeds 3x its
-  per-workload median
+* per-workload sample data is complete and no wall or reported-duration
+  sample exceeds 3x its per-workload median
 
-The volatile Go build cache path is recorded as calibration evidence only;
+A durable baseline requires activation metadata (positive PR, non-empty
+actor, RFC 3339 UTC) recorded from the reviewed activation flow. The
+volatile Go build cache path is recorded as calibration evidence only;
 it is never part of cross-run measurement identity.
 """
 import argparse
@@ -39,7 +42,20 @@ BASELINE_SCHEMA = 1
 EXPECTED_CACHE_STATE = "primed"
 EXPECTED_CACHE_POLICY = "job-private-explicit-gocache"
 SAMPLE_COUNT = 5
-MAX_WALL_TO_MEDIAN = 3
+MAX_SAMPLE_TO_MEDIAN = 3
+COMPARISON_POLICY = (
+    "durable regression gate: median of three primed samples per workload/metric; "
+    "hard failure when any workload/metric median exceeds the fixed tolerance_policy v1 "
+    "(2*M > 3*B + 2*floor); raw sample spikes that do not move the median, ratio drift, "
+    "and sign drift are observational only"
+)
+FIXED_TOLERANCE_POLICY = {
+    "policy_version": 1,
+    "repetitions": 3,
+    "aggregation": "median",
+    "wall_ms": {"relative_numerator": 3, "relative_denominator": 2, "absolute_floor_ms": 250},
+    "reported_duration_ms": {"relative_numerator": 3, "relative_denominator": 2, "absolute_floor_ms": 100},
+}
 ROOT = Path(__file__).resolve().parents[2]
 MANIFEST_PATH = ROOT / "benchmarks/pr-loop/manifest.json"
 CANDIDATE_NAME = "pr-loop-calibration-candidate.json"
@@ -208,9 +224,9 @@ def main(argv):
     parser.add_argument("--github-artifact-sha256", required=True, help="normalized SHA-256 of the downloaded GitHub artifact ZIP")
     parser.add_argument("--output", required=True, type=Path, help="new baseline JSON path")
     parser.add_argument("--expected-source-commit", required=True, help="source commit the artifact must calibrate")
-    parser.add_argument("--activation-pr", type=int, default=None, help="activation PR number, supplied by the activation flow")
-    parser.add_argument("--activation-actor", default=None, help="activation actor, supplied by the activation flow")
-    parser.add_argument("--activation-utc", default=None, help="activation time (RFC 3339 UTC), supplied by the activation flow")
+    parser.add_argument("--activation-pr", type=int, required=True, help="positive activation PR number from the reviewed activation flow")
+    parser.add_argument("--activation-actor", required=True, help="non-empty activation actor from the reviewed activation flow")
+    parser.add_argument("--activation-utc", required=True, help="activation time (RFC 3339 UTC) from the reviewed activation flow")
     parser.add_argument("--overwrite", action="store_true", help="replace an existing output document")
     args = parser.parse_args(argv)
 
@@ -310,6 +326,7 @@ def main(argv):
         wall = [entry[name][0] for entry in walls]
         duration = [entry[name][1] for entry in walls]
         median = statistics.median(wall)
+        duration_median = statistics.median(duration)
         recomputed = {
             "wall_ms": wall,
             "duration_ms": duration,
@@ -320,23 +337,31 @@ def main(argv):
             fail(f"candidate samples for workload {name} do not match the artifact results")
         if median <= 0:
             fail(f"workload {name} has a non-positive wall median")
+        if duration_median <= 0:
+            fail(f"workload {name} has a non-positive reported-duration median")
         for value in wall:
-            if value > MAX_WALL_TO_MEDIAN * median:
-                fail(f"workload {name} has a wall sample above {MAX_WALL_TO_MEDIAN}x its median")
-        samples[name] = recomputed
+            if value > MAX_SAMPLE_TO_MEDIAN * median:
+                fail(f"workload {name} has a wall sample above {MAX_SAMPLE_TO_MEDIAN}x its median")
+        for value in duration:
+            if value > MAX_SAMPLE_TO_MEDIAN * duration_median:
+                fail(f"workload {name} has a reported-duration sample above {MAX_SAMPLE_TO_MEDIAN}x its median")
+        samples[name] = {
+            "wall_ms": wall,
+            "reported_duration_ms": duration,
+            "wall_ms_median": median,
+            "reported_duration_ms_median": duration_median,
+        }
 
-    if args.activation_pr is not None and args.activation_pr < 1:
-        fail("activation PR must be a positive integer")
-    if args.activation_actor is not None:
-        require(args.activation_actor, nonempty_string, "activation actor must be non-empty")
-    if args.activation_utc is not None:
-        validate_rfc3339_utc(args.activation_utc, "activation UTC must be RFC 3339 UTC (YYYY-MM-DDTHH:MM:SSZ)")
+    require(args.activation_pr, lambda item: exact_int(item) and item >= 1, "activation PR must be a positive integer")
+    require(args.activation_actor, nonempty_string, "activation actor must be non-empty")
+    validate_rfc3339_utc(args.activation_utc, "activation UTC must be RFC 3339 UTC (YYYY-MM-DDTHH:MM:SSZ)")
 
     baseline = {
         "kind": BASELINE_KIND,
         "schema_version": BASELINE_SCHEMA,
-        "status": "pending-activation",
-        "comparison_policy": "no comparator, tolerance, or gate is defined by this document; the separately reviewed activation PR defines the review mechanism",
+        "status": "durable",
+        "comparison_policy": COMPARISON_POLICY,
+        "tolerance_policy": FIXED_TOLERANCE_POLICY,
         "activation": {
             "pr": args.activation_pr,
             "actor": args.activation_actor,

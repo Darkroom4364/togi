@@ -346,10 +346,15 @@ never between them. Every workload records its scenario, runner mode
 (regular/schemata/default), resolved test command, cache policy, wall time,
 and machine/runner provenance.
 
-The metric that will support the PR-loop speed claim is the warm-exact-cache
+The metric that supports the PR-loop speed claim is the warm-exact-cache
 versus cold-regular wall-clock median, computed from a reviewed, activated
-baseline. No baseline, comparator, or timing gate exists yet; benchmark
-evidence in CI is strictly telemetry.
+baseline. The comparison policy below is fixed by the repository; the durable
+baseline it runs against is generated data added by a separate activation PR.
+The current baseline records, on the `github-actions-ubuntu-24.04-linux-x86_64`
+runner class (4 logical CPUs, Go 1.26.5, togi 0.5.0 at `af02876`), a
+warm-exact-cache wall median of 228 ms against a cold-regular wall median of
+933 ms; these are the promoted calibration measurements, not a universal
+performance guarantee on other hardware.
 
 ## PR-loop calibration acquisition
 
@@ -371,10 +376,91 @@ the archive and extracted artifact (contained regular files, sample digests,
 manifest/fixture/patch digests, five distinct primed v2 samples, cache-policy
 identity, complete sample data, and no wall sample above 3x its per-workload
 median) before writing a deterministic baseline document. The volatile cache
-path is kept only as calibration evidence, never as cross-run identity. A
-later, separately reviewed baseline-activation PR supplies the activation
-metadata via the promoter's CLI and explicitly defines any comparison policy;
-do not copy or invent a candidate baseline by hand.
+path is kept only as calibration evidence, never as cross-run identity. The
+promoter requires the reviewed activation metadata (positive PR number,
+non-empty actor, RFC 3339 UTC) and always pins the fixed tolerance policy
+described below; hand-authored thresholds have no CLI surface. Do not copy or
+invent a candidate baseline by hand.
+
+## PR-loop regression gate policy
+
+The comparison policy is fixed in `benchmarks/pr-loop/compare-baseline.py`
+and pinned into every durable baseline as `tolerance_policy` v1. The gate
+measures exactly three primed harness samples and, for every workload and
+both metrics (`wall_ms` and `reported_duration_ms`), takes the median M of
+the three. A workload/metric is over tolerance iff `2*M > 3*B + 2*floor`,
+where B is the baseline's stored median (verified against its five raw
+values) and the floor is 250 ms for wall time and 100 ms for reported
+duration. Any workload/metric median over the cap is a hard regression and
+fails the comparison. A single high raw sample whose median stays under the
+cap (one spike in three) is recorded and warned about observationally; it
+never fails the gate. A missing, malformed, stale, or incomparable baseline
+or sample fails closed: the **PR-loop Regression Gate** workflow run itself
+fails, with no skip or bypass path inside the workflow. On `pull_request` the
+gate never trusts the PR head's copies: it checks out full history, validates
+the event's base SHA as a 40-hex commit that is locally available, and
+compares against `benchmarks/pr-loop/baseline.json` read from that trusted
+base commit. The single exception is the one-time bootstrap: when the base
+genuinely carries no baseline yet, the gate says so explicitly and uses the
+PR-head baseline; an invalid or unavailable base SHA is never a fallback and
+fails the run. On `push` to `main` the checked-out head baseline is used.
+The Go toolchain is a pinned comparable dimension: a result measured under a
+different Go version than the baseline recorded is incomparable (exit 2),
+while truly volatile provenance (Git, kernel, image, togi versions) only
+warns. Merge blocking is a
+separate enforcement layer: it applies only while the exact check context
+`PR-loop Regression Gate` is required by the active `main` ruleset and the
+protected paths are code-owner reviewed (see the activation runbook below).
+`.github/CODEOWNERS` assigns the entire PR-loop corpus, the gate and
+calibration workflows, and CODEOWNERS itself to `@Darkroom4364`, so an
+ordinary PR cannot self-authorize by rewriting its own baseline, comparator,
+or gate definition. Warm/cold wall-ratio drift beyond 25%,
+schemata-versus-cold wall-delta sign changes, and volatile
+execution-provenance drift print observational warnings but never fail the
+gate.
+
+Activation runbook: a maintainer dispatches **PR-loop Calibration** from
+`main`, downloads the fresh calibration artifact ZIP with its positive GitHub
+artifact ID and normalized SHA-256, and runs the promoter with the activation
+metadata. The promoter writes the durable `benchmarks/pr-loop/baseline.json`
+deterministically; the separately reviewed activation PR adds exactly that
+generated file together with the gate workflow, atomically. That bootstrap
+PR is a reviewed one-time exception: it merges before ruleset enforcement is
+enabled, so its gate run necessarily uses the bootstrap path (the base has no
+baseline yet). Once the bootstrap PR's own **PR-loop Regression Gate** check
+is green and it merges, a repository admin performs the final activation
+step: enable required code-owner review and add the exact context
+`PR-loop Regression Gate` as a required status check to ruleset 15308939
+(the active `main` ruleset), then verify both are enforced before
+considering the gate live. From that point, ordinary PRs compare against the
+trusted base baseline and cannot modify gate inputs without code-owner
+review. The current durable baseline was promoted from calibration run
+30928964359 (GitHub artifact 8900358130, measured 2026-08-04T16:26:18Z on
+`af02876`) with activation recorded as PR #497 by Darkroom4364 at
+2026-08-04T16:43:25Z.
+
+### Corpus changes and recalibration
+
+There is no automatic escape hatch, and none should be invented. Any
+intentional corpus identity change (manifest, scenario patches, fixture tree,
+workload definitions, or mutation surface) makes the checked-in baseline
+incomparable: the gate fails closed with exit 2 on every subsequent run until
+a refreshed baseline lands. The authorized procedure is:
+
+1. A maintainer lands the corpus change using a reviewed temporary ruleset
+   exception or an approved bypass. Expect an interim gate-red window: every
+   PR and push runs a failing **PR-loop Regression Gate** from the moment the
+   corpus change merges until the refreshed baseline lands.
+2. Immediately dispatch **PR-loop Calibration** on the merged `main`.
+3. Promote the fresh artifact with current activation metadata and land the
+   refreshed `benchmarks/pr-loop/baseline.json` as an immediate fast-follow
+   PR (the gate is green again from that merge).
+4. Restore the ruleset to its normal state (remove the temporary exception)
+   and verify the `PR-loop Regression Gate` context is again required and
+   green on `main`.
+
+Minimize the gate-red window; never leave the required-check enforcement
+disabled after the fast-follow lands.
 
 ## Configuration
 
