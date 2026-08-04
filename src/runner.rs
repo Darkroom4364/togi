@@ -12981,6 +12981,93 @@ rmdir "$lock"
 
     #[cfg(unix)]
     #[test]
+    fn cache_identity_excludes_parallelism() {
+        // Exact-cache identity must not include the runner's parallelism:
+        // a mutation executed by a jobs=1 run must be an exact cache hit for
+        // an otherwise identical jobs=4 run. This guards the real regression
+        // (adding jobs to CacheKey::new or the cache context) that the
+        // benchmark harness fakes cannot see.
+        let dir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let file = dir.path().join("target.txt");
+        std::fs::write(&file, b"hello world").unwrap();
+        let mut mutation = make_test_mutation(&file);
+        mutation.id = 7;
+        mutation.description = "jobs cache identity".into();
+
+        let script = r#"
+lock="$STATE_DIR/lock"
+while ! mkdir "$lock" 2>/dev/null; do sleep 0.01; done
+runs=0
+if [ -f "$STATE_DIR/runs" ]; then runs=$(cat "$STATE_DIR/runs"); fi
+runs=$((runs + 1))
+printf '%s\n' "$runs" > "$STATE_DIR/runs"
+rmdir "$lock"
+"#;
+        let mut env = HashMap::new();
+        env.insert("STATE_DIR".to_string(), state.path().display().to_string());
+
+        let make_runner = |parallelism: usize| TestRunner {
+            commands: CommandConfig {
+                command: vec!["sh".into(), "-c".into(), script.into()],
+                force_default_command: false,
+                force_default_timeout: false,
+                project_commands: vec![],
+                language_commands: HashMap::new(),
+                build_command: vec![],
+                sandbox_command: vec![],
+                build_command_explicit: false,
+                timeout: Duration::from_secs(5),
+                language_timeouts: HashMap::new(),
+                test_selection: None,
+            },
+            parallelism,
+            project_root: dir.path().to_path_buf(),
+            verbose: false,
+            show_output: false,
+            max_tested: None,
+            early_stop: Default::default(),
+            respect_workspace_ignores: true,
+            env: env.clone(),
+            incremental_history: true,
+            force_rerun: false,
+            learned_selection: false,
+            cancelled: Arc::new(AtomicBool::new(false)),
+        };
+
+        // Phase 1: a jobs=1 run executes the mutation and seeds the cache.
+        let first = make_runner(1).run(vec![mutation.clone()]).report;
+        assert_eq!(first.total, 1);
+        assert_eq!(first.results[0].1, MutationResult::Survived);
+        assert_eq!(
+            first.execution_for(first.results[0].0.id, MutationResult::Survived),
+            MutationExecution::Executed
+        );
+
+        // Phase 2: an otherwise identical jobs=4 run must hit the exact cache.
+        let second = make_runner(4).run(vec![mutation]).report;
+        assert_eq!(second.total, 1);
+        assert_eq!(second.results[0].1, MutationResult::Survived);
+        assert_eq!(
+            second.execution_for(second.results[0].0.id, MutationResult::Survived),
+            MutationExecution::ExactCache
+        );
+        assert_eq!(second.tested_count(), 0);
+        assert_eq!(second.execution_counts().exact_cache_reused, 1);
+
+        let runs: usize = std::fs::read_to_string(state.path().join("runs"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(
+            runs, 1,
+            "parallelism must not change exact-cache identity: the underlying test ran once"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn max_tested_does_not_count_build_errors() {
         let dir = tempfile::tempdir().unwrap();
 

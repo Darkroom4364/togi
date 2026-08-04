@@ -1,0 +1,98 @@
+{
+  "schema_version": 3,
+  "name": "togi-pr-loop-scale-benchmarks",
+  "description": "Observational PR-loop scaling corpus for togi (issue #498): the Go scale fixture is copied into a disposable temp project, committed as the base revision, modified by the pinned scale patch, and measured through `togi check --base HEAD` so every run represents a PR diff, never --all.",
+  "notes": [
+    "Timing is observational only: no tracked baseline, no timing threshold, no score judgment, and no CI gate is defined by this manifest.",
+    "Semantic and provenance invariants are hard failures; the harness exits non-zero when any invariant fails.",
+    "expected_mutation_count and the changed-file line ranges pin the mutation surface of the scenario patch; operator or fixture drift must be resolved by updating this manifest deliberately.",
+    "Workloads run in declaration order and workloads of one scenario must be contiguous. scale-warm-exact-cache reuses the .togi-cache seeded by scale-regular-jobs1 inside the scale-file scenario only; cache dependencies never cross scenarios.",
+    "runner_mode is declared per workload (regular, schemata, or default) and validated against the effective argv: regular requires --no-schemata, schemata requires --schemata, default requires neither.",
+    "Zero-config runs enable schemata; this fixture's togi.toml omits the schemata key, whose config-file default is off, so scale-default measures the zero-flag config-present path: regular runner with default parallelism (jobs from available_parallelism), schemata null. Only the explicit --schemata workloads carry schemata evidence; --jobs only affects fallback/regular execution because the schema fast path runs sequentially per language.",
+    "The harness requires bash, git, go, jq, sed, sha256sum or shasum, and python3 (monotonic high-resolution wall clock)."
+  ],
+  "fixture": {
+    "source_dir": "tests/fixtures/go-scale",
+    "base_ref": "HEAD"
+  },
+  "scenarios": [
+    {
+      "name": "scale-file",
+      "description": "Scale PR diff: scale-change.patch appends seven expression-dense functions to scale.go, calibrated to a 98-mutant surface with at least one schemata fast-path and one fallback mutant.",
+      "patch_file": "benchmarks/pr-loop-scale/scale-change.patch",
+      "patch_sha256": "ac993114dfef39cd4e52d2cedbe26935e4410048471924a3df2431c13cef41dd",
+      "changed_files": [
+        { "path": "scale.go", "line_range": [15, 74] }
+      ],
+      "expected_mutation_count": 98
+    }
+  ],
+  "togi": {
+    "common_args": [
+      "check",
+      "--base", "HEAD",
+      "--timeout", "60",
+      "--max-per-run", "500",
+      "--test-cmd", "go test ./...",
+      "--format", "json"
+    ]
+  },
+  "workloads": [
+    {
+      "name": "scale-regular-jobs1",
+      "scenario": "scale-file",
+      "runner_mode": "regular",
+      "description": "Cold per-mutant runner on the scale diff with one job: fresh cache, schemata disabled, every mutation re-executed.",
+      "extra_args": ["--no-schemata", "--force-rerun", "--jobs", "1"],
+      "cache": "fresh",
+      "seeds_cache": true,
+      "invariants": ["report-well-formed", "full-fresh-execution"]
+    },
+    {
+      "name": "scale-warm-exact-cache",
+      "scenario": "scale-file",
+      "runner_mode": "regular",
+      "description": "Identical second run reusing the cache seeded by scale-regular-jobs1; every verdict must come from the exact cache.",
+      "extra_args": ["--no-schemata", "--jobs", "1"],
+      "cache": "reuse",
+      "expects_cache_from": "scale-regular-jobs1",
+      "invariants": ["report-well-formed", "full-exact-cache-reuse"]
+    },
+    {
+      "name": "scale-regular-jobs4",
+      "scenario": "scale-file",
+      "runner_mode": "regular",
+      "description": "Cold per-mutant runner on the scale diff with four jobs: fresh cache, schemata disabled, every mutation re-executed.",
+      "extra_args": ["--no-schemata", "--force-rerun", "--jobs", "4"],
+      "cache": "fresh",
+      "invariants": ["report-well-formed", "full-fresh-execution"]
+    },
+    {
+      "name": "scale-schemata",
+      "scenario": "scale-file",
+      "runner_mode": "schemata",
+      "description": "Cold schemata run on the scale diff: fresh cache; the patch guarantees at least one schema fast-path mutant and at least one fallback mutant.",
+      "extra_args": ["--schemata", "--force-rerun", "--jobs", "1"],
+      "cache": "fresh",
+      "invariants": ["report-well-formed", "schemata-fast-path-and-fallback"]
+    },
+    {
+      "name": "scale-schemata-jobs4",
+      "scenario": "scale-file",
+      "runner_mode": "schemata",
+      "description": "Cold schemata run on the scale diff with four jobs: --jobs affects only the fallback mutants because the schema fast path executes sequentially per language.",
+      "extra_args": ["--schemata", "--force-rerun", "--jobs", "4"],
+      "cache": "fresh",
+      "invariants": ["report-well-formed", "schemata-fast-path-and-fallback"]
+    },
+    {
+      "name": "scale-default",
+      "scenario": "scale-file",
+      "runner_mode": "default",
+      "description": "Zero-flag invocation on the scale diff (no cache, schemata, or jobs flags): the config-present default path, a regular run with default parallelism and schemata null; mutations must target only the patched lines.",
+      "extra_args": [],
+      "cache": "fresh",
+      "invariants": ["report-well-formed", "pr-diff-targeting"]
+    }
+  ]
+}

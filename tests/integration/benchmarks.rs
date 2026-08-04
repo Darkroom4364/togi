@@ -4356,3 +4356,945 @@ fn pr_loop_regression_gate_workflow_is_fail_closed_and_comparator_driven() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Schema v3 observational scale corpus (issue #498, PR 1).
+//
+// These tests drive the same harness with the additive v3 scale manifest via
+// BENCH_MANIFEST and a dedicated fake scale togi. They prove the v3 branch
+// accepts the scale corpus, enforces its generic contracts, emits schema 3
+// results, keeps per-workload mutation identity, and that the schema-2
+// comparator fails closed on v3 results. No existing v2 test is modified.
+// ---------------------------------------------------------------------------
+
+/// Fake togi for the scale corpus: same contract as FAKE_TOGI (logs argv,
+/// cwd, and cache presence; seeds .togi-cache; exits 1) but emits a
+/// synthesized 98-mutant report for tests/fixtures/go-scale with all lines
+/// inside the scenario patch's changed range [15, 74].
+const FAKE_SCALE_TOGI: &str = r#"#!/usr/bin/env bash
+set -euo pipefail
+
+if [ "${1:-}" = "--version" ]; then
+  echo "togi 0.5.0-fake-scale"
+  exit 0
+fi
+
+log=${FAKE_TOGI_LOG:?FAKE_TOGI_LOG must be set}
+cache_present=false
+if [ -d .togi-cache ]; then
+  cache_present=true
+fi
+argv_json=$(printf '%s\n' "$@" | jq -Rn '[inputs]')
+jq -nc \
+  --argjson argv "$argv_json" \
+  --arg cwd "$(pwd)" \
+  --argjson cache_present "$cache_present" \
+  '{argv: $argv, cwd: $cwd, cache_present: $cache_present}' >> "$log"
+
+force_rerun=false
+schemata=false
+for arg in "$@"; do
+  case "$arg" in
+    --force-rerun) force_rerun=true ;;
+    --schemata) schemata=true ;;
+    --no-schemata) schemata=false ;;
+  esac
+done
+
+total=${FAKE_TOGI_TOTAL:-98}
+tested=$total
+exact=0
+state="executed"
+if [ "$cache_present" = true ] && [ "$force_rerun" = false ]; then
+  tested=0
+  exact=$total
+  state="exact_cache"
+fi
+mkdir -p .togi-cache
+touch .togi-cache/seed
+
+schemata_json="null"
+if [ "$schemata" = true ]; then
+  schemata_json=$(jq -nc --argjson total "$total" '
+    {fast_path: ($total - 1), fallback: 1,
+     fallback_reasons: [{reason: "unsupported_operator", count: 1}]}')
+fi
+
+mutations_json=$(jq -nc --arg state "$state" --argjson total "$total" '
+  [range(1; $total + 1)
+   | {id: ., file: "scale.go", line: (15 + ((. - 1) % 60)), column: 7,
+      operator: "gt_to_gte", original: ">", replacement: ">=",
+      description: "fake", result: "survived",
+      execution: {state: $state}, language: "go"}]')
+
+jq -n \
+  --argjson total "$total" \
+  --argjson tested "$tested" \
+  --argjson exact "$exact" \
+  --argjson schemata "$schemata_json" \
+  --argjson mutations "$mutations_json" \
+  '{
+    kind: "mutation_report",
+    schema_version: 1,
+    generator: "togi/0.5.0-fake-scale",
+    total: $total,
+    planned_total: $total,
+    tested: $tested,
+    killed: 0,
+    survived: $total,
+    timeout: 0,
+    build_errors: 0,
+    exact_cache_reused: $exact,
+    incremental_history_reused: 0,
+    partial: false,
+    mutation_score: 0,
+    duration_ms: 42,
+    test_command: ["go", "test", "./..."],
+    build_command: [],
+    schemata: $schemata,
+    build_error_groups: [],
+    mutations: $mutations
+  }'
+exit 1
+"#;
+
+const SCALE_WORKLOAD_NAMES: [&str; 6] = [
+    "scale-regular-jobs1",
+    "scale-warm-exact-cache",
+    "scale-regular-jobs4",
+    "scale-schemata",
+    "scale-schemata-jobs4",
+    "scale-default",
+];
+
+fn scale_script_path() -> PathBuf {
+    repo_root().join("benchmarks/pr-loop-scale/run-pr-loop-scale-benchmarks.sh")
+}
+
+/// Mirror of run_harness targeting the self-contained v3 scale harness.
+fn run_scale_harness(
+    tools: &FakeTools,
+    out_dir: &Path,
+    manifest: Option<&Path>,
+    extra_env: &[(&str, &str)],
+) -> Output {
+    let mut command = Command::new("bash");
+    command
+        .arg(scale_script_path())
+        .arg("--output")
+        .arg(out_dir)
+        .env("TOGI_BIN", &tools.togi)
+        .env("FAKE_TOGI_LOG", &tools.log)
+        // Cache provenance must come from the test, never the host env.
+        .env_remove("GOCACHE")
+        .env_remove("BENCH_GO_BUILD_CACHE_STATE")
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                tools.bin.display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        );
+    if let Some(manifest) = manifest {
+        command.env("BENCH_MANIFEST", manifest);
+    }
+    for (key, value) in extra_env {
+        command.env(key, value);
+    }
+    command.output().expect("spawn scale harness")
+}
+
+fn scale_manifest_path() -> PathBuf {
+    repo_root().join("benchmarks/pr-loop-scale/manifest.json")
+}
+
+fn install_fake_scale_tools() -> FakeTools {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().expect("tempdir for fake scale tools");
+    let bin = dir.path().join("bin");
+    fs::create_dir(&bin).expect("fake bin dir");
+    let togi = bin.join("togi");
+    let go = bin.join("go");
+    fs::write(&togi, FAKE_SCALE_TOGI).expect("write fake scale togi");
+    fs::write(&go, FAKE_GO).expect("write stub go");
+    fs::set_permissions(&togi, fs::Permissions::from_mode(0o755)).expect("chmod fake scale togi");
+    fs::set_permissions(&go, fs::Permissions::from_mode(0o755)).expect("chmod stub go");
+    let log = dir.path().join("invocations.jsonl");
+    FakeTools {
+        _dir: dir,
+        bin,
+        togi,
+        log,
+    }
+}
+
+/// Assert a scale-corpus argv/command vector invokes `check --base HEAD`
+/// with exactly one --timeout 60, one --max-per-run 500, one --test-cmd
+/// "go test ./...", and never --all. Mirrors the v3 argv contract; unlike
+/// the v2 helper, --jobs is per-workload and checked by the caller.
+fn assert_scale_pr_diff_command(args: &[&str]) {
+    let check_pos = args
+        .iter()
+        .position(|arg| *arg == "check")
+        .expect("command must invoke `check`");
+    let base_positions: Vec<usize> = args
+        .iter()
+        .enumerate()
+        .filter_map(|(index, arg)| (*arg == "--base").then_some(index))
+        .collect();
+    assert_eq!(
+        base_positions.len(),
+        1,
+        "exactly one split --base: {args:?}"
+    );
+    assert!(
+        check_pos < base_positions[0],
+        "`check` must precede --base: {args:?}"
+    );
+    assert_eq!(
+        args[base_positions[0] + 1],
+        "HEAD",
+        "diff base must be HEAD (PR diff), got: {args:?}"
+    );
+    assert!(
+        !args.contains(&"--all"),
+        "benchmarks must never use --all: {args:?}"
+    );
+    assert!(
+        !args.iter().any(|arg| arg.starts_with("--base=")),
+        "inline --base= form is rejected: {args:?}"
+    );
+    for (flag, value) in [
+        ("--timeout", "60"),
+        ("--max-per-run", "500"),
+        ("--test-cmd", "go test ./..."),
+    ] {
+        let positions: Vec<usize> = args
+            .iter()
+            .enumerate()
+            .filter_map(|(index, arg)| (*arg == flag).then_some(index))
+            .collect();
+        assert_eq!(
+            positions.len(),
+            1,
+            "exactly one {flag} pair expected: {args:?}"
+        );
+        assert_eq!(
+            args[positions[0] + 1],
+            value,
+            "{flag} must be pinned to {value}: {args:?}"
+        );
+    }
+}
+
+#[test]
+fn pr_loop_scale_harness_runs_all_six_workloads_in_one_scenario() {
+    if !harness_tools_available() {
+        eprintln!("skipping: harness tools (bash/git/jq/sed/sha256sum|shasum/python3) unavailable");
+        return;
+    }
+    let tools = install_fake_scale_tools();
+    let out_dir = tempfile::tempdir().expect("output tempdir");
+
+    let output = run_scale_harness(&tools, out_dir.path(), Some(&scale_manifest_path()), &[]);
+    assert!(
+        output.status.success(),
+        "scale harness must succeed with well-formed fake reports\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let result = read_result(out_dir.path());
+    assert_eq!(result["kind"], "togi_pr_loop_benchmark_result");
+    assert_eq!(result["schema_version"], 3);
+    assert_eq!(result["manifest"]["name"], "togi-pr-loop-scale-benchmarks");
+    assert_eq!(result["manifest"]["schema_version"], 3);
+    assert_eq!(
+        result["manifest"]["path"],
+        "benchmarks/pr-loop-scale/manifest.json"
+    );
+    assert_eq!(result["timing_policy"], "observational-only");
+    assert_eq!(result["ok"], true);
+    assert_eq!(result["failures"], serde_json::json!([]));
+    assert_eq!(
+        result["provenance"]["fixture_source_dir"],
+        "tests/fixtures/go-scale"
+    );
+    let scale_provenance = &result["provenance"]["fixture_scenarios"]["scale-file"];
+    assert_eq!(
+        scale_provenance["patch_file"],
+        "benchmarks/pr-loop-scale/scale-change.patch"
+    );
+    assert_eq!(
+        scale_provenance["patch_sha256"],
+        "ac993114dfef39cd4e52d2cedbe26935e4410048471924a3df2431c13cef41dd"
+    );
+
+    let scenarios = result["cross_workload"]["scenarios"]
+        .as_object()
+        .expect("per-scenario identity");
+    assert_eq!(scenarios.len(), 1, "the scale corpus has one scenario");
+    assert_eq!(
+        scenarios["scale-file"]["mutation_identity_consistent"], true,
+        "all six workloads must share one mutation identity"
+    );
+    let identity = scenarios["scale-file"]["mutation_identity_sha256"]
+        .as_str()
+        .expect("scenario mutation identity digest")
+        .to_string();
+
+    let workloads = result["workloads"].as_array().expect("workloads array");
+    let names: Vec<&str> = workloads
+        .iter()
+        .map(|workload| workload["name"].as_str().expect("workload name"))
+        .collect();
+    assert_eq!(names, SCALE_WORKLOAD_NAMES);
+    let runner_modes: Vec<&str> = workloads
+        .iter()
+        .map(|workload| workload["runner_mode"].as_str().expect("runner mode"))
+        .collect();
+    assert_eq!(
+        runner_modes,
+        [
+            "regular", "regular", "regular", "schemata", "schemata", "default"
+        ]
+    );
+
+    let expected_jobs = [Some("1"), Some("1"), Some("4"), Some("1"), Some("4"), None];
+    for (workload, jobs) in workloads.iter().zip(expected_jobs) {
+        assert_eq!(workload["ok"], true, "workload {} failed", workload["name"]);
+        for invariant in workload["invariants"].as_array().expect("invariants") {
+            assert_eq!(
+                invariant["ok"], true,
+                "invariant {} failed for workload {}",
+                invariant["name"], workload["name"]
+            );
+        }
+        let args = command_strings(workload);
+        assert_scale_pr_diff_command(&args);
+        let jobs_positions: Vec<usize> = args
+            .iter()
+            .enumerate()
+            .filter_map(|(index, arg)| (*arg == "--jobs").then_some(index))
+            .collect();
+        match jobs {
+            Some(value) => {
+                assert_eq!(
+                    jobs_positions.len(),
+                    1,
+                    "workload {} must pin --jobs once",
+                    workload["name"]
+                );
+                assert_eq!(args[jobs_positions[0] + 1], value);
+            }
+            None => assert!(
+                jobs_positions.is_empty(),
+                "scale-default must inherit togi's job default: {args:?}"
+            ),
+        }
+        assert_eq!(
+            workload["semantics"]["total"], 98,
+            "workload {} must see the pinned mutation count",
+            workload["name"]
+        );
+        assert_eq!(
+            workload["semantics"]["mutation_identity_sha256"]
+                .as_str()
+                .expect("workload mutation identity"),
+            identity,
+            "workload {} mutation identity must match the scenario",
+            workload["name"]
+        );
+    }
+
+    // Cache reuse is proven semantically from the report, not by directory
+    // presence: every verdict of the warm run must come from the exact cache.
+    assert_eq!(workloads[1]["semantics"]["tested"], 0);
+    assert_eq!(workloads[1]["semantics"]["exact_cache_reused"], 98);
+    // Fresh runs execute every mutation without cache hits.
+    for index in [0, 2, 3, 4, 5] {
+        assert_eq!(workloads[index]["semantics"]["tested"], 98);
+        assert_eq!(workloads[index]["semantics"]["exact_cache_reused"], 0);
+    }
+    // Both flag-driven schemata workloads report at least one fast-path
+    // and one fallback.
+    for index in [3, 4] {
+        let schemata = &workloads[index]["semantics"]["schemata"];
+        assert!(schemata["fast_path"].as_u64().expect("fast_path") >= 1);
+        assert!(schemata["fallback"].as_u64().expect("fallback") >= 1);
+        assert_eq!(
+            schemata["fast_path"].as_u64().unwrap() + schemata["fallback"].as_u64().unwrap(),
+            98
+        );
+    }
+    // The zero-flag default workload is the config-present path: the
+    // fixture config omits the schemata key, whose config-file default is
+    // off (a zero-config run would enable it), so the report must carry
+    // schemata: null.
+    assert_eq!(
+        workloads[5]["semantics"]["schemata"],
+        serde_json::Value::Null,
+        "scale-default must report schemata null on the config-present path"
+    );
+    let default_args = command_strings(&workloads[5]);
+    assert!(
+        !default_args.contains(&"--schemata") && !default_args.contains(&"--no-schemata"),
+        "scale-default must pass no schemata flag"
+    );
+
+    // Raw artifacts persist for every workload.
+    for name in &names {
+        assert!(
+            out_dir
+                .path()
+                .join("raw")
+                .join(format!("{name}.report.json"))
+                .exists(),
+            "raw report missing for {name}"
+        );
+    }
+
+    // Invocation log: one shared disposable project, `check --base HEAD`,
+    // and the seeded-cache lifecycle.
+    let runs = invocation_log(&tools);
+    assert_eq!(runs.len(), 6, "expected exactly six togi invocations");
+    let project = runs[0]["cwd"].as_str().expect("invocation cwd");
+    assert_ne!(
+        Path::new(project),
+        repo_root().join("tests/fixtures/go-scale"),
+        "harness must copy the fixture into a disposable project"
+    );
+    for run in &runs {
+        assert_eq!(
+            run["cwd"].as_str().expect("cwd"),
+            project,
+            "all scale workloads share the scenario's disposable project"
+        );
+        assert_scale_pr_diff_command(&argv_strings(run));
+    }
+    let cache_sequence: Vec<bool> = runs
+        .iter()
+        .map(|run| run["cache_present"].as_bool().expect("cache flag"))
+        .collect();
+    assert_eq!(
+        cache_sequence,
+        [false, true, false, false, false, false],
+        "only the warm run may observe the seeded cache"
+    );
+    let force_rerun_sequence: Vec<bool> = runs
+        .iter()
+        .map(|run| argv_strings(run).contains(&"--force-rerun"))
+        .collect();
+    assert_eq!(force_rerun_sequence, [true, false, true, true, true, false]);
+    assert!(
+        !Path::new(project).exists(),
+        "the disposable project must be removed after the run"
+    );
+}
+
+#[test]
+fn pr_loop_scale_harness_rejects_malformed_manifests() {
+    if !harness_tools_available() {
+        eprintln!("skipping: harness tools (bash/git/jq/sed/sha256sum|shasum/python3) unavailable");
+        return;
+    }
+    let tools = install_fake_scale_tools();
+    let base: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(scale_manifest_path()).expect("read scale manifest"),
+    )
+    .expect("scale manifest is valid JSON");
+
+    let mut empty_workloads = base.clone();
+    empty_workloads["workloads"] = serde_json::json!([]);
+
+    let mut duplicate_names = base.clone();
+    duplicate_names["workloads"][1]["name"] = serde_json::json!("scale-regular-jobs1");
+
+    let mut undeclared_scenario = base.clone();
+    undeclared_scenario["workloads"][0]["scenario"] = serde_json::json!("no-such-scenario");
+
+    // A second declared scenario lets the contiguity and cache-edge checks
+    // be exercised in isolation.
+    let with_second_scenario = |manifest: &mut serde_json::Value| {
+        let mut second = manifest["scenarios"][0].clone();
+        second["name"] = serde_json::json!("scale-b");
+        manifest["scenarios"].as_array_mut().unwrap().push(second);
+    };
+
+    let mut non_contiguous = base.clone();
+    with_second_scenario(&mut non_contiguous);
+    non_contiguous["workloads"][2]["scenario"] = serde_json::json!("scale-b");
+
+    let mut cross_scenario_edge = base.clone();
+    with_second_scenario(&mut cross_scenario_edge);
+    {
+        let workloads = cross_scenario_edge["workloads"].as_array_mut().unwrap();
+        let mut warm = workloads[1].clone();
+        warm["scenario"] = serde_json::json!("scale-b");
+        // Contiguous order (the scale-b workload moves last), but its cache
+        // edge still names a workload from the scale-file scenario.
+        warm["expects_cache_from"] = serde_json::json!("scale-regular-jobs1");
+        workloads.remove(1);
+        workloads.push(warm);
+    }
+
+    let mut forward_dependency = base.clone();
+    forward_dependency["workloads"][0]["expects_cache_from"] =
+        serde_json::json!("scale-warm-exact-cache");
+
+    let mut dependency_without_seed = base.clone();
+    dependency_without_seed["workloads"][3]["expects_cache_from"] =
+        serde_json::json!("scale-warm-exact-cache");
+
+    let mut missing_well_formed = base.clone();
+    missing_well_formed["workloads"][3]["invariants"] =
+        serde_json::json!(["schemata-fast-path-and-fallback"]);
+
+    let mut unknown_invariant = base.clone();
+    unknown_invariant["workloads"][0]["invariants"] = serde_json::json!(["made-up-invariant"]);
+
+    let mut all_flag = base.clone();
+    all_flag["workloads"][0]["extra_args"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!("--all"));
+
+    let mut missing_base = base.clone();
+    missing_base["togi"]["common_args"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|arg| arg != "--base" && arg != "HEAD");
+
+    let mut wrong_base_value = base.clone();
+    wrong_base_value["workloads"][2]["extra_args"]
+        .as_array_mut()
+        .unwrap()
+        .extend([serde_json::json!("--base"), serde_json::json!("HEAD~1")]);
+
+    let mut inline_base_form = base.clone();
+    inline_base_form["workloads"][3]["extra_args"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!("--base=HEAD"));
+
+    let mut duplicate_base = base.clone();
+    duplicate_base["workloads"][1]["extra_args"]
+        .as_array_mut()
+        .unwrap()
+        .extend([serde_json::json!("--base"), serde_json::json!("HEAD")]);
+
+    let mut wrong_subcommand = base.clone();
+    wrong_subcommand["togi"]["common_args"][0] = serde_json::json!("list-operators");
+
+    let mut base_ref_not_head = base.clone();
+    base_ref_not_head["fixture"]["base_ref"] = serde_json::json!("HEAD~1");
+
+    let mut runner_mode_mismatch = base.clone();
+    runner_mode_mismatch["workloads"][0]["runner_mode"] = serde_json::json!("schemata");
+
+    let mut regular_without_flag = base.clone();
+    regular_without_flag["workloads"][0]["extra_args"] =
+        serde_json::json!(["--force-rerun", "--jobs", "1"]);
+
+    let mut default_with_schemata_flag = base.clone();
+    default_with_schemata_flag["workloads"][5]["extra_args"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!("--schemata"));
+
+    let mut unknown_runner_mode = base.clone();
+    unknown_runner_mode["workloads"][0]["runner_mode"] = serde_json::json!("turbo");
+
+    let mut duplicate_test_cmd = base.clone();
+    duplicate_test_cmd["workloads"][0]["extra_args"]
+        .as_array_mut()
+        .unwrap()
+        .extend([
+            serde_json::json!("--test-cmd"),
+            serde_json::json!("go test ./..."),
+        ]);
+
+    let mut duplicate_timeout = base.clone();
+    duplicate_timeout["workloads"][0]["extra_args"]
+        .as_array_mut()
+        .unwrap()
+        .extend([serde_json::json!("--timeout"), serde_json::json!("30")]);
+
+    let mut duplicate_max_per_run = base.clone();
+    duplicate_max_per_run["workloads"][0]["extra_args"]
+        .as_array_mut()
+        .unwrap()
+        .extend([serde_json::json!("--max-per-run"), serde_json::json!("100")]);
+
+    let mut non_integer_jobs = base.clone();
+    non_integer_jobs["workloads"][0]["extra_args"][3] = serde_json::json!("0");
+
+    let mut dangling_jobs = base.clone();
+    dangling_jobs["workloads"][5]["extra_args"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!("--jobs"));
+
+    let mut zero_count = base.clone();
+    zero_count["scenarios"][0]["expected_mutation_count"] = serde_json::json!(0);
+
+    let mut bad_patch_digest = base.clone();
+    bad_patch_digest["scenarios"][0]["patch_sha256"] = serde_json::json!("not-a-digest");
+
+    let mut absolute_patch = base.clone();
+    absolute_patch["scenarios"][0]["patch_file"] = serde_json::json!("/etc/passwd");
+
+    let mut escaping_patch = base.clone();
+    escaping_patch["scenarios"][0]["patch_file"] = serde_json::json!("benchmarks/../escape.patch");
+
+    let mut missing_patch = base.clone();
+    missing_patch["scenarios"][0]["patch_file"] =
+        serde_json::json!("benchmarks/pr-loop-scale/no-such.patch");
+
+    let mut absolute_fixture = base.clone();
+    absolute_fixture["fixture"]["source_dir"] = serde_json::json!("/tmp");
+
+    let mut escaping_fixture = base.clone();
+    escaping_fixture["fixture"]["source_dir"] = serde_json::json!("tests/../escape");
+
+    let mut unknown_schema = base.clone();
+    unknown_schema["schema_version"] = serde_json::json!(4);
+
+    let mut mismatched_name = base.clone();
+    mismatched_name["name"] = serde_json::json!("togi-pr-loop-benchmarks");
+
+    // P1a: inline forms and wrong values for the controlled flags must be
+    // rejected during preflight, before any fixture copy or togi execution.
+    let mut inline_jobs = base.clone();
+    inline_jobs["workloads"][0]["extra_args"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!("--jobs=0"));
+
+    let mut inline_jobs_negative = base.clone();
+    inline_jobs_negative["workloads"][0]["extra_args"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!("--jobs=-1"));
+
+    let mut duplicate_jobs = base.clone();
+    duplicate_jobs["workloads"][0]["extra_args"]
+        .as_array_mut()
+        .unwrap()
+        .extend([serde_json::json!("--jobs"), serde_json::json!("2")]);
+
+    let mut inline_timeout = base.clone();
+    inline_timeout["workloads"][0]["extra_args"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!("--timeout=60"));
+
+    let mut wrong_timeout = base.clone();
+    wrong_timeout["workloads"][0]["extra_args"]
+        .as_array_mut()
+        .unwrap()
+        .extend([serde_json::json!("--timeout"), serde_json::json!("30")]);
+
+    let mut missing_timeout = base.clone();
+    missing_timeout["togi"]["common_args"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|arg| arg != "--timeout" && arg != "60");
+
+    let mut inline_max_per_run = base.clone();
+    inline_max_per_run["workloads"][0]["extra_args"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!("--max-per-run=500"));
+
+    let mut wrong_max_per_run = base.clone();
+    wrong_max_per_run["workloads"][0]["extra_args"]
+        .as_array_mut()
+        .unwrap()
+        .extend([serde_json::json!("--max-per-run"), serde_json::json!("25")]);
+
+    let mut inline_test_cmd = base.clone();
+    inline_test_cmd["workloads"][0]["extra_args"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!("--test-cmd=go test ./..."));
+
+    // P1b: scenario/workload names are interpolated into filesystem paths,
+    // so anything outside the safe-identifier syntax is rejected preflight.
+    let mut traversal_workload = base.clone();
+    traversal_workload["workloads"][5]["name"] = serde_json::json!("../../outside");
+
+    let mut slash_workload = base.clone();
+    slash_workload["workloads"][5]["name"] = serde_json::json!("a/b");
+
+    let mut absolute_workload = base.clone();
+    absolute_workload["workloads"][5]["name"] = serde_json::json!("/abs");
+
+    let mut dotdot_workload = base.clone();
+    dotdot_workload["workloads"][5]["name"] = serde_json::json!("..");
+
+    let mut dash_workload = base.clone();
+    dash_workload["workloads"][5]["name"] = serde_json::json!("-x");
+
+    let mut space_workload = base.clone();
+    space_workload["workloads"][5]["name"] = serde_json::json!("with space");
+
+    let mut traversal_scenario = base.clone();
+    traversal_scenario["scenarios"][0]["name"] = serde_json::json!("../../outside");
+
+    // CR/LF integrity: `IFS= read` would split embedded newlines after
+    // validation, so the executed argv could gain flags validation never
+    // saw; every such element is rejected preflight.
+    let mut newline_all_extra = base.clone();
+    newline_all_extra["workloads"][0]["extra_args"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!("--force-rerun\n--all"));
+
+    let mut newline_controlled_split = base.clone();
+    newline_controlled_split["workloads"][5]["extra_args"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!("--jobs\n8"));
+
+    let mut carriage_return_common = base.clone();
+    carriage_return_common["togi"]["common_args"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!("--format\rjson"));
+
+    // A fresh workload between the cache seed and its consumer resets the
+    // scenario's cache; preflight must reject the interleaving.
+    let mut interleaved_fresh_reset = base.clone();
+    {
+        let workloads = interleaved_fresh_reset["workloads"].as_array_mut().unwrap();
+        let warm = workloads.remove(1);
+        workloads.insert(2, warm);
+    }
+
+    let cases: Vec<(&str, serde_json::Value)> = vec![
+        ("empty workloads array", empty_workloads),
+        ("duplicate workload names", duplicate_names),
+        ("undeclared scenario reference", undeclared_scenario),
+        ("non-contiguous scenario workloads", non_contiguous),
+        ("cross-scenario cache dependency", cross_scenario_edge),
+        ("forward cache dependency", forward_dependency),
+        (
+            "cache dependency without seeds_cache",
+            dependency_without_seed,
+        ),
+        ("workload missing report-well-formed", missing_well_formed),
+        ("unknown invariant name", unknown_invariant),
+        ("--all injected via extra_args", all_flag),
+        ("missing --base in common_args", missing_base),
+        (
+            "wrong split --base injected via extra_args",
+            wrong_base_value,
+        ),
+        ("inline --base= injected via extra_args", inline_base_form),
+        ("duplicate --base injected via extra_args", duplicate_base),
+        ("wrong subcommand in common_args", wrong_subcommand),
+        ("fixture.base_ref not HEAD", base_ref_not_head),
+        ("runner_mode contradicting argv", runner_mode_mismatch),
+        (
+            "regular workload without --no-schemata",
+            regular_without_flag,
+        ),
+        (
+            "default workload with --schemata",
+            default_with_schemata_flag,
+        ),
+        ("unknown runner_mode", unknown_runner_mode),
+        ("duplicate --test-cmd in extra_args", duplicate_test_cmd),
+        ("duplicate --timeout in extra_args", duplicate_timeout),
+        (
+            "duplicate --max-per-run in extra_args",
+            duplicate_max_per_run,
+        ),
+        ("non-positive --jobs value", non_integer_jobs),
+        ("dangling --jobs without value", dangling_jobs),
+        ("zero expected_mutation_count", zero_count),
+        ("malformed patch digest", bad_patch_digest),
+        ("absolute patch_file path", absolute_patch),
+        ("escaping patch_file path", escaping_patch),
+        ("nonexistent patch_file", missing_patch),
+        ("absolute fixture source_dir", absolute_fixture),
+        ("escaping fixture source_dir", escaping_fixture),
+        ("unsupported schema_version", unknown_schema),
+        ("schema v3 with v2 manifest name", mismatched_name),
+        ("inline --jobs= form", inline_jobs),
+        ("inline --jobs= negative form", inline_jobs_negative),
+        ("duplicate --jobs pairs", duplicate_jobs),
+        ("inline --timeout= form", inline_timeout),
+        ("wrong --timeout value", wrong_timeout),
+        ("missing --timeout pair", missing_timeout),
+        ("inline --max-per-run= form", inline_max_per_run),
+        ("wrong --max-per-run value", wrong_max_per_run),
+        ("inline --test-cmd= form", inline_test_cmd),
+        ("traversal workload name", traversal_workload),
+        ("slash workload name", slash_workload),
+        ("absolute workload name", absolute_workload),
+        ("dotdot workload name", dotdot_workload),
+        ("leading-dash workload name", dash_workload),
+        ("space workload name", space_workload),
+        ("traversal scenario name", traversal_scenario),
+        ("newline --all injected via extra_args", newline_all_extra),
+        (
+            "newline splitting a controlled flag pair",
+            newline_controlled_split,
+        ),
+        ("carriage return in common_args", carriage_return_common),
+        (
+            "fresh workload interleaved between seed and consumer",
+            interleaved_fresh_reset,
+        ),
+    ];
+
+    for (label, manifest) in cases {
+        let dir = tempfile::tempdir().expect("case tempdir");
+        let manifest_file = dir.path().join("manifest.json");
+        fs::write(
+            &manifest_file,
+            serde_json::to_string_pretty(&manifest).expect("serialize manifest"),
+        )
+        .expect("write case manifest");
+        let out_dir = dir.path().join("out");
+
+        let output = run_scale_harness(&tools, &out_dir, Some(&manifest_file), &[]);
+        assert!(
+            !output.status.success(),
+            "scale harness must reject {label}\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            !out_dir.exists(),
+            "scale harness must reject {label} before creating any output"
+        );
+        let result_path = out_dir.join("pr-loop-benchmark-result.json");
+        if result_path.exists() {
+            let result = read_result(&out_dir);
+            assert_ne!(
+                result["ok"], true,
+                "scale harness must never emit success for {label}"
+            );
+        }
+    }
+
+    assert!(
+        !tools.log.exists(),
+        "every malformed manifest must be rejected before togi is ever invoked"
+    );
+}
+
+#[test]
+fn pr_loop_scale_result_fails_the_v2_comparator() {
+    if !tool_on_path("python3") {
+        eprintln!("skipping: python3 unavailable");
+        return;
+    }
+    // Cross-contamination guard: the schema-2 comparator must fail closed on
+    // v3 scale results, independently of their other content.
+    let dir = tempfile::tempdir().expect("case tempdir");
+    let mut results = Vec::new();
+    for index in 0..3 {
+        let path = dir.path().join(format!("scale-result-{index}.json"));
+        fs::write(
+            &path,
+            serde_json::json!({
+                "kind": "togi_pr_loop_benchmark_result",
+                "schema_version": 3,
+                "probe": index
+            })
+            .to_string(),
+        )
+        .expect("write schema-3 result");
+        results.push(path);
+    }
+    let output = run_comparator(
+        &repo_root().join("benchmarks/pr-loop/baseline.json"),
+        &results,
+        None,
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "comparator must exit 2 on schema-3 results\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("wrong result schema"),
+        "comparator must name the schema mismatch, got: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// Extract the closed invariant-name list literal from a harness script,
+/// whitespace-normalized so only the names and their order are compared.
+fn extract_invariant_list(script: &str) -> String {
+    let start = script
+        .find("[\"report-well-formed\"")
+        .expect("harness must contain the closed invariant list");
+    let rest = &script[start..];
+    let end = rest.find(']').expect("invariant list terminator");
+    rest[..=end]
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect()
+}
+
+#[test]
+fn pr_loop_harnesses_share_the_closed_invariant_list() {
+    // Duplication-drift control for the intentional v2/v3 mirroring: the one
+    // truly shared contract is the closed invariant-name list, which the v2
+    // header requires keeping in sync with invariant_filter().
+    let v2 = fs::read_to_string(script_path()).expect("read v2 harness");
+    let v3 = fs::read_to_string(scale_script_path()).expect("read v3 harness");
+    let v2_list = extract_invariant_list(&v2);
+    let v3_list = extract_invariant_list(&v3);
+    assert_eq!(
+        v2_list, v3_list,
+        "the frozen v2 and mirrored v3 harnesses must declare the same closed invariant list"
+    );
+    assert_eq!(
+        v2_list,
+        "[\"report-well-formed\",\"full-fresh-execution\",\"full-exact-cache-reuse\",\"schemata-fast-path-and-fallback\",\"pr-diff-targeting\"]",
+        "the shared invariant list itself drifted"
+    );
+}
+
+#[test]
+fn pr_loop_v2_harness_rejects_the_v3_scale_manifest() {
+    if !harness_tools_available() {
+        eprintln!("skipping: harness tools (bash/git/jq/sed/sha256sum|shasum/python3) unavailable");
+        return;
+    }
+    // Schema isolation: the frozen v2 harness must fail closed on the scale
+    // manifest, so the two corpora can never be cross-executed.
+    let tools = install_fake_tools();
+    let out_dir = tempfile::tempdir().expect("output tempdir");
+    let output = run_harness(&tools, out_dir.path(), Some(&scale_manifest_path()), &[]);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "v2 harness must exit 2 on the v3 manifest\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("unsupported manifest schema_version 3 (expected 2)"),
+        "v2 harness must name the schema rejection, got: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !out_dir
+            .path()
+            .join("pr-loop-benchmark-result.json")
+            .exists(),
+        "v2 harness must not emit a result for the v3 manifest"
+    );
+}

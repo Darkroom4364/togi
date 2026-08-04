@@ -1,0 +1,68 @@
+diff --git a/scale.go b/scale.go
+index 6547fbb..fea20f5 100644
+--- a/scale.go
++++ b/scale.go
+@@ -12,3 +12,63 @@ func Sign(n int) int {
+ 	}
+ 	return -1
+ }
++
++// The Scale* family below is deliberately expression-dense arithmetic. It
++// exists so the PR-loop scaling corpus produces a 50-150 mutant PR diff
++// while the underlying computations stay trivial and deterministic.
++
++// ScaleAlpha weights a against b with a small bias.
++func ScaleAlpha(a, b int) int {
++	if a*2-1 > b {
++		return a + b - 1
++	}
++	return a - b
++}
++
++// ScaleBeta weights a against b with a medium bias.
++func ScaleBeta(a, b int) int {
++	if a*3-2 > b {
++		return a + b - 2
++	}
++	return a - b
++}
++
++// ScaleGamma weights a against b with a larger bias.
++func ScaleGamma(a, b int) int {
++	if a*4-3 > b {
++		return a + b - 3
++	}
++	return a - b
++}
++
++// ScaleDelta blends a and b under a skewed threshold.
++func ScaleDelta(a, b int) int {
++	if a*5-4 > b {
++		return a + b - 4
++	}
++	return a - b
++}
++
++// ScaleEpsilon balances a and b with a wide margin.
++func ScaleEpsilon(a, b int) int {
++	if a*6-5 > b {
++		return a + b - 5
++	}
++	return a - b
++}
++
++// ScaleZeta folds a into b under a steep weight.
++func ScaleZeta(a, b int) int {
++	if a*7-6 > b {
++		return a + b - 6
++	}
++	return a - b
++}
++
++// ScaleEta merges a and b with the steepest weight.
++func ScaleEta(a, b int) int {
++	if a*8-7 > b {
++		return a + b - 7
++	}
++	return a - b
++}
