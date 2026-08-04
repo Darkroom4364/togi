@@ -243,17 +243,26 @@ jobs:
           done
       - name: Build release binary
         run: cargo build --locked --release
+      - name: Warm Go build cache for PR-loop benchmark evidence
+        shell: bash
+        env:
+          TOGI_BIN: ${{ github.workspace }}/target/release/togi
+          BENCH_RUNNER_LABEL: github-actions-ubuntu-24.04-linux-x86_64
+          BENCH_GO_BUILD_CACHE_STATE: warmup
+          BENCHMARK_OUTPUT: ${{ runner.temp }}/togi-pr-loop-benchmarks/warmup
+        run: bash benchmarks/pr-loop/run-pr-loop-benchmarks.sh --output "$BENCHMARK_OUTPUT"
       - name: Run PR-loop benchmark harness
         shell: bash
         env:
           TOGI_BIN: ${{ github.workspace }}/target/release/togi
-          BENCHMARK_OUTPUT: ${{ runner.temp }}/togi-pr-loop-benchmarks
-        run: |
-          bash benchmarks/pr-loop/run-pr-loop-benchmarks.sh --output "$BENCHMARK_OUTPUT"
+          BENCH_RUNNER_LABEL: github-actions-ubuntu-24.04-linux-x86_64
+          BENCH_GO_BUILD_CACHE_STATE: primed
+          BENCHMARK_OUTPUT: ${{ runner.temp }}/togi-pr-loop-benchmarks/measured
+        run: bash benchmarks/pr-loop/run-pr-loop-benchmarks.sh --output "$BENCHMARK_OUTPUT"
       - name: Validate PR-loop benchmark evidence
         shell: bash
         env:
-          BENCHMARK_OUTPUT: ${{ runner.temp }}/togi-pr-loop-benchmarks
+          BENCHMARK_OUTPUT: ${{ runner.temp }}/togi-pr-loop-benchmarks/measured
         run: |
           set -euo pipefail
           result="$BENCHMARK_OUTPUT/pr-loop-benchmark-result.json"

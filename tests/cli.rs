@@ -4671,7 +4671,14 @@ fn pr_loop_benchmark_workflow_collects_observational_evidence() {
             .get("env")
             .and_then(|env| env.get("BENCHMARK_OUTPUT"))
             .and_then(|value| value.as_str()),
-        Some("${{ runner.temp }}/togi-pr-loop-benchmarks")
+        Some("${{ runner.temp }}/togi-pr-loop-benchmarks/measured")
+    );
+    assert_eq!(
+        harness
+            .get("env")
+            .and_then(|env| env.get("BENCH_GO_BUILD_CACHE_STATE"))
+            .and_then(|value| value.as_str()),
+        Some("primed")
     );
     assert_eq!(
         harness

@@ -292,9 +292,11 @@ mutant source, command context, and relevant covering tests are unchanged.
 
 ## PR-loop calibration acquisition
 
-Maintainers may manually dispatch **PR-loop Calibration** from `main`. It runs five
-independent, observational-only Linux x86_64 harness samples and uploads a
-14-day artifact containing raw outputs and a candidate calibration JSON. It does
+Maintainers may manually dispatch **PR-loop Calibration** from `main`. An
+unmeasured warmup primes the runner-wide Go build cache, then five independent,
+observational-only Linux x86_64 harness samples run with fresh Togi `.togi-cache`
+and a primed Go build cache. The 14-day artifact contains warmup and measured
+raw outputs plus a candidate calibration JSON. It does
 not create a baseline, compare results, or gate CI. A later, separately reviewed
 baseline-activation PR must inspect that artifact and explicitly define any
 comparison policy; do not copy or invent a candidate baseline by hand.

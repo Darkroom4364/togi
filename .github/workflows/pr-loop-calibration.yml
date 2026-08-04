@@ -41,11 +41,20 @@ jobs:
           done
       - name: Build release binary
         run: cargo build --locked --release
+      - name: Warm Go build cache
+        shell: bash
+        env:
+          TOGI_BIN: ${{ github.workspace }}/target/release/togi
+          BENCH_RUNNER_LABEL: github-actions-ubuntu-24.04-linux-x86_64
+          BENCH_GO_BUILD_CACHE_STATE: warmup
+          CALIBRATION_OUTPUT: ${{ runner.temp }}/togi-pr-loop-calibration/warmup
+        run: bash benchmarks/pr-loop/run-pr-loop-benchmarks.sh --output "$CALIBRATION_OUTPUT"
       - name: Acquire five independent samples
         shell: bash
         env:
           TOGI_BIN: ${{ github.workspace }}/target/release/togi
           BENCH_RUNNER_LABEL: github-actions-ubuntu-24.04-linux-x86_64
+          BENCH_GO_BUILD_CACHE_STATE: primed
           CALIBRATION_OUTPUT: ${{ runner.temp }}/togi-pr-loop-calibration
         run: |
           set -euo pipefail

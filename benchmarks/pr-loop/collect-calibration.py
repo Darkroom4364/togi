@@ -91,6 +91,11 @@ def validate_result(result, path, expected_workloads, manifest_fixture_dir):
         require(provenance.get(key), nonempty_string, f"{path}: invalid provenance.{key}")
     require(provenance.get("logical_cpu_count"), lambda item: exact_int(item) and item > 0, f"{path}: invalid provenance.logical_cpu_count")
     require(provenance.get("report_schema_version"), exact_int, f"{path}: invalid provenance.report_schema_version")
+    require(
+        provenance.get("go_build_cache_state"),
+        lambda item: item == "primed",
+        f"{path}: go build cache state must be primed",
+    )
     for key in ("image_os", "image_version"):
         require(provenance.get(key), lambda item: item is None or nonempty_string(item), f"{path}: invalid provenance.{key}")
     fixture_dir = validate_fixture_path(provenance["fixture_source_dir"], manifest_fixture_dir)
@@ -159,6 +164,7 @@ def main(argv):
     }
     runner_class = {key: first_provenance[key] for key in ("runner_label", "os", "arch", "logical_cpu_count")}
     execution_provenance = {key: first_provenance[key] for key in ("togi_version", "report_kind", "report_schema_version", "go_version", "git_version")}
+    measurement_identity = {"go_build_cache_state": first_provenance["go_build_cache_state"]}
     diagnostics = []
     for index, ((path, result), (provenance, workloads, _)) in enumerate(zip(parsed, validated), start=1):
         candidate_identity = {
@@ -190,6 +196,7 @@ def main(argv):
         "runner_class": runner_class,
         "runner_diagnostics": diagnostics,
         "execution_provenance": execution_provenance,
+        "measurement_identity": measurement_identity,
         "semantic_identity": identity,
         "samples": samples,
         "source_file_digests": {
