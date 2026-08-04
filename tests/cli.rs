@@ -4741,9 +4741,9 @@ fn pr_loop_benchmark_workflow_collects_observational_evidence() {
     assert!(
         compatibility.contains("PR-loop Benchmark Evidence")
             && compatibility.contains("Linux x86_64 only")
-            && compatibility.contains("Timing is observational only")
-            && compatibility.contains("there is no\n  current baseline, threshold, or merge gate"),
-        "compatibility contract must describe Linux-only observational benchmark evidence"
+            && compatibility.contains("telemetry only")
+            && compatibility.contains("PR-loop Regression Gate"),
+        "compatibility contract must distinguish telemetry-only benchmark evidence from the regression gate"
     );
 }
 fn write_fake_rustc(bin_dir: &Path, host: &str) {

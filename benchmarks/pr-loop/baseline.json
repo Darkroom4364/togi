@@ -1,0 +1,643 @@
+{
+  "activation": {
+    "actor": "Darkroom4364",
+    "pr": 497,
+    "utc": "2026-08-04T16:43:25Z"
+  },
+  "calibration_evidence": {
+    "go_build_cache_path": "/home/runner/work/_temp/togi-pr-loop-gocache",
+    "note": "go_build_cache_path is volatile per-run evidence, never cross-run measurement identity",
+    "runner_diagnostics": [
+      {
+        "go_build_cache_path": "/home/runner/work/_temp/togi-pr-loop-gocache",
+        "image_os": "ubuntu24",
+        "image_version": "20260720.247.2",
+        "kernel_release": "6.17.0-1020-azure",
+        "sample": "sample-1"
+      },
+      {
+        "go_build_cache_path": "/home/runner/work/_temp/togi-pr-loop-gocache",
+        "image_os": "ubuntu24",
+        "image_version": "20260720.247.2",
+        "kernel_release": "6.17.0-1020-azure",
+        "sample": "sample-2"
+      },
+      {
+        "go_build_cache_path": "/home/runner/work/_temp/togi-pr-loop-gocache",
+        "image_os": "ubuntu24",
+        "image_version": "20260720.247.2",
+        "kernel_release": "6.17.0-1020-azure",
+        "sample": "sample-3"
+      },
+      {
+        "go_build_cache_path": "/home/runner/work/_temp/togi-pr-loop-gocache",
+        "image_os": "ubuntu24",
+        "image_version": "20260720.247.2",
+        "kernel_release": "6.17.0-1020-azure",
+        "sample": "sample-4"
+      },
+      {
+        "go_build_cache_path": "/home/runner/work/_temp/togi-pr-loop-gocache",
+        "image_os": "ubuntu24",
+        "image_version": "20260720.247.2",
+        "kernel_release": "6.17.0-1020-azure",
+        "sample": "sample-5"
+      }
+    ]
+  },
+  "comparison_policy": "durable regression gate: median of three primed samples per workload/metric; hard failure when any workload/metric median exceeds the fixed tolerance_policy v1 (2*M > 3*B + 2*floor); raw sample spikes that do not move the median, ratio drift, and sign drift are observational only",
+  "execution_provenance": {
+    "git_version": "git version 2.54.0",
+    "go_version": "go version go1.26.5 linux/amd64",
+    "report_kind": "mutation_report",
+    "report_schema_version": 1,
+    "togi_version": "togi 0.5.0"
+  },
+  "kind": "togi_pr_loop_baseline",
+  "measurement_identity": {
+    "go_build_cache_policy": "job-private-explicit-gocache",
+    "go_build_cache_state": "primed"
+  },
+  "runner_class": {
+    "arch": "x86_64",
+    "logical_cpu_count": 4,
+    "os": "Linux",
+    "runner_label": "github-actions-ubuntu-24.04-linux-x86_64"
+  },
+  "samples": {
+    "cold-regular": {
+      "reported_duration_ms": [
+        765,
+        717,
+        717,
+        717,
+        717
+      ],
+      "reported_duration_ms_median": 717,
+      "wall_ms": [
+        980,
+        932,
+        934,
+        933,
+        933
+      ],
+      "wall_ms_median": 933
+    },
+    "cold-schemata": {
+      "reported_duration_ms": [
+        745,
+        729,
+        744,
+        741,
+        731
+      ],
+      "reported_duration_ms_median": 741,
+      "wall_ms": [
+        960,
+        941,
+        976,
+        953,
+        945
+      ],
+      "wall_ms_median": 953
+    },
+    "multi-file-default": {
+      "reported_duration_ms": [
+        1568,
+        1586,
+        1557,
+        1547,
+        1556
+      ],
+      "reported_duration_ms_median": 1557,
+      "wall_ms": [
+        1782,
+        1820,
+        1775,
+        1761,
+        1769
+      ],
+      "wall_ms_median": 1775
+    },
+    "multi-file-regular": {
+      "reported_duration_ms": [
+        1585,
+        1563,
+        1558,
+        1555,
+        1543
+      ],
+      "reported_duration_ms_median": 1558,
+      "wall_ms": [
+        1810,
+        1779,
+        1773,
+        1769,
+        1759
+      ],
+      "wall_ms_median": 1773
+    },
+    "pr-diff-default": {
+      "reported_duration_ms": [
+        751,
+        730,
+        739,
+        761,
+        729
+      ],
+      "reported_duration_ms_median": 739,
+      "wall_ms": [
+        964,
+        944,
+        951,
+        973,
+        942
+      ],
+      "wall_ms_median": 951
+    },
+    "warm-exact-cache": {
+      "reported_duration_ms": [
+        13,
+        13,
+        13,
+        13,
+        13
+      ],
+      "reported_duration_ms_median": 13,
+      "wall_ms": [
+        240,
+        228,
+        228,
+        228,
+        230
+      ],
+      "wall_ms_median": 228
+    }
+  },
+  "schema_version": 1,
+  "semantic_identity": {
+    "fixture_scenarios": {
+      "multi-file": {
+        "patch_file": "benchmarks/pr-loop/fixture-change-multi.patch",
+        "patch_sha256": "f6936a8699651ff639b4c1bb842c2072586e204731d49f2f0ab1cd8113cef0cf"
+      },
+      "single-file": {
+        "patch_file": "benchmarks/pr-loop/fixture-change.patch",
+        "patch_sha256": "f2a0c45c7606dca549c339400e40a2c845c64e9535f3d7c48b8d9d3170f90104"
+      }
+    },
+    "fixture_source_dir": "tests/fixtures/go",
+    "manifest": {
+      "name": "togi-pr-loop-benchmarks",
+      "path": "benchmarks/pr-loop/manifest.json",
+      "schema_version": 2
+    },
+    "scenario_mutation_identity": {
+      "multi-file": "a040e178c13d8b03afd047175132abd27106490c18c50ae597bab005e419e7be",
+      "single-file": "57229ce0a4964fbe57d8d62edc50810e33521b38afb0132dad74570c4b70137d"
+    },
+    "workloads": [
+      {
+        "cache_policy": "fresh",
+        "command_args": [
+          "check",
+          "--base",
+          "HEAD",
+          "--jobs",
+          "1",
+          "--timeout",
+          "60",
+          "--max-per-run",
+          "25",
+          "--test-cmd",
+          "go test ./...",
+          "--format",
+          "json",
+          "--no-schemata",
+          "--force-rerun"
+        ],
+        "exit_status": 1,
+        "invariants": [
+          {
+            "name": "report-well-formed",
+            "ok": true
+          },
+          {
+            "name": "full-fresh-execution",
+            "ok": true
+          }
+        ],
+        "name": "cold-regular",
+        "ok": true,
+        "runner_mode": "regular",
+        "scenario": "single-file",
+        "semantics": {
+          "build_errors": 0,
+          "exact_cache_reused": 0,
+          "incremental_history_reused": 0,
+          "killed": 0,
+          "mutation_count": 4,
+          "mutation_identity_sha256": "57229ce0a4964fbe57d8d62edc50810e33521b38afb0132dad74570c4b70137d",
+          "partial": false,
+          "planned_total": 4,
+          "schemata": null,
+          "selected_test_command": [
+            "go",
+            "test",
+            "./..."
+          ],
+          "subsumed": 0,
+          "survived": 4,
+          "test_selection": {
+            "full_suite_mutation_count": 4,
+            "mode": "full-suite",
+            "narrowed_mutation_count": 0
+          },
+          "tested": 4,
+          "timeout": 0,
+          "total": 4,
+          "uncovered": 0
+        }
+      },
+      {
+        "cache_policy": "reuse",
+        "command_args": [
+          "check",
+          "--base",
+          "HEAD",
+          "--jobs",
+          "1",
+          "--timeout",
+          "60",
+          "--max-per-run",
+          "25",
+          "--test-cmd",
+          "go test ./...",
+          "--format",
+          "json",
+          "--no-schemata"
+        ],
+        "exit_status": 1,
+        "invariants": [
+          {
+            "name": "report-well-formed",
+            "ok": true
+          },
+          {
+            "name": "full-exact-cache-reuse",
+            "ok": true
+          }
+        ],
+        "name": "warm-exact-cache",
+        "ok": true,
+        "runner_mode": "regular",
+        "scenario": "single-file",
+        "semantics": {
+          "build_errors": 0,
+          "exact_cache_reused": 4,
+          "incremental_history_reused": 0,
+          "killed": 0,
+          "mutation_count": 4,
+          "mutation_identity_sha256": "57229ce0a4964fbe57d8d62edc50810e33521b38afb0132dad74570c4b70137d",
+          "partial": false,
+          "planned_total": 4,
+          "schemata": null,
+          "selected_test_command": [
+            "go",
+            "test",
+            "./..."
+          ],
+          "subsumed": 0,
+          "survived": 4,
+          "test_selection": {
+            "full_suite_mutation_count": 4,
+            "mode": "full-suite",
+            "narrowed_mutation_count": 0
+          },
+          "tested": 0,
+          "timeout": 0,
+          "total": 4,
+          "uncovered": 0
+        }
+      },
+      {
+        "cache_policy": "fresh",
+        "command_args": [
+          "check",
+          "--base",
+          "HEAD",
+          "--jobs",
+          "1",
+          "--timeout",
+          "60",
+          "--max-per-run",
+          "25",
+          "--test-cmd",
+          "go test ./...",
+          "--format",
+          "json",
+          "--schemata",
+          "--force-rerun"
+        ],
+        "exit_status": 1,
+        "invariants": [
+          {
+            "name": "report-well-formed",
+            "ok": true
+          },
+          {
+            "name": "schemata-fast-path-and-fallback",
+            "ok": true
+          }
+        ],
+        "name": "cold-schemata",
+        "ok": true,
+        "runner_mode": "schemata",
+        "scenario": "single-file",
+        "semantics": {
+          "build_errors": 0,
+          "exact_cache_reused": 0,
+          "incremental_history_reused": 0,
+          "killed": 0,
+          "mutation_count": 4,
+          "mutation_identity_sha256": "57229ce0a4964fbe57d8d62edc50810e33521b38afb0132dad74570c4b70137d",
+          "partial": false,
+          "planned_total": 4,
+          "schemata": {
+            "fallback": 3,
+            "fallback_reasons": [
+              {
+                "count": 1,
+                "reason": "overlapping_range"
+              },
+              {
+                "count": 2,
+                "reason": "unsupported_operator"
+              }
+            ],
+            "fast_path": 1
+          },
+          "selected_test_command": [
+            "go",
+            "test",
+            "./..."
+          ],
+          "subsumed": 0,
+          "survived": 4,
+          "test_selection": {
+            "full_suite_mutation_count": 4,
+            "mode": "full-suite",
+            "narrowed_mutation_count": 0
+          },
+          "tested": 4,
+          "timeout": 0,
+          "total": 4,
+          "uncovered": 0
+        }
+      },
+      {
+        "cache_policy": "fresh",
+        "command_args": [
+          "check",
+          "--base",
+          "HEAD",
+          "--jobs",
+          "1",
+          "--timeout",
+          "60",
+          "--max-per-run",
+          "25",
+          "--test-cmd",
+          "go test ./...",
+          "--format",
+          "json"
+        ],
+        "exit_status": 1,
+        "invariants": [
+          {
+            "name": "report-well-formed",
+            "ok": true
+          },
+          {
+            "name": "pr-diff-targeting",
+            "ok": true
+          }
+        ],
+        "name": "pr-diff-default",
+        "ok": true,
+        "runner_mode": "default",
+        "scenario": "single-file",
+        "semantics": {
+          "build_errors": 0,
+          "exact_cache_reused": 0,
+          "incremental_history_reused": 0,
+          "killed": 0,
+          "mutation_count": 4,
+          "mutation_identity_sha256": "57229ce0a4964fbe57d8d62edc50810e33521b38afb0132dad74570c4b70137d",
+          "partial": false,
+          "planned_total": 4,
+          "schemata": {
+            "fallback": 3,
+            "fallback_reasons": [
+              {
+                "count": 1,
+                "reason": "overlapping_range"
+              },
+              {
+                "count": 2,
+                "reason": "unsupported_operator"
+              }
+            ],
+            "fast_path": 1
+          },
+          "selected_test_command": [
+            "go",
+            "test",
+            "./..."
+          ],
+          "subsumed": 0,
+          "survived": 4,
+          "test_selection": {
+            "full_suite_mutation_count": 4,
+            "mode": "full-suite",
+            "narrowed_mutation_count": 0
+          },
+          "tested": 4,
+          "timeout": 0,
+          "total": 4,
+          "uncovered": 0
+        }
+      },
+      {
+        "cache_policy": "fresh",
+        "command_args": [
+          "check",
+          "--base",
+          "HEAD",
+          "--jobs",
+          "1",
+          "--timeout",
+          "60",
+          "--max-per-run",
+          "25",
+          "--test-cmd",
+          "go test ./...",
+          "--format",
+          "json",
+          "--no-schemata",
+          "--force-rerun"
+        ],
+        "exit_status": 1,
+        "invariants": [
+          {
+            "name": "report-well-formed",
+            "ok": true
+          },
+          {
+            "name": "full-fresh-execution",
+            "ok": true
+          },
+          {
+            "name": "pr-diff-targeting",
+            "ok": true
+          }
+        ],
+        "name": "multi-file-regular",
+        "ok": true,
+        "runner_mode": "regular",
+        "scenario": "multi-file",
+        "semantics": {
+          "build_errors": 0,
+          "exact_cache_reused": 0,
+          "incremental_history_reused": 0,
+          "killed": 7,
+          "mutation_count": 9,
+          "mutation_identity_sha256": "a040e178c13d8b03afd047175132abd27106490c18c50ae597bab005e419e7be",
+          "partial": false,
+          "planned_total": 9,
+          "schemata": null,
+          "selected_test_command": [
+            "go",
+            "test",
+            "./..."
+          ],
+          "subsumed": 0,
+          "survived": 2,
+          "test_selection": {
+            "full_suite_mutation_count": 9,
+            "mode": "full-suite",
+            "narrowed_mutation_count": 0
+          },
+          "tested": 9,
+          "timeout": 0,
+          "total": 9,
+          "uncovered": 0
+        }
+      },
+      {
+        "cache_policy": "fresh",
+        "command_args": [
+          "check",
+          "--base",
+          "HEAD",
+          "--jobs",
+          "1",
+          "--timeout",
+          "60",
+          "--max-per-run",
+          "25",
+          "--test-cmd",
+          "go test ./...",
+          "--format",
+          "json"
+        ],
+        "exit_status": 1,
+        "invariants": [
+          {
+            "name": "report-well-formed",
+            "ok": true
+          },
+          {
+            "name": "pr-diff-targeting",
+            "ok": true
+          }
+        ],
+        "name": "multi-file-default",
+        "ok": true,
+        "runner_mode": "default",
+        "scenario": "multi-file",
+        "semantics": {
+          "build_errors": 0,
+          "exact_cache_reused": 0,
+          "incremental_history_reused": 0,
+          "killed": 7,
+          "mutation_count": 9,
+          "mutation_identity_sha256": "a040e178c13d8b03afd047175132abd27106490c18c50ae597bab005e419e7be",
+          "partial": false,
+          "planned_total": 9,
+          "schemata": {
+            "fallback": 9,
+            "fallback_reasons": [
+              {
+                "count": 9,
+                "reason": "unsupported_operator"
+              }
+            ],
+            "fast_path": 0
+          },
+          "selected_test_command": [
+            "go",
+            "test",
+            "./..."
+          ],
+          "subsumed": 0,
+          "survived": 2,
+          "test_selection": {
+            "full_suite_mutation_count": 9,
+            "mode": "full-suite",
+            "narrowed_mutation_count": 0
+          },
+          "tested": 9,
+          "timeout": 0,
+          "total": 9,
+          "uncovered": 0
+        }
+      }
+    ]
+  },
+  "source": {
+    "attempt": 1,
+    "commit": "af028766abd95b41a3178573e0aa1f38c03d030d",
+    "github_artifact_id": 8900358130,
+    "github_artifact_sha256": "443ecc61725bd97fb1267ad66159f031d419dd257e6bee96a06b18e0923774ce",
+    "run": "30928964359",
+    "utc": "2026-08-04T16:26:18Z"
+  },
+  "source_file_digests": {
+    "benchmarks/pr-loop/fixture-change-multi.patch": "f6936a8699651ff639b4c1bb842c2072586e204731d49f2f0ab1cd8113cef0cf",
+    "benchmarks/pr-loop/fixture-change.patch": "f2a0c45c7606dca549c339400e40a2c845c64e9535f3d7c48b8d9d3170f90104",
+    "benchmarks/pr-loop/manifest.json": "eb5429ee09f4aac0c18235ad66c8d8fbbd182286b75e48d93db9fe9ce81984b4",
+    "sample-1/pr-loop-benchmark-result.json": "3518f59cffcc9c9a256c9e55a0de1e7b2c716cae20a658eb6ae45dc2d1e438a7",
+    "sample-2/pr-loop-benchmark-result.json": "ce1c13173b581292b0a528ae59000bc0d34d24df3f70be239cd1c3bf25700b89",
+    "sample-3/pr-loop-benchmark-result.json": "cc06cf5f6a038dce8c9c0342b453702766b5213578fb8e4c56afc39635cbf08a",
+    "sample-4/pr-loop-benchmark-result.json": "1cd999a6041909d0e7d3e7eb3c6cb7fafcccfce9d4556e35577c8683bf974775",
+    "sample-5/pr-loop-benchmark-result.json": "212430160ac221945db22fdf3dff61657de54312bd956d27c5d575080086b6e5",
+    "tests/fixtures/go/": "981a9a583ae99023cd694de5a4b3d256f68b7d6fc81f0ad36612d0424cc5c337"
+  },
+  "status": "durable",
+  "tolerance_policy": {
+    "aggregation": "median",
+    "policy_version": 1,
+    "repetitions": 3,
+    "reported_duration_ms": {
+      "absolute_floor_ms": 100,
+      "relative_denominator": 2,
+      "relative_numerator": 3
+    },
+    "wall_ms": {
+      "absolute_floor_ms": 250,
+      "relative_denominator": 2,
+      "relative_numerator": 3
+    }
+  }
+}
