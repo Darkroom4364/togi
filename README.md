@@ -462,6 +462,48 @@ a refreshed baseline lands. The authorized procedure is:
 Minimize the gate-red window; never leave the required-check enforcement
 disabled after the fast-follow lands.
 
+## PR-loop scaling evidence (observational)
+
+Beside the gated corpus, `benchmarks/pr-loop-scale/` holds an observational
+scaling corpus: `tests/fixtures/go-scale` plus a sha256-pinned patch that
+produces a 98-mutation PR diff, measured by six workloads
+(`scale-regular-jobs1`, `scale-warm-exact-cache`, `scale-regular-jobs4`,
+`scale-schemata`, `scale-schemata-jobs4`, `scale-default`). The harness
+emits schema-3 results, which the schema-2 gate comparator rejects by
+construction: this corpus has no baseline, no tolerance, and no gate, and
+its numbers are runner-class evidence only, never a general performance
+claim. `scale-default` is the zero-flag, config-present path: the fixture's
+`togi.toml` omits the schemata key (whose config-file default is off; a
+zero-config run would enable it), so it measures a regular run with default
+parallelism and `schemata: null`.
+
+Reproduce locally with a primed private Go build cache and summarize three
+samples:
+
+```bash
+cargo build --locked --release
+GOCACHE="$(mktemp -d "${TMPDIR:-/tmp}/.togi-pr-loop-scale-gocache.XXXXXX")"
+OUTPUT="$(mktemp -d "${TMPDIR:-/tmp}/.togi-pr-loop-scale.XXXXXX")"
+trap 'rm -rf "$GOCACHE" "$OUTPUT"' EXIT
+BENCH_GO_BUILD_CACHE_STATE=warmup GOCACHE="$GOCACHE" \
+  bash benchmarks/pr-loop-scale/run-pr-loop-scale-benchmarks.sh --output "$OUTPUT/warmup"
+for sample in 1 2 3; do
+  BENCH_GO_BUILD_CACHE_STATE=primed GOCACHE="$GOCACHE" \
+    bash benchmarks/pr-loop-scale/run-pr-loop-scale-benchmarks.sh --output "$OUTPUT/sample-$sample"
+done
+python3 benchmarks/pr-loop-scale/summarize-scale.py \
+  --output "$OUTPUT/scale-summary.json" \
+  "$OUTPUT"/sample-{1,2,3}/pr-loop-benchmark-result.json
+```
+
+The summarizer is stdlib-only and parse-only: it requires exactly three
+successful primed v3 results from one runner class and fails closed (exit 2)
+on anything else. It reports per-workload medians, the signed
+wall-minus-reported diagnostic (a diagnostic only — it is not an
+engine-versus-test-time attribution), and the four wall-ms ratio families
+(jobs4/jobs1 regular, schemata/jobs1 regular, schemata-jobs4/schemata-jobs1,
+warm/cold), each as the median of the three paired per-sample ratios.
+
 ## Configuration
 
 Optional. togi auto-detects a test command where supported; see [Before first run](#before-first-run) for its exact scope, prerequisites, and support boundaries.
