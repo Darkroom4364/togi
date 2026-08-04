@@ -1261,9 +1261,9 @@ fn validate_pr_loop_benchmark_step_set(job: &serde_yaml::Value) -> Result<(), St
         })
         .collect::<Result<_, _>>()?;
     keys.sort_unstable();
-    if keys != ["env", "name", "permissions", "runs-on", "steps"] {
+    if keys != ["name", "permissions", "runs-on", "steps"] {
         return Err(format!(
-            "benchmark job keys must be exactly name, runs-on, permissions, env, and steps; got {keys:?}"
+            "benchmark job keys must be exactly name, runs-on, permissions, and steps; got {keys:?}"
         ));
     }
     if job.get("name").and_then(|value| value.as_str()) != Some("PR-loop Benchmark Evidence")
@@ -1281,15 +1281,8 @@ fn validate_pr_loop_benchmark_step_set(job: &serde_yaml::Value) -> Result<(), St
     {
         return Err("benchmark job top-level values must match the approved contract".to_string());
     }
-    if job
-        .get("env")
-        .and_then(|env| env.get("BENCH_GOCACHE"))
-        .and_then(|value| value.as_str())
-        != Some("${{ runner.temp }}/togi-pr-loop-gocache")
-    {
-        return Err(
-            "benchmark job must define the job-private BENCH_GOCACHE under runner.temp".to_string(),
-        );
+    if job.get("env").is_some() {
+        return Err("benchmark job must not define job-level environment".to_string());
     }
 
     let steps = job
@@ -1365,9 +1358,14 @@ fn validate_pr_loop_benchmark_step_set(job: &serde_yaml::Value) -> Result<(), St
     }
     if steps[5].get("shell").and_then(|value| value.as_str()) != Some("bash")
         || steps[5].get("run").and_then(|value| value.as_str()) != Some(APPROVED_GO_CACHE_CREATION)
+        || steps[5]
+            .get("env")
+            .and_then(|env| env.get("BENCH_GOCACHE"))
+            .and_then(|value| value.as_str())
+            != Some("${{ runner.temp }}/togi-pr-loop-gocache")
     {
         return Err(
-            "cache creation step must create the job-private GOCACHE fail-closed and prove it empty"
+            "cache creation step must bind and create the job-private GOCACHE fail-closed"
                 .to_string(),
         );
     }
@@ -1402,7 +1400,7 @@ fn validate_pr_loop_benchmark_step_set(job: &serde_yaml::Value) -> Result<(), St
             .get("env")
             .and_then(|env| env.get("GOCACHE"))
             .and_then(|value| value.as_str())
-            != Some("${{ env.BENCH_GOCACHE }}")
+            != Some("${{ runner.temp }}/togi-pr-loop-gocache")
         {
             return Err(
                 "warmup and measured steps must bind the identical explicit GOCACHE".to_string(),
@@ -1556,7 +1554,7 @@ fn ci_pr_loop_benchmark_contract_is_structural() {
             .get("env")
             .and_then(|env| env.get("GOCACHE"))
             .and_then(|value| value.as_str()),
-        Some("${{ env.BENCH_GOCACHE }}")
+        Some("${{ runner.temp }}/togi-pr-loop-gocache")
     );
     assert_eq!(
         harness
@@ -2151,10 +2149,9 @@ fn pr_loop_calibration_workflow_is_manual_read_only_and_retained() {
             .expect("calibration workflow");
     let parsed: serde_yaml::Value = serde_yaml::from_str(&workflow).expect("workflow YAML");
     let job = &parsed["jobs"]["calibrate"];
-    assert_eq!(
-        job["env"]["BENCH_GOCACHE"].as_str(),
-        Some("${{ runner.temp }}/togi-pr-loop-gocache"),
-        "calibration job must define the job-private BENCH_GOCACHE"
+    assert!(
+        job.get("env").is_none(),
+        "calibration job must not use job-level runner context"
     );
     let steps = job["steps"]
         .as_sequence()
@@ -2176,10 +2173,14 @@ fn pr_loop_calibration_workflow_is_manual_read_only_and_retained() {
         "calibration must pin Go to exactly 1.26.5"
     );
     let (create_index, create) = step("Create job-private Go build cache");
-    assert_eq!(create["shell"].as_str(), Some("bash"));
-    assert_eq!(create["run"].as_str(), Some(APPROVED_GO_CACHE_CREATION));
     let (warmup_index, warmup) = step("Warm Go build cache");
     let (acquisition_index, acquisition) = step("Acquire five independent samples");
+    assert_eq!(create["shell"].as_str(), Some("bash"));
+    assert_eq!(create["run"].as_str(), Some(APPROVED_GO_CACHE_CREATION));
+    assert_eq!(
+        create["env"]["BENCH_GOCACHE"].as_str(),
+        Some("${{ runner.temp }}/togi-pr-loop-gocache")
+    );
     assert!(create_index < warmup_index);
     assert!(warmup_index < acquisition_index);
     assert_eq!(
@@ -2188,7 +2189,7 @@ fn pr_loop_calibration_workflow_is_manual_read_only_and_retained() {
     );
     assert_eq!(
         warmup["env"]["GOCACHE"].as_str(),
-        Some("${{ env.BENCH_GOCACHE }}")
+        Some("${{ runner.temp }}/togi-pr-loop-gocache")
     );
     assert_eq!(
         warmup["env"]["CALIBRATION_OUTPUT"].as_str(),
@@ -2204,7 +2205,7 @@ fn pr_loop_calibration_workflow_is_manual_read_only_and_retained() {
     );
     assert_eq!(
         acquisition["env"]["GOCACHE"].as_str(),
-        Some("${{ env.BENCH_GOCACHE }}"),
+        Some("${{ runner.temp }}/togi-pr-loop-gocache"),
         "warmup and measured acquisition must bind the identical explicit GOCACHE"
     );
     assert_eq!(

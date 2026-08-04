@@ -194,8 +194,6 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       contents: read
-    env:
-      BENCH_GOCACHE: ${{ runner.temp }}/togi-pr-loop-gocache
     steps:
       - uses: actions/checkout@v7
         with:
@@ -217,6 +215,8 @@ jobs:
           go-version: '1.26.5'
       - name: Create job-private Go build cache
         shell: bash
+        env:
+          BENCH_GOCACHE: ${{ runner.temp }}/togi-pr-loop-gocache
         run: |
           set -euo pipefail
           if [ -e "$BENCH_GOCACHE" ] && [ -n "$(ls -A "$BENCH_GOCACHE" 2>/dev/null)" ]; then
@@ -262,7 +262,7 @@ jobs:
           TOGI_BIN: ${{ github.workspace }}/target/release/togi
           BENCH_RUNNER_LABEL: github-actions-ubuntu-24.04-linux-x86_64
           BENCH_GO_BUILD_CACHE_STATE: warmup
-          GOCACHE: ${{ env.BENCH_GOCACHE }}
+          GOCACHE: ${{ runner.temp }}/togi-pr-loop-gocache
           BENCHMARK_OUTPUT: ${{ runner.temp }}/togi-pr-loop-benchmarks/warmup
         run: bash benchmarks/pr-loop/run-pr-loop-benchmarks.sh --output "$BENCHMARK_OUTPUT"
       - name: Run PR-loop benchmark harness
@@ -271,7 +271,7 @@ jobs:
           TOGI_BIN: ${{ github.workspace }}/target/release/togi
           BENCH_RUNNER_LABEL: github-actions-ubuntu-24.04-linux-x86_64
           BENCH_GO_BUILD_CACHE_STATE: primed
-          GOCACHE: ${{ env.BENCH_GOCACHE }}
+          GOCACHE: ${{ runner.temp }}/togi-pr-loop-gocache
           BENCHMARK_OUTPUT: ${{ runner.temp }}/togi-pr-loop-benchmarks/measured
         run: bash benchmarks/pr-loop/run-pr-loop-benchmarks.sh --output "$BENCHMARK_OUTPUT"
       - name: Validate PR-loop benchmark evidence
