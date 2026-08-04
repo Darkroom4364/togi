@@ -1,0 +1,9 @@
+# The scale corpus needs the full mutation surface of its scenario patch;
+# the engine's default per-file cap (20) would silently truncate it.
+# Schemata is deliberately not configured here: a zero-config run would
+# enable schemata, while a config file that omits the schemata key defaults
+# it off. The scale-default workload therefore measures the zero-flag,
+# config-present path (regular runner, default parallelism, schemata null).
+# Schemata evidence comes from the explicit --schemata workloads only.
+[mutations]
+max_per_file = 0
