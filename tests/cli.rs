@@ -4594,7 +4594,7 @@ fn pr_loop_benchmark_workflow_collects_observational_evidence() {
             "dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8",
             Some("stable"),
         ),
-        ("actions/setup-go@v7", Some("stable")),
+        ("actions/setup-go@v7", Some("1.26.5")),
     ] {
         let step = steps
             .iter()

@@ -212,7 +212,20 @@ jobs:
           cache-bin: false
       - uses: actions/setup-go@v7
         with:
-          go-version: stable
+          go-version: '1.26.5'
+      - name: Create job-private Go build cache
+        shell: bash
+        env:
+          BENCH_GOCACHE: ${{ runner.temp }}/togi-pr-loop-gocache
+        run: |
+          set -euo pipefail
+          if [ -e "$BENCH_GOCACHE" ] && [ -n "$(ls -A "$BENCH_GOCACHE" 2>/dev/null)" ]; then
+            echo "job-private Go build cache $BENCH_GOCACHE must start empty" >&2
+            exit 1
+          fi
+          mkdir -p "$BENCH_GOCACHE"
+          test -d "$BENCH_GOCACHE"
+          test -z "$(ls -A "$BENCH_GOCACHE")"
       - name: Check benchmark prerequisites
         shell: bash
         run: |
@@ -249,6 +262,7 @@ jobs:
           TOGI_BIN: ${{ github.workspace }}/target/release/togi
           BENCH_RUNNER_LABEL: github-actions-ubuntu-24.04-linux-x86_64
           BENCH_GO_BUILD_CACHE_STATE: warmup
+          GOCACHE: ${{ runner.temp }}/togi-pr-loop-gocache
           BENCHMARK_OUTPUT: ${{ runner.temp }}/togi-pr-loop-benchmarks/warmup
         run: bash benchmarks/pr-loop/run-pr-loop-benchmarks.sh --output "$BENCHMARK_OUTPUT"
       - name: Run PR-loop benchmark harness
@@ -257,6 +271,7 @@ jobs:
           TOGI_BIN: ${{ github.workspace }}/target/release/togi
           BENCH_RUNNER_LABEL: github-actions-ubuntu-24.04-linux-x86_64
           BENCH_GO_BUILD_CACHE_STATE: primed
+          GOCACHE: ${{ runner.temp }}/togi-pr-loop-gocache
           BENCHMARK_OUTPUT: ${{ runner.temp }}/togi-pr-loop-benchmarks/measured
         run: bash benchmarks/pr-loop/run-pr-loop-benchmarks.sh --output "$BENCHMARK_OUTPUT"
       - name: Validate PR-loop benchmark evidence
@@ -272,9 +287,10 @@ jobs:
           jq -e '
             .ok == true
             and ([.workloads[].name]
-                 == ["cold-regular", "warm-exact-cache", "cold-schemata", "pr-diff-default"])
+                 == ["cold-regular", "warm-exact-cache", "cold-schemata", "pr-diff-default",
+                     "multi-file-regular", "multi-file-default"])
           ' "$result" >/dev/null
-          for workload in cold-regular warm-exact-cache cold-schemata pr-diff-default; do
+          for workload in cold-regular warm-exact-cache cold-schemata pr-diff-default multi-file-regular multi-file-default; do
             for suffix in report.json stdout stderr; do
               test -f "$raw/$workload.$suffix"
             done

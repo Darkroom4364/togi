@@ -1,23 +1,43 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "name": "togi-pr-loop-benchmarks",
-  "description": "PR-loop benchmark workloads for togi: the Go fixture is copied into a disposable temp project, committed as the base revision, modified by one fixed working-tree patch, and measured through `togi check --base HEAD` so every run represents a PR diff, never --all.",
+  "description": "PR-loop benchmark workloads for togi: the Go fixture is copied into one disposable temp project per scenario, committed as the base revision, modified by the scenario's fixed working-tree patch, and measured through `togi check --base HEAD` so every run represents a PR diff, never --all.",
   "notes": [
     "Timing is observational only: no tracked baseline, no timing threshold, no score judgment, and no CI gate is defined by this manifest.",
     "Semantic and provenance invariants are hard failures; the harness exits non-zero when any invariant fails.",
-    "expected_mutation_count and the changed-line range pin the mutation surface of fixture-change.patch; operator or fixture drift must be resolved by updating this manifest deliberately.",
-    "Workloads run in declaration order. warm-exact-cache reuses the .togi-cache seeded by cold-regular.",
+    "expected_mutation_count and the changed-file line ranges pin the mutation surface of each scenario patch; operator or fixture drift must be resolved by updating this manifest deliberately.",
+    "Workloads run in declaration order and workloads of one scenario must be contiguous. warm-exact-cache reuses the .togi-cache seeded by cold-regular inside the single-file scenario only; cache dependencies never cross scenarios.",
+    "runner_mode is declared per workload (regular, schemata, or default) and validated against the effective argv: regular requires --no-schemata, schemata requires --schemata, default requires neither.",
     "The harness requires bash, git, go, jq, sha256sum or shasum, and python3 (monotonic high-resolution wall clock)."
   ],
   "fixture": {
     "source_dir": "tests/fixtures/go",
-    "patch_file": "benchmarks/pr-loop/fixture-change.patch",
-    "patch_sha256": "f2a0c45c7606dca549c339400e40a2c845c64e9535f3d7c48b8d9d3170f90104",
-    "changed_file": "calc.go",
-    "changed_line_range": [30, 37],
-    "base_ref": "HEAD",
-    "expected_mutation_count": 4
+    "base_ref": "HEAD"
   },
+  "scenarios": [
+    {
+      "name": "single-file",
+      "description": "One-file PR diff: fixture-change.patch appends Clamp to calc.go.",
+      "patch_file": "benchmarks/pr-loop/fixture-change.patch",
+      "patch_sha256": "f2a0c45c7606dca549c339400e40a2c845c64e9535f3d7c48b8d9d3170f90104",
+      "changed_files": [
+        { "path": "calc.go", "line_range": [30, 37] }
+      ],
+      "expected_mutation_count": 4
+    },
+    {
+      "name": "multi-file",
+      "description": "Two-file PR diff: fixture-change-multi.patch rewrites Add in calc.go through Sum and changes the Sum body in numbers.go.",
+      "patch_file": "benchmarks/pr-loop/fixture-change-multi.patch",
+      "patch_sha256": "f6936a8699651ff639b4c1bb842c2072586e204731d49f2f0ab1cd8113cef0cf",
+      "changed_files": [
+        { "path": "calc.go", "line_range": [5, 5] },
+        { "path": "numbers.go", "line_range": [5, 5] }
+      ],
+      "requires_mutation_per_changed_file": true,
+      "expected_mutation_count": 9
+    }
+  ],
   "togi": {
     "binary_env": "TOGI_BIN",
     "default_binary": "target/release/togi",
@@ -34,6 +54,8 @@
   "workloads": [
     {
       "name": "cold-regular",
+      "scenario": "single-file",
+      "runner_mode": "regular",
       "description": "Cold per-mutant runner on the PR diff: fresh cache, schemata disabled, every mutation re-executed.",
       "extra_args": ["--no-schemata", "--force-rerun"],
       "cache": "fresh",
@@ -42,6 +64,8 @@
     },
     {
       "name": "warm-exact-cache",
+      "scenario": "single-file",
+      "runner_mode": "regular",
       "description": "Identical second run reusing the cache seeded by cold-regular; every verdict must come from the exact cache.",
       "extra_args": ["--no-schemata"],
       "cache": "reuse",
@@ -50,6 +74,8 @@
     },
     {
       "name": "cold-schemata",
+      "scenario": "single-file",
+      "runner_mode": "schemata",
       "description": "Cold schemata run on the PR diff: fresh cache; the patch guarantees at least one schema fast-path mutant and at least one fallback mutant.",
       "extra_args": ["--schemata", "--force-rerun"],
       "cache": "fresh",
@@ -57,7 +83,28 @@
     },
     {
       "name": "pr-diff-default",
+      "scenario": "single-file",
+      "runner_mode": "default",
       "description": "Default invocation on the PR diff (no cache or schemata flags), representing out-of-the-box PR-loop behavior; mutations must target only the patched lines.",
+      "extra_args": [],
+      "cache": "fresh",
+      "invariants": ["report-well-formed", "pr-diff-targeting"]
+    },
+    {
+      "name": "multi-file-regular",
+      "scenario": "multi-file",
+      "runner_mode": "regular",
+      "description": "Cold per-mutant runner on the two-file PR diff: fresh cache, schemata disabled, every mutation re-executed across both changed files.",
+      "extra_args": ["--no-schemata", "--force-rerun"],
+      "cache": "fresh",
+      "seeds_cache": true,
+      "invariants": ["report-well-formed", "full-fresh-execution", "pr-diff-targeting"]
+    },
+    {
+      "name": "multi-file-default",
+      "scenario": "multi-file",
+      "runner_mode": "default",
+      "description": "Default invocation on the two-file PR diff, representing out-of-the-box PR-loop behavior across files; mutations must target only the patched lines in either changed file.",
       "extra_args": [],
       "cache": "fresh",
       "invariants": ["report-well-formed", "pr-diff-targeting"]
