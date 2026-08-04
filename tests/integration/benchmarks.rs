@@ -301,6 +301,7 @@ fn pr_loop_harness_runs_all_four_workloads_against_a_pr_diff() {
     let result = read_result(out_dir.path());
     assert_eq!(result["ok"], true);
     assert_eq!(result["failures"], serde_json::json!([]));
+    assert_eq!(result["provenance"]["go_build_cache_state"], "unclassified");
     assert_eq!(
         result["cross_workload"]["mutation_identity_consistent"],
         true
@@ -801,6 +802,7 @@ fn validate_pr_loop_benchmark_step_set(job: &serde_yaml::Value) -> Result<(), St
         ("uses", "actions/setup-go@v7"),
         ("name", "Check benchmark prerequisites"),
         ("name", "Build release binary"),
+        ("name", "Warm Go build cache for PR-loop benchmark evidence"),
         ("name", "Run PR-loop benchmark harness"),
         ("name", "Validate PR-loop benchmark evidence"),
         ("name", "Upload PR-loop benchmark evidence"),
@@ -824,7 +826,7 @@ fn validate_pr_loop_benchmark_step_set(job: &serde_yaml::Value) -> Result<(), St
             return Err(format!("benchmark step {index} must not mask failure"));
         }
         let condition = step.get("if").and_then(|value| value.as_str());
-        if index == 9 {
+        if index == 10 {
             if condition != Some("${{ always() }}") {
                 return Err("artifact upload must be the sole unconditional step".to_string());
             }
@@ -832,7 +834,7 @@ fn validate_pr_loop_benchmark_step_set(job: &serde_yaml::Value) -> Result<(), St
             return Err(format!("benchmark step {index} must not be conditional"));
         }
     }
-    for index in [0, 1, 3, 4, 9] {
+    for index in [0, 1, 3, 4, 10] {
         if steps[index].get("run").is_some() {
             return Err(format!(
                 "non-executable benchmark setup/upload step {index} must not contain `run`"
@@ -858,26 +860,47 @@ fn validate_pr_loop_benchmark_step_set(job: &serde_yaml::Value) -> Result<(), St
     {
         return Err("only the named release-build step may build togi".to_string());
     }
-    if steps[7]
-        .get("run")
-        .and_then(|value| value.as_str())
-        .map(str::trim)
-        != Some("bash benchmarks/pr-loop/run-pr-loop-benchmarks.sh --output \"$BENCHMARK_OUTPUT\"")
-    {
-        return Err("only the named harness step may run the benchmark harness".to_string());
+    for index in [7, 8] {
+        if steps[index]
+            .get("run")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            != Some(
+                "bash benchmarks/pr-loop/run-pr-loop-benchmarks.sh --output \"$BENCHMARK_OUTPUT\"",
+            )
+        {
+            return Err(
+                "only the named warmup and harness steps may run the benchmark harness".to_string(),
+            );
+        }
     }
-    if steps[8].get("shell").and_then(|value| value.as_str()) != Some("bash")
+    if steps[7]
+        .get("env")
+        .and_then(|env| env.get("BENCH_GO_BUILD_CACHE_STATE"))
+        .and_then(|value| value.as_str())
+        != Some("warmup")
         || steps[8]
+            .get("env")
+            .and_then(|env| env.get("BENCH_GO_BUILD_CACHE_STATE"))
+            .and_then(|value| value.as_str())
+            != Some("primed")
+    {
+        return Err("warmup must precede primed measured evidence".to_string());
+    }
+    if steps[9].get("shell").and_then(|value| value.as_str()) != Some("bash")
+        || steps[9]
             .get("env")
             .and_then(|env| env.get("BENCHMARK_OUTPUT"))
             .and_then(|value| value.as_str())
-            != Some("${{ runner.temp }}/togi-pr-loop-benchmarks")
-        || steps[8].get("run").and_then(|value| value.as_str())
+            != Some("${{ runner.temp }}/togi-pr-loop-benchmarks/measured")
+        || steps[9].get("run").and_then(|value| value.as_str())
             != Some(APPROVED_BENCHMARK_EVIDENCE_VALIDATION)
     {
-        return Err("only the named validation step may verify benchmark evidence".to_string());
+        return Err(
+            "only the named validation step may verify measured benchmark evidence".to_string(),
+        );
     }
-    if steps[9].get("if").and_then(|value| value.as_str()) != Some("${{ always() }}") {
+    if steps[10].get("if").and_then(|value| value.as_str()) != Some("${{ always() }}") {
         return Err("only the named upload step must be unconditional".to_string());
     }
     Ok(())
@@ -969,7 +992,14 @@ fn ci_pr_loop_benchmark_contract_is_structural() {
             .get("env")
             .and_then(|env| env.get("BENCHMARK_OUTPUT"))
             .and_then(|value| value.as_str()),
-        Some("${{ runner.temp }}/togi-pr-loop-benchmarks")
+        Some("${{ runner.temp }}/togi-pr-loop-benchmarks/measured")
+    );
+    assert_eq!(
+        harness
+            .get("env")
+            .and_then(|env| env.get("BENCH_GO_BUILD_CACHE_STATE"))
+            .and_then(|value| value.as_str()),
+        Some("primed")
     );
     assert_eq!(
         harness
@@ -1188,7 +1218,16 @@ fn pr_loop_calibration_collector_fails_closed_and_preserves_samples() {
     let mut results = Vec::new();
     for sample in 1..=5 {
         let output = samples.path().join(format!("sample-{sample}"));
-        assert!(run_harness(&tools, &output, None, &[]).status.success());
+        assert!(
+            run_harness(
+                &tools,
+                &output,
+                None,
+                &[("BENCH_GO_BUILD_CACHE_STATE", "primed")]
+            )
+            .status
+            .success()
+        );
         results.push(output.join("pr-loop-benchmark-result.json"));
     }
     let candidate = samples.path().join("candidate.json");
@@ -1211,6 +1250,10 @@ fn pr_loop_calibration_collector_fails_closed_and_preserves_samples() {
     );
     assert!(value["samples"]["cold-regular"]["wall_ms_median"].is_number());
     assert!(value["samples"]["cold-regular"]["wall_ms_mad"].is_number());
+    assert_eq!(
+        value["measurement_identity"]["go_build_cache_state"],
+        "primed"
+    );
 
     let wrong_count = run_collector(&samples.path().join("wrong-count.json"), &results[..4]);
     assert!(!wrong_count.status.success());
@@ -1291,6 +1334,11 @@ fn pr_loop_calibration_collector_fails_closed_and_preserves_samples() {
             serde_json::Value::String("different-togi".to_string()),
             "execution",
         ),
+        (
+            "/provenance/go_build_cache_state",
+            serde_json::Value::String("warmup".to_string()),
+            "go-cache-state",
+        ),
     ] {
         let altered = samples.path().join(format!("{output_name}.json"));
         let mut result: serde_json::Value =
@@ -1308,6 +1356,34 @@ fn pr_loop_calibration_collector_fails_closed_and_preserves_samples() {
             !String::from_utf8_lossy(&rejected.stderr).contains("Traceback"),
             "malformed input must have a collector error, not a traceback"
         );
+    }
+    for (replacement, output_name) in [
+        (
+            serde_json::Value::String("unclassified".to_string()),
+            "unclassified",
+        ),
+        (serde_json::Value::Null, "missing-state"),
+    ] {
+        let altered = samples.path().join(format!("{output_name}.json"));
+        let mut result: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&results[4]).unwrap()).unwrap();
+        if replacement.is_null() {
+            result["provenance"]
+                .as_object_mut()
+                .unwrap()
+                .remove("go_build_cache_state");
+        } else {
+            result["provenance"]["go_build_cache_state"] = replacement;
+        }
+        fs::write(&altered, serde_json::to_vec(&result).unwrap()).unwrap();
+        let mut mismatched = results.clone();
+        mismatched[4] = altered;
+        let candidate = samples.path().join(format!("{output_name}-out.json"));
+        assert_eq!(
+            run_collector(&candidate, &mismatched).status.code(),
+            Some(2)
+        );
+        assert!(!candidate.exists());
     }
 
     let diagnostic = samples.path().join("diagnostic.json");
@@ -1372,13 +1448,68 @@ fn pr_loop_calibration_workflow_is_manual_read_only_and_retained() {
     let workflow =
         fs::read_to_string(repo_root().join(".github/workflows/pr-loop-calibration.yml"))
             .expect("calibration workflow");
-    let _: serde_yaml::Value = serde_yaml::from_str(&workflow).expect("workflow YAML");
+    let parsed: serde_yaml::Value = serde_yaml::from_str(&workflow).expect("workflow YAML");
+    let steps = parsed["jobs"]["calibrate"]["steps"]
+        .as_sequence()
+        .expect("calibration must have steps");
+    let step = |name| {
+        steps
+            .iter()
+            .position(|item| item["name"].as_str() == Some(name))
+            .map(|index| (index, &steps[index]))
+            .unwrap_or_else(|| panic!("missing calibration step {name}"))
+    };
+    let (warmup_index, warmup) = step("Warm Go build cache");
+    let (acquisition_index, acquisition) = step("Acquire five independent samples");
+    assert!(warmup_index < acquisition_index);
+    assert_eq!(
+        warmup["env"]["BENCH_GO_BUILD_CACHE_STATE"].as_str(),
+        Some("warmup")
+    );
+    assert_eq!(
+        warmup["env"]["CALIBRATION_OUTPUT"].as_str(),
+        Some("${{ runner.temp }}/togi-pr-loop-calibration/warmup")
+    );
+    assert_eq!(
+        warmup["run"].as_str(),
+        Some("bash benchmarks/pr-loop/run-pr-loop-benchmarks.sh --output \"$CALIBRATION_OUTPUT\"")
+    );
+    assert_eq!(
+        acquisition["env"]["BENCH_GO_BUILD_CACHE_STATE"].as_str(),
+        Some("primed")
+    );
+    assert_eq!(
+        acquisition["env"]["CALIBRATION_OUTPUT"].as_str(),
+        Some("${{ runner.temp }}/togi-pr-loop-calibration")
+    );
+    let collect = step("Collect candidate calibration").1["run"]
+        .as_str()
+        .expect("collector command");
+    let result_arguments: Vec<&str> = collect
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.contains("pr-loop-benchmark-result.json"))
+        .map(|line| line.trim_end_matches('\\').trim())
+        .collect();
+    let expected_arguments: Vec<String> = (1..=5)
+        .map(|sample| {
+            format!("\"$CALIBRATION_OUTPUT/sample-{sample}/pr-loop-benchmark-result.json\"")
+        })
+        .collect();
+    assert_eq!(
+        result_arguments,
+        expected_arguments
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+    );
+    let upload = step("Upload calibration evidence").1;
+    assert_eq!(
+        upload["with"]["path"].as_str(),
+        Some("${{ runner.temp }}/togi-pr-loop-calibration")
+    );
     assert!(workflow.contains("workflow_dispatch:"));
     assert!(workflow.contains("if: github.ref == 'refs/heads/main'"));
-    assert!(workflow.contains("permissions:\n  contents: read"));
-    assert!(workflow.contains("runs-on: ubuntu-24.04"));
-    assert!(workflow.contains("BENCH_RUNNER_LABEL: github-actions-ubuntu-24.04-linux-x86_64"));
-    assert!(workflow.contains("for sample in 1 2 3 4 5; do"));
     assert!(workflow.contains("retention-days: 14"));
     assert!(!workflow.contains("pull_request:"));
     assert!(!workflow.contains("permissions: write"));

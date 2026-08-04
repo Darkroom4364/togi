@@ -279,6 +279,7 @@ fi
 KERNEL_RELEASE=$(uname -r)
 IMAGE_OS=${ImageOS:-}
 IMAGE_VERSION=${ImageVersion:-}
+BENCH_GO_BUILD_CACHE_STATE=${BENCH_GO_BUILD_CACHE_STATE:-unclassified}
 
 # jq filter for each named invariant. Manifest values are injected as
 # $expected_mutations, $changed_file, $line_min, and $line_max.
@@ -534,6 +535,7 @@ jq -n \
   --arg kernel_release "$KERNEL_RELEASE" \
   --arg image_os "$IMAGE_OS" \
   --arg image_version "$IMAGE_VERSION" \
+  --arg go_build_cache_state "$BENCH_GO_BUILD_CACHE_STATE" \
   --arg started_at "$STARTED_AT" \
   --arg fixture_source "$FIXTURE_SOURCE_DIR" \
   --arg patch_sha "$ACTUAL_PATCH_SHA" \
@@ -561,6 +563,7 @@ jq -n \
       image_os: (if $image_os == "" then null else $image_os end),
       image_version: (if $image_version == "" then null else $image_version end),
       git_version: $git_version,
+      go_build_cache_state: $go_build_cache_state,
       fixture_source_dir: $fixture_source,
       fixture_patch: "benchmarks/pr-loop/fixture-change.patch",
       fixture_patch_sha256: $patch_sha,
