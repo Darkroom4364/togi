@@ -4728,7 +4728,9 @@ fn pr_loop_benchmark_workflow_collects_observational_evidence() {
             "observational benchmark job must not add `{forbidden}`"
         );
     }
-    let compatibility = fs::read_to_string(root.join("docs/COMPATIBILITY.md")).unwrap();
+    let compatibility = fs::read_to_string(root.join("docs/COMPATIBILITY.md"))
+        .unwrap()
+        .replace("\r\n", "\n");
     assert!(
         compatibility.contains("PR-loop Benchmark Evidence")
             && compatibility.contains("Linux x86_64 only")
