@@ -2344,6 +2344,70 @@ fn build_calibration_artifact(tools: &FakeTools, artifact: &Path, gocache: &Path
     results
 }
 
+/// Acquires a fresh calibration artifact and promotes it, retrying the
+/// ENTIRE acquisition at most three times only when the promoter rejects
+/// exactly one fake-wall outlier diagnostic under test-host load. Any other
+/// failure — or exhausted retries — panics. Each attempt uses distinct paths.
+/// Returns (artifact dir, baseline path).
+fn acquire_and_promote_calibration(
+    tools: &FakeTools,
+    workspace: &Path,
+    gocache: &Path,
+    commit: &str,
+) -> (PathBuf, PathBuf) {
+    for attempt in 1..=3 {
+        let artifact = workspace.join(format!("artifact-attempt-{attempt}"));
+        fs::create_dir(&artifact).unwrap();
+        build_calibration_artifact(tools, &artifact, gocache);
+        let baseline = workspace.join(format!("baseline-attempt-{attempt}.json"));
+        let promoted = run_promoter(&artifact, &baseline, commit, &[]);
+        if promoted.status.success() {
+            return (artifact, baseline);
+        }
+        let stderr = String::from_utf8_lossy(&promoted.stderr);
+        assert!(
+            is_retryable_calibration_wall_outlier(&stderr),
+            "calibration promotion failed for a non-flake reason\nstderr: {stderr}"
+        );
+    }
+    panic!("calibration acquisition hit the above-3x-median flake three times in a row");
+}
+
+fn is_retryable_calibration_wall_outlier(stderr: &str) -> bool {
+    const PREFIX: &str = "baseline promotion failed: workload ";
+    const SUFFIX: &str = " has a wall sample above 3x its median";
+
+    stderr
+        .trim()
+        .strip_prefix(PREFIX)
+        .and_then(|diagnostic| diagnostic.strip_suffix(SUFFIX))
+        .is_some_and(|workload| !workload.trim().is_empty() && !workload.contains(['\n', '\r']))
+}
+
+#[test]
+fn calibration_wall_outlier_retry_predicate_is_exact() {
+    let diagnostic =
+        "baseline promotion failed: workload package/example has a wall sample above 3x its median";
+
+    assert!(is_retryable_calibration_wall_outlier(diagnostic));
+    assert!(is_retryable_calibration_wall_outlier(&format!(
+        "\n  {diagnostic}\t"
+    )));
+
+    for nonretryable in [
+        "baseline promotion failed: workload  has a wall sample above 3x its median",
+        "baseline promotion failed: workload package/example has a reported-duration sample above 3x its median",
+        "baseline promotion failed: workload package/example has a wall sample above 3x its median; retrying",
+        "baseline promotion failed: workload package/example\nhas a wall sample above 3x its median",
+        "another failure above 3x its median",
+    ] {
+        assert!(
+            !is_retryable_calibration_wall_outlier(nonretryable),
+            "unexpectedly retryable: {nonretryable:?}"
+        );
+    }
+}
+
 fn read_json(path: &Path) -> serde_json::Value {
     serde_json::from_str(&fs::read_to_string(path).expect("read JSON")).expect("valid JSON")
 }
@@ -2357,17 +2421,8 @@ fn pr_loop_promote_baseline_happy_path_is_deterministic_and_never_overwrites() {
     let tools = install_fake_tools();
     let gocache = tempfile::tempdir().expect("gocache tempdir");
     let workspace = tempfile::tempdir().expect("workspace");
-    let artifact = workspace.path().join("artifact");
-    fs::create_dir(&artifact).unwrap();
-    build_calibration_artifact(&tools, &artifact, gocache.path());
-
-    let baseline = workspace.path().join("baseline.json");
-    let promoted = run_promoter(&artifact, &baseline, "test-commit", &[]);
-    assert!(
-        promoted.status.success(),
-        "promotion must succeed\nstderr: {}",
-        String::from_utf8_lossy(&promoted.stderr)
-    );
+    let (artifact, baseline) =
+        acquire_and_promote_calibration(&tools, workspace.path(), gocache.path(), "test-commit");
     let value = read_json(&baseline);
     assert_eq!(value["kind"], "togi_pr_loop_baseline");
     assert_eq!(value["schema_version"], 1);
@@ -2511,9 +2566,8 @@ fn pr_loop_promote_baseline_fails_closed_on_artifact_tampering() {
     let tools = install_fake_tools();
     let gocache = tempfile::tempdir().expect("gocache tempdir");
     let workspace = tempfile::tempdir().expect("workspace");
-    let artifact = workspace.path().join("artifact");
-    fs::create_dir(&artifact).unwrap();
-    build_calibration_artifact(&tools, &artifact, gocache.path());
+    let (artifact, _pristine_baseline) =
+        acquire_and_promote_calibration(&tools, workspace.path(), gocache.path(), "test-commit");
     let candidate = artifact.join("pr-loop-calibration-candidate.json");
     let sample5 = artifact.join("sample-5/pr-loop-benchmark-result.json");
 
@@ -2916,16 +2970,8 @@ fn build_gate_fixture() -> (FakeTools, GateFixture) {
     let tools = install_fake_tools();
     let gocache = tempfile::tempdir().expect("gocache tempdir");
     let workspace = tempfile::tempdir().expect("workspace");
-    let artifact = workspace.path().join("artifact");
-    fs::create_dir(&artifact).unwrap();
-    build_calibration_artifact(&tools, &artifact, gocache.path());
-    let baseline = workspace.path().join("baseline.json");
-    let promoted = run_promoter(&artifact, &baseline, "test-commit", &[]);
-    assert!(
-        promoted.status.success(),
-        "gate fixture promotion failed\nstderr: {}",
-        String::from_utf8_lossy(&promoted.stderr)
-    );
+    let (_artifact, baseline) =
+        acquire_and_promote_calibration(&tools, workspace.path(), gocache.path(), "test-commit");
     let samples_dir = workspace.path().join("gate-samples");
     fs::create_dir(&samples_dir).unwrap();
     let results = run_gate_samples(&tools, &samples_dir, gocache.path(), 3);
