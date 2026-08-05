@@ -70,6 +70,13 @@ to force the regular runner for all mutations.
   invocation binds one job-private `GOCACHE` (created empty, warmed before
   measurement) so cache provenance is explicit. This job is telemetry only:
   it compares nothing and gates nothing.
+- **PR-loop Scale Evidence**
+  ([`pr-loop-scale-evidence.yml`](../.github/workflows/pr-loop-scale-evidence.yml),
+  Linux x86_64 only on the `ubuntu-24.04` runner class with the same
+  fail-closed native target/arch assertion): Go 1.26.5 uses a job-private cache
+  created empty, warmed once, then acquires three primed schema-v3 scale-harness
+  samples and uploads their complete output plus `scale-summary.json` as an
+  artifact. This evidence compares nothing and gates nothing.
 - **PR-loop Regression Gate**
   ([`pr-loop-regression-gate.yml`](../.github/workflows/pr-loop-regression-gate.yml),
   Linux x86_64 only on `ubuntu-24.04` with the same fail-closed native

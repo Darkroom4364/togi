@@ -2,6 +2,8 @@
 # self-authorize by rewriting the baseline, corpus, comparator, or gate.
 # Changes to any of these paths require @Darkroom4364 review.
 /benchmarks/pr-loop/ @Darkroom4364
+/benchmarks/pr-loop-scale/ @Darkroom4364
 /.github/workflows/pr-loop-regression-gate.yml @Darkroom4364
 /.github/workflows/pr-loop-calibration.yml @Darkroom4364
+/.github/workflows/pr-loop-scale-evidence.yml @Darkroom4364
 /.github/CODEOWNERS @Darkroom4364
