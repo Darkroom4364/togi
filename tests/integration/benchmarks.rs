@@ -2344,6 +2344,70 @@ fn build_calibration_artifact(tools: &FakeTools, artifact: &Path, gocache: &Path
     results
 }
 
+/// Acquires a fresh calibration artifact and promotes it, retrying the
+/// ENTIRE acquisition at most three times only when the promoter rejects
+/// exactly one fake-wall outlier diagnostic under test-host load. Any other
+/// failure — or exhausted retries — panics. Each attempt uses distinct paths.
+/// Returns (artifact dir, baseline path).
+fn acquire_and_promote_calibration(
+    tools: &FakeTools,
+    workspace: &Path,
+    gocache: &Path,
+    commit: &str,
+) -> (PathBuf, PathBuf) {
+    for attempt in 1..=3 {
+        let artifact = workspace.join(format!("artifact-attempt-{attempt}"));
+        fs::create_dir(&artifact).unwrap();
+        build_calibration_artifact(tools, &artifact, gocache);
+        let baseline = workspace.join(format!("baseline-attempt-{attempt}.json"));
+        let promoted = run_promoter(&artifact, &baseline, commit, &[]);
+        if promoted.status.success() {
+            return (artifact, baseline);
+        }
+        let stderr = String::from_utf8_lossy(&promoted.stderr);
+        assert!(
+            is_retryable_calibration_wall_outlier(&stderr),
+            "calibration promotion failed for a non-flake reason\nstderr: {stderr}"
+        );
+    }
+    panic!("calibration acquisition hit the above-3x-median flake three times in a row");
+}
+
+fn is_retryable_calibration_wall_outlier(stderr: &str) -> bool {
+    const PREFIX: &str = "baseline promotion failed: workload ";
+    const SUFFIX: &str = " has a wall sample above 3x its median";
+
+    stderr
+        .trim()
+        .strip_prefix(PREFIX)
+        .and_then(|diagnostic| diagnostic.strip_suffix(SUFFIX))
+        .is_some_and(|workload| !workload.trim().is_empty() && !workload.contains(['\n', '\r']))
+}
+
+#[test]
+fn calibration_wall_outlier_retry_predicate_is_exact() {
+    let diagnostic =
+        "baseline promotion failed: workload package/example has a wall sample above 3x its median";
+
+    assert!(is_retryable_calibration_wall_outlier(diagnostic));
+    assert!(is_retryable_calibration_wall_outlier(&format!(
+        "\n  {diagnostic}\t"
+    )));
+
+    for nonretryable in [
+        "baseline promotion failed: workload  has a wall sample above 3x its median",
+        "baseline promotion failed: workload package/example has a reported-duration sample above 3x its median",
+        "baseline promotion failed: workload package/example has a wall sample above 3x its median; retrying",
+        "baseline promotion failed: workload package/example\nhas a wall sample above 3x its median",
+        "another failure above 3x its median",
+    ] {
+        assert!(
+            !is_retryable_calibration_wall_outlier(nonretryable),
+            "unexpectedly retryable: {nonretryable:?}"
+        );
+    }
+}
+
 fn read_json(path: &Path) -> serde_json::Value {
     serde_json::from_str(&fs::read_to_string(path).expect("read JSON")).expect("valid JSON")
 }
@@ -2357,17 +2421,8 @@ fn pr_loop_promote_baseline_happy_path_is_deterministic_and_never_overwrites() {
     let tools = install_fake_tools();
     let gocache = tempfile::tempdir().expect("gocache tempdir");
     let workspace = tempfile::tempdir().expect("workspace");
-    let artifact = workspace.path().join("artifact");
-    fs::create_dir(&artifact).unwrap();
-    build_calibration_artifact(&tools, &artifact, gocache.path());
-
-    let baseline = workspace.path().join("baseline.json");
-    let promoted = run_promoter(&artifact, &baseline, "test-commit", &[]);
-    assert!(
-        promoted.status.success(),
-        "promotion must succeed\nstderr: {}",
-        String::from_utf8_lossy(&promoted.stderr)
-    );
+    let (artifact, baseline) =
+        acquire_and_promote_calibration(&tools, workspace.path(), gocache.path(), "test-commit");
     let value = read_json(&baseline);
     assert_eq!(value["kind"], "togi_pr_loop_baseline");
     assert_eq!(value["schema_version"], 1);
@@ -2511,9 +2566,8 @@ fn pr_loop_promote_baseline_fails_closed_on_artifact_tampering() {
     let tools = install_fake_tools();
     let gocache = tempfile::tempdir().expect("gocache tempdir");
     let workspace = tempfile::tempdir().expect("workspace");
-    let artifact = workspace.path().join("artifact");
-    fs::create_dir(&artifact).unwrap();
-    build_calibration_artifact(&tools, &artifact, gocache.path());
+    let (artifact, _pristine_baseline) =
+        acquire_and_promote_calibration(&tools, workspace.path(), gocache.path(), "test-commit");
     let candidate = artifact.join("pr-loop-calibration-candidate.json");
     let sample5 = artifact.join("sample-5/pr-loop-benchmark-result.json");
 
@@ -2916,16 +2970,8 @@ fn build_gate_fixture() -> (FakeTools, GateFixture) {
     let tools = install_fake_tools();
     let gocache = tempfile::tempdir().expect("gocache tempdir");
     let workspace = tempfile::tempdir().expect("workspace");
-    let artifact = workspace.path().join("artifact");
-    fs::create_dir(&artifact).unwrap();
-    build_calibration_artifact(&tools, &artifact, gocache.path());
-    let baseline = workspace.path().join("baseline.json");
-    let promoted = run_promoter(&artifact, &baseline, "test-commit", &[]);
-    assert!(
-        promoted.status.success(),
-        "gate fixture promotion failed\nstderr: {}",
-        String::from_utf8_lossy(&promoted.stderr)
-    );
+    let (_artifact, baseline) =
+        acquire_and_promote_calibration(&tools, workspace.path(), gocache.path(), "test-commit");
     let samples_dir = workspace.path().join("gate-samples");
     fs::create_dir(&samples_dir).unwrap();
     let results = run_gate_samples(&tools, &samples_dir, gocache.path(), 3);
@@ -5297,4 +5343,1101 @@ fn pr_loop_v2_harness_rejects_the_v3_scale_manifest() {
             .exists(),
         "v2 harness must not emit a result for the v3 manifest"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Schema-1 observational scale summary (issue #498, PR 2).
+//
+// These drive benchmarks/pr-loop-scale/summarize-scale.py with synthetic
+// primed v3 results in the real harness output shape, plus one end-to-end
+// run over three fake-tools harness acquisitions. The happy path proves the
+// paired per-sample ratio median (not the ratio of medians), the signed
+// wall-minus-reported diagnostic, and the identity/digest evidence; the
+// fail-closed table proves every malformed/missing/incomparable input exits
+// 2 with no stdout JSON.
+// ---------------------------------------------------------------------------
+
+const SCALE_SUMMARY_IDENTITY: &str =
+    "abababababababababababababababababababababababababababababababab";
+
+fn summarizer_path() -> PathBuf {
+    repo_root().join("benchmarks/pr-loop-scale/summarize-scale.py")
+}
+
+fn run_summarizer(results: &[PathBuf], output: Option<&Path>) -> Output {
+    let mut command = Command::new("python3");
+    command.arg(summarizer_path());
+    if let Some(output) = output {
+        command.arg("--output").arg(output);
+    }
+    for result in results {
+        command.arg(result);
+    }
+    command.output().expect("spawn summarizer")
+}
+
+/// Full-fidelity workload semantics for a valid primed v3 scale result:
+/// fresh workloads fully execute with zero reuse, the warm workload is
+/// entirely exact-cache, and schemata workloads carry a 7/91 split.
+fn scale_workload_semantics(name: &str, reported: u64) -> serde_json::Value {
+    let (tested, exact, schemata) = match name {
+        "scale-warm-exact-cache" => (0, 98, serde_json::Value::Null),
+        "scale-schemata" | "scale-schemata-jobs4" => {
+            (98, 0, serde_json::json!({"fast_path": 7, "fallback": 91}))
+        }
+        _ => (98, 0, serde_json::Value::Null),
+    };
+    serde_json::json!({
+        "total": 98,
+        "planned_total": 98,
+        "tested": tested,
+        "killed": 0,
+        "survived": 98,
+        "timeout": 0,
+        "build_errors": 0,
+        "uncovered": 0,
+        "subsumed": 0,
+        "exact_cache_reused": exact,
+        "incremental_history_reused": 0,
+        "partial": false,
+        "reported_duration_ms": reported,
+        "schemata": schemata,
+        "selected_test_command": ["go", "test", "./..."],
+        "test_selection": {
+            "mode": "full-suite",
+            "full_suite_mutation_count": 98,
+            "narrowed_mutation_count": 0
+        },
+        "mutation_count": 98,
+        "mutation_identity_sha256": SCALE_SUMMARY_IDENTITY
+    })
+}
+
+fn scale_workload_invariants(name: &str) -> serde_json::Value {
+    let extra = match name {
+        "scale-warm-exact-cache" => "full-exact-cache-reuse",
+        "scale-schemata" | "scale-schemata-jobs4" => "schemata-fast-path-and-fallback",
+        "scale-default" => "pr-diff-targeting",
+        _ => "full-fresh-execution",
+    };
+    serde_json::json!([
+        {"name": "report-well-formed", "ok": true},
+        {"name": extra, "ok": true}
+    ])
+}
+
+const SCALE_COMMON_TAIL: [&str; 11] = [
+    "check",
+    "--base",
+    "HEAD",
+    "--timeout",
+    "60",
+    "--max-per-run",
+    "500",
+    "--test-cmd",
+    "go test ./...",
+    "--format",
+    "json",
+];
+
+fn scale_workload_command(name: &str) -> serde_json::Value {
+    let extras: &[&str] = match name {
+        "scale-regular-jobs1" => &["--no-schemata", "--force-rerun", "--jobs", "1"],
+        "scale-warm-exact-cache" => &["--no-schemata", "--jobs", "1"],
+        "scale-regular-jobs4" => &["--no-schemata", "--force-rerun", "--jobs", "4"],
+        "scale-schemata" => &["--schemata", "--force-rerun", "--jobs", "1"],
+        "scale-schemata-jobs4" => &["--schemata", "--force-rerun", "--jobs", "4"],
+        _ => &[],
+    };
+    let mut argv = vec!["togi"];
+    argv.extend_from_slice(&SCALE_COMMON_TAIL);
+    argv.extend_from_slice(extras);
+    serde_json::json!(argv)
+}
+
+/// A valid primed v3 scale result in the real harness output shape, with
+/// the given per-workload wall/reported timings (declaration order).
+fn scale_result_value(walls: [u64; 6], reported: [u64; 6]) -> serde_json::Value {
+    let workloads: Vec<serde_json::Value> = SCALE_WORKLOAD_NAMES
+        .iter()
+        .zip([
+            ("regular", "fresh"),
+            ("regular", "reuse"),
+            ("regular", "fresh"),
+            ("schemata", "fresh"),
+            ("schemata", "fresh"),
+            ("default", "fresh"),
+        ])
+        .zip(walls.iter().zip(reported.iter()))
+        .map(|((name, (mode, cache)), (wall, rep))| {
+            serde_json::json!({
+                "name": name,
+                "scenario": "scale-file",
+                "runner_mode": mode,
+                "cache_policy": cache,
+                "ok": true,
+                "exit_status": 1,
+                "command": scale_workload_command(name),
+                "timing": {"wall_ms": wall, "reported_duration_ms": rep},
+                "semantics": scale_workload_semantics(name, *rep),
+                "invariants": scale_workload_invariants(name),
+                "artifacts": {"raw_stdout": "raw/x.stdout", "raw_stderr": "raw/x.stderr", "report": "raw/x.report.json"}
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "kind": "togi_pr_loop_benchmark_result",
+        "schema_version": 3,
+        "timing_policy": "observational-only",
+        "manifest": {
+            "name": "togi-pr-loop-scale-benchmarks",
+            "schema_version": 3,
+            "path": "benchmarks/pr-loop-scale/manifest.json"
+        },
+        "ok": true,
+        "failures": [],
+        "provenance": {
+            "togi_version": "togi 0.5.0",
+            "togi_binary": "/opt/togi",
+            "report_kind": "mutation_report",
+            "report_schema_version": 1,
+            "runner_label": "local",
+            "os": "Darwin",
+            "arch": "arm64",
+            "logical_cpu_count": 18,
+            "kernel_release": "25.5.0",
+            "git_version": "git version 2.50.1",
+            "go_version": "go version go1.26.4 darwin/arm64",
+            "image_os": null,
+            "image_version": null,
+            "fixture_source_dir": "tests/fixtures/go-scale",
+            "go_build_cache_state": "primed",
+            "go_build_cache_policy": "job-private-explicit-gocache",
+            "go_build_cache_path": "/tmp/scale-gocache",
+            "started_at_utc": "2026-08-04T00:00:00Z",
+            "fixture_scenarios": {"scale-file": {
+                "patch_file": "benchmarks/pr-loop-scale/scale-change.patch",
+                "patch_sha256": SCALE_SUMMARY_IDENTITY,
+                "base_revision": SCALE_SUMMARY_IDENTITY
+            }}
+        },
+        "cross_workload": {"scenarios": {"scale-file": {
+            "mutation_identity_consistent": true,
+            "mutation_identity_sha256": SCALE_SUMMARY_IDENTITY
+        }}},
+        "workloads": workloads,
+    })
+}
+
+/// Three distinct valid samples; the values make the paired per-sample
+/// ratio median differ from the ratio of medians.
+fn write_valid_summary_samples(dir: &Path) -> Vec<PathBuf> {
+    let walls: [[u64; 6]; 3] = [
+        [5, 3, 10, 6, 7, 4],
+        [100, 8, 20, 95, 50, 90],
+        [100, 9, 90, 105, 60, 88],
+    ];
+    let mut paths = Vec::new();
+    for (index, walls_for_sample) in walls.iter().enumerate() {
+        let reported: [u64; 6] = walls_for_sample.map(|wall| wall - 1);
+        let path = dir.join(format!("sample-{index}.json"));
+        fs::write(
+            &path,
+            serde_json::to_string_pretty(&scale_result_value(*walls_for_sample, reported))
+                .expect("serialize sample"),
+        )
+        .expect("write sample");
+        paths.push(path);
+    }
+    paths
+}
+
+#[test]
+fn pr_loop_scale_summary_reports_paired_ratio_medians_and_identity() {
+    if !tool_on_path("python3") {
+        eprintln!("skipping: python3 unavailable");
+        return;
+    }
+    let dir = tempfile::tempdir().expect("case tempdir");
+    let samples = write_valid_summary_samples(dir.path());
+
+    let output = run_summarizer(&samples, None);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "summarizer must accept three valid primed v3 results\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let summary: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("summary is valid JSON");
+    assert_eq!(summary["kind"], "togi_pr_loop_scale_summary");
+    assert_eq!(summary["schema_version"], 1);
+    assert_eq!(summary["timing_policy"], "observational-only");
+    assert_eq!(summary["sample_count"], 3);
+    assert_eq!(
+        summary["aggregation"],
+        serde_json::json!({
+            "workload_timings": "median_of_three",
+            "ratios": "median_of_paired_sample_ratios",
+            "ratio_metric": "wall_ms"
+        })
+    );
+
+    let workloads = summary["workloads"].as_array().expect("workloads array");
+    let names: Vec<&str> = workloads
+        .iter()
+        .map(|workload| workload["name"].as_str().expect("name"))
+        .collect();
+    assert_eq!(names, SCALE_WORKLOAD_NAMES);
+    assert_eq!(workloads[0]["wall_ms"], serde_json::json!([5, 100, 100]));
+    assert_eq!(workloads[0]["median_wall_ms"], 100);
+    assert_eq!(workloads[0]["median_reported_duration_ms"], 99);
+    assert_eq!(workloads[0]["diagnostic_wall_minus_reported_ms"], 1);
+
+    // jobs4 walls [10, 20, 90] over jobs1 walls [5, 100, 100]: the paired
+    // per-sample ratios are [2.0, 0.2, 0.9] with median 9/10, while the
+    // ratio of medians would be 20/100 = 1/5. Observing the exact fraction
+    // and the stored pairs proves the contract's aggregation rule.
+    let ratio = &summary["ratios"]["regular_jobs4_over_jobs1"];
+    assert_eq!(ratio["metric"], "wall_ms");
+    assert_eq!(
+        ratio["sample_pairs_ms"],
+        serde_json::json!([[10, 5], [20, 100], [90, 100]])
+    );
+    assert_eq!(
+        ratio["median_fraction"],
+        serde_json::json!({"numerator": 9, "denominator": 10})
+    );
+    assert_ne!(
+        ratio["median_fraction"],
+        serde_json::json!({"numerator": 1, "denominator": 5}),
+        "must be the median of paired ratios, never the ratio of medians"
+    );
+    assert_eq!(ratio["numerator_workload"], "scale-regular-jobs4");
+    assert_eq!(ratio["denominator_workload"], "scale-regular-jobs1");
+    let ratio_keys: Vec<&str> = summary["ratios"]
+        .as_object()
+        .expect("ratios object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        ratio_keys,
+        [
+            "regular_jobs4_over_jobs1",
+            "schemata_jobs4_over_schemata_jobs1",
+            "schemata_over_regular_jobs1",
+            "warm_over_cold"
+        ]
+    );
+    assert_eq!(
+        summary["ratios"]["schemata_jobs4_over_schemata_jobs1"]["denominator_workload"],
+        "scale-schemata"
+    );
+    assert_eq!(
+        summary["ratios"]["warm_over_cold"]["median_fraction"],
+        serde_json::json!({"numerator": 9, "denominator": 100})
+    );
+
+    let identity = &summary["identity"];
+    assert_eq!(
+        identity["manifest"]["path"],
+        "benchmarks/pr-loop-scale/manifest.json"
+    );
+    assert_eq!(identity["runner_class"]["logical_cpu_count"], 18);
+    assert_eq!(identity["toolchain"]["togi_version"], "togi 0.5.0");
+    assert_eq!(identity["toolchain"]["git_version"], "git version 2.50.1");
+    assert_eq!(
+        identity["corpus"]["mutation_identity_sha256"],
+        SCALE_SUMMARY_IDENTITY
+    );
+    assert_eq!(identity["measurement"]["go_build_cache_state"], "primed");
+    assert_eq!(
+        identity["measurement"]["go_build_cache_path"], "/tmp/scale-gocache",
+        "one shared primed cache path across the three samples"
+    );
+    let digests: Vec<&str> = identity["input_sha256"]
+        .as_array()
+        .expect("input digests")
+        .iter()
+        .map(|digest| digest.as_str().expect("digest string"))
+        .collect();
+    assert_eq!(digests.len(), 3);
+    for digest in &digests {
+        assert_eq!(digest.len(), 64);
+    }
+    let mut sorted = digests.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    assert_eq!(sorted.len(), 3, "sample content digests must be distinct");
+}
+
+#[test]
+fn pr_loop_scale_summary_output_is_exclusive_and_stdout_only() {
+    if !tool_on_path("python3") {
+        eprintln!("skipping: python3 unavailable");
+        return;
+    }
+    let dir = tempfile::tempdir().expect("case tempdir");
+    let samples = write_valid_summary_samples(dir.path());
+
+    let output_path = dir.path().join("scale-summary.json");
+    let first = run_summarizer(&samples, Some(&output_path));
+    assert_eq!(first.status.code(), Some(0));
+    let file_bytes = fs::read(&output_path).expect("summary file");
+    assert_eq!(
+        file_bytes, first.stdout,
+        "--output must contain exactly the stdout JSON"
+    );
+
+    let second = run_summarizer(&samples, Some(&output_path));
+    assert_eq!(
+        second.status.code(),
+        Some(2),
+        "re-running with the same --output must fail closed"
+    );
+    assert!(
+        String::from_utf8_lossy(&second.stderr).contains("output already exists"),
+        "clobber refusal must be named: {}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert!(
+        second.stdout.is_empty(),
+        "a failed run must not emit partial JSON"
+    );
+    assert_eq!(
+        fs::read(&output_path).expect("summary file"),
+        file_bytes,
+        "an existing output must never be overwritten"
+    );
+
+    let dangling = dir.path().join("dangling.json");
+    std::os::unix::fs::symlink(dir.path().join("no-such-target"), &dangling)
+        .expect("create dangling symlink");
+    let third = run_summarizer(&samples, Some(&dangling));
+    assert_eq!(
+        third.status.code(),
+        Some(2),
+        "a dangling symlink output path must be refused"
+    );
+
+    for count in [2usize, 4] {
+        let wrong: Vec<PathBuf> = (0..count).map(|index| samples[index % 3].clone()).collect();
+        let output = run_summarizer(&wrong, None);
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "exactly three results are required, not {count}"
+        );
+    }
+}
+
+/// (label, mutation, scope) for the summarizer fail-closed table; scope is
+/// "all", "first", or "second" and selects which samples get mutated.
+type SummaryMutationCase = (&'static str, fn(&mut serde_json::Value), &'static str);
+
+#[test]
+fn pr_loop_scale_summary_fails_closed_on_bad_inputs() {
+    if !tool_on_path("python3") {
+        eprintln!("skipping: python3 unavailable");
+        return;
+    }
+
+    let cases: Vec<SummaryMutationCase> = vec![
+        (
+            "wrong result kind",
+            |value| {
+                value["kind"] = serde_json::json!("mutation_report");
+            },
+            "all",
+        ),
+        (
+            "schema 2 result",
+            |value| {
+                value["schema_version"] = serde_json::json!(2);
+            },
+            "all",
+        ),
+        (
+            "wrong timing policy",
+            |value| {
+                value["timing_policy"] = serde_json::json!("gated");
+            },
+            "all",
+        ),
+        (
+            "manifest identity mismatch",
+            |value| {
+                value["manifest"]["name"] = serde_json::json!("togi-pr-loop-benchmarks");
+            },
+            "all",
+        ),
+        (
+            "ok false",
+            |value| {
+                value["ok"] = serde_json::json!(false);
+            },
+            "all",
+        ),
+        (
+            "non-empty failures",
+            |value| {
+                value["failures"] = serde_json::json!(["scale-default:report-well-formed"]);
+            },
+            "all",
+        ),
+        (
+            "five workloads",
+            |value| {
+                value["workloads"].as_array_mut().unwrap().truncate(5);
+            },
+            "all",
+        ),
+        (
+            "workloads in wrong order",
+            |value| {
+                value["workloads"].as_array_mut().unwrap().swap(0, 1);
+            },
+            "all",
+        ),
+        (
+            "runner mode mismatch",
+            |value| {
+                value["workloads"][3]["runner_mode"] = serde_json::json!("regular");
+            },
+            "all",
+        ),
+        (
+            "cache policy mismatch",
+            |value| {
+                value["workloads"][1]["cache_policy"] = serde_json::json!("fresh");
+            },
+            "all",
+        ),
+        (
+            "failed invariant",
+            |value| {
+                value["workloads"][0]["invariants"][0]["ok"] = serde_json::json!(false);
+            },
+            "all",
+        ),
+        (
+            "wrong invariant names",
+            |value| {
+                value["workloads"][0]["invariants"][1]["name"] =
+                    serde_json::json!("full-exact-cache-reuse");
+            },
+            "all",
+        ),
+        (
+            "workload not ok",
+            |value| {
+                value["workloads"][0]["ok"] = serde_json::json!(false);
+            },
+            "all",
+        ),
+        (
+            "unexpected exit status",
+            |value| {
+                value["workloads"][0]["exit_status"] = serde_json::json!(2);
+            },
+            "all",
+        ),
+        (
+            "command argv tail mismatch",
+            |value| {
+                value["workloads"][0]["command"] = serde_json::json!([
+                    "togi",
+                    "check",
+                    "--base",
+                    "HEAD",
+                    "--timeout",
+                    "60",
+                    "--max-per-run",
+                    "500",
+                    "--test-cmd",
+                    "go test ./...",
+                    "--format",
+                    "json",
+                    "--no-schemata",
+                    "--force-rerun",
+                    "--jobs",
+                    "2"
+                ]);
+            },
+            "all",
+        ),
+        (
+            "image_os wrong type",
+            |value| {
+                value["provenance"]["image_os"] = serde_json::json!(42);
+            },
+            "all",
+        ),
+        (
+            "image identity drift",
+            |value| {
+                value["provenance"]["image_os"] = serde_json::json!("ubuntu-24.04");
+            },
+            "second",
+        ),
+        (
+            "empty command binary",
+            |value| {
+                value["workloads"][0]["command"][0] = serde_json::json!("");
+            },
+            "all",
+        ),
+        (
+            "wrong mutation total",
+            |value| {
+                value["workloads"][0]["semantics"]["total"] = serde_json::json!(97);
+            },
+            "all",
+        ),
+        (
+            "planned total mismatch",
+            |value| {
+                value["workloads"][0]["semantics"]["planned_total"] = serde_json::json!(97);
+            },
+            "all",
+        ),
+        (
+            "mutation count mismatch",
+            |value| {
+                value["workloads"][0]["semantics"]["mutation_count"] = serde_json::json!(97);
+            },
+            "all",
+        ),
+        (
+            "wrong test command",
+            |value| {
+                value["workloads"][0]["semantics"]["selected_test_command"] =
+                    serde_json::json!(["go", "test"]);
+            },
+            "all",
+        ),
+        (
+            "narrowed test selection",
+            |value| {
+                value["workloads"][0]["semantics"]["test_selection"]["mode"] =
+                    serde_json::json!("narrowed");
+            },
+            "all",
+        ),
+        (
+            "reported duration disagrees with timing",
+            |value| {
+                value["workloads"][0]["semantics"]["reported_duration_ms"] = serde_json::json!(1);
+            },
+            "all",
+        ),
+        (
+            "fresh workload not fully executed",
+            |value| {
+                value["workloads"][0]["semantics"]["tested"] = serde_json::json!(97);
+            },
+            "all",
+        ),
+        (
+            "fresh workload reusing cache",
+            |value| {
+                value["workloads"][0]["semantics"]["exact_cache_reused"] = serde_json::json!(1);
+            },
+            "all",
+        ),
+        (
+            "fresh workload reusing history",
+            |value| {
+                value["workloads"][0]["semantics"]["incremental_history_reused"] =
+                    serde_json::json!(1);
+            },
+            "all",
+        ),
+        (
+            "warm workload re-executing",
+            |value| {
+                value["workloads"][1]["semantics"]["tested"] = serde_json::json!(1);
+            },
+            "all",
+        ),
+        (
+            "warm workload partial cache",
+            |value| {
+                value["workloads"][1]["semantics"]["exact_cache_reused"] = serde_json::json!(97);
+            },
+            "all",
+        ),
+        (
+            "schemata without fast path",
+            |value| {
+                value["workloads"][3]["semantics"]["schemata"]["fast_path"] = serde_json::json!(0);
+            },
+            "all",
+        ),
+        (
+            "schemata without fallback",
+            |value| {
+                value["workloads"][3]["semantics"]["schemata"]["fallback"] = serde_json::json!(0);
+            },
+            "all",
+        ),
+        (
+            "schemata split not summing to total",
+            |value| {
+                value["workloads"][3]["semantics"]["schemata"]["fallback"] = serde_json::json!(90);
+            },
+            "all",
+        ),
+        (
+            "regular workload with schemata evidence",
+            |value| {
+                value["workloads"][0]["semantics"]["schemata"] =
+                    serde_json::json!({"fast_path": 7, "fallback": 91});
+            },
+            "all",
+        ),
+        (
+            "workload identity differs from scenario",
+            |value| {
+                value["workloads"][2]["semantics"]["mutation_identity_sha256"] =
+                    serde_json::json!("cd".repeat(32));
+            },
+            "all",
+        ),
+        (
+            "scenario identity inconsistent",
+            |value| {
+                value["cross_workload"]["scenarios"]["scale-file"]["mutation_identity_consistent"] =
+                    serde_json::json!(false);
+            },
+            "all",
+        ),
+        (
+            "float wall time",
+            |value| {
+                value["workloads"][0]["timing"]["wall_ms"] = serde_json::json!(100.5);
+            },
+            "all",
+        ),
+        (
+            "zero wall time",
+            |value| {
+                value["workloads"][1]["timing"]["wall_ms"] = serde_json::json!(0);
+            },
+            "all",
+        ),
+        (
+            "float mutation total",
+            |value| {
+                value["workloads"][0]["semantics"]["total"] = serde_json::json!(98.0);
+            },
+            "all",
+        ),
+        (
+            "float full-suite count",
+            |value| {
+                value["workloads"][0]["semantics"]["test_selection"]["full_suite_mutation_count"] =
+                    serde_json::json!(98.0);
+            },
+            "all",
+        ),
+        (
+            "float narrowed count",
+            |value| {
+                value["workloads"][0]["semantics"]["test_selection"]["narrowed_mutation_count"] =
+                    serde_json::json!(0.0);
+            },
+            "all",
+        ),
+        (
+            "float tested count",
+            |value| {
+                value["workloads"][0]["semantics"]["tested"] = serde_json::json!(98.0);
+            },
+            "all",
+        ),
+        (
+            "boolean exact-cache count",
+            |value| {
+                value["workloads"][0]["semantics"]["exact_cache_reused"] = serde_json::json!(false);
+            },
+            "all",
+        ),
+        (
+            "boolean report schema version",
+            |value| {
+                value["provenance"]["report_schema_version"] = serde_json::json!(true);
+            },
+            "all",
+        ),
+        (
+            "float result schema version",
+            |value| {
+                value["schema_version"] = serde_json::json!(3.0);
+            },
+            "all",
+        ),
+        (
+            "float manifest schema version",
+            |value| {
+                value["manifest"]["schema_version"] = serde_json::json!(3.0);
+            },
+            "all",
+        ),
+        (
+            "malformed patch digest",
+            |value| {
+                value["provenance"]["fixture_scenarios"]["scale-file"]["patch_sha256"] =
+                    serde_json::json!("not-a-digest");
+            },
+            "all",
+        ),
+        (
+            "patch digest drift",
+            |value| {
+                value["provenance"]["fixture_scenarios"]["scale-file"]["patch_sha256"] =
+                    serde_json::json!("cd".repeat(32));
+            },
+            "second",
+        ),
+        (
+            "zero logical cpu count",
+            |value| {
+                value["provenance"]["logical_cpu_count"] = serde_json::json!(0);
+            },
+            "all",
+        ),
+        (
+            "logical cpu drift",
+            |value| {
+                value["provenance"]["logical_cpu_count"] = serde_json::json!(16);
+            },
+            "second",
+        ),
+        (
+            "negative wall time",
+            |value| {
+                value["workloads"][0]["timing"]["wall_ms"] = serde_json::json!(-1);
+            },
+            "all",
+        ),
+        (
+            "boolean wall time",
+            |value| {
+                value["workloads"][0]["timing"]["wall_ms"] = serde_json::json!(true);
+            },
+            "all",
+        ),
+        (
+            "null wall time",
+            |value| {
+                value["workloads"][0]["timing"]["wall_ms"] = serde_json::Value::Null;
+            },
+            "all",
+        ),
+        (
+            "string reported time",
+            |value| {
+                value["workloads"][0]["timing"]["reported_duration_ms"] = serde_json::json!("42");
+            },
+            "all",
+        ),
+        (
+            "unprimed cache state",
+            |value| {
+                value["provenance"]["go_build_cache_state"] = serde_json::json!("unclassified");
+            },
+            "all",
+        ),
+        (
+            "wrong cache policy",
+            |value| {
+                value["provenance"]["go_build_cache_policy"] = serde_json::json!("unenforced");
+            },
+            "all",
+        ),
+        (
+            "relative cache path",
+            |value| {
+                value["provenance"]["go_build_cache_path"] = serde_json::json!("tmp/cache");
+            },
+            "all",
+        ),
+        (
+            "empty cache path",
+            |value| {
+                value["provenance"]["go_build_cache_path"] = serde_json::json!("");
+            },
+            "all",
+        ),
+        (
+            "cache path drift across samples",
+            |value| {
+                value["provenance"]["go_build_cache_path"] = serde_json::json!("/tmp/other-cache");
+            },
+            "second",
+        ),
+        (
+            "missing report kind",
+            |value| {
+                value["provenance"]["report_kind"] = serde_json::json!("other_report");
+            },
+            "all",
+        ),
+        (
+            "wrong report schema version",
+            |value| {
+                value["provenance"]["report_schema_version"] = serde_json::json!(2);
+            },
+            "all",
+        ),
+        (
+            "missing git version",
+            |value| {
+                value["provenance"]["git_version"] = serde_json::json!("");
+            },
+            "all",
+        ),
+        (
+            "missing kernel release",
+            |value| {
+                value["provenance"]["kernel_release"] = serde_json::json!("");
+            },
+            "all",
+        ),
+        (
+            "runner class drift",
+            |value| {
+                value["provenance"]["runner_label"] = serde_json::json!("github-actions");
+            },
+            "second",
+        ),
+        (
+            "toolchain drift",
+            |value| {
+                value["provenance"]["go_version"] =
+                    serde_json::json!("go version go1.25.0 darwin/arm64");
+            },
+            "first",
+        ),
+        (
+            "togi version drift",
+            |value| {
+                value["provenance"]["togi_version"] = serde_json::json!("togi 0.5.1");
+            },
+            "second",
+        ),
+        (
+            "git version drift",
+            |value| {
+                value["provenance"]["git_version"] = serde_json::json!("git version 2.49.0");
+            },
+            "second",
+        ),
+        (
+            "kernel drift",
+            |value| {
+                value["provenance"]["kernel_release"] = serde_json::json!("25.4.0");
+            },
+            "second",
+        ),
+        (
+            "mutation identity drift",
+            |value| {
+                value["cross_workload"]["scenarios"]["scale-file"]["mutation_identity_sha256"] =
+                    serde_json::json!("cd".repeat(32));
+            },
+            "second",
+        ),
+    ];
+
+    for (label, mutation, scope) in cases {
+        let dir = tempfile::tempdir().expect("case tempdir");
+        let samples = write_valid_summary_samples(dir.path());
+        let targets: &[usize] = match scope {
+            "all" => &[0, 1, 2],
+            "first" => &[0],
+            "second" => &[1],
+            _ => unreachable!(),
+        };
+        for index in targets {
+            let mut value: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(&samples[*index]).expect("read sample"))
+                    .expect("sample JSON");
+            mutation(&mut value);
+            fs::write(
+                &samples[*index],
+                serde_json::to_string_pretty(&value).expect("serialize"),
+            )
+            .expect("rewrite sample");
+        }
+        let output = run_summarizer(&samples, None);
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "summarizer must exit 2 for {label}\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            output.stdout.is_empty(),
+            "no JSON on stdout for rejected input {label}"
+        );
+    }
+
+    // Non-JSON and non-object documents.
+    for (label, contents) in [("malformed JSON", "{"), ("non-object JSON", "[]")] {
+        let dir = tempfile::tempdir().expect("case tempdir");
+        let samples = write_valid_summary_samples(dir.path());
+        fs::write(&samples[0], contents).expect("corrupt sample");
+        let output = run_summarizer(&samples, None);
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "summarizer must exit 2 for {label}"
+        );
+    }
+
+    // Same path twice.
+    let dir = tempfile::tempdir().expect("case tempdir");
+    let samples = write_valid_summary_samples(dir.path());
+    let output = run_summarizer(
+        &[samples[0].clone(), samples[0].clone(), samples[1].clone()],
+        None,
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "duplicate result paths must fail closed"
+    );
+
+    // Distinct paths, identical content.
+    let dir = tempfile::tempdir().expect("case tempdir");
+    let samples = write_valid_summary_samples(dir.path());
+    let clone_path = dir.path().join("clone.json");
+    fs::copy(&samples[0], &clone_path).expect("clone sample");
+    let output = run_summarizer(&[samples[0].clone(), clone_path, samples[1].clone()], None);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "identical content digests must fail closed"
+    );
+
+    // Symlink input.
+    let dir = tempfile::tempdir().expect("case tempdir");
+    let samples = write_valid_summary_samples(dir.path());
+    let link = dir.path().join("linked.json");
+    std::os::unix::fs::symlink(&samples[2], &link).expect("symlink sample");
+    let output = run_summarizer(&[samples[0].clone(), samples[1].clone(), link], None);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "symlink inputs must fail closed"
+    );
+
+    // Missing input.
+    let dir = tempfile::tempdir().expect("case tempdir");
+    let samples = write_valid_summary_samples(dir.path());
+    let output = run_summarizer(
+        &[
+            samples[0].clone(),
+            samples[1].clone(),
+            dir.path().join("missing.json"),
+        ],
+        None,
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "missing inputs must fail closed"
+    );
+}
+
+/// End-to-end compatibility: three real fake-tools harness acquisitions
+/// (primed, one shared private GOCACHE) must summarize successfully. This
+//  proves the summarizer accepts the current harness result shape, not only
+//  synthetic fixtures.
+#[test]
+fn pr_loop_scale_summary_accepts_real_harness_output_shape() {
+    if !harness_tools_available() || !tool_on_path("python3") {
+        eprintln!("skipping: harness or Python tools unavailable");
+        return;
+    }
+    let tools = install_fake_scale_tools();
+    let gocache = tempfile::tempdir().expect("gocache tempdir");
+    let cache_path = gocache.path().to_str().expect("gocache path").to_string();
+
+    let mut results = Vec::new();
+    let mut sample_dirs = Vec::new();
+    for sample in 1..=3 {
+        let out_dir = tempfile::tempdir().expect("sample output tempdir");
+        let output = run_scale_harness(
+            &tools,
+            out_dir.path(),
+            Some(&scale_manifest_path()),
+            &[
+                ("BENCH_GO_BUILD_CACHE_STATE", "primed"),
+                ("GOCACHE", cache_path.as_str()),
+                ("FAKE_GO_ENV_GOCACHE", cache_path.as_str()),
+            ],
+        );
+        assert!(
+            output.status.success(),
+            "harness sample {sample} must succeed\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        // Guarantee distinct content digests with a minimal timing tweak.
+        let result_path = out_dir.path().join("pr-loop-benchmark-result.json");
+        let mut result = read_result(out_dir.path());
+        result["workloads"][0]["timing"]["wall_ms"] = serde_json::json!(100 + sample);
+        let kept = result_path.clone();
+        fs::write(&kept, serde_json::to_string_pretty(&result).unwrap()).expect("rewrite sample");
+        results.push(kept);
+        sample_dirs.push(out_dir); // retained so the samples live until drop
+    }
+
+    let output = run_summarizer(&results, None);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "summarizer must accept three real harness results\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let summary: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("summary is valid JSON");
+    assert_eq!(summary["kind"], "togi_pr_loop_scale_summary");
+    assert_eq!(summary["schema_version"], 1);
+    assert_eq!(summary["sample_count"], 3);
+    assert_eq!(
+        summary["identity"]["corpus"]["mutation_identity_sha256"]
+            .as_str()
+            .expect("digest")
+            .len(),
+        64
+    );
+    assert_eq!(
+        summary["identity"]["measurement"]["go_build_cache_path"],
+        cache_path.as_str()
+    );
+    let ratio_keys: Vec<&str> = summary["ratios"]
+        .as_object()
+        .expect("ratios")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        ratio_keys,
+        [
+            "regular_jobs4_over_jobs1",
+            "schemata_jobs4_over_schemata_jobs1",
+            "schemata_over_regular_jobs1",
+            "warm_over_cold"
+        ]
+    );
+    for workload in summary["workloads"].as_array().expect("workloads") {
+        assert!(workload["median_wall_ms"].as_u64().expect("median") > 0);
+    }
+    drop(sample_dirs);
 }
