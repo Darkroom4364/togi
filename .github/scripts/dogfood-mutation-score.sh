@@ -48,14 +48,15 @@ if ! jq -e '.tested > 0 and .timeout == 0 and .build_errors == 0 and .partial ==
 fi
 
 score="$(jq -r '.mutation_score | round' "$report_path")"
+tested="$(jq -r '.tested' "$report_path")"
 
-jq -n --argjson score "$score" '{
+jq -n --argjson score "$score" --argjson tested "$tested" '{
   schemaVersion: 1,
-  label: "mutation score (dogfood)",
-  message: "\($score)%",
+  label: "mutation score (dogfood: src/report/json.rs)",
+  message: "\($score)% (\($tested) tested)",
   color: "brightgreen"
 }' >"$output_path"
 
 python3 -m json.tool "$output_path" >/dev/null
 
-echo "Dogfood mutation score: ${score}% -> ${output_path}"
+echo "Dogfood mutation score: ${score}% (${tested} tested) -> ${output_path}"

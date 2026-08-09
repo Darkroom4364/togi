@@ -5933,3 +5933,312 @@ fn list_operators_prints_known_ids_and_categories() {
         );
     }
 }
+
+const DOGFOOD_BADGE_LABEL: &str = "mutation score (dogfood: src/report/json.rs)";
+const DOGFOOD_BADGE_ENDPOINT: &str =
+    "https://raw.githubusercontent.com/Darkroom4364/togi/badges/mutation-score.json";
+const DOGFOOD_BADGE_JOB_NAME: &str = "Update mutation score (dogfood: src/report/json.rs) badge";
+const DOGFOOD_BADGE_STEP_NAME: &str = "Run mutation score (dogfood: src/report/json.rs) check";
+
+struct DogfoodBadgeFixture {
+    dir: TempDir,
+    fake_togi: PathBuf,
+    invocation_log: PathBuf,
+    endpoint: PathBuf,
+}
+
+fn dogfood_badge_fixture() -> DogfoodBadgeFixture {
+    let dir = TempDir::new().unwrap();
+    let fake_togi = dir.path().join("fake-togi.sh");
+    let invocation_log = dir.path().join("invocations.log");
+    let endpoint = dir.path().join("mutation-score.json");
+    fs::write(
+        &fake_togi,
+        r#"#!/usr/bin/env bash
+set -euo pipefail
+for argument in "$@"; do
+  printf '<%s>\n' "$argument" >> "$FAKE_TOGI_LOG"
+done
+printf '%s\n' '--' >> "$FAKE_TOGI_LOG"
+printf '%s\n' "${FAKE_TOGI_REPORT:?}"
+exit "${FAKE_TOGI_STATUS:-0}"
+"#,
+    )
+    .unwrap();
+    let output = std::process::Command::new("bash")
+        .args(["-c", "chmod +x \"$1\"", "--"])
+        .arg(&fake_togi)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    DogfoodBadgeFixture {
+        dir,
+        fake_togi,
+        invocation_log,
+        endpoint,
+    }
+}
+
+fn run_dogfood_badge_generator(
+    fixture: &DogfoodBadgeFixture,
+    report: &str,
+    status: i32,
+) -> std::process::Output {
+    std::process::Command::new("bash")
+        .arg(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join(".github/scripts/dogfood-mutation-score.sh"),
+        )
+        .arg(&fixture.endpoint)
+        .current_dir(fixture.dir.path())
+        .env("TOGI_BIN", &fixture.fake_togi)
+        .env("RUNNER_TEMP", fixture.dir.path())
+        .env("FAKE_TOGI_LOG", &fixture.invocation_log)
+        .env("FAKE_TOGI_REPORT", report)
+        .env("FAKE_TOGI_STATUS", status.to_string())
+        .output()
+        .unwrap()
+}
+
+fn dogfood_badge_invocation(fixture: &DogfoodBadgeFixture) -> Vec<String> {
+    let log = fs::read_to_string(&fixture.invocation_log).unwrap();
+    let mut lines = log.lines();
+    let mut args = Vec::new();
+    loop {
+        let line = lines
+            .next()
+            .expect("fake togi invocation must terminate with `--`");
+        if line == "--" {
+            break;
+        }
+        assert!(
+            line.starts_with('<') && line.ends_with('>'),
+            "unexpected fake togi invocation line: {line}"
+        );
+        args.push(line[1..line.len() - 1].to_string());
+    }
+    assert!(
+        lines.next().is_none(),
+        "dogfood badge generator must invoke togi exactly once"
+    );
+    args
+}
+
+#[test]
+fn dogfood_badge_generator_scopes_the_bounded_healthy_check() {
+    if !bash_available() || !jq_available() {
+        eprintln!("skipping dogfood badge generator test because bash or jq is unavailable");
+        return;
+    }
+
+    let fixture = dogfood_badge_fixture();
+    let output = run_dogfood_badge_generator(
+        &fixture,
+        r#"{"kind":"mutation_report","schema_version":1,"tested":4,"timeout":0,"build_errors":0,"partial":false,"mutation_score":75.6,"survived":1}"#,
+        1,
+    );
+
+    assert!(
+        output.status.success(),
+        "generator failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        dogfood_badge_invocation(&fixture),
+        action_args(&[
+            "check",
+            "--all",
+            "--path",
+            "src/report/json.rs",
+            "--test-cmd",
+            "cargo test --locked",
+            "--calibrate-timeout",
+            "--timeout-multiplier",
+            "4",
+            "--timeout-slack",
+            "2",
+            "--format",
+            "json",
+        ])
+    );
+    let endpoint: serde_json::Value =
+        serde_json::from_slice(&fs::read(&fixture.endpoint).unwrap()).unwrap();
+    assert_eq!(
+        endpoint,
+        serde_json::json!({
+            "schemaVersion": 1,
+            "label": DOGFOOD_BADGE_LABEL,
+            "message": "76% (4 tested)",
+            "color": "brightgreen",
+        })
+    );
+}
+
+#[test]
+fn dogfood_badge_generator_reports_dynamic_tested_count() {
+    if !bash_available() || !jq_available() {
+        eprintln!("skipping dogfood badge generator test because bash or jq is unavailable");
+        return;
+    }
+
+    let fixture = dogfood_badge_fixture();
+    let output = run_dogfood_badge_generator(
+        &fixture,
+        r#"{"kind":"mutation_report","schema_version":1,"tested":17,"timeout":0,"build_errors":0,"partial":false,"mutation_score":75.6,"survived":4}"#,
+        1,
+    );
+
+    assert!(
+        output.status.success(),
+        "generator failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let endpoint: serde_json::Value =
+        serde_json::from_slice(&fs::read(&fixture.endpoint).unwrap()).unwrap();
+    assert_eq!(
+        endpoint.get("message").and_then(|message| message.as_str()),
+        Some("76% (17 tested)")
+    );
+}
+
+#[test]
+fn dogfood_badge_generator_rejects_partial_or_invalid_reports_without_endpoint() {
+    if !bash_available() || !jq_available() {
+        eprintln!("skipping dogfood badge generator test because bash or jq is unavailable");
+        return;
+    }
+
+    for (case, report) in [
+        (
+            "partial",
+            r#"{"tested":4,"timeout":0,"build_errors":0,"partial":true,"mutation_score":75.6}"#,
+        ),
+        (
+            "no tested mutations",
+            r#"{"tested":0,"timeout":0,"build_errors":0,"partial":false,"mutation_score":75.6}"#,
+        ),
+        (
+            "timeout",
+            r#"{"tested":4,"timeout":1,"build_errors":0,"partial":false,"mutation_score":75.6}"#,
+        ),
+        (
+            "build errors",
+            r#"{"tested":4,"timeout":0,"build_errors":1,"partial":false,"mutation_score":75.6}"#,
+        ),
+        ("malformed JSON", "not JSON"),
+    ] {
+        let fixture = dogfood_badge_fixture();
+        let output = run_dogfood_badge_generator(&fixture, report, 0);
+
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{case} report unexpectedly succeeded:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            !fixture.endpoint.exists(),
+            "{case} report must not produce an endpoint"
+        );
+    }
+}
+
+#[test]
+fn dogfood_badge_scope_contract_binds_docs_generator_workflow_and_public_route() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let readme = fs::read_to_string(root.join("README.md")).unwrap();
+    let expected_badge = format!(
+        "[![{DOGFOOD_BADGE_LABEL}](https://img.shields.io/endpoint?url={DOGFOOD_BADGE_ENDPOINT})]"
+    );
+    assert!(
+        readme.contains(&expected_badge),
+        "README must expose the scoped badge through its existing public route"
+    );
+    assert!(
+        readme.contains(&format!(
+            "The {DOGFOOD_BADGE_LABEL} badge presents both percentage and tested mutant count for its bounded `src/report/json.rs` selector; it is not a repository-wide score."
+        )),
+        "README must disclose the scoped percentage and tested mutant count"
+    );
+
+    let generator = fs::read_to_string(root.join(".github/scripts/dogfood-mutation-score.sh"))
+        .unwrap()
+        .replace("\r\n", "\n");
+    let blocking_smoke = fs::read_to_string(root.join(".github/scripts/run-dogfood-smoke.sh"))
+        .unwrap()
+        .replace("\r\n", "\n");
+    let bounded_selector = concat!(
+        "  --all \\\n",
+        "  --path src/report/json.rs \\\n",
+        "  --test-cmd \"cargo test --locked\" \\\n",
+        "  --calibrate-timeout \\\n",
+        "  --timeout-multiplier 4 \\\n",
+        "  --timeout-slack 2 \\\n",
+        "  --format json \\\n",
+    );
+    for (script_name, script) in [
+        ("badge generator", &generator),
+        ("blocking dogfood smoke", &blocking_smoke),
+    ] {
+        assert!(
+            script.contains(bounded_selector),
+            "{script_name} must retain the bounded dogfood selector"
+        );
+    }
+    assert!(
+        generator.contains(&format!("label: \"{DOGFOOD_BADGE_LABEL}\"")),
+        "generator must emit the same scoped badge label"
+    );
+    assert!(
+        generator.contains(r#"output_path="${1:-mutation-score.json}""#),
+        "generator must retain the published endpoint filename"
+    );
+
+    let workflow_text =
+        fs::read_to_string(root.join(".github/workflows/dogfood-badge.yml")).unwrap();
+    let workflow: serde_yaml::Value =
+        serde_yaml::from_str(&workflow_text).expect("dogfood badge workflow must parse as YAML");
+    let job = workflow
+        .get("jobs")
+        .and_then(|jobs| jobs.get("mutation-score"))
+        .expect("dogfood badge workflow must retain its mutation-score job");
+    assert_eq!(
+        job.get("name").and_then(|name| name.as_str()),
+        Some(DOGFOOD_BADGE_JOB_NAME)
+    );
+    let steps = job_steps(&workflow, "mutation-score");
+    let badge_step = steps
+        .iter()
+        .find(|step| {
+            step.get("name").and_then(|name| name.as_str()) == Some(DOGFOOD_BADGE_STEP_NAME)
+        })
+        .expect("workflow must name its scoped badge generator step");
+    assert_eq!(
+        badge_step
+            .get("run")
+            .and_then(|run| run.as_str())
+            .map(str::trim),
+        Some("./.github/scripts/dogfood-mutation-score.sh \"$RUNNER_TEMP/mutation-score.json\"")
+    );
+    let publish_step = steps
+        .iter()
+        .find(|step| {
+            step.get("name").and_then(|name| name.as_str()) == Some("Publish to badges branch")
+        })
+        .expect("workflow must retain the badge publication step");
+    let publish_run = publish_step
+        .get("run")
+        .and_then(|run| run.as_str())
+        .expect("badge publication step must run a script");
+    for required in [
+        "git checkout badges",
+        "git checkout --orphan badges",
+        "cp \"$RUNNER_TEMP/mutation-score.json\" mutation-score.json",
+    ] {
+        assert!(
+            publish_run.contains(required),
+            "badge publication must retain `{required}`"
+        );
+    }
+}

@@ -14,7 +14,7 @@ concurrency:
 
 jobs:
   mutation-score:
-    name: Update mutation score badge
+    name: "Update mutation score (dogfood: src/report/json.rs) badge"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -26,7 +26,7 @@ jobs:
           cache-bin: false
       - name: Build togi
         run: cargo build --locked --release
-      - name: Run dogfood mutation check
+      - name: "Run mutation score (dogfood: src/report/json.rs) check"
         run: ./.github/scripts/dogfood-mutation-score.sh "$RUNNER_TEMP/mutation-score.json"
       - name: Publish to badges branch
         run: |
