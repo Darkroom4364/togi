@@ -6430,6 +6430,75 @@ fn released_archive_install_smoke_verifies_published_asset() {
     );
 }
 
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+#[ignore]
+fn released_binary_smoke_stages_complete_go_fixture() {
+    if !bash_available() {
+        eprintln!("skipping released-binary smoke test because bash is unavailable");
+        return;
+    }
+
+    let asset = action_asset("togi-linux-x86_64.tar.gz", "togi");
+    let dir = TempDir::new().unwrap();
+    let payload_dir = dir.path().join("payload");
+    fs::create_dir_all(&payload_dir).unwrap();
+    let payload_binary = payload_dir.join(&asset.binary);
+    fs::copy(assert_cmd::cargo::cargo_bin("togi"), &payload_binary).unwrap();
+    chmod_executable(&payload_binary);
+
+    let release_dir = dir.path().join("release");
+    fs::create_dir_all(&release_dir).unwrap();
+    let archive_path = release_dir.join(&asset.archive);
+    create_action_archive(&asset, &payload_dir, &archive_path);
+    let sha = sha256_hex(&archive_path);
+    fs::write(
+        release_dir.join("checksums.txt"),
+        format!("{sha}  ./{}\n", asset.archive),
+    )
+    .unwrap();
+
+    let bin_dir = dir.path().join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    write_fake_curl(&bin_dir);
+    let mut paths = vec![bin_dir];
+    paths.extend(
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+            .filter(|path| !path.join("togi").exists()),
+    );
+
+    let runner_temp = dir.path().join("runner-temp");
+    fs::create_dir_all(&runner_temp).unwrap();
+    let github_path = dir.path().join("github-path");
+    fs::write(&github_path, "").unwrap();
+    let version = format!("v{}", env!("CARGO_PKG_VERSION"));
+    let output = std::process::Command::new("bash")
+        .arg(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join(".github/scripts/run-released-binary-smoke.sh"),
+        )
+        .env("GITHUB_WORKSPACE", env!("CARGO_MANIFEST_DIR"))
+        .env("TOGI_VERSION", &version)
+        .env("TOGI_EXPECTED_ARCH", "x86_64")
+        .env("TOGI_EXPECTED_ARCHIVE", &asset.archive)
+        .env("TOGI_EXPECTED_BINARY", &asset.binary)
+        .env("RUNNER_TEMP", &runner_temp)
+        .env("GITHUB_PATH", &github_path)
+        .env("FAKE_RELEASE_DIR", &release_dir)
+        .env("PATH", std::env::join_paths(paths).unwrap())
+        .env_remove("TOGI_OS")
+        .env_remove("TOGI_ARCH")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "released-binary smoke failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 #[test]
 fn release_target_binding_rejects_mismatched_host_and_asset() {
     if !bash_available() {
