@@ -3815,7 +3815,7 @@ fn github_action_declares_replay_report_contract() {
         "TOGI_REPORT_PATH: ${{ runner.temp }}/togi-report.json",
         "report-artifact-name:",
         "if: ${{ always() && inputs.upload-report == 'true' && steps.run-togi.outputs.report-path != '' }}",
-        "uses: actions/upload-artifact@v7",
+        "uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7",
         "name: ${{ inputs.report-artifact-name }}",
         "path: ${{ runner.temp }}/togi-report.json",
         "retention-days: ${{ inputs.report-retention-days }}",
@@ -3824,6 +3824,41 @@ fn github_action_declares_replay_report_contract() {
         assert!(
             action_yml.contains(expected),
             "action.yml is missing `{expected}`"
+        );
+    }
+}
+
+#[test]
+fn production_upload_artifact_pins_are_immutable() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let expected = "uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7";
+
+    for path in [
+        "action.yml",
+        ".github/workflows/ci.yml",
+        ".github/workflows/pr-loop-calibration.yml",
+        ".github/workflows/pr-loop-regression-gate.yml",
+        ".github/workflows/pr-loop-scale-evidence.yml",
+        ".github/workflows/release.yml",
+    ] {
+        let source = fs::read_to_string(root.join(path))
+            .unwrap()
+            .replace("\r\n", "\n");
+        let mut pins = source
+            .lines()
+            .map(str::trim)
+            .map(|line| line.strip_prefix("- ").unwrap_or(line))
+            .filter(|line| line.starts_with("uses: actions/upload-artifact@"));
+
+        assert_eq!(
+            pins.next(),
+            Some(expected),
+            "{path} must use the immutable upload-artifact v7 pin"
+        );
+        assert_eq!(
+            pins.next(),
+            None,
+            "{path} must declare exactly one upload-artifact use"
         );
     }
 }
@@ -4692,7 +4727,7 @@ fn pr_loop_benchmark_workflow_collects_observational_evidence() {
         .iter()
         .find(|step| {
             step.get("uses").and_then(|value| value.as_str())
-                == Some("actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02")
+                == Some("actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a")
         })
         .expect("benchmark job must upload evidence with a pinned action");
     assert_eq!(

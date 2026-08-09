@@ -1571,7 +1571,7 @@ fn ci_pr_loop_benchmark_contract_is_structural() {
     );
     assert_eq!(
         upload.get("uses").and_then(|value| value.as_str()),
-        Some("actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02")
+        Some("actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a")
     );
     for (key, expected) in [
         ("path", "${{ runner.temp }}/togi-pr-loop-benchmarks"),
@@ -4374,7 +4374,7 @@ fn pr_loop_regression_gate_workflow_is_fail_closed_and_comparator_driven() {
     assert_eq!(upload["if"].as_str(), Some("${{ always() }}"));
     assert_eq!(
         upload["uses"].as_str(),
-        Some("actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02")
+        Some("actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a")
     );
     assert_eq!(
         upload["with"]["name"].as_str(),
