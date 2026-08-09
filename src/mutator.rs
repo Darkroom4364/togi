@@ -239,7 +239,7 @@ mod tests {
     use super::*;
     use crate::languages::LanguageSupport;
     use crate::languages::go::Go;
-    use crate::test_helpers::{find_node_by_kind, parse_go, parse_python};
+    use crate::test_helpers::{find_node_by_kind, parse_go, parse_python, parse_rust};
     use crate::{ChangedFile, LineRange, MutationCandidate};
     use std::path::PathBuf;
     use tempfile::TempDir;
@@ -267,6 +267,24 @@ mod tests {
             mutation.replacement.as_bytes().iter().copied(),
         );
         String::from_utf8(mutated).unwrap()
+    }
+
+    fn assert_rust_library_compiles(source: &str) {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("lib.rs");
+        std::fs::write(&source_path, source).unwrap();
+        let output = std::process::Command::new("rustc")
+            .args(["--crate-type=lib", "--emit=metadata"])
+            .arg(&source_path)
+            .arg("-o")
+            .arg(dir.path().join("lib.rmeta"))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "mutated Rust source must compile:\n{source}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]
@@ -859,6 +877,443 @@ mod tests {
             "return_empty should be allowed for i32 return type, got: {:?}",
             mutations.iter().map(|m| &m.operator).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn rust_expression_if_filters_invalid_removal_mutations() {
+        let tmp = TempDir::new().unwrap();
+        let src = concat!(
+            "fn label(flag: bool) -> Option<String> {\n",
+            "    if flag {\n",
+            "        Some(\"yes\".to_owned())\n",
+            "    } else {\n",
+            "        None\n",
+            "    }\n",
+            "}\n",
+        );
+        let rel = write_test_file(tmp.path(), "lib.rs", src);
+        let changed = vec![ChangedFile {
+            path: rel,
+            hunks: vec![LineRange { start: 1, end: 7 }],
+        }];
+
+        let mutations = generate_mutations(
+            &changed,
+            tmp.path(),
+            100,
+            0,
+            &[
+                "remove_if_body".into(),
+                "remove_else".into(),
+                "negate_condition".into(),
+            ],
+        )
+        .unwrap();
+
+        assert!(
+            !mutations.iter().any(|mutation| matches!(
+                mutation.operator.as_str(),
+                "remove_if_body" | "remove_else"
+            )),
+            "expression-valued Rust if removals must be filtered: {mutations:?}"
+        );
+        let control = mutations
+            .iter()
+            .find(|mutation| mutation.operator == "negate_condition")
+            .expect("the Rust feasibility filter must leave valid if mutations available");
+        let mutated = apply_mutation(src, control);
+        assert!(
+            !parse_rust(&mutated).root_node().has_error(),
+            "control mutation should remain valid Rust:\n{mutated}"
+        );
+        assert_rust_library_compiles(&mutated);
+    }
+
+    #[test]
+    fn rust_field_value_if_filters_invalid_removal_mutations() {
+        let tmp = TempDir::new().unwrap();
+        let src = concat!(
+            "struct Marker { value: Option<i32> }\n",
+            "fn label(flag: bool) -> Marker {\n",
+            "    Marker { value: if flag { Some(1) } else { None } }\n",
+            "}\n",
+        );
+        let rel = write_test_file(tmp.path(), "lib.rs", src);
+        let changed = vec![ChangedFile {
+            path: rel,
+            hunks: vec![LineRange { start: 1, end: 4 }],
+        }];
+        let mutations = generate_mutations(
+            &changed,
+            tmp.path(),
+            100,
+            0,
+            &[
+                "remove_if_body".into(),
+                "remove_else".into(),
+                "negate_condition".into(),
+            ],
+        )
+        .unwrap();
+
+        assert!(
+            !mutations.iter().any(|mutation| matches!(
+                mutation.operator.as_str(),
+                "remove_if_body" | "remove_else"
+            )),
+            "field-valued Rust if removals must be filtered: {mutations:?}"
+        );
+        let control = mutations
+            .iter()
+            .find(|mutation| mutation.operator == "negate_condition")
+            .expect("the Rust feasibility filter must preserve valid if mutations");
+        let mutated = apply_mutation(src, control);
+        assert!(
+            !parse_rust(&mutated).root_node().has_error(),
+            "control mutation should remain valid Rust:\n{mutated}"
+        );
+        assert_rust_library_compiles(&mutated);
+    }
+
+    #[test]
+    fn rust_nested_tail_if_filters_invalid_removal_mutations() {
+        let tmp = TempDir::new().unwrap();
+        let src = concat!(
+            "pub fn f(flag: bool) -> i32 {\n",
+            "    if flag {\n",
+            "        if flag {\n",
+            "            1\n",
+            "        } else {\n",
+            "            2\n",
+            "        }\n",
+            "    } else {\n",
+            "        3\n",
+            "    }\n",
+            "}\n",
+        );
+        let rel = write_test_file(tmp.path(), "lib.rs", src);
+        let changed = vec![ChangedFile {
+            path: rel,
+            hunks: vec![LineRange {
+                start: 1,
+                end: src.lines().count(),
+            }],
+        }];
+        let mutations = generate_mutations(
+            &changed,
+            tmp.path(),
+            100,
+            0,
+            &[
+                "remove_if_body".into(),
+                "remove_else".into(),
+                "negate_condition".into(),
+            ],
+        )
+        .unwrap();
+
+        assert!(
+            !mutations.iter().any(|mutation| matches!(
+                mutation.operator.as_str(),
+                "remove_if_body" | "remove_else"
+            )),
+            "nested value-producing Rust if removals must be filtered: {mutations:?}"
+        );
+        let controls: Vec<_> = mutations
+            .iter()
+            .filter(|mutation| mutation.operator == "negate_condition")
+            .collect();
+        assert_eq!(
+            controls.len(),
+            2,
+            "both nested if conditions should retain valid mutations: {mutations:?}"
+        );
+        for control in controls {
+            let mutated = apply_mutation(src, control);
+            assert!(
+                !parse_rust(&mutated).root_node().has_error(),
+                "control mutation should remain valid Rust:\n{mutated}"
+            );
+            assert_rust_library_compiles(&mutated);
+        }
+    }
+
+    #[test]
+    fn rust_match_arm_tail_if_filters_invalid_removal_mutations() {
+        let tmp = TempDir::new().unwrap();
+        let src = concat!(
+            "pub fn f(flag: bool) -> i32 {\n",
+            "    match flag {\n",
+            "        true => {\n",
+            "            if flag {\n",
+            "                1\n",
+            "            } else {\n",
+            "                2\n",
+            "            }\n",
+            "        }\n",
+            "        false => 3,\n",
+            "    }\n",
+            "}\n",
+        );
+        let rel = write_test_file(tmp.path(), "lib.rs", src);
+        let changed = vec![ChangedFile {
+            path: rel,
+            hunks: vec![LineRange {
+                start: 1,
+                end: src.lines().count(),
+            }],
+        }];
+        let mutations = generate_mutations(
+            &changed,
+            tmp.path(),
+            100,
+            0,
+            &[
+                "remove_if_body".into(),
+                "remove_else".into(),
+                "negate_condition".into(),
+            ],
+        )
+        .unwrap();
+
+        assert!(
+            !mutations.iter().any(|mutation| matches!(
+                mutation.operator.as_str(),
+                "remove_if_body" | "remove_else"
+            )),
+            "match-arm value-producing Rust if removals must be filtered: {mutations:?}"
+        );
+        let controls: Vec<_> = mutations
+            .iter()
+            .filter(|mutation| mutation.operator == "negate_condition")
+            .collect();
+        assert_eq!(
+            controls.len(),
+            1,
+            "the match-arm if condition should retain a valid mutation: {mutations:?}"
+        );
+        for control in controls {
+            let mutated = apply_mutation(src, control);
+            assert!(
+                !parse_rust(&mutated).root_node().has_error(),
+                "control mutation should remain valid Rust:\n{mutated}"
+            );
+            assert_rust_library_compiles(&mutated);
+        }
+    }
+
+    #[test]
+    fn rust_non_tail_nonunit_if_filters_invalid_removal_mutations() {
+        let tmp = TempDir::new().unwrap();
+        let src = concat!(
+            "fn work() {}\n",
+            "pub fn f(flag: bool) {\n",
+            "    if flag {\n",
+            "        1\n",
+            "    } else {\n",
+            "        2\n",
+            "    };\n",
+            "    work();\n",
+            "}\n",
+        );
+        let rel = write_test_file(tmp.path(), "lib.rs", src);
+        let changed = vec![ChangedFile {
+            path: rel,
+            hunks: vec![LineRange {
+                start: 1,
+                end: src.lines().count(),
+            }],
+        }];
+        let mutations = generate_mutations(
+            &changed,
+            tmp.path(),
+            100,
+            0,
+            &[
+                "remove_if_body".into(),
+                "remove_else".into(),
+                "negate_condition".into(),
+            ],
+        )
+        .unwrap();
+
+        assert!(
+            !mutations.iter().any(|mutation| matches!(
+                mutation.operator.as_str(),
+                "remove_if_body" | "remove_else"
+            )),
+            "non-unit if statement removals must be filtered: {mutations:?}"
+        );
+        let controls: Vec<_> = mutations
+            .iter()
+            .filter(|mutation| mutation.operator == "negate_condition")
+            .collect();
+        assert_eq!(
+            controls.len(),
+            1,
+            "the non-unit if condition should retain a valid mutation: {mutations:?}"
+        );
+        for control in controls {
+            let mutated = apply_mutation(src, control);
+            assert!(
+                !parse_rust(&mutated).root_node().has_error(),
+                "control mutation should remain valid Rust:\n{mutated}"
+            );
+            assert_rust_library_compiles(&mutated);
+        }
+    }
+
+    #[test]
+    fn rust_statement_and_unit_if_keep_valid_removal_mutations() {
+        for (name, src) in [
+            (
+                "statement",
+                concat!(
+                    "fn work() {}\n",
+                    "fn statement(flag: bool) -> i32 {\n",
+                    "    if flag {\n",
+                    "        work();\n",
+                    "    } else {\n",
+                    "        work();\n",
+                    "    }\n",
+                    "    3\n",
+                    "}\n",
+                ),
+            ),
+            (
+                "unit tail",
+                concat!(
+                    "fn work() {}\n",
+                    "fn unit_tail(flag: bool) {\n",
+                    "    if flag {\n",
+                    "        work();\n",
+                    "    } else {\n",
+                    "        work();\n",
+                    "    }\n",
+                    "}\n",
+                ),
+            ),
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let rel = write_test_file(tmp.path(), "lib.rs", src);
+            let changed = vec![ChangedFile {
+                path: rel,
+                hunks: vec![LineRange {
+                    start: 1,
+                    end: src.lines().count(),
+                }],
+            }];
+            let mutations = generate_mutations(
+                &changed,
+                tmp.path(),
+                100,
+                0,
+                &["remove_if_body".into(), "remove_else".into()],
+            )
+            .unwrap();
+
+            for operator in ["remove_if_body", "remove_else"] {
+                let mutation = mutations
+                    .iter()
+                    .find(|mutation| mutation.operator == operator)
+                    .unwrap_or_else(|| {
+                        panic!("{name} Rust if should retain {operator}: {mutations:?}")
+                    });
+                let mutated = apply_mutation(src, mutation);
+                assert!(
+                    !parse_rust(&mutated).root_node().has_error(),
+                    "{operator} should parse as Rust:\n{mutated}"
+                );
+                assert_rust_library_compiles(&mutated);
+            }
+        }
+    }
+
+    #[test]
+    fn rust_nested_unit_if_keeps_all_removal_mutations() {
+        let tmp = TempDir::new().unwrap();
+        let src = concat!(
+            "fn work() {}\n",
+            "pub fn f(a: bool, b: bool) {\n",
+            "    if a {\n",
+            "        if b {\n",
+            "            work();\n",
+            "        } else {\n",
+            "            work();\n",
+            "        }\n",
+            "    } else {\n",
+            "        work();\n",
+            "    }\n",
+            "}\n",
+        );
+        let rel = write_test_file(tmp.path(), "lib.rs", src);
+        let changed = vec![ChangedFile {
+            path: rel,
+            hunks: vec![LineRange {
+                start: 1,
+                end: src.lines().count(),
+            }],
+        }];
+        let mutations = generate_mutations(
+            &changed,
+            tmp.path(),
+            100,
+            0,
+            &["remove_if_body".into(), "remove_else".into()],
+        )
+        .unwrap();
+        let removals: Vec<_> = mutations
+            .iter()
+            .filter(|mutation| {
+                matches!(mutation.operator.as_str(), "remove_if_body" | "remove_else")
+            })
+            .collect();
+        assert_eq!(
+            removals.len(),
+            4,
+            "both nested unit ifs should retain both removals: {mutations:?}"
+        );
+        for mutation in removals {
+            let mutated = apply_mutation(src, mutation);
+            assert!(
+                !parse_rust(&mutated).root_node().has_error(),
+                "unit if removal should parse as Rust:\n{mutated}"
+            );
+            assert_rust_library_compiles(&mutated);
+        }
+    }
+
+    #[test]
+    fn rust_no_else_never_if_keeps_remove_if_body() {
+        let tmp = TempDir::new().unwrap();
+        let src = concat!(
+            "fn never() -> ! { panic!() }\n",
+            "pub fn f(flag: bool) {\n",
+            "    if flag {\n",
+            "        never()\n",
+            "    }\n",
+            "}\n",
+        );
+        let rel = write_test_file(tmp.path(), "lib.rs", src);
+        let changed = vec![ChangedFile {
+            path: rel,
+            hunks: vec![LineRange {
+                start: 1,
+                end: src.lines().count(),
+            }],
+        }];
+        let mutations =
+            generate_mutations(&changed, tmp.path(), 100, 0, &["remove_if_body".into()]).unwrap();
+        let mutation = mutations
+            .iter()
+            .find(|mutation| mutation.operator == "remove_if_body")
+            .expect("no-else if replacement is always unit");
+        let mutated = apply_mutation(src, mutation);
+        assert!(
+            !parse_rust(&mutated).root_node().has_error(),
+            "no-else if removal should parse as Rust:\n{mutated}"
+        );
+        assert_rust_library_compiles(&mutated);
     }
 
     #[test]
