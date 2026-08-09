@@ -83,10 +83,10 @@ fn collect_mutable_nodes<'a>(
     skipped_child
 }
 
-/// Check if a node's line range overlaps with any changed line range.
+/// Check whether a source line range overlaps any changed line range.
 /// Requires: changed_lines sorted with non-decreasing start and end values,
 /// and each range satisfies `start <= end`. Produced by `parse_diff`.
-fn overlaps(node_start: usize, node_end: usize, changed_lines: &[LineRange]) -> bool {
+pub(crate) fn overlaps(node_start: usize, node_end: usize, changed_lines: &[LineRange]) -> bool {
     debug_assert!(
         changed_lines
             .windows(2)
