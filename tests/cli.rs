@@ -4235,7 +4235,7 @@ if [[ "${args[0]:-}" == "--version" ]]; then
   if [[ -n "${FAKE_TOGI_VERSION_STDERR:-}" ]]; then
     printf '%s\n' "$FAKE_TOGI_VERSION_STDERR" >&2
   fi
-  printf 'togi %s\n' "${FAKE_TOGI_VERSION:-0.5.1}"
+  printf 'togi %s\n' "${FAKE_TOGI_VERSION:-0.5.2}"
   exit "${FAKE_TOGI_VERSION_STATUS:-0}"
 fi
 if [[ "${args[0]:-}" == "help" && "${args[1]:-}" == "check" ]]; then
@@ -4296,7 +4296,7 @@ fn action_helper_command(
         .arg(helper)
         .current_dir(fixture.dir.path())
         .env("TOGI_BIN", &fixture.fake_togi)
-        .env("TOGI_EXPECTED_VERSION", "v0.5.1")
+        .env("TOGI_EXPECTED_VERSION", "v0.5.2")
         .env("RUNNER_TEMP", fixture.dir.path())
         .env("GITHUB_OUTPUT", &fixture.github_output)
         .env("TOGI_REPORT_PATH", &fixture.report_path)
@@ -4503,7 +4503,7 @@ fn github_action_run_helper_rejects_version_mismatches_before_check() {
         return;
     }
 
-    for version in ["0.5.0", "0.5.2"] {
+    for version in ["0.5.0", "0.5.1"] {
         let fixture = action_helper_fixture();
         let existing = "{\"kind\":\"mutation_report\",\"schema_version\":1}\n";
         fs::write(&fixture.report_path, existing).unwrap();
@@ -4689,7 +4689,7 @@ fn github_action_run_helper_keeps_native_report_output_path() {
         .current_dir(fixture.dir.path())
         .env("PATH", path)
         .env("TOGI_BIN", &fixture.fake_togi)
-        .env("TOGI_EXPECTED_VERSION", "v0.5.1")
+        .env("TOGI_EXPECTED_VERSION", "v0.5.2")
         .env("TOGI_REPORT_PATH", r"C:\runner\temp\togi-report.json")
         .env("RUNNER_TEMP", fixture.dir.path())
         .env("GITHUB_OUTPUT", &fixture.github_output)
@@ -4849,7 +4849,7 @@ fn github_action_report_replays_a_direct_mutation() {
         .arg(helper)
         .current_dir(repo.path())
         .env("TOGI_BIN", assert_cmd::cargo::cargo_bin("togi"))
-        .env("TOGI_EXPECTED_VERSION", "v0.5.1")
+        .env("TOGI_EXPECTED_VERSION", "v0.5.2")
         .env("RUNNER_TEMP", report_dir.path())
         .env("GITHUB_OUTPUT", &github_output)
         .env("TOGI_BASE", "HEAD")
@@ -4935,7 +4935,7 @@ fn github_action_install_rejects_failed_fetch_without_ambient_archive_fallback()
         .args(["-c", &action_install_run_script(&action_path)])
         .current_dir(dir.path())
         .env("GITHUB_OUTPUT", &github_output)
-        .env("TOGI_VERSION_INPUT", "v0.5.1")
+        .env("TOGI_VERSION_INPUT", "v0.5.2")
         .env("RUNNER_TEMP", &runner_temp)
         .env("GITHUB_ENV", &github_env)
         .env("TOGI_ARCHIVE", "ambient-archive.tar.gz")
@@ -4956,7 +4956,7 @@ fn github_action_install_rejects_failed_fetch_without_ambient_archive_fallback()
         String::from_utf8_lossy(&output.stderr)
     );
 
-    assert_eq!(fs::read_to_string(&fetch_log).unwrap(), "v0.5.1\n");
+    assert_eq!(fs::read_to_string(&fetch_log).unwrap(), "v0.5.2\n");
     assert_eq!(
         fs::read_to_string(&resolver_log).unwrap(),
         "__unset__/__unset__\n"
@@ -5033,7 +5033,7 @@ fn github_action_install_uses_the_resolved_temp_root() {
     let output = std::process::Command::new("bash")
         .args(["-c", install_script.as_str()])
         .current_dir(dir.path())
-        .env("TOGI_VERSION_INPUT", "v0.5.1")
+        .env("TOGI_VERSION_INPUT", "v0.5.2")
         .env("RUNNER_TEMP", &raw_runner_temp)
         .env("GITHUB_ENV", &github_env)
         .env("GITHUB_PATH", &github_path)
@@ -5057,7 +5057,7 @@ fn github_action_install_uses_the_resolved_temp_root() {
     assert_eq!(
         fs::read_to_string(&github_env).unwrap(),
         format!(
-            "TOGI_BIN={}/togi-bin/togi\nTOGI_EXPECTED_VERSION=v0.5.1\n",
+            "TOGI_BIN={}/togi-bin/togi\nTOGI_EXPECTED_VERSION=v0.5.2\n",
             resolved_temp_root.display()
         )
     );
@@ -5107,7 +5107,7 @@ fn github_action_inputs_have_no_baked_in_defaults() {
     }
 
     for (name, default) in [
-        ("version", "'v0.5.1'"),
+        ("version", "'v0.5.2'"),
         ("upload-report", "'true'"),
         ("report-retention-days", "'14'"),
         ("report-artifact-name", "'togi-report'"),
@@ -5136,7 +5136,7 @@ fn github_action_inputs_have_no_baked_in_defaults() {
         "Action releases must not resolve a mutable version"
     );
     for expected in [
-        "VERSION=\"${TOGI_VERSION_INPUT:-v0.5.1}\"",
+        "VERSION=\"${TOGI_VERSION_INPUT:-v0.5.2}\"",
         "^v[0-9]+[.][0-9]+[.][0-9]+$",
         "resolve-togi-asset.sh",
         "fetch-togi-release-asset.sh",
