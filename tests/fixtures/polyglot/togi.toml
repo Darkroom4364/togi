@@ -8,3 +8,6 @@ command = ["go", "test", "./..."]
 
 [test.languages.python]
 command = ["python3", "-m", "unittest"]
+
+[mutations]
+max_per_run = 23
