@@ -3190,6 +3190,23 @@ struct EarlyStopCounts {
     killed: usize,
     survived: usize,
     build_errors: usize,
+    exact_cache_gate_total: usize,
+    exact_cache_gate_killed: usize,
+}
+
+impl EarlyStopCounts {
+    fn record_exact_cache(&mut self, result: MutationResult) {
+        match result {
+            MutationResult::Killed => {
+                self.exact_cache_gate_total += 1;
+                self.exact_cache_gate_killed += 1;
+            }
+            MutationResult::Survived | MutationResult::Timeout => {
+                self.exact_cache_gate_total += 1;
+            }
+            MutationResult::BuildError | MutationResult::Uncovered | MutationResult::Subsumed => {}
+        }
+    }
 }
 
 struct EarlyStopState {
@@ -3229,7 +3246,8 @@ impl EarlyStopState {
             .clone()
     }
 
-    fn record(&self, result: MutationResult) {
+    /// Fresh results are the only evidence for survivor-count early stopping.
+    fn record_fresh(&self, result: MutationResult) {
         if self.should_stop() {
             return;
         }
@@ -3248,14 +3266,37 @@ impl EarlyStopState {
         self.reevaluate(&counts);
     }
 
-    /// Remove a restored cache/history verdict from the fresh-work budget
-    /// without treating its verdict as a newly observed result.
-    fn exclude_restored(&self) {
+    /// Add all final exact-cache verdicts together before selecting workers.
+    fn record_preclassified_exact_cache(&self, restored: &[(usize, MutationRunRecord)]) {
         let mut counts = self
             .counts
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        counts.fresh_eligible_total = counts.fresh_eligible_total.saturating_sub(1);
+        for (_, record) in restored {
+            if record.execution == MutationExecution::ExactCache {
+                counts.record_exact_cache(record.result);
+            }
+        }
+        self.reevaluate(&counts);
+    }
+
+    /// A late restored verdict no longer consumes fresh work; only an exact
+    /// cache verdict contributes to the independent fail-under gate evidence.
+    fn record_restored(&self, execution: MutationExecution, result: MutationResult) {
+        if self.should_stop() {
+            return;
+        }
+
+        let mut counts = self
+            .counts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if execution.is_reused() {
+            counts.fresh_eligible_total = counts.fresh_eligible_total.saturating_sub(1);
+        }
+        if execution == MutationExecution::ExactCache {
+            counts.record_exact_cache(result);
+        }
         self.reevaluate(&counts);
     }
 
@@ -3281,19 +3322,19 @@ impl EarlyStopState {
         }
 
         if let Some(threshold) = self.config.fail_under {
-            let tested = counts.completed.saturating_sub(counts.build_errors);
-            let best_tested = tested + remaining;
-            let best_killed = counts.killed + remaining;
+            let fresh_tested = counts.completed.saturating_sub(counts.build_errors);
+            let best_tested = counts.exact_cache_gate_total + fresh_tested + remaining;
+            let best_killed = counts.exact_cache_gate_killed + counts.killed + remaining;
             let best_score = if best_tested > 0 {
                 (best_killed as f64 / best_tested as f64) * 100.0
-            } else if counts.fresh_eligible_total == 0 {
+            } else if counts.fresh_eligible_total == 0 && counts.exact_cache_gate_total == 0 {
                 100.0
             } else {
                 0.0
             };
             if best_score < threshold {
                 self.stop(format!(
-                    "--fail-under {threshold:.1} cannot be reached; best possible score is {best_score:.1}%"
+                    "--fail-under {threshold:.1} cannot be reached; best possible fail-under gate score is {best_score:.1}%"
                 ));
             }
         }
@@ -3337,20 +3378,19 @@ fn should_stop_early(early_stop: &Option<Arc<EarlyStopState>>) -> bool {
     early_stop.as_ref().is_some_and(|state| state.should_stop())
 }
 
-fn record_early_stop(shared: &RunShared<'_>, result: MutationResult) {
+fn record_fresh_early_stop(shared: &RunShared<'_>, result: MutationResult) {
     if let Some(early_stop) = shared.early_stop {
-        early_stop.record(result);
+        early_stop.record_fresh(result);
     }
 }
 
-fn exclude_restored_from_early_stop(
+fn record_restored_for_early_stop(
     early_stop: Option<&Arc<EarlyStopState>>,
     execution: MutationExecution,
+    result: MutationResult,
 ) {
-    if execution.is_reused() {
-        if let Some(early_stop) = early_stop {
-            early_stop.exclude_restored();
-        }
+    if let Some(early_stop) = early_stop {
+        early_stop.record_restored(execution, result);
     }
 }
 
@@ -3707,7 +3747,7 @@ fn run_queued_mutation(
     if let Some(restored) = restored {
         if !needs_survivor_confirmation(&prepared.selected_test, restored.result) {
             reservation.release();
-            exclude_restored_from_early_stop(shared.early_stop, restored.execution);
+            record_restored_for_early_stop(shared.early_stop, restored.execution, restored.result);
             record_progress(&shared, &mutation, restored.result, None, true);
             let mut record = MutationRunRecord::new(mutation, restored.result, None)
                 .with_execution(restored.execution)
@@ -3746,7 +3786,7 @@ fn run_queued_mutation(
                 );
                 reservation.release();
                 record_progress(&shared, &mutation, MutationResult::BuildError, None, false);
-                record_early_stop(&shared, MutationResult::BuildError);
+                record_fresh_early_stop(&shared, MutationResult::BuildError);
                 let diagnostic = BuildErrorDiagnostic::new(
                     mutation.id,
                     "regular",
@@ -3882,7 +3922,7 @@ fn run_queued_mutation(
         outcome.test_output.as_deref(),
         false,
     );
-    record_early_stop(&shared, result);
+    record_fresh_early_stop(&shared, result);
     let diagnostic = build_error_diagnostic_from_outcome(&mutation, "regular", &outcome);
     let mut record = MutationRunRecord::new(mutation, result, diagnostic)
         .with_execution(execution)
@@ -4132,6 +4172,9 @@ impl TestRunner {
         let preclassified = self.preclassify_for_early_stop(&mutations);
         let early_stop =
             EarlyStopState::for_config(self.early_stop.clone(), preclassified.fresh.len());
+        if let Some(early_stop) = &early_stop {
+            early_stop.record_preclassified_exact_cache(&preclassified.restored);
+        }
         let mut outcome = self.run_regular_with_state(
             preclassified.fresh,
             preclassified.restored,
@@ -4218,6 +4261,9 @@ impl TestRunner {
         let restore_checked = self.early_stop.is_enabled();
         let early_stop =
             EarlyStopState::for_config(self.early_stop.clone(), preclassified.fresh.len());
+        if let Some(early_stop) = &early_stop {
+            early_stop.record_preclassified_exact_cache(&preclassified.restored);
+        }
         let tested_counter = Arc::new(AtomicUsize::new(0));
 
         let index_by_id: HashMap<u32, usize> = mutations
@@ -4368,7 +4414,10 @@ impl TestRunner {
         let start = Instant::now();
         let fresh_total = mutations.len();
         let total = fresh_total + restored.len();
-        if fresh_total == 0 || self.cancelled.load(Ordering::Acquire) {
+        if fresh_total == 0
+            || self.cancelled.load(Ordering::Acquire)
+            || should_stop_early(&early_stop)
+        {
             restored.sort_by_key(|(index, _)| *index);
             return self.outcome_from_records_with_status(
                 restored.into_iter().map(|(_, record)| record).collect(),
@@ -4642,7 +4691,11 @@ impl TestRunner {
             if let Some(restored) = primary_restore {
                 if !needs_survivor_confirmation(&prepared.selected_test, restored.result) {
                     reservation.release();
-                    exclude_restored_from_early_stop(early_stop.as_ref(), restored.execution);
+                    record_restored_for_early_stop(
+                        early_stop.as_ref(),
+                        restored.execution,
+                        restored.result,
+                    );
                     if self.verbose {
                         eprintln!(
                             "  [schema] ↻ cached  {}:{} — {}",
@@ -4880,7 +4933,7 @@ impl TestRunner {
                 reservation.commit();
             }
             if let Some(early_stop) = &early_stop {
-                early_stop.record(final_outcome.result);
+                early_stop.record_fresh(final_outcome.result);
             }
             if self.verbose {
                 let symbol = match final_outcome.result {
@@ -7964,11 +8017,28 @@ mod tests {
         mutation: &Mutation,
         reuse_source: ReuseSource,
     ) -> anyhow::Result<()> {
-        seed_reused_survivor_with_env(
+        seed_reused_result(
             project_root,
             commands,
             mutation,
             reuse_source,
+            MutationResult::Survived,
+        )
+    }
+
+    fn seed_reused_result(
+        project_root: &Path,
+        commands: &CommandConfig,
+        mutation: &Mutation,
+        reuse_source: ReuseSource,
+        result: MutationResult,
+    ) -> anyhow::Result<()> {
+        seed_reused_result_with_env(
+            project_root,
+            commands,
+            mutation,
+            reuse_source,
+            result,
             &HashMap::new(),
         )
     }
@@ -7978,6 +8048,24 @@ mod tests {
         commands: &CommandConfig,
         mutation: &Mutation,
         reuse_source: ReuseSource,
+        env: &HashMap<String, String>,
+    ) -> anyhow::Result<()> {
+        seed_reused_result_with_env(
+            project_root,
+            commands,
+            mutation,
+            reuse_source,
+            MutationResult::Survived,
+            env,
+        )
+    }
+
+    fn seed_reused_result_with_env(
+        project_root: &Path,
+        commands: &CommandConfig,
+        mutation: &Mutation,
+        reuse_source: ReuseSource,
+        result: MutationResult,
         env: &HashMap<String, String>,
     ) -> anyhow::Result<()> {
         let selected = select_test_command(project_root, commands, mutation);
@@ -8003,7 +8091,7 @@ mod tests {
                     &mutation.description,
                     &format!("{command_context};context={context_hash:016x}"),
                 );
-                cache::store(project_root, &key, MutationResult::Survived);
+                cache::store(project_root, &key, result);
             }
             ReuseSource::IncrementalHistory => {
                 let test_context_index = TestContextIndex::build(project_root);
@@ -8019,7 +8107,7 @@ mod tests {
                     cache::IncrementalHistoryEntry {
                         mutation_identity: query.mutation_identity,
                         mutation_description: query.mutation_description,
-                        result: MutationResult::Survived,
+                        result,
                         source_hash: query.source_hash,
                         command_hash: query.command_hash,
                         relevant_test_hash: query.relevant_test_hash,
@@ -12333,8 +12421,96 @@ esac
     }
 
     #[cfg(unix)]
+    fn exact_cached_kill_keeps_fail_under_reachable(use_schemata: bool) -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = tempfile::tempdir()?;
+        let source = "\
+package calc
+func first(a, b int) bool { return a == b }
+func second(a, b int) bool { return a == b }
+func third(a, b int) bool { return a == b }
+";
+        std::fs::write(dir.path().join("calc.go"), source)?;
+        let mutations = (0..3)
+            .map(|id| go_operator_mutation(id, "calc.go", source, id as usize))
+            .collect::<Vec<_>>();
+        let commands = CommandConfig {
+            command: first_run_survives_second_kills_command(state.path()),
+            force_default_command: false,
+            force_default_timeout: false,
+            project_commands: vec![],
+            language_commands: HashMap::new(),
+            build_command: vec![],
+            sandbox_command: vec![],
+            build_command_origin: BuildCommandOrigin::None,
+            timeout: Duration::from_secs(5),
+            language_timeouts: HashMap::new(),
+            test_selection: None,
+        };
+        seed_reused_result(
+            dir.path(),
+            &commands,
+            &mutations[0],
+            ReuseSource::ExactCache,
+            MutationResult::Killed,
+        )?;
+        let runner = TestRunner {
+            commands,
+            parallelism: 1,
+            project_root: dir.path().to_path_buf(),
+            verbose: false,
+            show_output: false,
+            max_tested: None,
+            early_stop: EarlyStopConfig {
+                max_survivors: None,
+                fail_under: Some(60.0),
+            },
+            respect_workspace_ignores: true,
+            env: HashMap::new(),
+            incremental_history: false,
+            force_rerun: false,
+            learned_selection: false,
+            cancelled: Arc::new(AtomicBool::new(false)),
+        };
+
+        let report = if use_schemata {
+            runner.run_with_schemata(mutations).report
+        } else {
+            runner.run(mutations).report
+        };
+
+        assert_eq!(report.planned_total, 3);
+        assert_eq!(report.total, 3);
+        assert_eq!(report.killed, 2);
+        assert_eq!(report.survived, 1);
+        assert_eq!(report.tested_count(), 2);
+        assert_eq!(
+            report.execution_for(0, MutationResult::Killed),
+            MutationExecution::ExactCache
+        );
+        assert_eq!(crate::report::mutation_score(&report), 50.0);
+        assert!(crate::report::fail_under_score(&report) > 60.0);
+        assert!(report.early_stop_reason.is_none(), "{report:?}");
+        assert_eq!(
+            std::fs::read_to_string(state.path().join("runs"))?.trim(),
+            "2"
+        );
+        if use_schemata {
+            assert_eq!(
+                report
+                    .schemata
+                    .as_ref()
+                    .expect("schemata summary")
+                    .fast_path,
+                report.tested_count()
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
     #[test]
-    fn reused_schemata_survivor_does_not_trigger_early_stop() -> anyhow::Result<()> {
+    fn reused_schemata_survivor_keeps_max_survivors_fresh_only() -> anyhow::Result<()> {
         for reuse_source in [ReuseSource::ExactCache, ReuseSource::IncrementalHistory] {
             for (early_stop, gate) in [
                 (
@@ -12396,23 +12572,46 @@ func third(a, b int) bool { return a == b }
                     learned_selection: false,
                     cancelled: Arc::new(AtomicBool::new(false)),
                 };
-
                 let report = runner.run_with_schemata(mutations).report;
                 let schemata = report.schemata.as_ref().expect("schemata summary");
 
-                assert_eq!(report.total, 3, "{gate} should not stop fresh mutations");
-                assert_eq!(report.survived, 1);
-                assert_eq!(report.killed, 2);
-                assert_eq!(report.tested_count(), 2);
-                assert_eq!(schemata.fast_path, report.tested_count());
-                assert_eq!(
-                    report.execution_for(0, MutationResult::Survived),
-                    expected_execution
-                );
-                assert!(report.early_stop_reason.is_none(), "{gate}: {report:?}");
+                if matches!(reuse_source, ReuseSource::ExactCache) && gate == "fail under" {
+                    assert_eq!(report.total, 1, "{gate}: {report:?}");
+                    assert_eq!(report.survived, 1);
+                    assert_eq!(report.killed, 0);
+                    assert_eq!(report.tested_count(), 0);
+                    assert_eq!(
+                        report.execution_for(0, MutationResult::Survived),
+                        MutationExecution::ExactCache
+                    );
+                    assert!(
+                        report
+                            .early_stop_reason
+                            .as_deref()
+                            .is_some_and(|reason| reason.contains("--fail-under 100.0")),
+                        "{report:?}"
+                    );
+                } else {
+                    assert_eq!(report.total, 3, "{gate} should not stop fresh mutations");
+                    assert_eq!(report.survived, 1);
+                    assert_eq!(report.killed, 2);
+                    assert_eq!(report.tested_count(), 2);
+                    assert_eq!(schemata.fast_path, report.tested_count());
+                    assert_eq!(
+                        report.execution_for(0, MutationResult::Survived),
+                        expected_execution
+                    );
+                    assert!(report.early_stop_reason.is_none(), "{gate}: {report:?}");
+                }
             }
         }
         Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_cached_kill_keeps_schemata_fail_under_reachable() -> anyhow::Result<()> {
+        exact_cached_kill_keeps_fail_under_reachable(true)
     }
 
     #[cfg(unix)]
@@ -13106,7 +13305,71 @@ mod tests {
     }
 
     #[test]
-    fn reused_regular_survivor_does_not_trigger_early_stop() -> anyhow::Result<()> {
+    fn late_exact_cache_restore_keeps_gate_and_survivor_evidence_separate() {
+        let gate = EarlyStopState::new(
+            EarlyStopConfig {
+                max_survivors: None,
+                fail_under: Some(60.0),
+            },
+            3,
+        );
+        gate.record_restored(MutationExecution::ExactCache, MutationResult::Killed);
+        gate.record_fresh(MutationResult::Survived);
+        assert!(!gate.should_stop());
+
+        let survivor_limit = EarlyStopState::new(
+            EarlyStopConfig {
+                max_survivors: Some(1),
+                fail_under: None,
+            },
+            4,
+        );
+        survivor_limit.record_restored(MutationExecution::ExactCache, MutationResult::Survived);
+        assert!(!survivor_limit.should_stop());
+        survivor_limit.record_fresh(MutationResult::Killed);
+        assert!(!survivor_limit.should_stop());
+        survivor_limit.record_fresh(MutationResult::Survived);
+        assert!(
+            survivor_limit
+                .reason()
+                .as_deref()
+                .is_some_and(|reason| reason.contains("--max-survivors 1"))
+        );
+    }
+
+    #[test]
+    fn preclassified_exact_cache_evidence_is_aggregated_before_gating() {
+        let mut cached_survivor = make_test_mutation(std::path::Path::new("cached-survivor"));
+        cached_survivor.id = 0;
+        let mut cached_kill = make_test_mutation(std::path::Path::new("cached-kill"));
+        cached_kill.id = 1;
+        let restored = vec![
+            (
+                0,
+                MutationRunRecord::new(cached_survivor, MutationResult::Survived, None)
+                    .with_execution(MutationExecution::ExactCache),
+            ),
+            (
+                1,
+                MutationRunRecord::new(cached_kill, MutationResult::Killed, None)
+                    .with_execution(MutationExecution::ExactCache),
+            ),
+        ];
+        let state = EarlyStopState::new(
+            EarlyStopConfig {
+                max_survivors: None,
+                fail_under: Some(60.0),
+            },
+            1,
+        );
+
+        state.record_preclassified_exact_cache(&restored);
+
+        assert!(!state.should_stop());
+    }
+
+    #[test]
+    fn reused_regular_survivor_keeps_max_survivors_fresh_only() -> anyhow::Result<()> {
         for reuse_source in [ReuseSource::ExactCache, ReuseSource::IncrementalHistory] {
             for (early_stop, gate) in [
                 (
@@ -13173,18 +13436,42 @@ mod tests {
 
                 let report = runner.run(mutations).report;
 
-                assert_eq!(report.total, 3, "{gate} should not stop fresh mutations");
-                assert_eq!(report.survived, 1);
-                assert_eq!(report.killed, 2);
-                assert_eq!(report.tested_count(), 2);
-                assert_eq!(
-                    report.execution_for(0, MutationResult::Survived),
-                    expected_execution
-                );
-                assert!(report.early_stop_reason.is_none(), "{gate}: {report:?}");
+                if matches!(reuse_source, ReuseSource::ExactCache) && gate == "fail under" {
+                    assert_eq!(report.total, 1, "{gate}: {report:?}");
+                    assert_eq!(report.survived, 1);
+                    assert_eq!(report.killed, 0);
+                    assert_eq!(report.tested_count(), 0);
+                    assert_eq!(
+                        report.execution_for(0, MutationResult::Survived),
+                        MutationExecution::ExactCache
+                    );
+                    assert!(
+                        report
+                            .early_stop_reason
+                            .as_deref()
+                            .is_some_and(|reason| reason.contains("--fail-under 100.0")),
+                        "{report:?}"
+                    );
+                } else {
+                    assert_eq!(report.total, 3, "{gate} should not stop fresh mutations");
+                    assert_eq!(report.survived, 1);
+                    assert_eq!(report.killed, 2);
+                    assert_eq!(report.tested_count(), 2);
+                    assert_eq!(
+                        report.execution_for(0, MutationResult::Survived),
+                        expected_execution
+                    );
+                    assert!(report.early_stop_reason.is_none(), "{gate}: {report:?}");
+                }
             }
         }
         Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_cached_kill_keeps_regular_fail_under_reachable() -> anyhow::Result<()> {
+        exact_cached_kill_keeps_fail_under_reachable(false)
     }
 
     #[cfg(unix)]
