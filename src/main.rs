@@ -1,6 +1,7 @@
 use anyhow::Context;
 use clap::Parser;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::ffi::{OsStr, OsString};
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use std::process;
@@ -661,7 +662,18 @@ fn run_check(cfg: togi::cli::CheckArgs, cancelled: Arc<AtomicBool>) -> anyhow::R
         }
     }
 
-    if output_format == togi::cli::OutputFormat::Json || json_report_path.is_some() {
+    // Test commands can change symlink topology. Re-resolve all publication
+    // paths after the campaign, before any report side effect.
+    validate_json_report_destinations(
+        json_report_path.as_deref(),
+        output_format,
+        save_baseline,
+        pr_comment.as_deref(),
+        &project_root_ref,
+    )?;
+
+    let json_stdout = output_format == togi::cli::OutputFormat::Json;
+    if json_stdout || json_report_path.is_some() {
         replay_capture.revalidate(&project_root_ref);
         let json = togi::report::json::to_json_string_with_baseline_and_replay(
             &report,
@@ -672,16 +684,11 @@ fn run_check(cfg: togi::cli::CheckArgs, cancelled: Arc<AtomicBool>) -> anyhow::R
         if let Some(path) = &json_report_path {
             write_json_report(path, &json)?;
         }
-        if output_format == togi::cli::OutputFormat::Json {
+        if json_stdout {
             println!("{json}");
-        } else {
-            togi::report::print_report_with_baseline(
-                &report,
-                output_format,
-                survivor_comparison.as_ref(),
-            )?;
         }
-    } else {
+    }
+    if !json_stdout {
         togi::report::print_report_with_baseline(
             &report,
             output_format,
@@ -1535,7 +1542,7 @@ fn validate_json_report_destinations(
         return Ok(());
     };
     let current_dir = std::env::current_dir().context("could not determine current directory")?;
-    let normalized_json_report = normalize_output_destination(json_report_path, &current_dir)?;
+    let json_report_identity = destination_identity(json_report_path, &current_dir)?;
     let mut destinations = Vec::with_capacity(3);
 
     if output_format == togi::cli::OutputFormat::Html {
@@ -1549,7 +1556,10 @@ fn validate_json_report_destinations(
     }
 
     for (name, path) in destinations {
-        if normalized_json_report == normalize_output_destination(&path, &current_dir)? {
+        if same_output_destination(
+            &json_report_identity,
+            &destination_identity(&path, &current_dir)?,
+        ) {
             anyhow::bail!(
                 "--json-report {} conflicts with the {name} destination {}",
                 json_report_path.display(),
@@ -1560,45 +1570,136 @@ fn validate_json_report_destinations(
     Ok(())
 }
 
-fn normalize_output_destination(path: &Path, current_dir: &Path) -> anyhow::Result<PathBuf> {
-    let path = if path.is_absolute() {
+fn destination_identity(path: &Path, current_dir: &Path) -> anyhow::Result<PathBuf> {
+    let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
         current_dir.join(path)
     };
-    let mut normalized = PathBuf::new();
+    let (root, components) = absolute_output_destination_components(&absolute)?;
+    resolve_output_destination(root, components)
+}
+
+fn absolute_output_destination_components(
+    path: &Path,
+) -> anyhow::Result<(PathBuf, VecDeque<OsString>)> {
+    let mut root = PathBuf::new();
+    let mut components = VecDeque::new();
     for component in path.components() {
         match component {
-            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
-            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::Prefix(prefix) => root.push(prefix.as_os_str()),
+            Component::RootDir => root.push(component.as_os_str()),
             Component::CurDir => {}
-            Component::ParentDir => {
-                if !normalized.pop() && !normalized.has_root() {
-                    normalized.push(component.as_os_str());
-                }
+            Component::ParentDir | Component::Normal(_) => {
+                components.push_back(component.as_os_str().to_os_string());
             }
-            Component::Normal(part) => normalized.push(part),
         }
     }
-
-    let mut suffix = Vec::new();
-    let mut ancestor = normalized.as_path();
-    while !ancestor.exists() {
-        let name = ancestor
-            .file_name()
-            .context("output destination has no parent")?;
-        suffix.push(name);
-        ancestor = ancestor
-            .parent()
-            .context("output destination has no parent")?;
+    if !root.has_root() {
+        anyhow::bail!("output destination must be absolute: {}", path.display());
     }
-    let mut resolved = ancestor
-        .canonicalize()
-        .unwrap_or_else(|_| ancestor.to_path_buf());
-    for part in suffix.into_iter().rev() {
-        resolved.push(part);
+    Ok((root, components))
+}
+
+fn relative_output_destination_components(path: &Path) -> anyhow::Result<VecDeque<OsString>> {
+    let mut components = VecDeque::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir | Component::Normal(_) => {
+                components.push_back(component.as_os_str().to_os_string());
+            }
+            Component::Prefix(_) | Component::RootDir => {
+                anyhow::bail!(
+                    "could not safely resolve output destination symlink target {}",
+                    path.display()
+                );
+            }
+        }
+    }
+    Ok(components)
+}
+
+fn resolve_output_destination(
+    mut resolved: PathBuf,
+    mut components: VecDeque<OsString>,
+) -> anyhow::Result<PathBuf> {
+    let mut symlink_depth = 0;
+    while let Some(component) = components.pop_front() {
+        if component == OsStr::new("..") {
+            resolved.pop();
+            continue;
+        }
+
+        let candidate = resolved.join(&component);
+        match std::fs::symlink_metadata(&candidate) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                symlink_depth += 1;
+                if symlink_depth > 40 {
+                    anyhow::bail!(
+                        "could not safely resolve output destination {}: too many symlinks",
+                        candidate.display()
+                    );
+                }
+
+                let target = std::fs::read_link(&candidate).with_context(|| {
+                    format!(
+                        "could not read output destination symlink {}",
+                        candidate.display()
+                    )
+                })?;
+                let mut target_components = if target.is_absolute() {
+                    let (target_root, components) =
+                        absolute_output_destination_components(&target)?;
+                    resolved = target_root;
+                    components
+                } else {
+                    relative_output_destination_components(&target)?
+                };
+                target_components.append(&mut components);
+                components = target_components;
+            }
+            Ok(_) => resolved.push(component),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // Queues retain only normal names and `..`; after a missing
+                // component, `..` would be ambiguous if the campaign creates
+                // that component before publishing an output.
+                if components
+                    .iter()
+                    .any(|remaining| remaining == OsStr::new(".."))
+                {
+                    anyhow::bail!(
+                        "could not safely resolve output destination {}: missing intermediate component",
+                        candidate.display()
+                    );
+                }
+                resolved.push(component);
+                resolved.extend(components);
+                return Ok(resolved);
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "could not resolve output destination component {}",
+                        candidate.display()
+                    )
+                });
+            }
+        }
     }
     Ok(resolved)
+}
+
+/// Deliberately reject case-only aliases even on case-sensitive volumes so an
+/// Action cannot overwrite a sidecar when a checkout runs on case-insensitive
+/// APFS or Windows. Valid UTF-8 paths use UAX canonical caseless matching;
+/// non-UTF-8 paths retain exact PathBuf equality and are never lossy-normalized.
+fn same_output_destination(left: &Path, right: &Path) -> bool {
+    left == right
+        || left
+            .to_str()
+            .zip(right.to_str())
+            .is_some_and(|(left, right)| caseless::canonical_caseless_match_str(left, right))
 }
 
 fn write_json_report(path: &Path, json: &str) -> anyhow::Result<()> {
@@ -2582,6 +2683,96 @@ example.com/calc/calc.go:9.29,10.11 1 0
         assert!(total.contains(&4));
         assert!(total.contains(&10));
     }
+    #[test]
+    fn destination_identity_resolves_equivalent_and_nested_missing_paths() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let current_dir = dir.path().join("current");
+        std::fs::create_dir_all(current_dir.join("existing/child"))?;
+
+        let absolute = current_dir.join("existing/report.json");
+        let relative = Path::new("existing/child/../report.json");
+        assert_eq!(
+            destination_identity(relative, &current_dir)?,
+            destination_identity(&absolute, &current_dir)?
+        );
+
+        let missing_leaf = current_dir.join("missing-leaf.json");
+        assert_eq!(
+            destination_identity(&missing_leaf, &current_dir)?,
+            destination_identity(&current_dir, &current_dir)?.join("missing-leaf.json")
+        );
+        let missing_nested = current_dir.join("missing/parent/report.json");
+        assert_eq!(
+            destination_identity(&missing_nested, &current_dir)?,
+            destination_identity(&current_dir, &current_dir)?.join("missing/parent/report.json")
+        );
+        assert!(
+            destination_identity(&current_dir.join("foo/../report.json"), &current_dir).is_err(),
+            "a parent traversal after a missing component is unsafe to preflight"
+        );
+        assert!(
+            same_output_destination(&absolute, &current_dir.join("EXISTING/REPORT.JSON")),
+            "case-only aliases are deliberately rejected for case-insensitive volumes"
+        );
+        assert!(
+            same_output_destination(
+                Path::new("/tmp/über-report.html"),
+                Path::new("/tmp/ÜBER-report.html")
+            ),
+            "valid UTF-8 aliases use Unicode-aware lowercase comparison"
+        );
+        assert!(
+            same_output_destination(Path::new("/tmp/café.md"), Path::new("/tmp/cafe\u{301}.md")),
+            "valid UTF-8 aliases normalize NFC and NFD before comparison"
+        );
+        assert!(
+            same_output_destination(Path::new("/tmp/straße.md"), Path::new("/tmp/STRASSE.md")),
+            "canonical caseless matching folds sharp s"
+        );
+        assert!(
+            same_output_destination(Path::new("/tmp/σigma.md"), Path::new("/tmp/ςIGMA.md")),
+            "canonical caseless matching folds Greek sigma variants"
+        );
+        assert!(
+            same_output_destination(Path::new("/tmp/σigma.md"), Path::new("/tmp/ΣIGMA.md")),
+            "canonical caseless matching folds Greek sigma case variants"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn destination_identity_does_not_conflate_non_utf8_paths() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let mut left = PathBuf::new();
+        left.push(OsStr::from_bytes(&[b'/', b't', 0xff]));
+        let mut right = PathBuf::new();
+        right.push(OsStr::from_bytes(&[b'/', b't', 0xfe]));
+        assert!(!same_output_destination(&left, &right));
+        assert!(same_output_destination(&left, &left));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn destination_identity_follows_symlinks_before_parent_components() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let current_dir = dir.path().join("current");
+        std::fs::create_dir_all(current_dir.join("target/nested"))?;
+        std::os::unix::fs::symlink("target/nested", current_dir.join("link"))?;
+        std::os::unix::fs::symlink("target/report.json", current_dir.join("togi-report.html"))?;
+
+        assert_eq!(
+            destination_identity(Path::new("link/../report.json"), &current_dir)?,
+            destination_identity(&current_dir.join("target/report.json"), &current_dir)?
+        );
+        assert_eq!(
+            destination_identity(Path::new("togi-report.html"), &current_dir)?,
+            destination_identity(&current_dir.join("target/report.json"), &current_dir)?
+        );
+        Ok(())
+    }
+
     #[test]
     fn json_report_publish_replaces_existing_report_after_staging() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;

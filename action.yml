@@ -60,7 +60,7 @@ runs:
           exit 1
         fi
 
-        unset resolver_output TOGI_ARCHIVE TOGI_BINARY TOGI_ARCHIVE_PATH
+        unset resolver_output TOGI_ARCHIVE TOGI_BINARY TOGI_ARCHIVE_PATH TOGI_OS TOGI_ARCH
         if ! resolver_output=$(bash "${{ github.action_path }}/.github/scripts/resolve-togi-asset.sh"); then
           echo "Could not resolve Togi release asset" >&2
           exit 1
@@ -89,7 +89,7 @@ runs:
           echo "Togi release asset fetch returned no archive path" >&2
           exit 1
         fi
-        TOGI_ARCHIVE="$TOGI_ARCHIVE" TOGI_BINARY="$TOGI_BINARY" \
+        RUNNER_TEMP="$TEMP_ROOT" TOGI_ARCHIVE="$TOGI_ARCHIVE" TOGI_BINARY="$TOGI_BINARY" \
           TOGI_ARCHIVE_PATH="$TOGI_ARCHIVE_PATH" \
           bash "${{ github.action_path }}/.github/scripts/install-togi-archive.sh"
 

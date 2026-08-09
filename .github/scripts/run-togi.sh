@@ -22,7 +22,7 @@ run_togi() (
   "$togi_bin" "$@"
 )
 
-if ! version_output="$(run_togi --version 2>&1)"; then
+if ! version_output="$(run_togi --version)"; then
   echo "Could not verify the installed Togi binary version." >&2
   exit 2
 fi
