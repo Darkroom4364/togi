@@ -291,6 +291,11 @@ matching older `.togi-cache` entries. Structured incremental history is stored
 under `.togi-cache/history.json`; it can reuse killed/survived results when the
 mutant source, command context, and relevant covering tests are unchanged.
 
+The displayed mutation score, `tested` count, and report formats stay
+fresh-only. `--fail-under` uses a gate score that incorporates final
+exact-cache killed, survived, and timed-out verdicts; incremental history
+remains excluded from that gate-only calculation.
+
 ## PR-loop performance evidence
 
 The PR-loop benchmark harness measures togi on versioned PR-shaped corpus

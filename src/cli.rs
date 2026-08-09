@@ -163,7 +163,9 @@ pub struct CheckArgs {
     #[arg(long, value_delimiter = ',')]
     pub operators: Option<Vec<String>>,
 
-    /// Fail if mutation score is below this percentage (e.g. --fail-under 80)
+    /// Fail if gate score is below this percentage (fresh plus reusable exact-cache
+    /// final killed, survived, or timed-out verdicts; incremental history excluded;
+    /// displayed mutation score stays fresh-only; e.g. --fail-under 80)
     #[arg(long)]
     pub fail_under: Option<f64>,
 

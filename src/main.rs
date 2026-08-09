@@ -691,12 +691,14 @@ fn run_check(cfg: togi::cli::CheckArgs, cancelled: Arc<AtomicBool>) -> anyhow::R
         eprintln!("PR comment written to {}", path.display());
     }
 
-    let score = togi::report::mutation_score(&report);
     if should_fail {
         exit_with(_lock, 1);
     } else if let Some(threshold) = fail_under {
-        if score < threshold {
-            eprintln!("Mutation score {score:.1}% is below --fail-under threshold {threshold:.1}%");
+        let gate_score = togi::report::fail_under_score(&report);
+        if gate_score < threshold {
+            eprintln!(
+                "Fail-under gate score {gate_score:.1}% is below --fail-under threshold {threshold:.1}% (displayed mutation score is fresh-only)."
+            );
             exit_with(_lock, 1);
         }
     } else if report.survived > 0 && !loaded_baseline {

@@ -5,7 +5,7 @@ pub mod json;
 pub mod sarif;
 pub mod terminal;
 
-use crate::{BuildErrorDiagnostic, Mutation, MutationReport, MutationResult};
+use crate::{BuildErrorDiagnostic, Mutation, MutationExecution, MutationReport, MutationResult};
 use std::collections::BTreeMap;
 use std::fmt::Write;
 use std::fs;
@@ -22,6 +22,44 @@ pub fn mutation_score(report: &MutationReport) -> f64 {
         // Nothing was eligible to execute: either the report is empty or every
         // mutant sat on a zero-coverage line or was subsumed by a cluster sibling.
         // Vacuous pass, same as an empty report.
+        100.0
+    } else {
+        0.0
+    }
+}
+
+/// Compute the score used only to enforce `--fail-under`.
+///
+/// Unlike [`mutation_score`], exact-cache verdicts preserve their final
+/// killed/survived/timeout evidence so an exact-warm gate agrees with its cold
+/// run. Incremental history remains intentionally excluded.
+pub fn fail_under_score(report: &MutationReport) -> f64 {
+    let mut eligible = 0usize;
+    let mut killed = 0usize;
+    for (mutation, result) in &report.results {
+        if !matches!(
+            report.execution_for(mutation.id, *result),
+            MutationExecution::Executed | MutationExecution::ExactCache
+        ) {
+            continue;
+        }
+        match result {
+            MutationResult::Killed => {
+                eligible += 1;
+                killed += 1;
+            }
+            MutationResult::Survived | MutationResult::Timeout => eligible += 1,
+            MutationResult::BuildError | MutationResult::Uncovered | MutationResult::Subsumed => {}
+        }
+    }
+
+    if eligible > 0 {
+        (killed as f64 / eligible as f64) * 100.0
+    } else if report
+        .results
+        .iter()
+        .all(|(_, result)| matches!(result, MutationResult::Uncovered | MutationResult::Subsumed))
+    {
         100.0
     } else {
         0.0
@@ -1058,6 +1096,95 @@ mod tests {
         assert_eq!(counts.exact_cache_reused, 1);
         assert_eq!(report.tested_count(), 1);
         assert_eq!(mutation_score(&report), 0.0);
+    }
+
+    #[test]
+    fn fail_under_score_keeps_exact_cache_evidence_out_of_public_score() {
+        struct Case {
+            name: &'static str,
+            result: MutationResult,
+            execution: Option<MutationExecution>,
+            public_score: f64,
+            gate_score: f64,
+        }
+
+        let cases = [
+            Case {
+                name: "fresh killed",
+                result: MutationResult::Killed,
+                execution: None,
+                public_score: 100.0,
+                gate_score: 100.0,
+            },
+            Case {
+                name: "exact cached killed",
+                result: MutationResult::Killed,
+                execution: Some(MutationExecution::ExactCache),
+                public_score: 0.0,
+                gate_score: 100.0,
+            },
+            Case {
+                name: "exact cached survived",
+                result: MutationResult::Survived,
+                execution: Some(MutationExecution::ExactCache),
+                public_score: 0.0,
+                gate_score: 0.0,
+            },
+            Case {
+                name: "exact cached timeout",
+                result: MutationResult::Timeout,
+                execution: Some(MutationExecution::ExactCache),
+                public_score: 0.0,
+                gate_score: 0.0,
+            },
+            Case {
+                name: "exact cached build error",
+                result: MutationResult::BuildError,
+                execution: Some(MutationExecution::ExactCache),
+                public_score: 0.0,
+                gate_score: 0.0,
+            },
+            Case {
+                name: "incremental history killed",
+                result: MutationResult::Killed,
+                execution: Some(MutationExecution::IncrementalHistory),
+                public_score: 0.0,
+                gate_score: 0.0,
+            },
+            Case {
+                name: "uncovered",
+                result: MutationResult::Uncovered,
+                execution: None,
+                public_score: 100.0,
+                gate_score: 100.0,
+            },
+            Case {
+                name: "subsumed",
+                result: MutationResult::Subsumed,
+                execution: None,
+                public_score: 100.0,
+                gate_score: 100.0,
+            },
+        ];
+
+        for case in cases {
+            let mut report = uncovered_report(vec![report_mutation(0, "src/a.rs", case.result)]);
+            if let Some(execution) = case.execution {
+                report.execution_provenance.insert(0, execution);
+            }
+            assert_eq!(
+                mutation_score(&report),
+                case.public_score,
+                "{} public score",
+                case.name
+            );
+            assert_eq!(
+                fail_under_score(&report),
+                case.gate_score,
+                "{} gate score",
+                case.name
+            );
+        }
     }
 
     #[test]

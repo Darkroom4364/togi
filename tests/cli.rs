@@ -2738,7 +2738,208 @@ fn check_baseline_still_honors_fail_under() {
         .current_dir(dir.path())
         .assert()
         .code(1)
-        .stderr(predicate::str::contains("below --fail-under threshold"));
+        .stderr(predicate::str::contains("below --fail-under threshold"))
+        .stderr(predicate::str::contains("Fail-under gate score"))
+        .stderr(predicate::str::contains("fresh-only"));
+}
+
+#[cfg(unix)]
+#[test]
+fn check_fail_under_exact_cache_matches_cold_gate_with_fresh_only_json_score() {
+    let dir = setup_git_repo();
+    let test_cmd = format!(
+        "sh -c {}",
+        shell_quote_text("if grep -Fq 'a >= b' main.go; then exit 1; fi")
+    );
+    let args = [
+        "check",
+        "--base",
+        "HEAD",
+        "--format",
+        "json",
+        "--test-cmd",
+        test_cmd.as_str(),
+        "--no-schemata",
+        "--operators",
+        "gt_to_gte",
+        "--max-per-run",
+        "1",
+        "--jobs",
+        "1",
+        "--no-incremental-history",
+        "--fail-under",
+        "100",
+    ];
+
+    let cold = togi().args(args).current_dir(dir.path()).output().unwrap();
+    assert!(
+        cold.status.success(),
+        "cold gate failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&cold.stdout),
+        String::from_utf8_lossy(&cold.stderr)
+    );
+    let cold_report: serde_json::Value = serde_json::from_slice(&cold.stdout).unwrap();
+    assert_eq!(cold_report["tested"], 1);
+    assert_eq!(cold_report["mutation_score"], 100.0);
+
+    let warm = togi().args(args).current_dir(dir.path()).output().unwrap();
+    assert!(
+        warm.status.success(),
+        "warm exact-cache gate failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&warm.stdout),
+        String::from_utf8_lossy(&warm.stderr)
+    );
+    let warm_report: serde_json::Value = serde_json::from_slice(&warm.stdout).unwrap();
+    assert_eq!(warm_report["tested"], 0);
+    assert_eq!(warm_report["mutation_score"], 0.0);
+    assert_eq!(
+        warm_report["mutations"][0]["execution"]["state"],
+        "exact_cache"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn check_fail_under_fails_cached_survivors_and_excludes_incremental_history() {
+    let survivor_dir = setup_git_repo();
+    let survivor_seed = togi()
+        .args([
+            "check",
+            "--base",
+            "HEAD",
+            "--format",
+            "json",
+            "--test-cmd",
+            "true",
+            "--no-schemata",
+            "--operators",
+            "gt_to_gte",
+            "--max-per-run",
+            "1",
+            "--jobs",
+            "1",
+            "--no-incremental-history",
+            "--fail-under",
+            "0",
+        ])
+        .current_dir(survivor_dir.path())
+        .output()
+        .unwrap();
+    assert!(
+        survivor_seed.status.success(),
+        "survivor seed failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&survivor_seed.stdout),
+        String::from_utf8_lossy(&survivor_seed.stderr)
+    );
+    let survivor_warm = togi()
+        .args([
+            "check",
+            "--base",
+            "HEAD",
+            "--format",
+            "json",
+            "--test-cmd",
+            "true",
+            "--no-schemata",
+            "--operators",
+            "gt_to_gte",
+            "--max-per-run",
+            "1",
+            "--jobs",
+            "1",
+            "--no-incremental-history",
+            "--fail-under",
+            "1",
+        ])
+        .current_dir(survivor_dir.path())
+        .output()
+        .unwrap();
+    assert_eq!(survivor_warm.status.code(), Some(1));
+    let survivor_report: serde_json::Value = serde_json::from_slice(&survivor_warm.stdout).unwrap();
+    assert_eq!(survivor_report["tested"], 0);
+    assert_eq!(survivor_report["mutation_score"], 0.0);
+    assert_eq!(survivor_report["mutations"][0]["result"], "survived");
+    assert_eq!(
+        survivor_report["mutations"][0]["execution"]["state"],
+        "exact_cache"
+    );
+    assert!(String::from_utf8_lossy(&survivor_warm.stderr).contains("Fail-under gate score"));
+
+    let history_dir = setup_git_repo();
+    let killed_test_cmd = format!(
+        "sh -c {}",
+        shell_quote_text("if grep -Fq 'a >= b' main.go; then exit 1; fi")
+    );
+    let history_seed = togi()
+        .args([
+            "check",
+            "--base",
+            "HEAD",
+            "--format",
+            "json",
+            "--test-cmd",
+            killed_test_cmd.as_str(),
+            "--no-schemata",
+            "--operators",
+            "gt_to_gte",
+            "--max-per-run",
+            "1",
+            "--jobs",
+            "1",
+            "--fail-under",
+            "0",
+        ])
+        .current_dir(history_dir.path())
+        .output()
+        .unwrap();
+    assert!(
+        history_seed.status.success(),
+        "history seed failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&history_seed.stdout),
+        String::from_utf8_lossy(&history_seed.stderr)
+    );
+    let cache_dir = history_dir.path().join(".togi-cache");
+    for entry in fs::read_dir(&cache_dir).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_type().unwrap().is_file()
+            && entry.file_name().to_string_lossy() != "history.json"
+        {
+            fs::remove_file(entry.path()).unwrap();
+        }
+    }
+
+    let history_warm = togi()
+        .args([
+            "check",
+            "--base",
+            "HEAD",
+            "--format",
+            "json",
+            "--test-cmd",
+            killed_test_cmd.as_str(),
+            "--no-schemata",
+            "--operators",
+            "gt_to_gte",
+            "--max-per-run",
+            "1",
+            "--jobs",
+            "1",
+            "--fail-under",
+            "100",
+        ])
+        .current_dir(history_dir.path())
+        .output()
+        .unwrap();
+    assert_eq!(history_warm.status.code(), Some(1));
+    let history_report: serde_json::Value = serde_json::from_slice(&history_warm.stdout).unwrap();
+    assert_eq!(history_report["tested"], 0);
+    assert_eq!(history_report["mutation_score"], 0.0);
+    assert_eq!(history_report["mutations"][0]["result"], "killed");
+    assert_eq!(
+        history_report["mutations"][0]["execution"]["state"],
+        "incremental_history"
+    );
+    assert!(String::from_utf8_lossy(&history_warm.stderr).contains("Fail-under gate score"));
 }
 
 #[test]
