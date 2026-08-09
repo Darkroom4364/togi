@@ -1,6 +1,6 @@
 use anyhow::Context;
 use clap::ValueEnum;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -45,7 +45,8 @@ pub struct LanguageTestConfig {
 }
 
 /// Where the effective build command came from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum BuildCommandOrigin {
     /// No build command is available for this run.
     None,

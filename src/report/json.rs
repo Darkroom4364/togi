@@ -161,6 +161,7 @@ enum JsonMutationReplay {
         test_command: Vec<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         build_command: Option<Vec<String>>,
+        build_command_origin: crate::config::BuildCommandOrigin,
         timeout_ms: u64,
         env: BTreeMap<String, String>,
         respect_workspace_ignores: bool,
@@ -205,6 +206,7 @@ fn json_replay_mutation_fields(
             JsonMutationReplay::RegularDirect {
                 test_command: recipe.test_command.clone(),
                 build_command: recipe.build_command.clone(),
+                build_command_origin: recipe.build_command_origin,
                 timeout_ms: recipe.timeout_ms,
                 env: recipe.env.clone(),
                 respect_workspace_ignores: recipe.respect_workspace_ignores,
@@ -1134,6 +1136,7 @@ mod tests {
         let recipe = RegularDirectRecipe {
             test_command: vec!["cargo".into(), "test".into()],
             build_command: None,
+            build_command_origin: crate::config::BuildCommandOrigin::None,
             timeout_ms: 1_000,
             env: BTreeMap::new(),
             respect_workspace_ignores: true,
@@ -1159,6 +1162,10 @@ mod tests {
         assert_eq!(
             replayable["mutations"][0]["replay"]["kind"],
             "regular_direct"
+        );
+        assert_eq!(
+            replayable["mutations"][0]["replay"]["build_command_origin"],
+            "none"
         );
 
         let schema: Value = serde_json::from_str(

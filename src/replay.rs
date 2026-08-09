@@ -1,3 +1,4 @@
+use crate::config::BuildCommandOrigin;
 use crate::source_identity::{
     is_normalized_project_relative_path, normalized_project_relative_path, range_matches,
     resolve_normalized_project_relative_path, source_fingerprint,
@@ -53,6 +54,8 @@ pub struct RegularDirectRecipe {
     pub test_command: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub build_command: Option<Vec<String>>,
+    /// The source of `build_command`; legacy reports default to configured.
+    pub build_command_origin: BuildCommandOrigin,
     pub timeout_ms: u64,
     pub env: BTreeMap<String, String>,
     pub respect_workspace_ignores: bool,
@@ -302,6 +305,8 @@ enum StoredReplayRecipe {
         test_command: Vec<String>,
         #[serde(default)]
         build_command: Option<Vec<String>>,
+        #[serde(default = "legacy_build_command_origin")]
+        build_command_origin: BuildCommandOrigin,
         timeout_ms: u64,
         #[serde(default)]
         env: BTreeMap<String, String>,
@@ -334,10 +339,8 @@ pub fn replay_mutation(
     let project_root = current_project_root()?;
     validate_project_and_source(&project_root, &validated)?;
 
-    let mut build_command = validated.recipe.build_command.clone();
-    if let Some(command) = &mut build_command {
-        normalize_auto_go_compile_output(command, crate::config::AUTO_GO_COMPILE_OUTPUT);
-    }
+    let build_command =
+        replay_build_command(&validated.recipe, crate::config::AUTO_GO_COMPILE_OUTPUT);
     let build_command_json = build_command
         .as_ref()
         .map(serde_json::to_string)
@@ -468,6 +471,7 @@ fn validate_report_mutation(
         StoredReplayRecipe::RegularDirect {
             test_command,
             build_command,
+            build_command_origin,
             timeout_ms,
             env,
             respect_workspace_ignores,
@@ -475,6 +479,7 @@ fn validate_report_mutation(
         } => RegularDirectRecipe {
             test_command,
             build_command,
+            build_command_origin,
             timeout_ms,
             env,
             respect_workspace_ignores,
@@ -705,24 +710,49 @@ fn is_valid_env_key(key: &str) -> bool {
         && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
 }
 
-/// Normalize only the exact auto-detected Go compile command for replay.
-///
-/// Replay recipes retain their serialized command unchanged; this operates on
-/// the execution copy after validation, so cache identity remains host-specific.
-fn normalize_auto_go_compile_output(command: &mut [String], target_null_device: &str) {
-    const OUTPUT_INDEX: usize = 5;
-    let is_auto_go_compile = command.len() == 7
-        && command[0] == "go"
-        && command[1] == "test"
-        && command[2] == "-c"
-        && command[3] == "-vet=off"
-        && command[4] == "-o"
-        && (command[OUTPUT_INDEX] == crate::config::AUTO_GO_COMPILE_UNIX_OUTPUT
-            || command[OUTPUT_INDEX] == crate::config::AUTO_GO_COMPILE_WINDOWS_OUTPUT)
-        && command[6] == "./...";
-    if is_auto_go_compile && command[OUTPUT_INDEX] != target_null_device {
-        command[OUTPUT_INDEX] = target_null_device.to_owned();
+/// Clone a serialized build command for replay, adapting only the known
+/// auto-detected Go null-device argument to this host.
+fn replay_build_command(
+    recipe: &RegularDirectRecipe,
+    target_null_device: &str,
+) -> Option<Vec<String>> {
+    let mut build_command = recipe.build_command.clone();
+    if recipe.build_command_origin == BuildCommandOrigin::AutoDetected {
+        if let Some(command) = &mut build_command {
+            normalize_auto_go_compile_output(command, target_null_device);
+        }
     }
+    build_command
+}
+
+/// Normalize only the terminal exact auto-detected Go compile command.
+///
+/// The command may have a sandbox wrapper prefix. Replay recipes retain their
+/// serialized command unchanged; this operates on the execution copy after
+/// validation, so cache identity remains host-specific.
+fn normalize_auto_go_compile_output(command: &mut [String], target_null_device: &str) {
+    const AUTO_GO_COMPILE_ARG_COUNT: usize = 7;
+    const OUTPUT_INDEX: usize = 5;
+    if command.len() < AUTO_GO_COMPILE_ARG_COUNT {
+        return;
+    }
+    let suffix_start = command.len() - AUTO_GO_COMPILE_ARG_COUNT;
+    let suffix = &mut command[suffix_start..];
+    let is_auto_go_compile = suffix[0] == "go"
+        && suffix[1] == "test"
+        && suffix[2] == "-c"
+        && suffix[3] == "-vet=off"
+        && suffix[4] == "-o"
+        && (suffix[OUTPUT_INDEX] == crate::config::AUTO_GO_COMPILE_UNIX_OUTPUT
+            || suffix[OUTPUT_INDEX] == crate::config::AUTO_GO_COMPILE_WINDOWS_OUTPUT)
+        && suffix[6] == "./...";
+    if is_auto_go_compile && suffix[OUTPUT_INDEX] != target_null_device {
+        suffix[OUTPUT_INDEX] = target_null_device.to_owned();
+    }
+}
+
+fn legacy_build_command_origin() -> BuildCommandOrigin {
+    BuildCommandOrigin::Configured
 }
 
 fn result_name(result: MutationResult) -> &'static str {
@@ -763,6 +793,7 @@ mod tests {
                 replay: StoredReplayRecipe::RegularDirect {
                     test_command,
                     build_command: None,
+                    build_command_origin: BuildCommandOrigin::None,
                     timeout_ms: 1,
                     env: BTreeMap::new(),
                     respect_workspace_ignores: true,
@@ -895,19 +926,81 @@ mod tests {
         ]
     }
 
+    fn direct_recipe(
+        build_command: Option<Vec<String>>,
+        build_command_origin: BuildCommandOrigin,
+    ) -> RegularDirectRecipe {
+        RegularDirectRecipe {
+            test_command: vec!["test".into()],
+            build_command,
+            build_command_origin,
+            timeout_ms: 1_000,
+            env: BTreeMap::new(),
+            respect_workspace_ignores: true,
+            origin: DirectRecipeOrigin::Executed,
+        }
+    }
+
     #[test]
     fn normalizes_auto_go_compile_output_for_either_host() {
-        let mut unix_recipe = auto_go_compile_command("/dev/null");
-        normalize_auto_go_compile_output(&mut unix_recipe, "NUL");
-        assert_eq!(unix_recipe, auto_go_compile_command("NUL"));
+        let unix_recipe = direct_recipe(
+            Some(auto_go_compile_command("/dev/null")),
+            BuildCommandOrigin::AutoDetected,
+        );
+        assert_eq!(
+            replay_build_command(&unix_recipe, "NUL"),
+            Some(auto_go_compile_command("NUL"))
+        );
 
-        let mut windows_recipe = auto_go_compile_command("NUL");
-        normalize_auto_go_compile_output(&mut windows_recipe, "/dev/null");
-        assert_eq!(windows_recipe, auto_go_compile_command("/dev/null"));
+        let windows_recipe = direct_recipe(
+            Some(auto_go_compile_command("NUL")),
+            BuildCommandOrigin::AutoDetected,
+        );
+        assert_eq!(
+            replay_build_command(&windows_recipe, "/dev/null"),
+            Some(auto_go_compile_command("/dev/null"))
+        );
+    }
 
-        let mut same_host_recipe = auto_go_compile_command("/dev/null");
-        normalize_auto_go_compile_output(&mut same_host_recipe, "/dev/null");
-        assert_eq!(same_host_recipe, auto_go_compile_command("/dev/null"));
+    #[test]
+    fn normalizes_only_the_terminal_auto_go_compile_suffix_after_a_wrapper() {
+        let wrapper = vec!["sandbox".into(), "--".into()];
+        let mut wrapped_unix = wrapper.clone();
+        wrapped_unix.extend(auto_go_compile_command("/dev/null"));
+        let mut wrapped_windows = wrapper.clone();
+        wrapped_windows.extend(auto_go_compile_command("NUL"));
+
+        let mut expected_windows = wrapper.clone();
+        expected_windows.extend(auto_go_compile_command("NUL"));
+        assert_eq!(
+            replay_build_command(
+                &direct_recipe(Some(wrapped_unix), BuildCommandOrigin::AutoDetected),
+                "NUL"
+            ),
+            Some(expected_windows)
+        );
+
+        let mut expected_unix = wrapper;
+        expected_unix.extend(auto_go_compile_command("/dev/null"));
+        assert_eq!(
+            replay_build_command(
+                &direct_recipe(Some(wrapped_windows), BuildCommandOrigin::AutoDetected),
+                "/dev/null"
+            ),
+            Some(expected_unix)
+        );
+    }
+
+    #[test]
+    fn configured_auto_go_compile_lookalike_is_replayed_byte_for_byte() {
+        let build_command = auto_go_compile_command("/dev/null");
+        let recipe = direct_recipe(Some(build_command.clone()), BuildCommandOrigin::Configured);
+
+        assert_eq!(
+            replay_build_command(&recipe, "NUL"),
+            Some(build_command.clone())
+        );
+        assert_eq!(recipe.build_command, Some(build_command));
     }
 
     #[test]

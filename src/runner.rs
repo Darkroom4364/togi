@@ -3552,11 +3552,17 @@ impl PreparedMutationRun {
         respect_workspace_ignores: bool,
         origin: DirectRecipeOrigin,
     ) -> RegularDirectRecipe {
+        let build_command = commands
+            .has_build_command()
+            .then(|| sandboxed_command(&commands.sandbox_command, &commands.build_command));
+        let build_command_origin = build_command
+            .as_ref()
+            .map(|_| commands.build_command_origin)
+            .unwrap_or(BuildCommandOrigin::None);
         RegularDirectRecipe {
             test_command: sandboxed_command(&commands.sandbox_command, test_command),
-            build_command: commands
-                .has_build_command()
-                .then(|| sandboxed_command(&commands.sandbox_command, &commands.build_command)),
+            build_command,
+            build_command_origin,
             timeout_ms: u64::try_from(self.selected_test.timeout.as_millis()).unwrap_or(u64::MAX),
             env: env
                 .iter()
@@ -7847,6 +7853,8 @@ mod tests {
                 .expect("regular result should capture a direct replay recipe");
             assert_eq!(recipe.origin, expected_origin);
             assert_eq!(recipe.test_command, successful_command());
+            assert_eq!(recipe.build_command, None);
+            assert_eq!(recipe.build_command_origin, BuildCommandOrigin::None);
         }
 
         let (dir, _file, mut mutation) = make_relative_test_setup();
@@ -7880,6 +7888,43 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(not(windows))]
+    #[test]
+    fn direct_recipe_omits_sandboxed_auto_build_suggestion() -> anyhow::Result<()> {
+        let (dir, _file, mutation) = make_relative_test_setup();
+        let mut commands = test_command_config();
+        commands.command = successful_command();
+        commands.build_command = successful_command();
+        commands.build_command_origin = BuildCommandOrigin::AutoDetected;
+        commands.sandbox_command = vec!["env".into()];
+        let mut expected_command = commands.sandbox_command.clone();
+        expected_command.extend(successful_command());
+        let runner = TestRunner {
+            commands,
+            parallelism: 1,
+            project_root: dir.path().to_path_buf(),
+            verbose: false,
+            show_output: false,
+            max_tested: None,
+            early_stop: EarlyStopConfig::default(),
+            respect_workspace_ignores: true,
+            env: HashMap::new(),
+            incremental_history: false,
+            force_rerun: true,
+            learned_selection: false,
+            cancelled: Arc::new(AtomicBool::new(false)),
+        };
+
+        let outcome = runner.run(vec![mutation.clone()]);
+        let recipe = outcome
+            .replay_recipes
+            .get(&mutation.id)
+            .expect("regular result should capture a direct replay recipe");
+        assert_eq!(recipe.test_command, expected_command);
+        assert_eq!(recipe.build_command, None);
+        assert_eq!(recipe.build_command_origin, BuildCommandOrigin::None);
+        Ok(())
+    }
 
     fn go_operator_mutation(id: u32, file: &str, source: &str, nth: usize) -> Mutation {
         let mut offset = 0usize;
