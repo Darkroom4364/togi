@@ -1,7 +1,9 @@
 use anyhow::Context;
 use clap::Parser;
-use std::collections::{BTreeMap, HashMap};
-use std::path::{Path, PathBuf};
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::ffi::{OsStr, OsString};
+use std::io::Write;
+use std::path::{Component, Path, PathBuf};
 use std::process;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -314,6 +316,7 @@ fn run_check(cfg: togi::cli::CheckArgs, cancelled: Arc<AtomicBool>) -> anyhow::R
     let verbose = cfg.verbose;
     let show_output = cfg.show_output;
     let output_format = cfg.format;
+    let json_report_path = cfg.json_report.clone();
     let fail_under = cfg.fail_under;
     let max_survivors = match (cfg.first_survivor, cfg.max_survivors) {
         (true, _) => Some(1),
@@ -346,6 +349,13 @@ fn run_check(cfg: togi::cli::CheckArgs, cancelled: Arc<AtomicBool>) -> anyhow::R
         }
         Err(error) => return Err(error),
     };
+    validate_json_report_destinations(
+        json_report_path.as_deref(),
+        output_format,
+        save_baseline,
+        pr_comment.as_deref(),
+        &project_root,
+    )?;
     let ambiguous_test_command = match config.resolve_test_command(&project_root) {
         togi::config::TestCommandResolution::Resolved => None,
         togi::config::TestCommandResolution::Ambiguous(ambiguity) => Some(ambiguity),
@@ -388,8 +398,15 @@ fn run_check(cfg: togi::cli::CheckArgs, cancelled: Arc<AtomicBool>) -> anyhow::R
         &project_root,
     )?;
     if changed_files.is_empty() {
-        if output_format == togi::cli::OutputFormat::Json {
-            print_empty_json_check_output(&config, build_command_origin, dry_run, &project_root)?;
+        if output_format == togi::cli::OutputFormat::Json || json_report_path.is_some() {
+            emit_empty_json_check_output(
+                &config,
+                build_command_origin,
+                dry_run,
+                &project_root,
+                output_format == togi::cli::OutputFormat::Json,
+                json_report_path.as_deref(),
+            )?;
         }
         return Ok(());
     }
@@ -463,12 +480,21 @@ fn run_check(cfg: togi::cli::CheckArgs, cancelled: Arc<AtomicBool>) -> anyhow::R
             eprintln!("  - Changed files are in an unsupported language");
             eprintln!("  - All mutable nodes were filtered out (test files, noisy patterns)");
             eprintln!("  - max_per_run or max_per_file is set to 0 in togi.toml");
-            print_empty_json_check_output(&config, build_command_origin, dry_run, &project_root)?;
         } else {
             println!("No mutations generated. Possible causes:");
             println!("  - Changed files are in an unsupported language");
             println!("  - All mutable nodes were filtered out (test files, noisy patterns)");
             println!("  - max_per_run or max_per_file is set to 0 in togi.toml");
+        }
+        if output_format == togi::cli::OutputFormat::Json || json_report_path.is_some() {
+            emit_empty_json_check_output(
+                &config,
+                build_command_origin,
+                dry_run,
+                &project_root,
+                output_format == togi::cli::OutputFormat::Json,
+                json_report_path.as_deref(),
+            )?;
         }
         return Ok(());
     }
@@ -636,15 +662,33 @@ fn run_check(cfg: togi::cli::CheckArgs, cancelled: Arc<AtomicBool>) -> anyhow::R
         }
     }
 
-    if output_format == togi::cli::OutputFormat::Json {
+    // Test commands can change symlink topology. Re-resolve all publication
+    // paths after the campaign, before any report side effect.
+    validate_json_report_destinations(
+        json_report_path.as_deref(),
+        output_format,
+        save_baseline,
+        pr_comment.as_deref(),
+        &project_root_ref,
+    )?;
+
+    let json_stdout = output_format == togi::cli::OutputFormat::Json;
+    if json_stdout || json_report_path.is_some() {
         replay_capture.revalidate(&project_root_ref);
-        togi::report::print_report_with_baseline_and_replay(
+        let json = togi::report::json::to_json_string_with_baseline_and_replay(
             &report,
-            output_format,
             survivor_comparison.as_ref(),
-            Some((&replay_capture, &direct_recipes)),
+            &replay_capture,
+            &direct_recipes,
         )?;
-    } else {
+        if let Some(path) = &json_report_path {
+            write_json_report(path, &json)?;
+        }
+        if json_stdout {
+            println!("{json}");
+        }
+    }
+    if !json_stdout {
         togi::report::print_report_with_baseline(
             &report,
             output_format,
@@ -1455,26 +1499,244 @@ fn coverage_only_report(
     }
 }
 
-fn print_empty_json_check_output(
+fn emit_empty_json_check_output(
     config: &togi::config::Config,
     build_command_origin: togi::config::BuildCommandOrigin,
     dry_run: bool,
     project_root: &Path,
+    print_stdout: bool,
+    json_report_path: Option<&Path>,
 ) -> anyhow::Result<()> {
     if dry_run {
-        togi::report::json::print_dry_run(&[])?;
+        if print_stdout {
+            togi::report::json::print_dry_run(&[])?;
+        }
     } else {
         let report = coverage_only_report(config, build_command_origin);
         let mut capture = togi::replay::ReplayReportCapture::capture(project_root, &[]);
         capture.revalidate(project_root);
-        togi::report::json::print_report_with_baseline_and_replay(
+        let json = togi::report::json::to_json_string_with_baseline_and_replay(
             &report,
             None,
             &capture,
             &BTreeMap::new(),
         )?;
+        if let Some(path) = json_report_path {
+            write_json_report(path, &json)?;
+        }
+        if print_stdout {
+            println!("{json}");
+        }
     }
     Ok(())
+}
+
+fn validate_json_report_destinations(
+    json_report_path: Option<&Path>,
+    output_format: togi::cli::OutputFormat,
+    save_baseline: bool,
+    pr_comment: Option<&Path>,
+    project_root: &Path,
+) -> anyhow::Result<()> {
+    let Some(json_report_path) = json_report_path else {
+        return Ok(());
+    };
+    let current_dir = std::env::current_dir().context("could not determine current directory")?;
+    let json_report_identity = destination_identity(json_report_path, &current_dir)?;
+    let mut destinations = Vec::with_capacity(3);
+
+    if output_format == togi::cli::OutputFormat::Html {
+        destinations.push(("HTML report", PathBuf::from("togi-report.html")));
+    }
+    if save_baseline {
+        destinations.push(("baseline", project_root.join(".togi-baseline")));
+    }
+    if let Some(path) = pr_comment {
+        destinations.push(("PR comment", path.to_path_buf()));
+    }
+
+    for (name, path) in destinations {
+        if same_output_destination(
+            &json_report_identity,
+            &destination_identity(&path, &current_dir)?,
+        ) {
+            anyhow::bail!(
+                "--json-report {} conflicts with the {name} destination {}",
+                json_report_path.display(),
+                path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn destination_identity(path: &Path, current_dir: &Path) -> anyhow::Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        current_dir.join(path)
+    };
+    let (root, components) = absolute_output_destination_components(&absolute)?;
+    resolve_output_destination(root, components)
+}
+
+fn absolute_output_destination_components(
+    path: &Path,
+) -> anyhow::Result<(PathBuf, VecDeque<OsString>)> {
+    let mut root = PathBuf::new();
+    let mut components = VecDeque::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => root.push(prefix.as_os_str()),
+            Component::RootDir => root.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir | Component::Normal(_) => {
+                components.push_back(component.as_os_str().to_os_string());
+            }
+        }
+    }
+    if !root.has_root() {
+        anyhow::bail!("output destination must be absolute: {}", path.display());
+    }
+    Ok((root, components))
+}
+
+fn relative_output_destination_components(path: &Path) -> anyhow::Result<VecDeque<OsString>> {
+    let mut components = VecDeque::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir | Component::Normal(_) => {
+                components.push_back(component.as_os_str().to_os_string());
+            }
+            Component::Prefix(_) | Component::RootDir => {
+                anyhow::bail!(
+                    "could not safely resolve output destination symlink target {}",
+                    path.display()
+                );
+            }
+        }
+    }
+    Ok(components)
+}
+
+fn resolve_output_destination(
+    mut resolved: PathBuf,
+    mut components: VecDeque<OsString>,
+) -> anyhow::Result<PathBuf> {
+    let mut symlink_depth = 0;
+    while let Some(component) = components.pop_front() {
+        if component == OsStr::new("..") {
+            resolved.pop();
+            continue;
+        }
+
+        let candidate = resolved.join(&component);
+        match std::fs::symlink_metadata(&candidate) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                symlink_depth += 1;
+                if symlink_depth > 40 {
+                    anyhow::bail!(
+                        "could not safely resolve output destination {}: too many symlinks",
+                        candidate.display()
+                    );
+                }
+
+                let target = std::fs::read_link(&candidate).with_context(|| {
+                    format!(
+                        "could not read output destination symlink {}",
+                        candidate.display()
+                    )
+                })?;
+                let mut target_components = if target.is_absolute() {
+                    let (target_root, components) =
+                        absolute_output_destination_components(&target)?;
+                    resolved = target_root;
+                    components
+                } else {
+                    relative_output_destination_components(&target)?
+                };
+                target_components.append(&mut components);
+                components = target_components;
+            }
+            Ok(_) => resolved.push(component),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // Queues retain only normal names and `..`; after a missing
+                // component, `..` would be ambiguous if the campaign creates
+                // that component before publishing an output.
+                if components
+                    .iter()
+                    .any(|remaining| remaining == OsStr::new(".."))
+                {
+                    anyhow::bail!(
+                        "could not safely resolve output destination {}: missing intermediate component",
+                        candidate.display()
+                    );
+                }
+                resolved.push(component);
+                resolved.extend(components);
+                return Ok(resolved);
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "could not resolve output destination component {}",
+                        candidate.display()
+                    )
+                });
+            }
+        }
+    }
+    Ok(resolved)
+}
+
+/// Deliberately reject case-only aliases even on case-sensitive volumes so an
+/// Action cannot overwrite a sidecar when a checkout runs on case-insensitive
+/// APFS or Windows. Valid UTF-8 paths use UAX canonical caseless matching;
+/// non-UTF-8 paths retain exact PathBuf equality and are never lossy-normalized.
+fn same_output_destination(left: &Path, right: &Path) -> bool {
+    left == right
+        || left
+            .to_str()
+            .zip(right.to_str())
+            .is_some_and(|(left, right)| caseless::canonical_caseless_match_str(left, right))
+}
+
+fn write_json_report(path: &Path, json: &str) -> anyhow::Result<()> {
+    publish_json_report(path, |staged| {
+        staged.write_all(json.as_bytes())?;
+        staged.write_all(b"\n")
+    })
+}
+
+fn publish_json_report(
+    path: &Path,
+    write_contents: impl FnOnce(&mut tempfile::NamedTempFile) -> std::io::Result<()>,
+) -> anyhow::Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut staged = tempfile::NamedTempFile::new_in(parent).with_context(|| {
+        format!(
+            "could not create JSON report staging file in {}",
+            parent.display()
+        )
+    })?;
+    write_contents(&mut staged)
+        .with_context(|| format!("could not write JSON report {}", path.display()))?;
+    staged
+        .flush()
+        .with_context(|| format!("could not flush JSON report {}", path.display()))?;
+    staged
+        .as_file()
+        .sync_all()
+        .with_context(|| format!("could not sync JSON report {}", path.display()))?;
+    staged
+        .persist(path)
+        .map(|_| ())
+        .map_err(|error| error.error)
+        .with_context(|| format!("could not publish JSON report {}", path.display()))
 }
 
 fn print_dry_run(mutations: &[Mutation]) {
@@ -1972,6 +2234,7 @@ mod tests {
             base: None,
             config: None,
             format: togi::cli::OutputFormat::Terminal,
+            json_report: None,
             profile: None,
             jobs: None,
             timeout: None,
@@ -2419,5 +2682,129 @@ example.com/calc/calc.go:9.29,10.11 1 0
         let total = stats.total_lines.get(Path::new("calc.go")).unwrap();
         assert!(total.contains(&4));
         assert!(total.contains(&10));
+    }
+    #[test]
+    fn destination_identity_resolves_equivalent_and_nested_missing_paths() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let current_dir = dir.path().join("current");
+        std::fs::create_dir_all(current_dir.join("existing/child"))?;
+
+        let absolute = current_dir.join("existing/report.json");
+        let relative = Path::new("existing/child/../report.json");
+        assert_eq!(
+            destination_identity(relative, &current_dir)?,
+            destination_identity(&absolute, &current_dir)?
+        );
+
+        let missing_leaf = current_dir.join("missing-leaf.json");
+        assert_eq!(
+            destination_identity(&missing_leaf, &current_dir)?,
+            destination_identity(&current_dir, &current_dir)?.join("missing-leaf.json")
+        );
+        let missing_nested = current_dir.join("missing/parent/report.json");
+        assert_eq!(
+            destination_identity(&missing_nested, &current_dir)?,
+            destination_identity(&current_dir, &current_dir)?.join("missing/parent/report.json")
+        );
+        assert!(
+            destination_identity(&current_dir.join("foo/../report.json"), &current_dir).is_err(),
+            "a parent traversal after a missing component is unsafe to preflight"
+        );
+        assert!(
+            same_output_destination(&absolute, &current_dir.join("EXISTING/REPORT.JSON")),
+            "case-only aliases are deliberately rejected for case-insensitive volumes"
+        );
+        assert!(
+            same_output_destination(
+                Path::new("/tmp/über-report.html"),
+                Path::new("/tmp/ÜBER-report.html")
+            ),
+            "valid UTF-8 aliases use Unicode-aware lowercase comparison"
+        );
+        assert!(
+            same_output_destination(Path::new("/tmp/café.md"), Path::new("/tmp/cafe\u{301}.md")),
+            "valid UTF-8 aliases normalize NFC and NFD before comparison"
+        );
+        assert!(
+            same_output_destination(Path::new("/tmp/straße.md"), Path::new("/tmp/STRASSE.md")),
+            "canonical caseless matching folds sharp s"
+        );
+        assert!(
+            same_output_destination(Path::new("/tmp/σigma.md"), Path::new("/tmp/ςIGMA.md")),
+            "canonical caseless matching folds Greek sigma variants"
+        );
+        assert!(
+            same_output_destination(Path::new("/tmp/σigma.md"), Path::new("/tmp/ΣIGMA.md")),
+            "canonical caseless matching folds Greek sigma case variants"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn destination_identity_does_not_conflate_non_utf8_paths() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let mut left = PathBuf::new();
+        left.push(OsStr::from_bytes(&[b'/', b't', 0xff]));
+        let mut right = PathBuf::new();
+        right.push(OsStr::from_bytes(&[b'/', b't', 0xfe]));
+        assert!(!same_output_destination(&left, &right));
+        assert!(same_output_destination(&left, &left));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn destination_identity_follows_symlinks_before_parent_components() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let current_dir = dir.path().join("current");
+        std::fs::create_dir_all(current_dir.join("target/nested"))?;
+        std::os::unix::fs::symlink("target/nested", current_dir.join("link"))?;
+        std::os::unix::fs::symlink("target/report.json", current_dir.join("togi-report.html"))?;
+
+        assert_eq!(
+            destination_identity(Path::new("link/../report.json"), &current_dir)?,
+            destination_identity(&current_dir.join("target/report.json"), &current_dir)?
+        );
+        assert_eq!(
+            destination_identity(Path::new("togi-report.html"), &current_dir)?,
+            destination_identity(&current_dir.join("target/report.json"), &current_dir)?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn json_report_publish_replaces_existing_report_after_staging() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let report_path = dir.path().join("report.json");
+        std::fs::write(
+            &report_path,
+            "{\"kind\":\"mutation_report\",\"old\":true}\n",
+        )?;
+
+        write_json_report(&report_path, "{\"kind\":\"mutation_report\",\"new\":true}")?;
+
+        assert_eq!(
+            std::fs::read_to_string(&report_path)?,
+            "{\"kind\":\"mutation_report\",\"new\":true}\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn json_report_publish_preserves_existing_report_on_write_failure() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let report_path = dir.path().join("report.json");
+        let existing = "{\"kind\":\"mutation_report\",\"old\":true}\n";
+        std::fs::write(&report_path, existing)?;
+
+        let error = publish_json_report(&report_path, |staged| {
+            staged.write_all(b"{\"kind\":\"mutation_report\",\"partial\":")?;
+            Err(std::io::Error::other("simulated write failure"))
+        });
+
+        assert!(error.is_err());
+        assert_eq!(std::fs::read_to_string(&report_path)?, existing);
+        Ok(())
     }
 }

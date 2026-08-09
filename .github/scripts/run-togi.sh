@@ -1,6 +1,45 @@
 #!/usr/bin/env bash
 set -uo pipefail
 
+if [[ -z "${TOGI_BIN:-}" ]]; then
+  echo "TOGI_BIN must name the concrete installed Togi binary" >&2
+  exit 2
+fi
+if [[ -z "${TOGI_EXPECTED_VERSION:-}" ]]; then
+  echo "TOGI_EXPECTED_VERSION must name the installed Togi release tag" >&2
+  exit 2
+fi
+
+togi_bin="$TOGI_BIN"
+expected_tag="$TOGI_EXPECTED_VERSION"
+if [[ ! "$expected_tag" =~ ^v[0-9]+[.][0-9]+[.][0-9]+$ ]]; then
+  echo "TOGI_EXPECTED_VERSION must be an immutable vX.Y.Z tag" >&2
+  exit 2
+fi
+
+run_togi() (
+  unset TOGI_BASE TOGI_TIMEOUT TOGI_FORMAT TOGI_TEST_CMD TOGI_REPORT_PATH TOGI_BIN TOGI_EXPECTED_VERSION
+  "$togi_bin" "$@"
+)
+
+if ! version_output="$(run_togi --version)"; then
+  echo "Could not verify the installed Togi binary version." >&2
+  exit 2
+fi
+if [[ "$version_output" != "togi ${expected_tag#v}" ]]; then
+  echo "Installed Togi version does not match expected ${expected_tag}: ${version_output}" >&2
+  exit 2
+fi
+
+if ! check_help="$(run_togi help check 2>&1)"; then
+  echo "Could not verify that the installed Togi binary supports --json-report." >&2
+  exit 2
+fi
+if [[ "$check_help" != *"--json-report"* ]]; then
+  echo "The installed Togi binary does not support --json-report." >&2
+  exit 2
+fi
+
 if ! command -v jq >/dev/null 2>&1; then
   echo "jq is required to generate Action report outputs" >&2
   exit 2
@@ -21,68 +60,32 @@ if ! rm -f "$report_path"; then
 fi
 
 review_args=(check)
-json_args=(check)
 
 if [[ -n "${TOGI_BASE:-}" ]]; then
   review_args+=(--base "$TOGI_BASE")
-  json_args+=(--base "$TOGI_BASE")
 fi
 
 if [[ -n "${TOGI_TIMEOUT:-}" ]]; then
   review_args+=(--timeout "$TOGI_TIMEOUT")
-  json_args+=(--timeout "$TOGI_TIMEOUT")
 fi
 
 if [[ -n "${TOGI_FORMAT:-}" ]]; then
   review_args+=(--format "$TOGI_FORMAT")
 fi
-json_args+=(--format json)
 
 if [[ -n "${TOGI_TEST_CMD:-}" ]]; then
   review_args+=(--test-cmd "$TOGI_TEST_CMD")
-  json_args+=(--test-cmd "$TOGI_TEST_CMD")
 fi
+review_args+=(--json-report "$report_path")
 
-togi_bin="${TOGI_BIN:-togi}"
-run_togi() (
-  unset TOGI_BASE TOGI_TIMEOUT TOGI_FORMAT TOGI_TEST_CMD TOGI_REPORT_PATH TOGI_BIN
-  "$togi_bin" "$@"
-)
-
-
-if [[ "${TOGI_FORMAT:-}" == "json" ]]; then
-  run_togi "${review_args[@]}" | tee "$report_path"
-  statuses=("${PIPESTATUS[@]}")
-  review_status=${statuses[0]}
-  tee_status=${statuses[1]}
-  if (( tee_status != 0 )); then
-    echo "Could not write report to ${report_path}" >&2
-    rm -f "$report_path"
-    exit 2
-  fi
-  json_status=$review_status
-else
-  run_togi "${review_args[@]}"
-  review_status=$?
-  case "$review_status" in
-    0|1)
-      ;;
-    *)
-      rm -f "$report_path"
-      exit "$review_status"
-      ;;
-  esac
-
-  run_togi "${json_args[@]}" >"$report_path"
-  json_status=$?
-fi
-
-case "$json_status" in
+run_togi "${review_args[@]}"
+review_status=$?
+case "$review_status" in
   0|1)
     ;;
   *)
     rm -f "$report_path"
-    exit "$json_status"
+    exit "$review_status"
     ;;
 esac
 

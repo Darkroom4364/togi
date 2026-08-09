@@ -2,7 +2,10 @@ use assert_cmd::Command;
 use predicates::prelude::*;
 use std::fs;
 #[cfg(unix)]
-use std::os::unix::{fs::PermissionsExt, process::CommandExt};
+use std::os::unix::{
+    fs::{PermissionsExt, symlink},
+    process::CommandExt,
+};
 use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::time::{Duration, Instant};
@@ -70,6 +73,105 @@ fn setup_git_repo() -> TempDir {
     .unwrap();
 
     dir
+}
+
+#[cfg(unix)]
+fn assert_json_report_destination_preflight(
+    dir: &TempDir,
+    json_report_path: &Path,
+    configure: impl FnOnce(&mut Command),
+) {
+    let campaign_marker = dir.path().join("campaign-ran");
+    let _ = fs::remove_file(&campaign_marker);
+    fs::write(
+        dir.path().join("record-campaign.sh"),
+        "#!/bin/sh\ntouch campaign-ran\n",
+    )
+    .unwrap();
+
+    let mut command = togi();
+    command
+        .args(["check", "--all", "--path", "main.go", "--json-report"])
+        .arg(json_report_path)
+        .args(["--test-cmd", "sh record-campaign.sh"])
+        .current_dir(dir.path());
+    configure(&mut command);
+    let output = command.output().unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty(), "stdout: {:?}", output.stdout);
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("conflicts with"),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !campaign_marker.exists(),
+        "collision must stop before a campaign"
+    );
+    assert!(
+        !dir.path().join(".togi-cache").exists(),
+        "collision must stop before mutation side effects"
+    );
+}
+
+#[cfg(unix)]
+fn assert_json_report_destination_collision(
+    dir: &TempDir,
+    json_report_path: &Path,
+    destination: &Path,
+    configure: impl FnOnce(&mut Command),
+) {
+    let existing = fs::read(destination).unwrap();
+    assert_json_report_destination_preflight(dir, json_report_path, configure);
+    assert_eq!(fs::read(destination).unwrap(), existing);
+}
+
+#[cfg(unix)]
+fn assert_missing_intermediate_destination_rejected(
+    dir: &TempDir,
+    json_report_path: &Path,
+    protected_output: &Path,
+    configure: impl FnOnce(&mut Command),
+) {
+    let missing_parent = dir.path().join("foo");
+    let campaign_marker = dir.path().join("campaign-ran");
+    assert!(!missing_parent.exists());
+    fs::write(
+        dir.path().join("create-foo.sh"),
+        "#!/bin/sh\nmkdir foo\ntouch campaign-ran\n",
+    )
+    .unwrap();
+    let existing = fs::read(protected_output).unwrap();
+
+    let mut command = togi();
+    command
+        .args(["check", "--all", "--path", "main.go", "--json-report"])
+        .arg(json_report_path)
+        .args(["--test-cmd", "sh create-foo.sh"])
+        .current_dir(dir.path());
+    configure(&mut command);
+    let output = command.output().unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("missing intermediate component"),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !missing_parent.exists(),
+        "the test command must not create foo"
+    );
+    assert!(
+        !campaign_marker.exists(),
+        "the test command must not create a campaign marker"
+    );
+    assert!(
+        !dir.path().join(".togi-cache").exists(),
+        "missing intermediate paths must stop before a campaign"
+    );
+    assert_eq!(fs::read(protected_output).unwrap(), existing);
 }
 
 #[test]
@@ -909,6 +1011,7 @@ fn check_all_mutants_uncovered_aborts_when_baseline_build_fails() {
         "SF:main.go\nDA:4,0\nDA:7,0\nend_of_record\n",
     )
     .unwrap();
+    let report_path = dir.path().join("baseline-failure-report.json");
 
     let output = togi()
         .args([
@@ -917,6 +1020,8 @@ fn check_all_mutants_uncovered_aborts_when_baseline_build_fails() {
             "HEAD",
             "--format",
             "json",
+            "--json-report",
+            report_path.to_str().unwrap(),
             "--test-cmd",
             "true",
             "--build-cmd",
@@ -941,6 +1046,7 @@ fn check_all_mutants_uncovered_aborts_when_baseline_build_fails() {
     assert!(failure.get("mutations").is_none());
     assert!(failure.get("mutation_score").is_none());
     assert!(!dir.path().join(".togi-cache").exists());
+    assert!(!report_path.exists());
 }
 
 #[test]
@@ -1046,6 +1152,421 @@ fn check_format_json_outputs_valid_json() {
 }
 
 #[test]
+fn check_json_report_sidecar_preserves_non_json_output_and_replays() {
+    let dir = setup_git_repo();
+    let report_path = dir.path().join("report.json");
+
+    let output = togi()
+        .args([
+            "check",
+            "--base",
+            "HEAD",
+            "--format",
+            "github",
+            "--json-report",
+            report_path.to_str().unwrap(),
+            "--no-schemata",
+            "--test-cmd",
+            "true",
+            "--fail-under",
+            "0",
+        ])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("::warning"));
+
+    let report: serde_json::Value = serde_json::from_slice(&fs::read(&report_path).unwrap())
+        .expect("sidecar must be valid JSON");
+    assert_eq!(report["kind"], "mutation_report");
+    assert_eq!(report["schema_version"], 1);
+    let mutation = report["mutations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|mutation| mutation["replay"]["kind"] == "regular_direct")
+        .expect("sidecar must contain a directly replayable mutation");
+    let mutant_id = mutation["id"].as_u64().unwrap().to_string();
+
+    togi()
+        .args([
+            "replay",
+            &mutant_id,
+            "--report",
+            report_path.to_str().unwrap(),
+        ])
+        .current_dir(dir.path())
+        .assert()
+        .success();
+}
+
+#[test]
+fn check_json_report_sidecar_reuses_json_stdout_payload() {
+    let dir = setup_git_repo();
+    let report_path = dir.path().join("report.json");
+    fs::write(&report_path, "stale report\n").unwrap();
+
+    let output = togi()
+        .args([
+            "check",
+            "--base",
+            "HEAD",
+            "--format",
+            "json",
+            "--json-report",
+            report_path.to_str().unwrap(),
+            "--no-schemata",
+            "--test-cmd",
+            "true",
+            "--fail-under",
+            "0",
+        ])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, fs::read(&report_path).unwrap());
+}
+
+#[cfg(unix)]
+#[test]
+fn check_json_report_staging_failure_preserves_existing_report() {
+    if std::process::Command::new("id")
+        .arg("-u")
+        .output()
+        .is_ok_and(|output| output.status.success() && output.stdout == b"0\n")
+    {
+        eprintln!("skipping staging-failure test because the test runs as root");
+        return;
+    }
+    let dir = setup_git_repo();
+    let report_dir = dir.path().join("locked-report-directory");
+    fs::create_dir(&report_dir).unwrap();
+    let report_path = report_dir.join("report.json");
+    let existing = "{\"kind\":\"mutation_report\",\"old\":true}\n";
+    fs::write(&report_path, existing).unwrap();
+    let original_permissions = fs::metadata(&report_dir).unwrap().permissions();
+    let mut locked_permissions = original_permissions.clone();
+    locked_permissions.set_mode(0o500);
+    fs::set_permissions(&report_dir, locked_permissions).unwrap();
+
+    let output = togi()
+        .args([
+            "check",
+            "--base",
+            "HEAD",
+            "--format",
+            "github",
+            "--json-report",
+            report_path.to_str().unwrap(),
+            "--no-schemata",
+            "--test-cmd",
+            "true",
+            "--fail-under",
+            "0",
+        ])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    fs::set_permissions(&report_dir, original_permissions).unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(fs::read_to_string(&report_path).unwrap(), existing);
+}
+
+#[cfg(unix)]
+#[test]
+fn check_json_report_rejects_later_output_destination_collisions_before_campaign() {
+    let dir = setup_git_repo();
+
+    let html_parent = dir.path().join("html-parent");
+    fs::create_dir(&html_parent).unwrap();
+    let html_report = dir.path().join("togi-report.html");
+    fs::write(&html_report, "existing HTML report\n").unwrap();
+    let html_sidecar = html_parent.join("..").join("togi-report.html");
+    assert_json_report_destination_collision(&dir, &html_sidecar, &html_report, |command| {
+        command.args(["--format", "html"]);
+    });
+
+    let baseline_parent = dir.path().join("baseline-parent");
+    fs::create_dir(&baseline_parent).unwrap();
+    let baseline = dir.path().join(".togi-baseline");
+    fs::write(&baseline, "existing baseline\n").unwrap();
+    let baseline_sidecar = baseline_parent.join("..").join(".togi-baseline");
+    assert_json_report_destination_collision(&dir, &baseline_sidecar, &baseline, |command| {
+        command.arg("--save-baseline");
+    });
+
+    let comment_parent = dir.path().join("comment-parent");
+    fs::create_dir(&comment_parent).unwrap();
+    let comment = dir.path().join("togi-comment.md");
+    fs::write(&comment, "existing PR comment\n").unwrap();
+    let comment_sidecar = comment_parent.join("..").join("togi-comment.md");
+    assert_json_report_destination_collision(&dir, &comment_sidecar, &comment, |command| {
+        command.arg("--pr-comment").arg(&comment);
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn check_json_report_rejects_symlink_output_aliases_before_campaign() {
+    let dangling_html_repo = setup_git_repo();
+    let dangling_html = dangling_html_repo.path().join("togi-report.html");
+    let dangling_html_sidecar = dangling_html_repo.path().join("report.json");
+    symlink("report.json", &dangling_html).unwrap();
+    assert_json_report_destination_preflight(
+        &dangling_html_repo,
+        &dangling_html_sidecar,
+        |command| {
+            command.args(["--format", "html"]);
+        },
+    );
+    assert!(!dangling_html_sidecar.exists());
+    assert!(
+        fs::symlink_metadata(&dangling_html)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+
+    let comment_repo = setup_git_repo();
+    let comment_target = comment_repo.path().join("comment-target");
+    fs::create_dir_all(comment_target.join("nested")).unwrap();
+    symlink(
+        "comment-target/nested",
+        comment_repo.path().join("comment-link"),
+    )
+    .unwrap();
+    let comment_sidecar = comment_target.join("togi-comment.md");
+    fs::write(&comment_sidecar, "JSON sidecar must survive\n").unwrap();
+    let comment_alias = PathBuf::from("comment-link")
+        .join("..")
+        .join("togi-comment.md");
+    assert_json_report_destination_collision(
+        &comment_repo,
+        &comment_sidecar,
+        &comment_sidecar,
+        |command| {
+            command.arg("--pr-comment").arg(&comment_alias);
+        },
+    );
+
+    let baseline_repo = setup_git_repo();
+    let dangling_baseline = baseline_repo.path().join(".togi-baseline");
+    let dangling_baseline_sidecar = baseline_repo.path().join("baseline-sidecar.json");
+    symlink("baseline-sidecar.json", &dangling_baseline).unwrap();
+    assert_json_report_destination_preflight(
+        &baseline_repo,
+        &dangling_baseline_sidecar,
+        |command| {
+            command.arg("--save-baseline");
+        },
+    );
+    assert!(!dangling_baseline_sidecar.exists());
+    assert!(
+        fs::symlink_metadata(&dangling_baseline)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn check_json_report_rejects_missing_intermediate_output_aliases_before_campaign() {
+    let html_repo = setup_git_repo();
+    let html_output = html_repo.path().join("togi-report.html");
+    fs::write(&html_output, "HTML output must survive\n").unwrap();
+    assert_missing_intermediate_destination_rejected(
+        &html_repo,
+        Path::new("foo/../togi-report.html"),
+        &html_output,
+        |command| {
+            command.args(["--format", "html"]);
+        },
+    );
+
+    let comment_repo = setup_git_repo();
+    let comment_output = comment_repo.path().join("togi-comment.md");
+    fs::write(&comment_output, "PR comment must survive\n").unwrap();
+    assert_missing_intermediate_destination_rejected(
+        &comment_repo,
+        Path::new("foo/../togi-comment.md"),
+        &comment_output,
+        |command| {
+            command.arg("--pr-comment").arg("togi-comment.md");
+        },
+    );
+}
+
+#[test]
+fn check_json_report_allows_distinct_nested_pr_comment_output() {
+    let dir = setup_git_repo();
+    let report_path = dir.path().join("report.json");
+    let comment_path = dir.path().join("reports/comment.md");
+    assert!(!comment_path.parent().unwrap().exists());
+
+    let output = togi()
+        .args([
+            "check",
+            "--all",
+            "--path",
+            "main.go",
+            "--json-report",
+            report_path.to_str().unwrap(),
+            "--pr-comment",
+            comment_path.to_str().unwrap(),
+            "--no-schemata",
+            "--test-cmd",
+            "true",
+            "--fail-under",
+            "0",
+        ])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&fs::read(&report_path).unwrap()).expect("sidecar must be JSON");
+    assert_eq!(report["kind"], "mutation_report");
+    assert_eq!(report["schema_version"], 1);
+    assert!(
+        report["total"].as_u64().unwrap() > 0,
+        "the nested output path must not skip the mutation campaign"
+    );
+    let comment = fs::read_to_string(&comment_path).expect("nested PR comment must be written");
+    assert!(comment.contains("<!-- togi-mutation-report -->"));
+    assert_ne!(fs::read(&report_path).unwrap(), comment.as_bytes());
+}
+
+#[cfg(unix)]
+#[test]
+fn check_json_report_revalidates_nested_pr_comment_after_campaign() {
+    let dir = setup_git_repo();
+    let report_path = dir.path().join("report.json");
+    let comment_path = Path::new("reports/report.json");
+    let campaign_marker = dir.path().join("campaign-ran");
+    let sentinel = "JSON sidecar must survive\n";
+    fs::write(&report_path, sentinel).unwrap();
+    assert!(!dir.path().join("reports").exists());
+    let root = dir.path().to_str().unwrap();
+    fs::write(
+        dir.path().join("create-reports-alias.sh"),
+        format!(
+            "#!/bin/sh\nif [ ! -L \"{root}/reports\" ]; then\n  rm -rf \"{root}/reports\"\n  ln -s . \"{root}/reports\"\nfi\ntouch \"{root}/campaign-ran\"\n"
+        ),
+    )
+    .unwrap();
+
+    let output = togi()
+        .args([
+            "check",
+            "--all",
+            "--path",
+            "main.go",
+            "--json-report",
+            report_path.to_str().unwrap(),
+            "--pr-comment",
+            comment_path.to_str().unwrap(),
+            "--no-schemata",
+            "--jobs",
+            "1",
+            "--test-cmd",
+            "sh create-reports-alias.sh",
+        ])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("conflicts with"), "stderr: {stderr}");
+    assert!(
+        !stdout.contains("Results:"),
+        "the report renderer must not publish after the collision: {stdout}"
+    );
+    assert!(
+        !stderr.contains("PR comment written"),
+        "the PR comment writer must not publish after the collision: {stderr}"
+    );
+    assert!(
+        campaign_marker.exists(),
+        "the post-campaign check must run after test commands"
+    );
+    assert_eq!(fs::read_to_string(&report_path).unwrap(), sentinel);
+    assert!(
+        fs::symlink_metadata(dir.path().join("reports"))
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "the test command must leave reports aliased to the project root"
+    );
+}
+
+#[test]
+fn check_json_report_rejects_case_only_html_alias_before_campaign() {
+    let dir = setup_git_repo();
+    let sidecar = dir.path().join("TOGI-REPORT.HTML");
+    let existing = "JSON sidecar must survive\n";
+    fs::write(&sidecar, existing).unwrap();
+
+    let output = togi()
+        .args([
+            "check",
+            "--all",
+            "--path",
+            "main.go",
+            "--format",
+            "html",
+            "--json-report",
+            sidecar.to_str().unwrap(),
+            "--test-cmd",
+            "command-that-must-not-run",
+        ])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("conflicts with"),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !dir.path().join(".togi-cache").exists(),
+        "case-only collision must stop before a campaign"
+    );
+    assert_eq!(fs::read_to_string(&sidecar).unwrap(), existing);
+}
+
+#[test]
 fn check_format_json_dry_run_outputs_a_single_preview_document() {
     let dir = setup_git_repo();
 
@@ -1083,6 +1604,60 @@ fn check_format_json_dry_run_outputs_a_single_preview_document() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(!dir.path().join(".togi-cache").exists());
+}
+
+#[test]
+fn check_dry_run_rejects_json_report_and_preserves_existing_report() {
+    for has_mutations in [false, true] {
+        let dir = setup_git_repo();
+        if !has_mutations {
+            assert_command_success(
+                std::process::Command::new("git")
+                    .args(["add", "."])
+                    .current_dir(dir.path())
+                    .output()
+                    .unwrap(),
+                "commit no-diff setup",
+            );
+            assert_command_success(
+                std::process::Command::new("git")
+                    .args(["commit", "-m", "second"])
+                    .current_dir(dir.path())
+                    .output()
+                    .unwrap(),
+                "commit no-diff setup",
+            );
+        }
+        let report_path = dir.path().join("dry-run-report.json");
+        let existing = "{\"kind\":\"mutation_report\",\"schema_version\":1}\n";
+        fs::write(&report_path, existing).unwrap();
+
+        let output = togi()
+            .args([
+                "check",
+                "--base",
+                "HEAD",
+                "--format",
+                "json",
+                "--dry-run",
+                "--json-report",
+                report_path.to_str().unwrap(),
+                "--test-cmd",
+                "true",
+            ])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("cannot be used with"),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(fs::read_to_string(&report_path).unwrap(), existing);
+    }
 }
 
 #[test]
@@ -1157,6 +1732,7 @@ fn check_format_json_no_mutations_outputs_an_empty_report() {
             .unwrap(),
         "commit no-diff setup",
     );
+    let report_path = dir.path().join("empty-report.json");
 
     let output = togi()
         .args([
@@ -1165,6 +1741,8 @@ fn check_format_json_no_mutations_outputs_an_empty_report() {
             "HEAD",
             "--format",
             "json",
+            "--json-report",
+            report_path.to_str().unwrap(),
             "--test-cmd",
             "true",
         ])
@@ -1183,6 +1761,9 @@ fn check_format_json_no_mutations_outputs_an_empty_report() {
     assert_eq!(value["planned_total"], 0);
     assert_eq!(value["mutation_score"], 100.0);
     assert_eq!(value["mutations"], serde_json::json!([]));
+    assert_eq!(value["kind"], "mutation_report");
+    assert_eq!(value["schema_version"], 1);
+    assert_eq!(output.stdout, fs::read(&report_path).unwrap());
     assert!(
         String::from_utf8_lossy(&output.stderr).contains("No changes found"),
         "stderr: {}",
@@ -1220,6 +1801,7 @@ fn check_format_json_post_generation_no_mutations_outputs_empty_report() {
         "package main\n\nconst name = \"after\"\n\nfunc main() {}\n",
     )
     .unwrap();
+    let report_path = dir.path().join("post-generation-empty-report.json");
 
     let output = togi()
         .args([
@@ -1228,6 +1810,8 @@ fn check_format_json_post_generation_no_mutations_outputs_empty_report() {
             "HEAD",
             "--format",
             "json",
+            "--json-report",
+            report_path.to_str().unwrap(),
             "--operators",
             "string_to_empty",
             "--test-cmd",
@@ -1247,6 +1831,9 @@ fn check_format_json_post_generation_no_mutations_outputs_empty_report() {
     assert_eq!(value["total"], 0);
     assert_eq!(value["planned_total"], 0);
     assert_eq!(value["mutations"], serde_json::json!([]));
+    assert_eq!(value["kind"], "mutation_report");
+    assert_eq!(value["schema_version"], 1);
+    assert_eq!(output.stdout, fs::read(&report_path).unwrap());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("No mutations generated"),
@@ -3568,6 +4155,33 @@ fn jq_available() -> bool {
         .unwrap_or(false)
 }
 
+#[cfg(unix)]
+fn action_install_run_script(action_path: &Path) -> String {
+    let action_yml =
+        fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("action.yml")).unwrap();
+    let action: serde_yaml::Value = serde_yaml::from_str(&action_yml).unwrap();
+    let run = action
+        .get("runs")
+        .and_then(|runs| runs.get("steps"))
+        .and_then(serde_yaml::Value::as_sequence)
+        .and_then(|steps| {
+            steps.iter().find(|step| {
+                step.get("name")
+                    .and_then(serde_yaml::Value::as_str)
+                    .is_some_and(|name| name == "Install togi")
+            })
+        })
+        .and_then(|step| step.get("run"))
+        .and_then(serde_yaml::Value::as_str)
+        .expect("Action is missing the Install togi shell script");
+    run.replace(
+        "${{ github.action_path }}",
+        action_path
+            .to_str()
+            .expect("temporary action path must be valid UTF-8"),
+    )
+}
+
 struct ActionHelperFixture {
     dir: TempDir,
     fake_togi: PathBuf,
@@ -3595,27 +4209,54 @@ if [[ -n "${FAKE_TOGI_ENV_LOG:-}" ]]; then
   printf 'TOGI_TEST_CMD=%s\n' "${TOGI_TEST_CMD-__unset__}" >> "$FAKE_TOGI_ENV_LOG"
   printf 'TOGI_REPORT_PATH=%s\n' "${TOGI_REPORT_PATH-__unset__}" >> "$FAKE_TOGI_ENV_LOG"
   printf 'TOGI_BIN=%s\n' "${TOGI_BIN-__unset__}" >> "$FAKE_TOGI_ENV_LOG"
+  printf 'TOGI_EXPECTED_VERSION=%s\n' "${TOGI_EXPECTED_VERSION-__unset__}" >> "$FAKE_TOGI_ENV_LOG"
   printf '%s\n' '--' >> "$FAKE_TOGI_ENV_LOG"
 fi
 
 args=("$@")
 format=terminal
+report_path=
 for ((index = 0; index < ${#args[@]}; index++)); do
-  if [[ "${args[index]}" == "--format" ]]; then
-    format="${args[$((index + 1))]}"
-    break
-  fi
+  case "${args[index]}" in
+    --format)
+      format="${args[$((index + 1))]}"
+      ;;
+    --json-report)
+      report_path="${args[$((index + 1))]}"
+      ;;
+  esac
 done
 for arg in "${args[@]}"; do
   printf '<%s>\n' "$arg" >> "$FAKE_TOGI_LOG"
 done
 printf '%s\n' '--' >> "$FAKE_TOGI_LOG"
+
+if [[ "${args[0]:-}" == "--version" ]]; then
+  if [[ -n "${FAKE_TOGI_VERSION_STDERR:-}" ]]; then
+    printf '%s\n' "$FAKE_TOGI_VERSION_STDERR" >&2
+  fi
+  printf 'togi %s\n' "${FAKE_TOGI_VERSION:-0.5.1}"
+  exit "${FAKE_TOGI_VERSION_STATUS:-0}"
+fi
+if [[ "${args[0]:-}" == "help" && "${args[1]:-}" == "check" ]]; then
+  if [[ "${FAKE_TOGI_SUPPORTS_JSON_REPORT:-1}" == "1" ]]; then
+    printf '%s\n' '--json-report <PATH>'
+  else
+    printf '%s\n' 'check help without JSON sidecar support'
+  fi
+  exit 0
+fi
+
+status="${FAKE_TOGI_STATUS:-0}"
+if [[ "$status" == "0" || "$status" == "1" ]] && [[ -n "$report_path" ]]; then
+  printf '%s\n' "${FAKE_TOGI_JSON:?}" > "$report_path"
+fi
 if [[ "$format" == "json" ]]; then
   printf '%s\n' "${FAKE_TOGI_JSON:?}"
-  exit "${FAKE_TOGI_JSON_STATUS:-0}"
+else
+  printf 'review-format=%s\n' "$format"
 fi
-printf 'review-format=%s\n' "$format"
-exit "${FAKE_TOGI_REVIEW_STATUS:-0}"
+exit "$status"
 "#,
     )
     .unwrap();
@@ -3641,28 +4282,27 @@ struct ActionHelperRun<'a> {
     timeout: Option<&'a str>,
     format: Option<&'a str>,
     test_cmd: Option<&'a str>,
-    review_status: i32,
-    json_status: i32,
+    status: i32,
     json: &'a str,
 }
 
-fn run_action_helper(
+fn action_helper_command(
     fixture: &ActionHelperFixture,
     run: ActionHelperRun<'_>,
-) -> std::process::Output {
+) -> std::process::Command {
     let helper = Path::new(env!("CARGO_MANIFEST_DIR")).join(".github/scripts/run-togi.sh");
     let mut command = std::process::Command::new("bash");
     command
         .arg(helper)
         .current_dir(fixture.dir.path())
         .env("TOGI_BIN", &fixture.fake_togi)
+        .env("TOGI_EXPECTED_VERSION", "v0.5.1")
         .env("RUNNER_TEMP", fixture.dir.path())
         .env("GITHUB_OUTPUT", &fixture.github_output)
         .env("TOGI_REPORT_PATH", &fixture.report_path)
         .env("FAKE_TOGI_LOG", &fixture.invocation_log)
         .env("FAKE_TOGI_ENV_LOG", &fixture.child_environment_log)
-        .env("FAKE_TOGI_REVIEW_STATUS", run.review_status.to_string())
-        .env("FAKE_TOGI_JSON_STATUS", run.json_status.to_string())
+        .env("FAKE_TOGI_STATUS", run.status.to_string())
         .env("FAKE_TOGI_JSON", run.json);
     for (name, value) in [
         ("TOGI_BASE", run.base),
@@ -3676,7 +4316,14 @@ fn run_action_helper(
             command.env_remove(name);
         }
     }
-    command.output().unwrap()
+    command
+}
+
+fn run_action_helper(
+    fixture: &ActionHelperFixture,
+    run: ActionHelperRun<'_>,
+) -> std::process::Output {
+    action_helper_command(fixture, run).output().unwrap()
 }
 
 fn action_helper_invocations(fixture: &ActionHelperFixture) -> Vec<Vec<String>> {
@@ -3697,8 +4344,24 @@ fn action_helper_invocations(fixture: &ActionHelperFixture) -> Vec<Vec<String>> 
     invocations
 }
 
+fn action_helper_check_invocations(fixture: &ActionHelperFixture) -> Vec<Vec<String>> {
+    action_helper_invocations(fixture)
+        .into_iter()
+        .filter(|invocation| invocation.first().is_some_and(|arg| arg == "check"))
+        .collect()
+}
+
 fn action_args(args: &[&str]) -> Vec<String> {
     args.iter().map(|arg| (*arg).to_string()).collect()
+}
+
+fn action_args_with_report(fixture: &ActionHelperFixture, args: &[&str]) -> Vec<String> {
+    let mut args = action_args(args);
+    args.extend([
+        "--json-report".to_string(),
+        fixture.report_path.display().to_string(),
+    ]);
+    args
 }
 
 fn assert_action_outputs(fixture: &ActionHelperFixture) {
@@ -3729,8 +4392,7 @@ fn github_action_run_helper_preserves_selected_format_and_exit_one() {
             timeout: Some("45"),
             format: Some("github"),
             test_cmd: Some("cargo test --workspace --all-features"),
-            review_status: 1,
-            json_status: 1,
+            status: 1,
             json: NORMAL_ACTION_REPORT,
         },
     );
@@ -3748,28 +4410,22 @@ fn github_action_run_helper_preserves_selected_format_and_exit_one() {
     assert_eq!(
         action_helper_invocations(&fixture),
         vec![
-            action_args(&[
-                "check",
-                "--base",
-                "HEAD~1",
-                "--timeout",
-                "45",
-                "--format",
-                "github",
-                "--test-cmd",
-                "cargo test --workspace --all-features",
-            ]),
-            action_args(&[
-                "check",
-                "--base",
-                "HEAD~1",
-                "--timeout",
-                "45",
-                "--format",
-                "json",
-                "--test-cmd",
-                "cargo test --workspace --all-features",
-            ]),
+            action_args(&["--version"]),
+            action_args(&["help", "check"]),
+            action_args_with_report(
+                &fixture,
+                &[
+                    "check",
+                    "--base",
+                    "HEAD~1",
+                    "--timeout",
+                    "45",
+                    "--format",
+                    "github",
+                    "--test-cmd",
+                    "cargo test --workspace --all-features",
+                ],
+            ),
         ]
     );
     assert_eq!(
@@ -3777,6 +4433,186 @@ fn github_action_run_helper_preserves_selected_format_and_exit_one() {
         format!("{NORMAL_ACTION_REPORT}\n")
     );
     assert_action_outputs(&fixture);
+}
+
+#[test]
+fn github_action_run_helper_runs_each_selected_format_once() {
+    if !bash_available() || !jq_available() {
+        eprintln!("skipping action helper test because bash or jq is unavailable");
+        return;
+    }
+
+    for format in [
+        None,
+        Some("terminal"),
+        Some("github"),
+        Some("html"),
+        Some("sarif"),
+        Some("json"),
+    ] {
+        let fixture = action_helper_fixture();
+        let output = run_action_helper(
+            &fixture,
+            ActionHelperRun {
+                base: None,
+                timeout: None,
+                format,
+                test_cmd: None,
+                status: 1,
+                json: NORMAL_ACTION_REPORT,
+            },
+        );
+
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{format:?} helper stderr:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let expected_stdout = if format == Some("json") {
+            format!("{NORMAL_ACTION_REPORT}\n")
+        } else {
+            format!("review-format={}\n", format.unwrap_or("terminal"))
+        };
+        assert_eq!(String::from_utf8_lossy(&output.stdout), expected_stdout);
+        let mut expected_args = action_args(&["check"]);
+        if let Some(format) = format {
+            expected_args.extend(["--format".to_string(), format.to_string()]);
+        }
+        expected_args.extend([
+            "--json-report".to_string(),
+            fixture.report_path.display().to_string(),
+        ]);
+        assert_eq!(
+            action_helper_check_invocations(&fixture),
+            vec![expected_args],
+            "{format:?} must run exactly one check campaign"
+        );
+        assert_eq!(
+            fs::read_to_string(&fixture.report_path).unwrap(),
+            format!("{NORMAL_ACTION_REPORT}\n")
+        );
+        assert_action_outputs(&fixture);
+    }
+}
+
+#[test]
+fn github_action_run_helper_rejects_version_mismatches_before_check() {
+    if !bash_available() || !jq_available() {
+        eprintln!("skipping action helper test because bash or jq is unavailable");
+        return;
+    }
+
+    for version in ["0.5.0", "0.5.2"] {
+        let fixture = action_helper_fixture();
+        let existing = "{\"kind\":\"mutation_report\",\"schema_version\":1}\n";
+        fs::write(&fixture.report_path, existing).unwrap();
+        let mut command = action_helper_command(
+            &fixture,
+            ActionHelperRun {
+                base: Some("HEAD~1"),
+                timeout: None,
+                format: Some("github"),
+                test_cmd: None,
+                status: 1,
+                json: NORMAL_ACTION_REPORT,
+            },
+        );
+        command.env("FAKE_TOGI_VERSION", version);
+        let output = command.output().unwrap();
+
+        assert_eq!(output.status.code(), Some(2));
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("does not match expected"),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            action_helper_invocations(&fixture),
+            vec![action_args(&["--version"])]
+        );
+        assert!(action_helper_check_invocations(&fixture).is_empty());
+        assert_eq!(fs::read_to_string(&fixture.report_path).unwrap(), existing);
+        assert!(
+            !fixture.github_output.exists()
+                || fs::read_to_string(&fixture.github_output)
+                    .unwrap()
+                    .is_empty()
+        );
+    }
+}
+
+#[test]
+fn github_action_run_helper_accepts_matching_version_with_stderr() {
+    if !bash_available() || !jq_available() {
+        eprintln!("skipping action helper test because bash or jq is unavailable");
+        return;
+    }
+
+    let fixture = action_helper_fixture();
+    let mut command = action_helper_command(
+        &fixture,
+        ActionHelperRun {
+            base: Some("HEAD~1"),
+            timeout: None,
+            format: Some("github"),
+            test_cmd: None,
+            status: 0,
+            json: NORMAL_ACTION_REPORT,
+        },
+    );
+    command.env("FAKE_TOGI_VERSION_STDERR", "binary loader warning");
+    let output = command.output().unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("binary loader warning"));
+    assert_eq!(action_helper_check_invocations(&fixture).len(), 1);
+    assert_action_outputs(&fixture);
+}
+
+#[test]
+fn github_action_run_helper_rejects_binary_without_json_report_before_check() {
+    if !bash_available() || !jq_available() {
+        eprintln!("skipping action helper test because bash or jq is unavailable");
+        return;
+    }
+
+    let fixture = action_helper_fixture();
+    let existing = "{\"kind\":\"mutation_report\",\"schema_version\":1}\n";
+    fs::write(&fixture.report_path, existing).unwrap();
+    let mut command = action_helper_command(
+        &fixture,
+        ActionHelperRun {
+            base: Some("HEAD~1"),
+            timeout: None,
+            format: Some("github"),
+            test_cmd: None,
+            status: 1,
+            json: NORMAL_ACTION_REPORT,
+        },
+    );
+    command.env("FAKE_TOGI_SUPPORTS_JSON_REPORT", "0");
+    let output = command.output().unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("does not support --json-report"));
+    assert_eq!(
+        action_helper_invocations(&fixture),
+        vec![action_args(&["--version"]), action_args(&["help", "check"])]
+    );
+    assert!(action_helper_check_invocations(&fixture).is_empty());
+    assert_eq!(fs::read_to_string(&fixture.report_path).unwrap(), existing);
+    assert!(
+        !fixture.github_output.exists()
+            || fs::read_to_string(&fixture.github_output)
+                .unwrap()
+                .is_empty()
+    );
 }
 
 #[test]
@@ -3794,8 +4630,7 @@ fn github_action_run_helper_isolates_private_environment_from_child_togi() {
             timeout: Some("120"),
             format: Some("github"),
             test_cmd: Some("cargo test --locked"),
-            review_status: 0,
-            json_status: 0,
+            status: 0,
             json: NORMAL_ACTION_REPORT,
         },
     );
@@ -3813,58 +4648,14 @@ fn github_action_run_helper_isolates_private_environment_from_child_togi() {
         "TOGI_TEST_CMD=__unset__\n",
         "TOGI_REPORT_PATH=__unset__\n",
         "TOGI_BIN=__unset__\n",
+        "TOGI_EXPECTED_VERSION=__unset__\n",
     );
     assert_eq!(
         fs::read_to_string(&fixture.child_environment_log).unwrap(),
-        format!("{isolated_child_environment}--\n{isolated_child_environment}--\n")
+        format!(
+            "{isolated_child_environment}--\n{isolated_child_environment}--\n{isolated_child_environment}--\n"
+        )
     );
-}
-
-#[test]
-fn github_action_run_helper_reuses_selected_json_stdout_once() {
-    if !bash_available() || !jq_available() {
-        eprintln!("skipping action helper test because bash or jq is unavailable");
-        return;
-    }
-
-    let fixture = action_helper_fixture();
-    let output = run_action_helper(
-        &fixture,
-        ActionHelperRun {
-            base: Some("HEAD~1"),
-            timeout: Some("45"),
-            format: Some("json"),
-            test_cmd: Some("go test ./..."),
-            review_status: 1,
-            json_status: 1,
-            json: NORMAL_ACTION_REPORT,
-        },
-    );
-
-    assert_eq!(output.status.code(), Some(1));
-    assert_eq!(
-        String::from_utf8_lossy(&output.stdout),
-        format!("{NORMAL_ACTION_REPORT}\n")
-    );
-    assert_eq!(
-        action_helper_invocations(&fixture),
-        vec![action_args(&[
-            "check",
-            "--base",
-            "HEAD~1",
-            "--timeout",
-            "45",
-            "--format",
-            "json",
-            "--test-cmd",
-            "go test ./...",
-        ])]
-    );
-    assert_eq!(
-        fs::read_to_string(&fixture.report_path).unwrap(),
-        format!("{NORMAL_ACTION_REPORT}\n")
-    );
-    assert_action_outputs(&fixture);
 }
 
 #[cfg(not(windows))]
@@ -3898,12 +4689,12 @@ fn github_action_run_helper_keeps_native_report_output_path() {
         .current_dir(fixture.dir.path())
         .env("PATH", path)
         .env("TOGI_BIN", &fixture.fake_togi)
+        .env("TOGI_EXPECTED_VERSION", "v0.5.1")
         .env("TOGI_REPORT_PATH", r"C:\runner\temp\togi-report.json")
         .env("RUNNER_TEMP", fixture.dir.path())
         .env("GITHUB_OUTPUT", &fixture.github_output)
         .env("FAKE_TOGI_LOG", &fixture.invocation_log)
-        .env("FAKE_TOGI_REVIEW_STATUS", "0")
-        .env("FAKE_TOGI_JSON_STATUS", "0")
+        .env("FAKE_TOGI_STATUS", "0")
         .env("FAKE_TOGI_JSON", NORMAL_ACTION_REPORT)
         .env("FAKE_CYGPATH_RESULT", &fixture.report_path)
         .env_remove("TOGI_BASE")
@@ -3916,11 +4707,11 @@ fn github_action_run_helper_keeps_native_report_output_path() {
     assert!(output.status.success());
     assert!(fixture.report_path.exists());
     assert_eq!(
-        action_helper_invocations(&fixture),
-        vec![
-            action_args(&["check", "--format", "github"]),
-            action_args(&["check", "--format", "json"]),
-        ]
+        action_helper_check_invocations(&fixture),
+        vec![action_args_with_report(
+            &fixture,
+            &["check", "--format", "github"],
+        )]
     );
     assert_eq!(
         fs::read_to_string(&fixture.github_output).unwrap(),
@@ -3943,8 +4734,7 @@ fn github_action_run_helper_omits_unset_review_flags() {
             timeout: None,
             format: None,
             test_cmd: None,
-            review_status: 0,
-            json_status: 0,
+            status: 0,
             json: NORMAL_ACTION_REPORT,
         },
     );
@@ -3955,11 +4745,8 @@ fn github_action_run_helper_omits_unset_review_flags() {
         "review-format=terminal\n"
     );
     assert_eq!(
-        action_helper_invocations(&fixture),
-        vec![
-            action_args(&["check"]),
-            action_args(&["check", "--format", "json"]),
-        ]
+        action_helper_check_invocations(&fixture),
+        vec![action_args_with_report(&fixture, &["check"])]
     );
     assert_action_outputs(&fixture);
 }
@@ -3971,7 +4758,7 @@ fn github_action_run_helper_removes_invalid_or_fatal_sidecar_reports() {
         return;
     }
 
-    for (json_status, json) in [(1, "not json"), (2, NORMAL_ACTION_REPORT)] {
+    for (status, json) in [(1, "not json"), (2, NORMAL_ACTION_REPORT)] {
         let fixture = action_helper_fixture();
         let output = run_action_helper(
             &fixture,
@@ -3980,8 +4767,7 @@ fn github_action_run_helper_removes_invalid_or_fatal_sidecar_reports() {
                 timeout: None,
                 format: Some("github"),
                 test_cmd: None,
-                review_status: 1,
-                json_status,
+                status,
                 json,
             },
         );
@@ -3989,7 +4775,7 @@ fn github_action_run_helper_removes_invalid_or_fatal_sidecar_reports() {
         assert_eq!(
             output.status.code(),
             Some(2),
-            "unexpected status for JSON sidecar status {json_status}\nstderr:\n{}",
+            "unexpected status for JSON sidecar status {status}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stderr)
         );
         assert!(!fixture.report_path.exists());
@@ -4018,18 +4804,18 @@ fn github_action_run_helper_propagates_fatal_review_and_cleans_stale_report() {
             timeout: None,
             format: Some("github"),
             test_cmd: None,
-            review_status: 2,
-            json_status: 0,
+            status: 2,
             json: NORMAL_ACTION_REPORT,
         },
     );
 
     assert_eq!(output.status.code(), Some(2));
     assert_eq!(
-        action_helper_invocations(&fixture),
-        vec![action_args(&[
-            "check", "--base", "HEAD~1", "--format", "github",
-        ])]
+        action_helper_check_invocations(&fixture),
+        vec![action_args_with_report(
+            &fixture,
+            &["check", "--base", "HEAD~1", "--format", "github"],
+        )]
     );
     assert!(!fixture.report_path.exists());
     assert!(
@@ -4063,6 +4849,7 @@ fn github_action_report_replays_a_direct_mutation() {
         .arg(helper)
         .current_dir(repo.path())
         .env("TOGI_BIN", assert_cmd::cargo::cargo_bin("togi"))
+        .env("TOGI_EXPECTED_VERSION", "v0.5.1")
         .env("RUNNER_TEMP", report_dir.path())
         .env("GITHUB_OUTPUT", &github_output)
         .env("TOGI_BASE", "HEAD")
@@ -4108,10 +4895,179 @@ fn github_action_report_replays_a_direct_mutation() {
         .success();
 }
 
+#[cfg(unix)]
+#[test]
+fn github_action_install_rejects_failed_fetch_without_ambient_archive_fallback() {
+    if !bash_available() {
+        eprintln!("skipping Action install regression test because bash is unavailable");
+        return;
+    }
+
+    let dir = TempDir::new().unwrap();
+    let action_path = dir.path().join("fake-action");
+    let scripts = action_path.join(".github/scripts");
+    fs::create_dir_all(&scripts).unwrap();
+    let resolver_log = dir.path().join("resolver-environment");
+    fs::write(
+        scripts.join("resolve-togi-asset.sh"),
+        "#!/usr/bin/env bash\nprintf '%s/%s\\n' \"${TOGI_OS-__unset__}\" \"${TOGI_ARCH-__unset__}\" > \"$RESOLVER_LOG\"\nprintf 'TOGI_ARCHIVE=%q\\n' 'verified.tar.gz'\nprintf 'TOGI_BINARY=%q\\n' 'togi'\n",
+    )
+    .unwrap();
+    let fetch_log = dir.path().join("fetch-version");
+    fs::write(
+        scripts.join("fetch-togi-release-asset.sh"),
+        "#!/usr/bin/env bash\nprintf '%s\\n' \"$TOGI_VERSION\" > \"$FETCH_LOG\"\nexit 1\n",
+    )
+    .unwrap();
+    let install_marker = dir.path().join("installer-ran");
+    fs::write(
+        scripts.join("install-togi-archive.sh"),
+        "#!/usr/bin/env bash\ntouch \"$INSTALL_MARKER\"\n",
+    )
+    .unwrap();
+    let github_output = dir.path().join("github-output");
+
+    let runner_temp = dir.path().join("runner-temp");
+    let github_env = dir.path().join("github-env");
+    let ambient_archive = dir.path().join("ambient-unverified.tar.gz");
+    fs::write(&ambient_archive, "unverified archive").unwrap();
+    let output = std::process::Command::new("bash")
+        .args(["-c", &action_install_run_script(&action_path)])
+        .current_dir(dir.path())
+        .env("GITHUB_OUTPUT", &github_output)
+        .env("TOGI_VERSION_INPUT", "v0.5.1")
+        .env("RUNNER_TEMP", &runner_temp)
+        .env("GITHUB_ENV", &github_env)
+        .env("TOGI_ARCHIVE", "ambient-archive.tar.gz")
+        .env("TOGI_BINARY", "ambient-togi")
+        .env("TOGI_ARCHIVE_PATH", &ambient_archive)
+        .env("TOGI_OS", "forced-os")
+        .env("TOGI_ARCH", "forced-arch")
+        .env("RESOLVER_LOG", &resolver_log)
+        .env("FETCH_LOG", &fetch_log)
+        .env("INSTALL_MARKER", &install_marker)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("Could not fetch and verify"),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert_eq!(fs::read_to_string(&fetch_log).unwrap(), "v0.5.1\n");
+    assert_eq!(
+        fs::read_to_string(&resolver_log).unwrap(),
+        "__unset__/__unset__\n"
+    );
+    assert!(
+        !install_marker.exists(),
+        "failed fetch must not execute the installer with an ambient archive"
+    );
+    assert!(
+        !runner_temp.join("togi-bin").exists(),
+        "failed fetch must not publish a binary"
+    );
+    assert!(
+        !github_env.exists(),
+        "failed fetch must not publish binary or version environment"
+    );
+    assert!(
+        !runner_temp.join("togi-report.json").exists() && !github_output.exists(),
+        "failed fetch must not publish a report or Action outputs"
+    );
+}
+#[cfg(unix)]
+#[test]
+fn github_action_install_uses_the_resolved_temp_root() {
+    if !bash_available() {
+        eprintln!("skipping Action install path test because bash is unavailable");
+        return;
+    }
+
+    let dir = TempDir::new().unwrap();
+    let action_path = dir.path().join("fake-action");
+    let scripts = action_path.join(".github/scripts");
+    fs::create_dir_all(&scripts).unwrap();
+    fs::write(
+        scripts.join("resolve-togi-asset.sh"),
+        "#!/usr/bin/env bash\nprintf 'TOGI_ARCHIVE=%q\\n' 'verified.tar.gz'\nprintf 'TOGI_BINARY=%q\\n' 'togi'\n",
+    )
+    .unwrap();
+    fs::write(
+        scripts.join("fetch-togi-release-asset.sh"),
+        "#!/usr/bin/env bash\nprintf 'TOGI_ARCHIVE_PATH=%q\\n' \"$FAKE_ARCHIVE_PATH\"\n",
+    )
+    .unwrap();
+    let install_root_log = dir.path().join("install-root");
+    fs::write(
+        scripts.join("install-togi-archive.sh"),
+        "#!/usr/bin/env bash\nprintf '%s\\n' \"$RUNNER_TEMP\" > \"$INSTALL_ROOT_LOG\"\n",
+    )
+    .unwrap();
+
+    let fake_bin = dir.path().join("fake-bin");
+    fs::create_dir(&fake_bin).unwrap();
+    let cygpath = fake_bin.join("cygpath");
+    fs::write(
+        &cygpath,
+        "#!/usr/bin/env bash\n[[ \"$1\" == \"-u\" ]] || exit 2\nprintf '%s\\n' \"$FAKE_TEMP_ROOT\"\n",
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&cygpath).unwrap().permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(&cygpath, permissions).unwrap();
+
+    let raw_runner_temp = dir.path().join("raw-runner-temp");
+    let resolved_temp_root = dir.path().join("resolved-temp-root");
+    let archive_path = dir.path().join("verified.tar.gz");
+    fs::write(&archive_path, "verified archive").unwrap();
+    let github_env = dir.path().join("github-env");
+    let github_path = dir.path().join("github-path");
+    let mut paths = vec![fake_bin];
+    paths.extend(std::env::split_paths(
+        &std::env::var_os("PATH").expect("PATH must be set"),
+    ));
+    let install_script = action_install_run_script(&action_path);
+    let output = std::process::Command::new("bash")
+        .args(["-c", install_script.as_str()])
+        .current_dir(dir.path())
+        .env("TOGI_VERSION_INPUT", "v0.5.1")
+        .env("RUNNER_TEMP", &raw_runner_temp)
+        .env("GITHUB_ENV", &github_env)
+        .env("GITHUB_PATH", &github_path)
+        .env("FAKE_TEMP_ROOT", &resolved_temp_root)
+        .env("FAKE_ARCHIVE_PATH", &archive_path)
+        .env("INSTALL_ROOT_LOG", &install_root_log)
+        .env("PATH", std::env::join_paths(paths).unwrap())
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(&install_root_log).unwrap(),
+        format!("{}\n", resolved_temp_root.display())
+    );
+    assert_eq!(
+        fs::read_to_string(&github_env).unwrap(),
+        format!(
+            "TOGI_BIN={}/togi-bin/togi\nTOGI_EXPECTED_VERSION=v0.5.1\n",
+            resolved_temp_root.display()
+        )
+    );
+}
+
 #[test]
 fn github_action_inputs_have_no_baked_in_defaults() {
     let action_yml =
         fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("action.yml")).unwrap();
+    let action: serde_yaml::Value = serde_yaml::from_str(&action_yml).unwrap();
 
     // Split the inputs: mapping into per-input blocks keyed by name.
     let mut blocks: Vec<(&str, Vec<&str>)> = Vec::new();
@@ -4151,7 +5107,7 @@ fn github_action_inputs_have_no_baked_in_defaults() {
     }
 
     for (name, default) in [
-        ("version", "'latest'"),
+        ("version", "'v0.5.1'"),
         ("upload-report", "'true'"),
         ("report-retention-days", "'14'"),
         ("report-artifact-name", "'togi-report'"),
@@ -4166,6 +5122,38 @@ fn github_action_inputs_have_no_baked_in_defaults() {
             "action.yml input `{name}` must keep its {default} default"
         );
     }
+    let run_blocks = action
+        .get("runs")
+        .and_then(|runs| runs.get("steps"))
+        .and_then(serde_yaml::Value::as_sequence)
+        .expect("action.yml must contain composite Action steps")
+        .iter()
+        .filter_map(|step| step.get("run").and_then(serde_yaml::Value::as_str))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !run_blocks.contains("latest"),
+        "Action releases must not resolve a mutable version"
+    );
+    for expected in [
+        "VERSION=\"${TOGI_VERSION_INPUT:-v0.5.1}\"",
+        "^v[0-9]+[.][0-9]+[.][0-9]+$",
+        "resolve-togi-asset.sh",
+        "fetch-togi-release-asset.sh",
+        "install-togi-archive.sh",
+        "TOGI_BIN=\"${TEMP_ROOT}/togi-bin/${TOGI_BINARY}\"",
+        "RUNNER_TEMP=\"$TEMP_ROOT\"",
+        "printf 'TOGI_EXPECTED_VERSION=%s\\n' \"$VERSION\"",
+    ] {
+        assert!(
+            action_yml.contains(expected),
+            "action.yml must contain `{expected}`"
+        );
+    }
+    assert!(
+        !run_blocks.contains("curl "),
+        "Action downloads must go through the verified fetch helper"
+    );
 }
 
 #[test]
