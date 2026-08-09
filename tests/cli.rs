@@ -245,6 +245,25 @@ fn init_rejects_conflicting_java_routes_without_writing_config() {
     assert!(!dir.path().join("togi.toml").exists());
 }
 
+#[test]
+fn init_rejects_ambiguous_dotnet_routes_without_writing_fallback() {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("App.sln"), "").unwrap();
+    fs::write(dir.path().join("App.csproj"), "").unwrap();
+
+    togi()
+        .arg("init")
+        .current_dir(dir.path())
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains(
+            "multiple test runtimes detected (.sln/.csproj)",
+        ))
+        .stderr(predicate::str::contains("set [test] command in togi.toml"))
+        .stderr(predicate::str::contains("make test").not());
+    assert!(!dir.path().join("togi.toml").exists());
+}
+
 #[cfg(unix)]
 #[test]
 fn init_routes_non_primary_languages_over_cargo() {
@@ -1451,6 +1470,152 @@ fn check_failing_baseline_does_not_accept_a_preseeded_exact_cache_verdict() {
 
 #[cfg(unix)]
 #[test]
+fn check_configured_build_classifies_mutant_build_failure_before_test() {
+    let dir = setup_git_repo();
+    let fake_bin = dir.path().join("fake-go-bin");
+    let build_marker = dir.path().join("build_ran.marker");
+    let test_marker = dir.path().join("test_ran.marker");
+    let path = fake_go_path_env(&fake_bin);
+    let fake_go = fake_bin.join("go");
+    fs::write(
+        &fake_go,
+        format!(
+            "#!/bin/sh\nif grep -q '>=' main.go; then\n    touch {}\n    exit 1\nfi\n",
+            shell_quote(&build_marker)
+        ),
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&fake_go).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&fake_go, permissions).unwrap();
+    let test_cmd = format!(
+        "sh -c {}",
+        shell_quote_text(&format!(
+            "if grep -q '>=' main.go; then touch {}; fi",
+            shell_quote(&test_marker)
+        ))
+    );
+
+    let output = togi()
+        .args([
+            "check",
+            "--base",
+            "HEAD",
+            "--test-cmd",
+            &test_cmd,
+            "--build-cmd",
+            "go test -c -vet=off -o /dev/null ./...",
+            "--operators",
+            "gt_to_gte",
+            "--max-per-run",
+            "1",
+            "--no-schemata",
+            "--force-rerun",
+            "--no-incremental-history",
+            "--fail-under",
+            "0",
+            "--format",
+            "json",
+        ])
+        .env("PATH", path)
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["build_errors"], 1);
+    assert_eq!(report["killed"], 0);
+    assert_eq!(
+        report["build_command"],
+        serde_json::json!(["go", "test", "-c", "-vet=off", "-o", "/dev/null", "./..."])
+    );
+    assert!(build_marker.exists(), "configured build check did not run");
+    assert!(
+        !test_marker.exists(),
+        "test command ran after configured build failure"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn check_detected_build_suggestion_does_not_pre_filter_mutants() {
+    let dir = setup_git_repo();
+    let fake_bin = dir.path().join("fake-go-bin");
+    let build_marker = dir.path().join("build_ran.marker");
+    let test_marker = dir.path().join("test_ran.marker");
+    let path = fake_go_path_env(&fake_bin);
+    let fake_go = fake_bin.join("go");
+    fs::write(
+        &fake_go,
+        format!(
+            "#!/bin/sh\nif grep -q '>=' main.go; then\n    touch {}\n    exit 1\nfi\n",
+            shell_quote(&build_marker)
+        ),
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&fake_go).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&fake_go, permissions).unwrap();
+    let test_cmd = format!(
+        "sh -c {}",
+        shell_quote_text(&format!(
+            "if grep -q '>=' main.go; then touch {}; exit 1; fi",
+            shell_quote(&test_marker)
+        ))
+    );
+
+    let output = togi()
+        .args([
+            "check",
+            "--base",
+            "HEAD",
+            "--test-cmd",
+            &test_cmd,
+            "--operators",
+            "gt_to_gte",
+            "--max-per-run",
+            "1",
+            "--no-schemata",
+            "--force-rerun",
+            "--no-incremental-history",
+            "--fail-under",
+            "0",
+            "--format",
+            "json",
+        ])
+        .env("PATH", path)
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["build_errors"], 0);
+    assert_eq!(report["killed"], 1);
+    assert_eq!(report["build_command"], serde_json::json!([]));
+    assert!(
+        !build_marker.exists(),
+        "detected build suggestion must not execute"
+    );
+    assert!(
+        test_marker.exists(),
+        "mutant should run the configured test command"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn check_schemata_baselines_go_with_the_no_cache_argv() {
     let dir = setup_git_repo();
     let fake_bin = dir.path().join("fake-go-bin");
@@ -1460,6 +1625,7 @@ fn check_schemata_baselines_go_with_the_no_cache_argv() {
         r#"
 [test]
 command = ["go", "test", "./..."]
+build_command = ["true"]
 timeout = 5
 
 [mutations]
@@ -1514,6 +1680,7 @@ fn check_no_schemata_keeps_the_raw_go_test_argv() {
         r#"
 [test]
 command = ["go", "test", "./..."]
+build_command = ["true"]
 timeout = 5
 "#,
     )

@@ -1,6 +1,6 @@
 use anyhow::Context;
 use clap::ValueEnum;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -44,11 +44,57 @@ pub struct LanguageTestConfig {
     pub timeout: Option<u64>,
 }
 
+/// Where the effective build command came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BuildCommandOrigin {
+    /// No build command is available for this run.
+    None,
+    /// A safe command suggested from project markers; it is not executed until
+    /// the user configures it.
+    AutoDetected,
+    /// The user supplied a nonempty command through config or the CLI.
+    Configured,
+}
+
+/// Known Unix null device used by the automatic Go compile check.
+pub(crate) const AUTO_GO_COMPILE_UNIX_OUTPUT: &str = "/dev/null";
+/// Known Windows null device used by the automatic Go compile check.
+pub(crate) const AUTO_GO_COMPILE_WINDOWS_OUTPUT: &str = "NUL";
+/// Null device used to discard automatically compiled Go test binaries.
+#[cfg(windows)]
+pub(crate) const AUTO_GO_COMPILE_OUTPUT: &str = AUTO_GO_COMPILE_WINDOWS_OUTPUT;
+/// Null device used to discard automatically compiled Go test binaries.
+#[cfg(not(windows))]
+pub(crate) const AUTO_GO_COMPILE_OUTPUT: &str = AUTO_GO_COMPILE_UNIX_OUTPUT;
+
+/// Compile Go packages and tests without running test code or `go vet`.
+pub(crate) const AUTO_GO_COMPILE_COMMAND: [&str; 7] = [
+    "go",
+    "test",
+    "-c",
+    "-vet=off",
+    "-o",
+    AUTO_GO_COMPILE_OUTPUT,
+    "./...",
+];
+
+impl BuildCommandOrigin {
+    /// Whether this command should run before each test command.
+    ///
+    /// Auto-detection is only a `togi init` suggestion, never an implicit
+    /// mutation pre-filter.
+    pub const fn runs_before_tests(self) -> bool {
+        matches!(self, Self::Configured)
+    }
+}
+
 #[derive(Debug)]
 pub struct TestConfig {
     pub profile: Option<ResourceProfile>,
     pub command: Vec<String>,
     pub build_command: Vec<String>,
+    pub build_command_origin: BuildCommandOrigin,
     pub sandbox_command: Vec<String>,
     pub timeout: u64,
     pub calibrate_timeout: bool,
@@ -90,10 +136,16 @@ impl<'de> Deserialize<'de> for TestConfig {
         D: serde::Deserializer<'de>,
     {
         let raw = RawTestConfig::deserialize(deserializer)?;
+        let build_command_origin = if raw.build_command.is_empty() {
+            BuildCommandOrigin::None
+        } else {
+            BuildCommandOrigin::Configured
+        };
         Ok(Self {
             profile: raw.profile,
             command: raw.command,
             build_command: raw.build_command,
+            build_command_origin,
             sandbox_command: raw.sandbox_command,
             timeout: raw.timeout.unwrap_or_else(default_timeout),
             calibrate_timeout: raw.calibrate_timeout.unwrap_or(false),
@@ -190,17 +242,66 @@ fn default_test_command() -> Vec<String> {
     vec![]
 }
 
-/// Auto-detect the test command based on project files in the given root.
-fn has_file_with_ext(dir: &Path, ext: &str) -> bool {
-    dir.read_dir()
-        .map(|entries| {
-            entries.filter_map(Result::ok).any(|e| {
-                e.path()
-                    .extension()
-                    .is_some_and(|e| e.eq_ignore_ascii_case(ext))
-            })
-        })
-        .unwrap_or(false)
+/// Regular top-level .NET project or solution candidates.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+enum DotnetCandidates {
+    #[default]
+    None,
+    Single(String),
+    Ambiguous,
+}
+
+impl DotnetCandidates {
+    fn scan(dir: &Path) -> Self {
+        let Ok(entries) = dir.read_dir() else {
+            return Self::None;
+        };
+        let mut candidates = Vec::new();
+        for entry in entries {
+            let Ok(entry) = entry else {
+                return Self::Ambiguous;
+            };
+            let path = entry.path();
+            let is_dotnet_candidate = path.extension().is_some_and(|extension| {
+                extension.eq_ignore_ascii_case("sln") || extension.eq_ignore_ascii_case("csproj")
+            });
+            if !is_dotnet_candidate {
+                continue;
+            }
+            let Ok(file_type) = entry.file_type() else {
+                return Self::Ambiguous;
+            };
+            if !file_type.is_file() {
+                continue;
+            }
+            let file_name = entry.file_name();
+            let Some(file_name) = file_name.to_str() else {
+                return Self::Ambiguous;
+            };
+            candidates.push(file_name.to_owned());
+        }
+        candidates.sort_unstable();
+        match candidates.len() {
+            0 => Self::None,
+            1 => candidates.pop().map_or(Self::None, Self::Single),
+            _ => Self::Ambiguous,
+        }
+    }
+
+    fn single(&self) -> Option<&str> {
+        match self {
+            Self::Single(candidate) => Some(candidate),
+            Self::None | Self::Ambiguous => None,
+        }
+    }
+
+    const fn is_ambiguous(&self) -> bool {
+        matches!(self, Self::Ambiguous)
+    }
+
+    fn test_command_ambiguity_marker(&self) -> Option<&'static str> {
+        self.is_ambiguous().then_some(".sln/.csproj")
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -256,11 +357,11 @@ struct ProjectInspection {
     python_manifest: Option<&'static str>,
     javascript_runner: Option<JavaScriptRunner>,
     has_pom_xml: bool,
-    has_gradle: bool,
     gradle_manifest: Option<&'static str>,
     has_gemfile: bool,
+    has_makefile: bool,
     has_cmake: bool,
-    has_dotnet_project: bool,
+    dotnet_candidates: DotnetCandidates,
     has_tsconfig: bool,
 }
 
@@ -294,12 +395,13 @@ impl ProjectInspection {
             python_manifest,
             javascript_runner: JavaScriptRunner::detect(project_root),
             has_pom_xml: project_root.join("pom.xml").exists(),
-            has_gradle: gradle_manifest.is_some(),
             gradle_manifest,
             has_gemfile: project_root.join("Gemfile").exists(),
+            has_makefile: ["Makefile", "makefile", "GNUmakefile"]
+                .iter()
+                .any(|name| project_root.join(name).exists()),
             has_cmake: project_root.join("CMakeLists.txt").exists(),
-            has_dotnet_project: has_file_with_ext(project_root, "sln")
-                || has_file_with_ext(project_root, "csproj"),
+            dotnet_candidates: DotnetCandidates::scan(project_root),
             has_tsconfig: project_root.join("tsconfig.json").exists(),
         }
     }
@@ -362,35 +464,50 @@ impl ProjectInspection {
                 languages: &["c", "cpp"],
             });
         }
-        if self.has_dotnet_project {
+        if let Some(candidate) = self.dotnet_candidates.single() {
             detected.push(DetectedTestRoute {
                 marker: ".sln/.csproj",
-                command: vec!["dotnet".into(), "test".into()],
+                command: vec!["dotnet".into(), "test".into(), candidate.into()],
                 languages: &["c_sharp"],
             });
         }
         detected
     }
 
+    /// Return a build command only when exactly one safe root build system exists.
     fn detect_build_command(&self) -> Vec<String> {
+        // Build detection must honor every root signal that can select a test
+        // command or imply a `make test` fallback. A standalone tsconfig still
+        // prevents inferring another toolchain in a mixed root, even though
+        // TypeScript has no package-manager-agnostic automatic build command.
+        let root_signals = self.detected_test_routes().len()
+            + usize::from(self.has_tsconfig && self.javascript_runner.is_none())
+            + usize::from(self.has_makefile)
+            + usize::from(self.dotnet_candidates.is_ambiguous());
+        if root_signals != 1 {
+            return vec![];
+        }
+
         if self.has_cargo_toml {
             return vec!["cargo".into(), "check".into()];
         }
         if self.has_go_mod {
-            return vec!["go".into(), "build".into(), "./...".into()];
-        }
-        if self.has_tsconfig {
-            return vec!["npx".into(), "tsc".into(), "--noEmit".into()];
+            return AUTO_GO_COMPILE_COMMAND
+                .iter()
+                .map(|argument| (*argument).into())
+                .collect();
         }
         if self.has_pom_xml {
             return vec!["mvn".into(), "compile".into(), "-q".into()];
         }
-        if self.has_gradle {
-            return vec!["./gradlew".into(), "compileJava".into()];
+        if let Some(candidate) = self.dotnet_candidates.single() {
+            // Isolated workspaces intentionally omit ignored obj/ assets.
+            // Restore must therefore remain enabled for automatic checks.
+            return vec!["dotnet".into(), "build".into(), candidate.into()];
         }
-        if self.has_dotnet_project {
-            return vec!["dotnet".into(), "build".into(), "--no-restore".into()];
-        }
+
+        // Gradle and CMake are root signals, but neither has a portable,
+        // manifest-only compile command. Users can still configure one.
         vec![]
     }
 
@@ -569,6 +686,15 @@ impl TestConfig {
         }
     }
 
+    pub fn set_build_command(&mut self, build_command: Vec<String>) {
+        self.build_command_origin = if build_command.is_empty() {
+            BuildCommandOrigin::None
+        } else {
+            BuildCommandOrigin::Configured
+        };
+        self.build_command = build_command;
+    }
+
     pub fn jobs_was_explicit(&self) -> bool {
         self.jobs_explicit
     }
@@ -580,6 +706,7 @@ impl Default for TestConfig {
             profile: None,
             command: default_test_command(),
             build_command: vec![],
+            build_command_origin: BuildCommandOrigin::None,
             sandbox_command: vec![],
             timeout: default_timeout(),
             calibrate_timeout: false,
@@ -746,11 +873,15 @@ impl Config {
             return TestCommandResolution::Resolved;
         }
 
-        let detected = ProjectInspection::scan(project_root).detected_test_routes();
-        if detected.len() > 1 {
-            return TestCommandResolution::Ambiguous(AmbiguousTestCommand {
-                candidates: detected.iter().map(|route| route.marker).collect(),
-            });
+        let inspection = ProjectInspection::scan(project_root);
+        let detected = inspection.detected_test_routes();
+        let ambiguity_marker = inspection.dotnet_candidates.test_command_ambiguity_marker();
+        if detected.len() > 1 || ambiguity_marker.is_some() {
+            let mut candidates: Vec<_> = detected.iter().map(|route| route.marker).collect();
+            if let Some(marker) = ambiguity_marker {
+                candidates.push(marker);
+            }
+            return TestCommandResolution::Ambiguous(AmbiguousTestCommand { candidates });
         }
 
         self.test.command = if let Some(route) = detected.into_iter().next() {
@@ -765,10 +896,24 @@ impl Config {
         TestCommandResolution::Resolved
     }
 
-    /// If no build command was explicitly set in togi.toml, auto-detect from project files.
-    pub fn resolve_build_command(&mut self, project_root: &Path) {
-        if self.test.build_command.is_empty() {
-            self.test.build_command = detect_build_command(project_root);
+    /// Resolve an effective build command without selecting an arbitrary
+    /// pre-filter for ambiguous roots.
+    pub fn resolve_build_command(&mut self, project_root: &Path) -> BuildCommandOrigin {
+        if !matches!(self.test.build_command_origin, BuildCommandOrigin::None) {
+            return self.test.build_command_origin;
+        }
+        if !self.test.build_command.is_empty() {
+            self.test.build_command_origin = BuildCommandOrigin::Configured;
+            return self.test.build_command_origin;
+        }
+
+        let build_command = detect_build_command(project_root);
+        if build_command.is_empty() {
+            BuildCommandOrigin::None
+        } else {
+            self.test.build_command = build_command;
+            self.test.build_command_origin = BuildCommandOrigin::AutoDetected;
+            self.test.build_command_origin
         }
     }
 
@@ -780,6 +925,11 @@ impl Config {
             .unwrap_or(Path::new("."));
         let inspection = ProjectInspection::scan(project_root);
         let routes = inspection.detected_test_routes();
+        if let Some(marker) = inspection.dotnet_candidates.test_command_ambiguity_marker() {
+            let mut candidates: Vec<_> = routes.iter().map(|route| route.marker).collect();
+            candidates.push(marker);
+            return Err(AmbiguousTestCommand { candidates }.error());
+        }
         validate_init_language_routes(&routes)?;
         let test_cmd = select_primary_test_command(&routes);
         let build_cmd = inspection.detect_build_command();
@@ -799,7 +949,7 @@ impl Config {
             let build_cmd_toml: Vec<String> =
                 build_cmd.iter().map(|s| format!("\"{}\"", s)).collect();
             template.push_str(&format!(
-                "# build_command = [{}]  # uncomment to pre-filter mutations that don't compile\n",
+                "# build_command = [{}]  # optional compile check before each mutation's tests\n",
                 build_cmd_toml.join(", ")
             ));
         }
@@ -1259,7 +1409,7 @@ sandbox_command = ["bwrap", "--ro-bind", "/", "/", "--"]
             ("ruby", vec!["bundle", "exec", "rspec"]),
             ("c", vec!["ctest"]),
             ("cpp", vec!["ctest"]),
-            ("c_sharp", vec!["dotnet", "test"]),
+            ("c_sharp", vec!["dotnet", "test", "example.csproj"]),
         ] {
             let expected: Vec<String> = expected.into_iter().map(str::to_owned).collect();
             assert_eq!(
@@ -1434,17 +1584,13 @@ fail_on_uncovered_diff = true
     }
 
     #[test]
-    fn has_file_with_ext_returns_false_when_no_match() {
+    fn dotnet_candidates_ignore_nonmatching_or_missing_roots() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("foo.txt"), "").unwrap();
-        assert!(!has_file_with_ext(dir.path(), "rs"));
-    }
+        assert_eq!(DotnetCandidates::scan(dir.path()), DotnetCandidates::None);
 
-    #[test]
-    fn has_file_with_ext_returns_false_for_nonexistent_dir() {
-        let dir = tempfile::tempdir().unwrap();
-        let bad = dir.path().join("nonexistent");
-        assert!(!has_file_with_ext(&bad, "rs"));
+        let missing = dir.path().join("nonexistent");
+        assert_eq!(DotnetCandidates::scan(&missing), DotnetCandidates::None);
     }
 
     #[test]
@@ -1471,6 +1617,257 @@ fail_on_uncovered_diff = true
         assert_eq!(
             ambiguity.error().to_string(),
             "multiple test runtimes detected (setup.cfg, build.gradle.kts); set [test] command in togi.toml or pass --test-cmd <command>"
+        );
+    }
+
+    #[test]
+    fn ambiguous_dotnet_candidates_block_cargo_test_autodetection() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "").unwrap();
+        std::fs::write(dir.path().join("First.csproj"), "").unwrap();
+        std::fs::write(dir.path().join("Second.csproj"), "").unwrap();
+
+        let mut automatic = Config::default();
+        let TestCommandResolution::Ambiguous(ambiguity) =
+            automatic.resolve_test_command(dir.path())
+        else {
+            panic!("ambiguous .NET candidates must block automatic Cargo selection");
+        };
+        assert!(automatic.test.command.is_empty());
+        assert_eq!(
+            ambiguity.error().to_string(),
+            "multiple test runtimes detected (Cargo.toml, .sln/.csproj); set [test] command in togi.toml or pass --test-cmd <command>"
+        );
+
+        let mut explicit: Config =
+            toml::from_str("[test]\ncommand = [\"echo\", \"explicit\"]\n").unwrap();
+        assert!(matches!(
+            explicit.resolve_test_command(dir.path()),
+            TestCommandResolution::Resolved
+        ));
+        assert_eq!(explicit.test.command, vec!["echo", "explicit"]);
+    }
+
+    #[test]
+    fn resolve_build_command_suggests_one_safe_root_without_enabling_it() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("go.mod"), "module example.com/calculator\n").unwrap();
+        let mut config = Config::default();
+
+        let origin = config.resolve_build_command(dir.path());
+        assert_eq!(origin, BuildCommandOrigin::AutoDetected);
+        assert!(!origin.runs_before_tests());
+        assert_eq!(
+            config.test.build_command,
+            AUTO_GO_COMPILE_COMMAND
+                .iter()
+                .map(|argument| (*argument).to_string())
+                .collect::<Vec<_>>(),
+            "a single Go root gets the safe built-in compile check"
+        );
+        assert_eq!(
+            config.resolve_build_command(dir.path()),
+            BuildCommandOrigin::AutoDetected,
+            "re-resolution must preserve suggestion provenance"
+        );
+    }
+
+    #[test]
+    fn resolve_build_command_keeps_configured_command_authoritative() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("go.mod"), "module example.com/calculator\n").unwrap();
+        let mut config: Config =
+            toml::from_str("[test]\nbuild_command = [\"echo\", \"configured\"]\n").unwrap();
+
+        assert_eq!(
+            config.resolve_build_command(dir.path()),
+            BuildCommandOrigin::Configured
+        );
+        assert_eq!(config.test.build_command, vec!["echo", "configured"]);
+    }
+
+    #[test]
+    fn resolve_build_command_does_not_assume_npx_for_package_managers() {
+        for (lockfile, binary) in [
+            ("bun.lock", "bun"),
+            ("pnpm-lock.yaml", "pnpm"),
+            ("yarn.lock", "yarn"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("package.json"), "{}").unwrap();
+            std::fs::write(dir.path().join(lockfile), "").unwrap();
+            std::fs::write(dir.path().join("tsconfig.json"), "{}").unwrap();
+
+            assert_eq!(
+                detect_test_command(dir.path()),
+                vec![binary.to_string(), "test".to_string()]
+            );
+            let mut config = Config::default();
+            assert_eq!(
+                config.resolve_build_command(dir.path()),
+                BuildCommandOrigin::None,
+                "{lockfile} must not assume npx is available"
+            );
+            assert!(config.test.build_command.is_empty(), "{lockfile}");
+        }
+    }
+
+    #[test]
+    fn resolve_build_command_keeps_configured_typescript_command_authoritative() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("package.json"), "{}").unwrap();
+        std::fs::write(dir.path().join("pnpm-lock.yaml"), "").unwrap();
+        std::fs::write(dir.path().join("tsconfig.json"), "{}").unwrap();
+        let mut config: Config =
+            toml::from_str("[test]\nbuild_command = [\"pnpm\", \"exec\", \"tsc\", \"--noEmit\"]\n")
+                .unwrap();
+
+        assert_eq!(
+            config.resolve_build_command(dir.path()),
+            BuildCommandOrigin::Configured
+        );
+        assert_eq!(
+            config.test.build_command,
+            vec!["pnpm", "exec", "tsc", "--noEmit"]
+        );
+    }
+
+    #[test]
+    fn resolve_build_command_skips_package_manager_go_ambiguity() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("package.json"), "{}").unwrap();
+        std::fs::write(dir.path().join("bun.lock"), "").unwrap();
+        std::fs::write(dir.path().join("tsconfig.json"), "{}").unwrap();
+        std::fs::write(dir.path().join("go.mod"), "module example.com/mixed\n").unwrap();
+        let mut config = Config::default();
+
+        assert_eq!(
+            config.resolve_build_command(dir.path()),
+            BuildCommandOrigin::None
+        );
+        assert!(config.test.build_command.is_empty());
+    }
+
+    #[test]
+    fn resolve_build_command_skips_ambiguous_root() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("go.mod"), "module example.com/calculator\n").unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"calculator\"\n",
+        )
+        .unwrap();
+        let mut config = Config::default();
+
+        assert_eq!(
+            config.resolve_build_command(dir.path()),
+            BuildCommandOrigin::None
+        );
+        assert!(config.test.build_command.is_empty());
+    }
+
+    #[test]
+    fn resolve_build_command_skips_cargo_cmake_root() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"calculator\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("CMakeLists.txt"),
+            "cmake_minimum_required(VERSION 3.20)\n",
+        )
+        .unwrap();
+        let mut config = Config::default();
+
+        assert_eq!(
+            config.resolve_build_command(dir.path()),
+            BuildCommandOrigin::None
+        );
+        assert!(config.test.build_command.is_empty());
+    }
+
+    #[test]
+    fn resolve_build_command_skips_cargo_make_root() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"calculator\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("Makefile"), "test:\n\t@true\n").unwrap();
+        let mut config = Config::default();
+
+        assert_eq!(
+            config.resolve_build_command(dir.path()),
+            BuildCommandOrigin::None
+        );
+        assert!(config.test.build_command.is_empty());
+    }
+
+    #[test]
+    fn resolve_build_command_skips_ambiguous_dotnet_candidates() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("First.csproj"), "").unwrap();
+        std::fs::write(dir.path().join("Second.csproj"), "").unwrap();
+        let mut config: Config =
+            toml::from_str("[test]\ncommand = [\"echo\", \"custom\"]\n").unwrap();
+
+        assert_eq!(
+            ProjectInspection::scan(dir.path()).dotnet_candidates,
+            DotnetCandidates::Ambiguous
+        );
+        assert_eq!(
+            config.resolve_build_command(dir.path()),
+            BuildCommandOrigin::None
+        );
+        assert!(config.test.build_command.is_empty());
+        assert_eq!(config.test.command, vec!["echo", "custom"]);
+    }
+
+    #[test]
+    fn resolve_build_command_ignores_dotnet_named_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("fake.csproj")).unwrap();
+        let mut config = Config::default();
+
+        assert_eq!(
+            ProjectInspection::scan(dir.path()).dotnet_candidates,
+            DotnetCandidates::None
+        );
+        assert_eq!(
+            config.resolve_build_command(dir.path()),
+            BuildCommandOrigin::None
+        );
+        assert!(config.test.build_command.is_empty());
+    }
+
+    #[test]
+    fn detect_build_command_does_not_guess_gradle() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("build.gradle"), "").unwrap();
+
+        assert!(detect_build_command(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn detect_dotnet_build_keeps_restore_enabled() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Calculator.csproj"), "").unwrap();
+        let mut config = Config::default();
+
+        assert_eq!(
+            config.resolve_build_command(dir.path()),
+            BuildCommandOrigin::AutoDetected
+        );
+        assert_eq!(
+            config.test.build_command,
+            vec!["dotnet", "build", "Calculator.csproj"]
+        );
+        assert_eq!(
+            detect_test_command(dir.path()),
+            vec!["dotnet", "test", "Calculator.csproj"]
         );
     }
 
@@ -1505,14 +1902,24 @@ fail_on_uncovered_diff = true
     fn detect_csproj_only() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("MyApp.csproj"), "").unwrap();
-        assert_eq!(detect_test_command(dir.path()), vec!["dotnet", "test"]);
+        assert_eq!(
+            detect_test_command(dir.path()),
+            vec!["dotnet", "test", "MyApp.csproj"]
+        );
     }
 
     #[test]
     fn detect_sln_only() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("MyApp.sln"), "").unwrap();
-        assert_eq!(detect_test_command(dir.path()), vec!["dotnet", "test"]);
+        assert_eq!(
+            detect_test_command(dir.path()),
+            vec!["dotnet", "test", "MyApp.sln"]
+        );
+        assert_eq!(
+            detect_build_command(dir.path()),
+            vec!["dotnet", "build", "MyApp.sln"]
+        );
     }
 
     #[test]

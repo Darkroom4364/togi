@@ -1,5 +1,6 @@
 use assert_cmd::Command;
 use serde_json::{Value, json};
+use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
@@ -190,6 +191,52 @@ fn write_json(path: &Path, value: &Value) {
     fs::write(path, serde_json::to_vec_pretty(value).unwrap()).unwrap();
 }
 
+fn fake_go_path(root: &Path) -> OsString {
+    let bin = root.join("fake-go-bin");
+    fs::create_dir(&bin).unwrap();
+    #[cfg(windows)]
+    {
+        let source = bin.join("go.rs");
+        let go = bin.join("go.exe");
+        fs::write(
+            &source,
+            r#"use std::{fs::OpenOptions, io::Write};
+
+fn main() {
+    let mut log = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(std::env::var_os("TOGI_REPLAY_LOG").unwrap())
+        .unwrap();
+    log.write_all(b"g").unwrap();
+}"#,
+        )
+        .unwrap();
+        let status = std::process::Command::new("rustc")
+            .arg(source)
+            .arg("-o")
+            .arg(go)
+            .status()
+            .unwrap();
+        assert!(status.success(), "failed to build fake go.exe");
+    }
+    #[cfg(not(windows))]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let go = bin.join("go");
+        fs::write(&go, "#!/bin/sh\nprintf g >> \"$TOGI_REPLAY_LOG\"\nexit 0\n").unwrap();
+        let mut permissions = fs::metadata(&go).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&go, permissions).unwrap();
+    }
+    let mut paths = vec![bin];
+    paths.extend(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    ));
+    std::env::join_paths(paths).unwrap()
+}
+
 fn assert_rejected_without_invocation(fixture: &ReplayFixture, contents: &[u8], id: &str) {
     fs::write(&fixture.report_path, contents).unwrap();
     fs::write(&fixture.log_path, []).unwrap();
@@ -367,6 +414,56 @@ fn replay_forces_a_real_direct_execution_without_source_or_cache_residue() {
         lock_before
     );
     assert!(fixture.report_dir.path().exists());
+}
+
+#[test]
+fn legacy_report_without_build_origin_replays_configured_go_lookalike_unchanged() {
+    let fixture = setup_replay_fixture();
+    let id = fixture.report["mutations"][0]["id"]
+        .as_u64()
+        .unwrap()
+        .to_string();
+
+    let mut legacy = fixture.report.clone();
+    let replay = legacy["mutations"][0]["replay"].as_object_mut().unwrap();
+    replay.insert(
+        "build_command".into(),
+        json!(["go", "test", "-c", "-vet=off", "-o", "NUL", "./..."]),
+    );
+    replay.remove("build_command_origin");
+    write_json(&fixture.report_path, &legacy);
+    fs::write(&fixture.log_path, []).unwrap();
+
+    let output = togi()
+        .args([
+            "replay",
+            &id,
+            "--report",
+            fixture.report_path.to_str().unwrap(),
+        ])
+        .current_dir(fixture.repo.path())
+        .env("TOGI_REPLAY_LOG", &fixture.log_path)
+        .env("PATH", fake_go_path(fixture.report_dir.path()))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "legacy replay failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains(
+        "Effective build command: [\"go\",\"test\",\"-c\",\"-vet=off\",\"-o\",\"NUL\",\"./...\"]"
+    ));
+    let log = String::from_utf8(fs::read(&fixture.log_path).unwrap()).unwrap();
+    let ordered: String = log
+        .chars()
+        .filter(|character| !matches!(character, '\r' | '\n'))
+        .collect();
+    assert_eq!(
+        ordered, "gx",
+        "build command must run before the test command"
+    );
 }
 
 #[test]

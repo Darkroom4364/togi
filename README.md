@@ -227,7 +227,7 @@ togi check --operators=binary,removal
 # Stop on first test failure per mutation
 togi check --fail-fast
 
-# Use a build check before running tests
+# Run an explicitly configured build check before tests
 togi check --build-cmd "cargo check"
 
 # Only mutate lines covered by an LCOV file
@@ -523,7 +523,9 @@ calibrate_timeout = false
 timeout_multiplier = 4.0
 timeout_slack = 2
 jobs = 2
-build_command = ["go", "build", "./..."]
+# Optional: opt in to a build check before each mutation's tests.
+# Use "NUL" instead of "/dev/null" on Windows.
+build_command = ["go", "test", "-c", "-vet=off", "-o", "/dev/null", "./..."]
 sandbox_command = ["bwrap", "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--"]
 
 [test.languages.python]
@@ -566,6 +568,18 @@ include runner-specific fail-fast flags in `--test-cmd` instead.
 Resource profiles provide defaults only: explicit CLI flags and `togi.toml`
 settings such as `jobs` keep taking precedence.
 
+A nonempty `[test] build_command` or `--build-cmd` opts in to a build check
+before each mutant's test command. A failed configured build is reported as a
+build error and does not count as a test kill.
+
+`togi init` suggests a safe `build_command` when it detects exactly one root
+build system, but detection alone never runs a build before tests. Uncomment
+or copy that suggestion to opt in.
+
+For Go, the suggested compile-only command is `go test -c -vet=off -o <host
+null device> ./...`: `/dev/null` on Unix and `NUL` on Windows. It compiles
+test code without running package initialization, `TestMain`, or `go vet`.
+
 `[test] sandbox_command` is an optional wrapper that runs every build and test
 command inside your own sandbox tool. togi appends the selected command after
 the wrapper argv, so tools that expect `--` as a separator can use it directly.
@@ -573,7 +587,7 @@ the wrapper argv, so tools that expect `--` as a separator can use it directly.
 `--calibrate-timeout` (or `[test] calibrate_timeout = true`) runs the
 unmutated build/test command once in a disposable workspace, then sets the
 default mutation timeout to `max(build_time, test_time) * timeout_multiplier +
-timeout_slack`. When `build_command` is not set, only `test_time` is used.
+timeout_slack`. When no build check is available, only `test_time` is used.
 Explicit `--timeout` wins. Use `--skip-baseline-timing` in CI jobs that already
 provide a tuned timeout or should avoid repeating the baseline run across
 shards.

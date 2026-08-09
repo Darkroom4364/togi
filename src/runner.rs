@@ -1,6 +1,7 @@
 // Parallel test execution with timeouts
 
 use crate::cache::{self, CacheKey};
+use crate::config::BuildCommandOrigin;
 use crate::replay::{DirectRecipeOrigin, RegularDirectRecipe};
 use crate::source_identity::{
     normalized_project_relative_path, range_matches, resolve_normalized_project_relative_path,
@@ -42,9 +43,9 @@ fn write_workspace_file(path: &Path, data: &[u8]) -> std::io::Result<()> {
 ///
 /// `command` is the default test command. Project and language commands can
 /// override it for matching mutations unless `force_default_command` is set
-/// by a CLI command override. `build_command`, when explicitly enabled by the
-/// CLI/config, runs before tests to classify uncompilable mutations as build
-/// errors.
+/// by a CLI command override. An enabled build command runs before tests to
+/// classify uncompilable mutations as build errors; its origin records whether
+/// it was auto-detected or user-configured.
 pub struct CommandConfig {
     /// Default test command, stored as argv.
     pub command: Vec<String>,
@@ -60,14 +61,20 @@ pub struct CommandConfig {
     pub language_commands: HashMap<String, Vec<String>>,
     /// Optional build-check command, stored as argv.
     pub build_command: Vec<String>,
-    /// Whether the build command came from user config/CLI rather than detection.
-    pub build_command_explicit: bool,
+    /// How the effective build command was selected.
+    pub build_command_origin: BuildCommandOrigin,
     /// Default per-mutation timeout.
     pub timeout: Duration,
     /// Per-language timeout overrides keyed by `LanguageSupport::name()`.
     pub language_timeouts: HashMap<String, Duration>,
     /// Optional source-line to test-name map used to narrow test commands.
     pub test_selection: Option<TestSelectionConfig>,
+}
+
+impl CommandConfig {
+    fn has_build_command(&self) -> bool {
+        self.build_command_origin.runs_before_tests() && !self.build_command.is_empty()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -224,7 +231,7 @@ pub struct BaselineTimingConfig<'a> {
     pub test_command: &'a [String],
     pub build_command: &'a [String],
     pub sandbox_command: &'a [String],
-    pub build_command_explicit: bool,
+    pub build_command_origin: BuildCommandOrigin,
     pub timeout: Duration,
     pub env: &'a HashMap<String, String>,
     pub cancelled: &'a AtomicBool,
@@ -365,14 +372,15 @@ impl SelectedTestCommand {
     fn cache_context(
         &self,
         build_command: &[String],
-        build_command_explicit: bool,
+        build_command_origin: BuildCommandOrigin,
         sandbox_command: &[String],
         env: &HashMap<String, String>,
     ) -> String {
-        let build_str = if build_command_explicit {
-            format!("{build_command:?}")
-        } else {
-            String::new()
+        // Only configured checks participate in cache identity. A detected
+        // suggestion cannot change execution, so it must share no-build keys.
+        let build_str = match build_command_origin {
+            BuildCommandOrigin::None | BuildCommandOrigin::AutoDetected => String::new(),
+            BuildCommandOrigin::Configured => format!("{build_command:?}"),
         };
         let sandbox_str = if sandbox_command.is_empty() {
             String::new()
@@ -390,6 +398,7 @@ impl SelectedTestCommand {
             env_parts.join(",")
         )
     }
+
     fn is_narrowed(&self) -> bool {
         self.unnarrowed_argv.is_some()
     }
@@ -2159,19 +2168,20 @@ pub fn measure_baseline_timing(
     let workspace = copy_workspace_with_options(project_root, config.respect_workspace_ignores)
         .with_context(|| "could not create baseline timing workspace")?;
     let root = workspace.root();
-    let build_duration = if config.build_command_explicit && !config.build_command.is_empty() {
-        Some(measure_baseline_command(
-            SuiteFailurePhase::Build,
-            config.build_command,
-            config.sandbox_command,
-            root,
-            config.timeout,
-            config.env,
-            config.cancelled,
-        )?)
-    } else {
-        None
-    };
+    let build_duration =
+        if config.build_command_origin.runs_before_tests() && !config.build_command.is_empty() {
+            Some(measure_baseline_command(
+                SuiteFailurePhase::Build,
+                config.build_command,
+                config.sandbox_command,
+                root,
+                config.timeout,
+                config.env,
+                config.cancelled,
+            )?)
+        } else {
+            None
+        };
     let test_duration = measure_baseline_command(
         SuiteFailurePhase::Test,
         config.test_command,
@@ -2191,7 +2201,7 @@ pub fn measure_baseline_timing(
 ///
 /// Test selection is intentionally not applied: a narrowed command cannot
 /// establish that the full effective suite is healthy. Each suite runs in a
-/// fresh isolated workspace, with the opt-in build command immediately
+/// fresh isolated workspace, with the enabled build command immediately
 /// preceding its test command.
 pub fn check_baseline_health(
     project_root: &Path,
@@ -2214,9 +2224,7 @@ pub fn check_baseline_health(
             .with_context(|| "could not create baseline health workspace")?;
         let root = workspace.root();
         let timeout = baseline_suite_timeout(&suite, config.default_measurement_timeout);
-        let build_duration = if config.commands.build_command_explicit
-            && !config.commands.build_command.is_empty()
-        {
+        let build_duration = if config.commands.has_build_command() {
             Some(measure_baseline_command(
                 SuiteFailurePhase::Build,
                 &config.commands.build_command,
@@ -3308,7 +3316,7 @@ struct RunShared<'a> {
     project_root: &'a Path,
     commands: &'a CommandConfig,
     build_command: &'a [String],
-    build_command_explicit: bool,
+    build_command_origin: BuildCommandOrigin,
     env: &'a HashMap<String, String>,
     total: usize,
     verbose: bool,
@@ -3469,7 +3477,7 @@ impl PreparedMutationRun {
         let mutation_identity = cache_identity(project_root, mutation);
         let command_ctx = selected_test.cache_context(
             &context.commands.build_command,
-            context.commands.build_command_explicit,
+            context.commands.build_command_origin,
             context.commands.sandbox_command.as_slice(),
             context.env,
         );
@@ -3544,10 +3552,17 @@ impl PreparedMutationRun {
         respect_workspace_ignores: bool,
         origin: DirectRecipeOrigin,
     ) -> RegularDirectRecipe {
+        let build_command = commands
+            .has_build_command()
+            .then(|| sandboxed_command(&commands.sandbox_command, &commands.build_command));
+        let build_command_origin = build_command
+            .as_ref()
+            .map(|_| commands.build_command_origin)
+            .unwrap_or(BuildCommandOrigin::None);
         RegularDirectRecipe {
             test_command: sandboxed_command(&commands.sandbox_command, test_command),
-            build_command: (commands.build_command_explicit && !commands.build_command.is_empty())
-                .then(|| sandboxed_command(&commands.sandbox_command, &commands.build_command)),
+            build_command,
+            build_command_origin,
             timeout_ms: u64::try_from(self.selected_test.timeout.as_millis()).unwrap_or(u64::MAX),
             env: env
                 .iter()
@@ -3760,7 +3775,7 @@ fn run_queued_mutation(
             shared.commands.sandbox_command.as_slice(),
             BuildCommand {
                 argv: shared.build_command,
-                explicit: shared.build_command_explicit,
+                origin: shared.build_command_origin,
             },
             prepared.selected_test.timeout,
             &workspace_root,
@@ -3806,7 +3821,7 @@ fn run_queued_mutation(
                             shared.commands.sandbox_command.as_slice(),
                             BuildCommand {
                                 argv: shared.build_command,
-                                explicit: shared.build_command_explicit,
+                                origin: shared.build_command_origin,
                             },
                             prepared.selected_test.timeout,
                             &workspace_root,
@@ -4158,7 +4173,7 @@ impl TestRunner {
             );
             let command_ctx = selected.cache_context(
                 &self.commands.build_command,
-                self.commands.build_command_explicit,
+                self.commands.build_command_origin,
                 &self.commands.sandbox_command,
                 &self.env,
             );
@@ -4407,7 +4422,7 @@ impl TestRunner {
         let source_contents = SourceContentCache::default();
         let project_root = Arc::new(self.project_root.clone());
         let build_command = Arc::new(self.commands.build_command.clone());
-        let build_command_explicit = self.commands.build_command_explicit;
+        let build_command_origin = self.commands.build_command_origin;
         let queue = Arc::new(Mutex::new(mutations.into_iter().collect::<VecDeque<_>>()));
         let results = Arc::new(Mutex::new(restored));
         let worker_count = workspace_pool.len().min(fresh_total).max(1);
@@ -4472,7 +4487,7 @@ impl TestRunner {
                                     project_root: project_root.as_ref().as_path(),
                                     commands,
                                     build_command: build_command.as_ref().as_slice(),
-                                    build_command_explicit,
+                                    build_command_origin,
                                     env,
                                     total,
                                     verbose,
@@ -5122,7 +5137,7 @@ impl TestRunner {
                 } else {
                     None
                 },
-                build_command: if self.commands.build_command_explicit {
+                build_command: if self.commands.has_build_command() {
                     sandboxed_command(&self.commands.sandbox_command, &self.commands.build_command)
                 } else {
                     vec![]
@@ -5207,7 +5222,7 @@ fn run_schema_workspace_mutation(
         );
     }
 
-    if runner.commands.build_command_explicit && !runner.commands.build_command.is_empty() {
+    if runner.commands.has_build_command() {
         let build = run_command(
             &runner.commands.build_command,
             &runner.commands.sandbox_command,
@@ -5343,7 +5358,7 @@ impl MutationOutcome {
 
 struct BuildCommand<'a> {
     argv: &'a [String],
-    explicit: bool,
+    origin: BuildCommandOrigin,
 }
 
 fn build_error_diagnostic_from_outcome(
@@ -5635,7 +5650,11 @@ pub fn run_replay_mutation(
         &[],
         BuildCommand {
             argv: build_command,
-            explicit: config.build_command.is_some(),
+            origin: if config.build_command.is_some() {
+                BuildCommandOrigin::Configured
+            } else {
+                BuildCommandOrigin::None
+            },
         },
         config.timeout,
         workspace.root(),
@@ -5696,7 +5715,7 @@ pub fn fuzz_apply_and_restore(project_root: &Path, mutation: &Mutation) -> anyho
         &[],
         BuildCommand {
             argv: &[],
-            explicit: false,
+            origin: BuildCommandOrigin::None,
         },
         Duration::from_secs(1),
         project_root,
@@ -5851,8 +5870,8 @@ fn run_single_mutation_with_replay_access(
         );
     }
 
-    // Explicit build check: skip expensive test if mutation doesn't compile.
-    if build_command.explicit && !build_command.argv.is_empty() {
+    // Configured build checks skip expensive tests when the mutation does not compile.
+    if build_command.origin.runs_before_tests() && !build_command.argv.is_empty() {
         let build_outcome = run_command(
             build_command.argv,
             sandbox_command,
@@ -7834,6 +7853,8 @@ mod tests {
                 .expect("regular result should capture a direct replay recipe");
             assert_eq!(recipe.origin, expected_origin);
             assert_eq!(recipe.test_command, successful_command());
+            assert_eq!(recipe.build_command, None);
+            assert_eq!(recipe.build_command_origin, BuildCommandOrigin::None);
         }
 
         let (dir, _file, mut mutation) = make_relative_test_setup();
@@ -7864,6 +7885,44 @@ mod tests {
                 .map(|recipe| &recipe.origin),
             Some(&DirectRecipeOrigin::Executed)
         );
+        Ok(())
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn direct_recipe_omits_sandboxed_auto_build_suggestion() -> anyhow::Result<()> {
+        let (dir, _file, mutation) = make_relative_test_setup();
+        let mut commands = test_command_config();
+        commands.command = successful_command();
+        commands.build_command = successful_command();
+        commands.build_command_origin = BuildCommandOrigin::AutoDetected;
+        commands.sandbox_command = vec!["env".into()];
+        let mut expected_command = commands.sandbox_command.clone();
+        expected_command.extend(successful_command());
+        let runner = TestRunner {
+            commands,
+            parallelism: 1,
+            project_root: dir.path().to_path_buf(),
+            verbose: false,
+            show_output: false,
+            max_tested: None,
+            early_stop: EarlyStopConfig::default(),
+            respect_workspace_ignores: true,
+            env: HashMap::new(),
+            incremental_history: false,
+            force_rerun: true,
+            learned_selection: false,
+            cancelled: Arc::new(AtomicBool::new(false)),
+        };
+
+        let outcome = runner.run(vec![mutation.clone()]);
+        let recipe = outcome
+            .replay_recipes
+            .get(&mutation.id)
+            .expect("regular result should capture a direct replay recipe");
+        assert_eq!(recipe.test_command, expected_command);
+        assert_eq!(recipe.build_command, None);
+        assert_eq!(recipe.build_command_origin, BuildCommandOrigin::None);
         Ok(())
     }
 
@@ -7924,7 +7983,7 @@ mod tests {
         let selected = select_test_command(project_root, commands, mutation);
         let command_context = selected.cache_context(
             &commands.build_command,
-            commands.build_command_explicit,
+            commands.build_command_origin,
             &commands.sandbox_command,
             env,
         );
@@ -8280,7 +8339,7 @@ test "$runs" -eq 1
             language_commands: HashMap::new(),
             build_command: vec![],
             sandbox_command: vec![],
-            build_command_explicit: false,
+            build_command_origin: BuildCommandOrigin::None,
             timeout: Duration::from_secs(30),
             language_timeouts: HashMap::new(),
             test_selection: None,
@@ -8469,7 +8528,7 @@ test "$runs" -eq 1
     }
 
     #[test]
-    fn selected_test_command_cache_context_preserves_argv_boundaries() {
+    fn selected_test_command_cache_context_elides_auto_build_suggestions() {
         let selected = SelectedTestCommand {
             argv: vec!["cargo test".into()],
             unnarrowed_argv: None,
@@ -8488,9 +8547,127 @@ test "$runs" -eq 1
         };
 
         assert_ne!(
-            selected.cache_context(&[], false, &[], &HashMap::new()),
-            ambiguous.cache_context(&[], false, &[], &HashMap::new())
+            selected.cache_context(&[], BuildCommandOrigin::None, &[], &HashMap::new()),
+            ambiguous.cache_context(&[], BuildCommandOrigin::None, &[], &HashMap::new())
         );
+
+        let no_build = selected.cache_context(&[], BuildCommandOrigin::None, &[], &HashMap::new());
+        let auto_build = selected.cache_context(
+            &["go".into(), "build".into(), "./...".into()],
+            BuildCommandOrigin::AutoDetected,
+            &[],
+            &HashMap::new(),
+        );
+        let configured_build = selected.cache_context(
+            &["go".into(), "build".into(), "./...".into()],
+            BuildCommandOrigin::Configured,
+            &[],
+            &HashMap::new(),
+        );
+        assert_eq!(no_build, auto_build);
+        assert_ne!(no_build, configured_build);
+        assert_eq!(
+            CacheKey::new(b"source", "mutation", "description", &no_build).test_command_hash,
+            CacheKey::new(b"source", "mutation", "description", &auto_build).test_command_hash
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auto_build_suggestion_reuses_an_exact_cache_verdict() -> anyhow::Result<()> {
+        let (dir, _file, mutation) = make_relative_test_setup();
+        let build_log = dir.path().join("build.log");
+        let test_log = dir.path().join("test.log");
+        let test_command = vec![
+            "sh".into(),
+            "-c".into(),
+            "printf invoked >> \"$1\"; exit 1".into(),
+            "test".into(),
+            test_log.display().to_string(),
+        ];
+        let no_build_commands = CommandConfig {
+            command: test_command.clone(),
+            force_default_command: false,
+            force_default_timeout: false,
+            project_commands: vec![],
+            language_commands: HashMap::new(),
+            build_command: vec![],
+            sandbox_command: vec![],
+            build_command_origin: BuildCommandOrigin::None,
+            timeout: Duration::from_secs(5),
+            language_timeouts: HashMap::new(),
+            test_selection: None,
+        };
+        seed_reused_survivor(
+            dir.path(),
+            &no_build_commands,
+            &mutation,
+            ReuseSource::ExactCache,
+        )?;
+
+        let reused = TestRunner {
+            commands: no_build_commands,
+            parallelism: 1,
+            project_root: dir.path().to_path_buf(),
+            verbose: false,
+            show_output: false,
+            max_tested: None,
+            early_stop: Default::default(),
+            respect_workspace_ignores: true,
+            env: HashMap::new(),
+            incremental_history: false,
+            force_rerun: false,
+            learned_selection: false,
+            cancelled: Arc::new(AtomicBool::new(false)),
+        }
+        .run(vec![mutation.clone()])
+        .report;
+        assert_eq!(
+            reused.execution_for(mutation.id, MutationResult::Survived),
+            MutationExecution::ExactCache
+        );
+        assert!(!test_log.exists(), "the seeded verdict should be reused");
+
+        let auto_build_commands = CommandConfig {
+            command: test_command,
+            force_default_command: false,
+            force_default_timeout: false,
+            project_commands: vec![],
+            language_commands: HashMap::new(),
+            build_command: appending_log_command(&build_log),
+            sandbox_command: vec![],
+            build_command_origin: BuildCommandOrigin::AutoDetected,
+            timeout: Duration::from_secs(5),
+            language_timeouts: HashMap::new(),
+            test_selection: None,
+        };
+        let reused_auto = TestRunner {
+            commands: auto_build_commands,
+            parallelism: 1,
+            project_root: dir.path().to_path_buf(),
+            verbose: false,
+            show_output: false,
+            max_tested: None,
+            early_stop: Default::default(),
+            respect_workspace_ignores: true,
+            env: HashMap::new(),
+            incremental_history: false,
+            force_rerun: false,
+            learned_selection: false,
+            cancelled: Arc::new(AtomicBool::new(false)),
+        }
+        .run(vec![mutation.clone()])
+        .report;
+
+        assert_eq!(reused_auto.results.len(), 1);
+        assert_eq!(reused_auto.results[0].1, MutationResult::Survived);
+        assert_eq!(
+            reused_auto.execution_for(mutation.id, MutationResult::Survived),
+            MutationExecution::ExactCache
+        );
+        assert!(!build_log.exists(), "a detected suggestion must not run");
+        assert!(!test_log.exists(), "the seeded verdict should be reused");
+        Ok(())
     }
 
     #[test]
@@ -8964,7 +9141,7 @@ test "$runs" -eq 1
                 "{};context={:016x}",
                 selected.cache_context(
                     &runner.commands.build_command,
-                    runner.commands.build_command_explicit,
+                    runner.commands.build_command_origin,
                     &runner.commands.sandbox_command,
                     &runner.env,
                 ),
@@ -9144,7 +9321,7 @@ test "$runs" -eq 1
             language_commands: HashMap::new(),
             build_command: vec![],
             sandbox_command: vec![],
-            build_command_explicit: false,
+            build_command_origin: BuildCommandOrigin::None,
             timeout: Duration::from_secs(5),
             language_timeouts: HashMap::new(),
             test_selection: Some(selection.clone()),
@@ -9155,7 +9332,7 @@ test "$runs" -eq 1
             select_test_command_with_history(dir.path(), &command_config, &mutation, None);
         let command_ctx = selected.cache_context(
             &command_config.build_command,
-            false,
+            BuildCommandOrigin::None,
             &command_config.sandbox_command,
             &HashMap::new(),
         );
@@ -9259,7 +9436,7 @@ test "$runs" -eq 1
             language_commands: HashMap::new(),
             build_command: vec![],
             sandbox_command: vec![],
-            build_command_explicit: false,
+            build_command_origin: BuildCommandOrigin::None,
             timeout: Duration::from_secs(5),
             language_timeouts: HashMap::new(),
             test_selection: None,
@@ -9270,7 +9447,7 @@ test "$runs" -eq 1
         let selected = select_test_command(dir.path(), &commands, &cached);
         let context = selected.cache_context(
             &commands.build_command,
-            commands.build_command_explicit,
+            commands.build_command_origin,
             &commands.sandbox_command,
             &env,
         );
@@ -9285,7 +9462,7 @@ test "$runs" -eq 1
         let selected = select_test_command(dir.path(), &commands, &historical);
         let command_context = selected.cache_context(
             &commands.build_command,
-            commands.build_command_explicit,
+            commands.build_command_origin,
             &commands.sandbox_command,
             &env,
         );
@@ -9371,7 +9548,7 @@ test "$runs" -eq 1
             language_commands: HashMap::new(),
             build_command: vec![],
             sandbox_command: vec![],
-            build_command_explicit: false,
+            build_command_origin: BuildCommandOrigin::None,
             timeout: Duration::from_secs(5),
             language_timeouts: HashMap::new(),
             test_selection: None,
@@ -9381,7 +9558,7 @@ test "$runs" -eq 1
         let selected = select_test_command(dir.path(), &command_config, &mutation);
         let command_ctx = selected.cache_context(
             &command_config.build_command,
-            false,
+            BuildCommandOrigin::None,
             &command_config.sandbox_command,
             &HashMap::new(),
         );
@@ -9513,7 +9690,7 @@ test "$runs" -eq 1
             language_commands: HashMap::new(),
             build_command: vec![],
             sandbox_command: vec![],
-            build_command_explicit: false,
+            build_command_origin: BuildCommandOrigin::None,
             timeout: Duration::from_secs(5),
             language_timeouts: HashMap::new(),
             test_selection: None,
@@ -9582,7 +9759,7 @@ test "$runs" -eq 1
             language_commands: HashMap::new(),
             build_command: vec![],
             sandbox_command: vec![],
-            build_command_explicit: false,
+            build_command_origin: BuildCommandOrigin::None,
             timeout: Duration::from_secs(5),
             language_timeouts: HashMap::new(),
             test_selection: None,
@@ -9593,7 +9770,7 @@ test "$runs" -eq 1
             let selected = select_test_command(dir, &commands, mutation);
             let command_ctx = selected.cache_context(
                 &commands.build_command,
-                false,
+                BuildCommandOrigin::None,
                 &commands.sandbox_command,
                 &HashMap::new(),
             );
@@ -9620,7 +9797,7 @@ test "$runs" -eq 1
                 language_commands: HashMap::new(),
                 build_command: vec![],
                 sandbox_command: vec![],
-                build_command_explicit: false,
+                build_command_origin: BuildCommandOrigin::None,
                 timeout: Duration::from_secs(5),
                 language_timeouts: HashMap::new(),
                 test_selection: None,
@@ -10219,7 +10396,7 @@ test "$runs" -eq 1
                 test_command: &command,
                 build_command: &command,
                 sandbox_command: &[],
-                build_command_explicit: true,
+                build_command_origin: BuildCommandOrigin::Configured,
                 timeout: Duration::from_secs(5),
                 env: &HashMap::new(),
                 cancelled: &AtomicBool::new(false),
@@ -10295,7 +10472,7 @@ test "$runs" -eq 1
             timeout: None,
         });
         commands.build_command = build_command;
-        commands.build_command_explicit = true;
+        commands.build_command_origin = BuildCommandOrigin::Configured;
 
         let mut env = HashMap::new();
         env.insert(
@@ -10560,7 +10737,7 @@ test "$runs" -eq 1
             &[],
             BuildCommand {
                 argv: &[],
-                explicit: false,
+                origin: BuildCommandOrigin::None,
             },
             Duration::from_secs(5),
             dir.path(),
@@ -10583,7 +10760,7 @@ test "$runs" -eq 1
             &[],
             BuildCommand {
                 argv: &[],
-                explicit: false,
+                origin: BuildCommandOrigin::None,
             },
             Duration::from_secs(5),
             dir.path(),
@@ -10648,7 +10825,7 @@ test "$runs" -eq 1
                     &[],
                     BuildCommand {
                         argv: &[],
-                        explicit: false,
+                        origin: BuildCommandOrigin::None,
                     },
                     Duration::from_secs(5),
                     &project,
@@ -10683,7 +10860,7 @@ test "$runs" -eq 1
                     &[],
                     BuildCommand {
                         argv: &[],
-                        explicit: false,
+                        origin: BuildCommandOrigin::None,
                     },
                     Duration::from_secs(5),
                     &project,
@@ -10723,7 +10900,7 @@ test "$runs" -eq 1
             &[],
             BuildCommand {
                 argv: &[],
-                explicit: false,
+                origin: BuildCommandOrigin::None,
             },
             Duration::from_secs(5),
             dir.path(),
@@ -10747,7 +10924,7 @@ test "$runs" -eq 1
             &[],
             BuildCommand {
                 argv: &[],
-                explicit: false,
+                origin: BuildCommandOrigin::None,
             },
             Duration::from_secs(5),
             dir.path(),
@@ -10771,7 +10948,7 @@ test "$runs" -eq 1
             &[],
             BuildCommand {
                 argv: &[],
-                explicit: false,
+                origin: BuildCommandOrigin::None,
             },
             Duration::from_millis(100),
             dir.path(),
@@ -10820,7 +10997,7 @@ test "$runs" -eq 1
                     "-c".to_string(),
                     "echo compile nope >&2; exit 1".to_string(),
                 ],
-                explicit: true,
+                origin: BuildCommandOrigin::Configured,
             },
             Duration::from_secs(5),
             dir.path(),
@@ -10851,7 +11028,7 @@ test "$runs" -eq 1
             &[],
             BuildCommand {
                 argv: &["true".to_string()], // build succeeds
-                explicit: true,
+                origin: BuildCommandOrigin::Configured,
             },
             Duration::from_secs(5),
             dir.path(),
@@ -10866,7 +11043,7 @@ test "$runs" -eq 1
 
     #[cfg(unix)]
     #[test]
-    fn non_explicit_build_command_does_not_pre_filter() {
+    fn auto_detected_build_command_does_not_pre_filter() {
         let (dir, _file, mutation) = make_test_setup();
 
         let build_marker = dir.path().join("build_ran.marker");
@@ -10876,7 +11053,7 @@ test "$runs" -eq 1
             &[
                 "sh".to_string(),
                 "-c".to_string(),
-                format!("touch {}", test_marker.display()),
+                format!("touch {}; exit 1", test_marker.display()),
             ],
             &[],
             BuildCommand {
@@ -10885,7 +11062,7 @@ test "$runs" -eq 1
                     "-c".to_string(),
                     format!("touch {}; exit 1", build_marker.display()),
                 ],
-                explicit: false,
+                origin: BuildCommandOrigin::AutoDetected,
             },
             Duration::from_secs(5),
             dir.path(),
@@ -10895,12 +11072,380 @@ test "$runs" -eq 1
             &AtomicBool::new(false),
         );
 
-        assert_eq!(outcome.result, MutationResult::Survived);
+        assert_eq!(outcome.result, MutationResult::Killed);
         assert!(
             !build_marker.exists(),
-            "non-explicit build command should not run"
+            "auto-detected build suggestion must not run"
         );
-        assert!(test_marker.exists(), "test command should still run");
+        assert!(test_marker.exists(), "test command should run directly");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn configured_go_build_separates_compile_errors_from_test_kills() {
+        if std::process::Command::new("go")
+            .arg("version")
+            .output()
+            .is_err()
+        {
+            eprintln!("skipping Go build classification test because go is unavailable");
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("go.mod"), "module example.com/calculator\n").unwrap();
+        let source = "package calculator\n\nfunc Value() int { return 1 }\n";
+        let file = dir.path().join("calculator.go");
+        std::fs::write(&file, source).unwrap();
+        for (path, content) in [
+            ("one/shared/shared.go", "package shared\nfunc One() {}\n"),
+            ("two/shared/shared.go", "package shared\nfunc Two() {}\n"),
+        ] {
+            let path = dir.path().join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, content).unwrap();
+        }
+        let test_only_source = r#"package main
+
+import (
+    "fmt"
+    "os"
+    "testing"
+)
+
+func mark() {
+    if marker := os.Getenv("TOGI_GO_TEST_MARKER"); marker != "" {
+        _ = os.WriteFile(marker, []byte("ran"), 0o600)
+    }
+}
+
+func init() {
+    mark()
+}
+
+func TestMain(m *testing.M) {
+    mark()
+    os.Exit(m.Run())
+}
+
+func TestVetOnly(t *testing.T) {
+    fmt.Printf("%d", "not-an-int")
+}
+"#;
+        let test_only_file = dir.path().join("testonly/main_test.go");
+        std::fs::create_dir_all(test_only_file.parent().unwrap()).unwrap();
+        std::fs::write(&test_only_file, test_only_source).unwrap();
+
+        let offset = source.rfind('1').unwrap();
+        let mutation = |id: u32, replacement: &str| Mutation {
+            id,
+            file: PathBuf::from("calculator.go"),
+            language: "Go".into(),
+            line: 3,
+            column: offset + 1,
+            operator: "binary".into(),
+            description: format!("replace 1 with {replacement}"),
+            original: "1".into(),
+            replacement: replacement.into(),
+            byte_range: offset..offset + 1,
+        };
+        let mut config = crate::config::Config::default();
+        assert_eq!(
+            config.resolve_build_command(dir.path()),
+            BuildCommandOrigin::AutoDetected
+        );
+        assert_eq!(
+            config.test.build_command,
+            crate::config::AUTO_GO_COMPILE_COMMAND
+                .iter()
+                .map(|argument| (*argument).to_string())
+                .collect::<Vec<_>>()
+        );
+        let build_command = config.test.build_command.clone();
+        config.test.set_build_command(build_command);
+        let origin = config.test.build_command_origin;
+        assert_eq!(origin, BuildCommandOrigin::Configured);
+
+        let test_marker = dir.path().join("test_ran.marker");
+        let go_runtime_marker = dir.path().join("go_runtime.marker");
+        let failing_test = vec![
+            "sh".into(),
+            "-c".into(),
+            format!("touch {}; exit 1", test_marker.display()),
+        ];
+        let mut env = HashMap::new();
+        env.insert(
+            "TOGI_GO_TEST_MARKER".into(),
+            go_runtime_marker.display().to_string(),
+        );
+
+        let invalid = mutation(1, "+");
+        let invalid_outcome = run_single_mutation(
+            &failing_test,
+            &[],
+            BuildCommand {
+                argv: &config.test.build_command,
+                origin,
+            },
+            Duration::from_secs(30),
+            dir.path(),
+            ResolvedMutation::new(dir.path(), &invalid),
+            false,
+            &env,
+            &AtomicBool::new(false),
+        );
+        assert_eq!(invalid_outcome.result, MutationResult::BuildError);
+        assert_eq!(
+            invalid_outcome
+                .build_error_detail
+                .as_ref()
+                .map(|detail| detail.phase.as_str()),
+            Some("build_command")
+        );
+        assert!(
+            !test_marker.exists(),
+            "the test command must not be credited for a source-invalid mutant"
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), source);
+
+        let test_literal = "\"not-an-int\"";
+        let test_offset = test_only_source.find(test_literal).unwrap();
+        let invalid_test = Mutation {
+            id: 2,
+            file: PathBuf::from("testonly/main_test.go"),
+            language: "Go".into(),
+            line: 24,
+            column: test_offset + 1,
+            operator: "string".into(),
+            description: "break test-only source".into(),
+            original: test_literal.into(),
+            replacement: "\"".into(),
+            byte_range: test_offset..test_offset + test_literal.len(),
+        };
+        let invalid_test_outcome = run_single_mutation(
+            &failing_test,
+            &[],
+            BuildCommand {
+                argv: &config.test.build_command,
+                origin,
+            },
+            Duration::from_secs(30),
+            dir.path(),
+            ResolvedMutation::new(dir.path(), &invalid_test),
+            false,
+            &env,
+            &AtomicBool::new(false),
+        );
+        assert_eq!(invalid_test_outcome.result, MutationResult::BuildError);
+        assert!(
+            !test_marker.exists(),
+            "the test command must not be credited for a test-invalid mutant"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&test_only_file).unwrap(),
+            test_only_source
+        );
+
+        let valid = mutation(3, "2");
+        let valid_outcome = run_single_mutation(
+            &failing_test,
+            &[],
+            BuildCommand {
+                argv: &config.test.build_command,
+                origin,
+            },
+            Duration::from_secs(30),
+            dir.path(),
+            ResolvedMutation::new(dir.path(), &valid),
+            false,
+            &env,
+            &AtomicBool::new(false),
+        );
+        assert_eq!(valid_outcome.result, MutationResult::Killed);
+        assert!(
+            test_marker.exists(),
+            "a compilable mutant must reach the test command"
+        );
+        assert!(
+            !go_runtime_marker.exists(),
+            "the compile check must not execute init or TestMain"
+        );
+        assert!(
+            dir.path().read_dir().unwrap().all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".test")),
+            "the compile check must not leave Go test binaries in the workspace"
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), source);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn configured_dotnet_build_restores_ignored_assets_in_isolated_workspaces() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let source = "class Calculator { static bool Value() => true; }\n";
+        std::fs::write(
+            dir.path().join("Calculator.csproj"),
+            "<Project Sdk=\"Microsoft.NET.Sdk\" />\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("Calculator.cs"), source).unwrap();
+        std::fs::write(dir.path().join(".gitignore"), "obj/\n").unwrap();
+        let source_assets = dir.path().join("obj/project.assets.json");
+        std::fs::create_dir_all(source_assets.parent().unwrap()).unwrap();
+        std::fs::write(&source_assets, "source-assets").unwrap();
+
+        let bin = dir.path().join("fake-dotnet-bin");
+        std::fs::create_dir(&bin).unwrap();
+        let fake_dotnet = bin.join("dotnet");
+        std::fs::write(
+            &fake_dotnet,
+            r#"#!/bin/sh
+case "$1" in
+  build)
+    case " $* " in
+      *" --no-restore "*) exit 31 ;;
+    esac
+    if [ -e obj/project.assets.json ]; then
+      printf 'cached\n' >> "$TOGI_DOTNET_LOG"
+    else
+      printf 'restored\n' >> "$TOGI_DOTNET_LOG"
+      mkdir -p obj
+      : > obj/project.assets.json
+    fi
+    ;;
+  test)
+    test -f obj/project.assets.json || exit 32
+    if grep -q 'false' Calculator.cs; then
+      exit 1
+    fi
+    ;;
+  *) exit 33 ;;
+esac
+"#,
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&fake_dotnet).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake_dotnet, permissions).unwrap();
+
+        if !git_available() {
+            eprintln!("skipping dotnet isolated workspace test because git is unavailable");
+            return;
+        }
+        init_clean_git_fixture(dir.path());
+
+        let mut config = crate::config::Config::default();
+        assert_eq!(
+            config.resolve_build_command(dir.path()),
+            BuildCommandOrigin::AutoDetected
+        );
+        assert_eq!(
+            config.test.build_command,
+            vec!["dotnet", "build", "Calculator.csproj"]
+        );
+        let build_command = config.test.build_command.clone();
+        config.test.set_build_command(build_command);
+        let origin = config.test.build_command_origin;
+        assert_eq!(origin, BuildCommandOrigin::Configured);
+        assert_eq!(
+            crate::config::detect_test_command(dir.path()),
+            vec!["dotnet", "test", "Calculator.csproj"]
+        );
+
+        let mut env = HashMap::new();
+        env.insert(
+            "PATH".into(),
+            format!(
+                "{}:{}",
+                bin.display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        );
+        let log = dir.path().join("dotnet.log");
+        env.insert("TOGI_DOTNET_LOG".into(), log.display().to_string());
+        let commands = CommandConfig {
+            command: vec!["dotnet".into(), "test".into()],
+            force_default_command: false,
+            force_default_timeout: false,
+            project_commands: vec![],
+            language_commands: HashMap::new(),
+            build_command: config.test.build_command,
+            sandbox_command: vec![],
+            build_command_origin: origin,
+            timeout: Duration::from_secs(5),
+            language_timeouts: HashMap::new(),
+            test_selection: None,
+        };
+
+        let baseline_cancelled = AtomicBool::new(false);
+        let timing = measure_baseline_timing(
+            dir.path(),
+            BaselineTimingConfig {
+                test_command: &commands.command,
+                build_command: &commands.build_command,
+                sandbox_command: &commands.sandbox_command,
+                build_command_origin: commands.build_command_origin,
+                timeout: commands.timeout,
+                env: &env,
+                cancelled: &baseline_cancelled,
+                respect_workspace_ignores: true,
+            },
+        )
+        .unwrap();
+        assert!(timing.build_duration.is_some());
+
+        let offset = source.find("true").unwrap();
+        let mutation = Mutation {
+            id: 0,
+            file: PathBuf::from("Calculator.cs"),
+            language: "c_sharp".into(),
+            line: 1,
+            column: offset + 1,
+            operator: "boolean".into(),
+            description: "replace true with false".into(),
+            original: "true".into(),
+            replacement: "false".into(),
+            byte_range: offset..offset + "true".len(),
+        };
+        let report = TestRunner {
+            commands,
+            parallelism: 1,
+            project_root: dir.path().to_path_buf(),
+            verbose: false,
+            show_output: false,
+            max_tested: None,
+            early_stop: Default::default(),
+            respect_workspace_ignores: true,
+            env,
+            incremental_history: false,
+            force_rerun: true,
+            learned_selection: false,
+            cancelled: Arc::new(AtomicBool::new(false)),
+        }
+        .run(vec![mutation.clone()])
+        .report;
+
+        assert_eq!(report.results.len(), 1);
+        assert_eq!(report.results[0].0.id, mutation.id);
+        assert_eq!(report.results[0].1, MutationResult::Killed);
+        assert_eq!(report.build_errors, 0);
+        assert_eq!(
+            std::fs::read_to_string(log)
+                .unwrap()
+                .lines()
+                .collect::<Vec<_>>(),
+            ["restored", "restored"],
+            "both isolated baseline and mutation workspaces must restore ignored assets"
+        );
+        assert_eq!(
+            std::fs::read_to_string(source_assets).unwrap(),
+            "source-assets"
+        );
     }
 
     #[test]
@@ -10917,7 +11462,7 @@ test "$runs" -eq 1
             &[],
             BuildCommand {
                 argv: &[],
-                explicit: false,
+                origin: BuildCommandOrigin::None,
             },
             Duration::from_secs(5),
             dir.path(),
@@ -10940,7 +11485,7 @@ test "$runs" -eq 1
             &[],
             BuildCommand {
                 argv: &[],
-                explicit: false,
+                origin: BuildCommandOrigin::None,
             },
             Duration::from_secs(5),
             dir.path(),
@@ -11180,7 +11725,7 @@ sleep 10"#
                 language_commands: HashMap::new(),
                 build_command: vec![],
                 sandbox_command: vec![],
-                build_command_explicit: false,
+                build_command_origin: BuildCommandOrigin::None,
                 timeout: Duration::from_secs(30),
                 language_timeouts: HashMap::new(),
                 test_selection: None,
@@ -11246,7 +11791,7 @@ sleep 10"#
                 language_commands: HashMap::new(),
                 build_command: vec![],
                 sandbox_command: vec![],
-                build_command_explicit: false,
+                build_command_origin: BuildCommandOrigin::None,
                 timeout: Duration::from_secs(5),
                 language_timeouts: HashMap::new(),
                 test_selection: None,
@@ -11317,7 +11862,7 @@ int main(void) {
                 language_commands: HashMap::new(),
                 build_command: vec!["cc".into(), "calc.c".into(), "-o".into(), "calc".into()],
                 sandbox_command: vec![],
-                build_command_explicit: true,
+                build_command_origin: BuildCommandOrigin::Configured,
                 timeout: Duration::from_secs(30),
                 language_timeouts: HashMap::new(),
                 test_selection: None,
@@ -11388,7 +11933,7 @@ int main() {
                     "calc".into(),
                 ],
                 sandbox_command: vec![],
-                build_command_explicit: true,
+                build_command_origin: BuildCommandOrigin::Configured,
                 timeout: Duration::from_secs(30),
                 language_timeouts: HashMap::new(),
                 test_selection: None,
@@ -11446,7 +11991,7 @@ esac
                 language_commands: HashMap::new(),
                 build_command: vec![],
                 sandbox_command: vec![],
-                build_command_explicit: false,
+                build_command_origin: BuildCommandOrigin::None,
                 timeout: Duration::from_secs(5),
                 language_timeouts: HashMap::new(),
                 test_selection: None,
@@ -11499,7 +12044,7 @@ esac
                 language_commands: HashMap::new(),
                 build_command: vec!["sh".into(), "-c".into(), "sleep 1".into()],
                 sandbox_command: vec![],
-                build_command_explicit: true,
+                build_command_origin: BuildCommandOrigin::Configured,
                 timeout: Duration::from_millis(50),
                 language_timeouts: HashMap::new(),
                 test_selection: None,
@@ -11561,7 +12106,7 @@ touch side_effect
                 language_commands: HashMap::new(),
                 build_command: vec![],
                 sandbox_command: vec![],
-                build_command_explicit: false,
+                build_command_origin: BuildCommandOrigin::None,
                 timeout: Duration::from_secs(5),
                 language_timeouts: HashMap::new(),
                 test_selection: None,
@@ -11620,7 +12165,7 @@ esac
             language_commands: HashMap::new(),
             build_command: vec![],
             sandbox_command: vec![],
-            build_command_explicit: false,
+            build_command_origin: BuildCommandOrigin::None,
             timeout: Duration::from_secs(5),
             language_timeouts: HashMap::new(),
             test_selection: None,
@@ -11639,7 +12184,7 @@ esac
         };
         let cache_ctx = cache_selected.cache_context(
             &commands.build_command,
-            commands.build_command_explicit,
+            commands.build_command_origin,
             &commands.sandbox_command,
             &cache_env,
         );
@@ -11717,7 +12262,7 @@ esac
             language_commands: HashMap::new(),
             build_command: vec![],
             sandbox_command: vec![],
-            build_command_explicit: false,
+            build_command_origin: BuildCommandOrigin::None,
             timeout: Duration::from_secs(5),
             language_timeouts: HashMap::new(),
             test_selection: None,
@@ -11725,7 +12270,7 @@ esac
         let selected = select_test_command(dir.path(), &commands, &mutation);
         let command_context = selected.cache_context(
             &commands.build_command,
-            commands.build_command_explicit,
+            commands.build_command_origin,
             &commands.sandbox_command,
             &HashMap::new(),
         );
@@ -11826,7 +12371,7 @@ func third(a, b int) bool { return a == b }
                     language_commands: HashMap::new(),
                     build_command: vec![],
                     sandbox_command: vec![],
-                    build_command_explicit: false,
+                    build_command_origin: BuildCommandOrigin::None,
                     timeout: Duration::from_secs(5),
                     language_timeouts: HashMap::new(),
                     test_selection: None,
@@ -11894,7 +12439,7 @@ func third(a, b int) bool { return a == b }
                 language_commands: HashMap::new(),
                 build_command: vec![],
                 sandbox_command: vec![],
-                build_command_explicit: false,
+                build_command_origin: BuildCommandOrigin::None,
                 timeout: Duration::from_secs(5),
                 language_timeouts: HashMap::new(),
                 test_selection: None,
@@ -11998,7 +12543,7 @@ def second(c, d):
             language_commands: HashMap::new(),
             build_command: vec![],
             sandbox_command: vec![],
-            build_command_explicit: false,
+            build_command_origin: BuildCommandOrigin::None,
             timeout: Duration::from_secs(5),
             language_timeouts: HashMap::new(),
             test_selection: None,
@@ -12010,7 +12555,7 @@ def second(c, d):
             let selected = select_test_command(dir.path(), &commands, mutation);
             let context = selected.cache_context(
                 &commands.build_command,
-                commands.build_command_explicit,
+                commands.build_command_origin,
                 &commands.sandbox_command,
                 &env,
             );
@@ -12031,7 +12576,7 @@ def second(c, d):
         let selected = select_test_command(dir.path(), &commands, &python_history);
         let command_context = selected.cache_context(
             &commands.build_command,
-            commands.build_command_explicit,
+            commands.build_command_origin,
             &commands.sandbox_command,
             &env,
         );
@@ -12124,7 +12669,7 @@ func second(c, d int) bool { return c == d }
             language_commands: HashMap::new(),
             build_command: vec!["sh".into(), "-c".into(), build.into()],
             sandbox_command: vec![],
-            build_command_explicit: true,
+            build_command_origin: BuildCommandOrigin::Configured,
             timeout: Duration::from_secs(5),
             language_timeouts: HashMap::new(),
             test_selection: None,
@@ -12185,7 +12730,7 @@ func second(c, d int) bool { return c == d }
             language_commands: HashMap::new(),
             build_command: vec!["sh".into(), "-c".into(), build.into()],
             sandbox_command: vec![],
-            build_command_explicit: true,
+            build_command_origin: BuildCommandOrigin::Configured,
             timeout: Duration::from_secs(5),
             language_timeouts: HashMap::new(),
             test_selection: None,
@@ -12268,7 +12813,7 @@ class Calc {
                 language_commands: HashMap::new(),
                 build_command: vec!["javac".into(), "Calc.java".into()],
                 sandbox_command: vec![],
-                build_command_explicit: true,
+                build_command_origin: BuildCommandOrigin::Configured,
                 timeout: Duration::from_secs(30),
                 language_timeouts: HashMap::new(),
                 test_selection: None,
@@ -12328,7 +12873,7 @@ mod tests {
                 language_commands: HashMap::new(),
                 build_command: vec![],
                 sandbox_command: vec![],
-                build_command_explicit: false,
+                build_command_origin: BuildCommandOrigin::None,
                 timeout: Duration::from_secs(60),
                 language_timeouts: HashMap::new(),
                 test_selection: None,
@@ -12421,7 +12966,7 @@ mod tests {
                 language_commands: HashMap::new(),
                 build_command: vec![],
                 sandbox_command: vec![],
-                build_command_explicit: false,
+                build_command_origin: BuildCommandOrigin::None,
                 timeout: Duration::from_secs(5),
                 language_timeouts: HashMap::new(),
                 test_selection: None,
@@ -12467,7 +13012,7 @@ mod tests {
                 language_commands: HashMap::new(),
                 build_command: vec![],
                 sandbox_command: vec![],
-                build_command_explicit: false,
+                build_command_origin: BuildCommandOrigin::None,
                 timeout: Duration::from_secs(5),
                 language_timeouts: HashMap::new(),
                 test_selection: None,
@@ -12525,7 +13070,7 @@ mod tests {
                 language_commands: HashMap::new(),
                 build_command: vec![],
                 sandbox_command: vec![],
-                build_command_explicit: false,
+                build_command_origin: BuildCommandOrigin::None,
                 timeout: Duration::from_secs(5),
                 language_timeouts: HashMap::new(),
                 test_selection: None,
@@ -12600,7 +13145,7 @@ mod tests {
                     language_commands: HashMap::new(),
                     build_command: vec![],
                     sandbox_command: vec![],
-                    build_command_explicit: false,
+                    build_command_origin: BuildCommandOrigin::None,
                     timeout: Duration::from_secs(5),
                     language_timeouts: HashMap::new(),
                     test_selection: None,
@@ -12668,7 +13213,7 @@ mod tests {
                 language_commands: HashMap::new(),
                 build_command: vec![],
                 sandbox_command: vec![],
-                build_command_explicit: false,
+                build_command_origin: BuildCommandOrigin::None,
                 timeout: Duration::from_secs(5),
                 language_timeouts: HashMap::new(),
                 test_selection: None,
@@ -12764,7 +13309,7 @@ sleep 0.2
                 language_commands: HashMap::new(),
                 build_command: vec![],
                 sandbox_command: vec![],
-                build_command_explicit: false,
+                build_command_origin: BuildCommandOrigin::None,
                 timeout: Duration::from_secs(5),
                 language_timeouts: HashMap::new(),
                 test_selection: None,
@@ -12840,7 +13385,7 @@ sleep 0.2
                 language_commands: HashMap::new(),
                 build_command: vec![],
                 sandbox_command: vec![],
-                build_command_explicit: false,
+                build_command_origin: BuildCommandOrigin::None,
                 timeout: Duration::from_secs(5),
                 language_timeouts: HashMap::new(),
                 test_selection: None,
@@ -12907,7 +13452,7 @@ rmdir "$lock"
                 language_commands: HashMap::new(),
                 build_command: vec![],
                 sandbox_command: vec![],
-                build_command_explicit: false,
+                build_command_origin: BuildCommandOrigin::None,
                 timeout: Duration::from_secs(5),
                 language_timeouts: HashMap::new(),
                 test_selection: None,
@@ -12916,7 +13461,7 @@ rmdir "$lock"
             let selected = select_test_command(dir.path(), &commands, &cached_mutation);
             let cache_ctx = selected.cache_context(
                 &commands.build_command,
-                commands.build_command_explicit,
+                commands.build_command_origin,
                 &commands.sandbox_command,
                 &env,
             );
@@ -13016,7 +13561,7 @@ rmdir "$lock"
                 language_commands: HashMap::new(),
                 build_command: vec![],
                 sandbox_command: vec![],
-                build_command_explicit: false,
+                build_command_origin: BuildCommandOrigin::None,
                 timeout: Duration::from_secs(5),
                 language_timeouts: HashMap::new(),
                 test_selection: None,
@@ -13102,7 +13647,7 @@ rmdir "$lock"
                     "grep -q build_error *.txt && exit 1; exit 0".into(),
                 ],
                 sandbox_command: vec![],
-                build_command_explicit: true,
+                build_command_origin: BuildCommandOrigin::Configured,
                 timeout: Duration::from_secs(5),
                 language_timeouts: HashMap::new(),
                 test_selection: None,
@@ -13176,7 +13721,7 @@ rmdir "$lock"
                 language_commands: HashMap::new(),
                 build_command: vec![],
                 sandbox_command: vec![],
-                build_command_explicit: false,
+                build_command_origin: BuildCommandOrigin::None,
                 timeout: Duration::from_secs(5),
                 language_timeouts: HashMap::new(),
                 test_selection: None,
@@ -13244,7 +13789,7 @@ rmdir "$lock"
                 language_commands: lang_cmds,
                 build_command: vec![],
                 sandbox_command: vec![],
-                build_command_explicit: false,
+                build_command_origin: BuildCommandOrigin::None,
                 timeout: Duration::from_secs(5),
                 language_timeouts: HashMap::new(),
                 test_selection: None,
@@ -13292,7 +13837,7 @@ rmdir "$lock"
                 language_commands: lang_cmds,
                 build_command: vec![],
                 sandbox_command: vec![],
-                build_command_explicit: false,
+                build_command_origin: BuildCommandOrigin::None,
                 timeout: Duration::from_secs(5),
                 language_timeouts: HashMap::new(),
                 test_selection: None,
@@ -13365,7 +13910,7 @@ while [ "$(find "{barrier}" -type f | wc -l)" -lt 4 ]; do sleep 0.1; done"#,
                 language_commands: HashMap::new(),
                 build_command: vec![],
                 sandbox_command: vec![],
-                build_command_explicit: false,
+                build_command_origin: BuildCommandOrigin::None,
                 timeout: Duration::from_secs(5),
                 language_timeouts: HashMap::new(),
                 test_selection: None,
@@ -13446,7 +13991,7 @@ exit 1"#
                 language_commands: HashMap::new(),
                 build_command: vec![],
                 sandbox_command: vec![],
-                build_command_explicit: false,
+                build_command_origin: BuildCommandOrigin::None,
                 timeout: Duration::from_secs(5),
                 language_timeouts: HashMap::new(),
                 test_selection: None,
@@ -13503,7 +14048,7 @@ exit 1"#
                 language_commands: HashMap::new(),
                 build_command: vec![],
                 sandbox_command: vec![],
-                build_command_explicit: false,
+                build_command_origin: BuildCommandOrigin::None,
                 timeout: Duration::from_secs(5),
                 language_timeouts: HashMap::new(),
                 test_selection: None,
@@ -13560,7 +14105,7 @@ exit 1"#
                 language_commands: HashMap::new(),
                 build_command: vec![],
                 sandbox_command: vec![],
-                build_command_explicit: false,
+                build_command_origin: BuildCommandOrigin::None,
                 timeout: Duration::from_secs(5),
                 language_timeouts,
                 test_selection: None,

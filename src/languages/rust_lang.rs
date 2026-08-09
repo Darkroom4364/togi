@@ -56,9 +56,12 @@ impl LanguageSupport for Rust {
         &self,
         candidate: &crate::MutationCandidate,
         node: &tree_sitter::Node,
-        _source: &[u8],
+        source: &[u8],
     ) -> bool {
         match candidate.operator_id.as_str() {
+            "remove_if_body" | "remove_else" => {
+                rust_if_removal_is_type_unsafe(candidate.operator_id.as_str(), node, source)
+            }
             "return_empty" => crate::languages::should_skip_return_empty_for_type(node, false),
             "string_to_empty" => {
                 crate::languages::should_skip_string_to_empty_in_compiled_context(node)
@@ -66,6 +69,79 @@ impl LanguageSupport for Rust {
             _ => false,
         }
     }
+}
+
+/// Removing an if branch changes its type independently of whether the
+/// enclosing if result is ignored. Retain candidates only when syntax proves
+/// the replacement is unit-compatible with its untouched branch; without an
+/// alternative, replacing the consequence with `{}` is itself unit.
+fn rust_if_removal_is_type_unsafe(operator: &str, node: &tree_sitter::Node, source: &[u8]) -> bool {
+    if node.kind() != "if_expression" {
+        return true;
+    }
+    let Some(consequence) = node.child_by_field_name("consequence") else {
+        return true;
+    };
+    match operator {
+        "remove_if_body" => node
+            .child_by_field_name("alternative")
+            .is_some_and(|alternative| !is_provably_unit_branch(&alternative, source)),
+        "remove_else" => !is_provably_unit_branch(&consequence, source),
+        _ => false,
+    }
+}
+
+/// Return whether syntax proves that this branch evaluates to `()`.
+fn is_provably_unit_branch(node: &tree_sitter::Node, source: &[u8]) -> bool {
+    match node.kind() {
+        "unit_expression" => true,
+        "block" => {
+            let mut cursor = node.walk();
+            match node.named_children(&mut cursor).last() {
+                None => true,
+                Some(last) => {
+                    last.kind() == "unit_expression"
+                        || source_ends_with_semicolon(&last, source)
+                        || unsemicolonated_tail_if_is_provably_unit(&last, source)
+                }
+            }
+        }
+        "else_clause" => {
+            let mut cursor = node.walk();
+            node.named_children(&mut cursor)
+                .next()
+                .is_some_and(|branch| is_provably_unit_branch(&branch, source))
+        }
+        "if_expression" => {
+            let Some(consequence) = node.child_by_field_name("consequence") else {
+                return false;
+            };
+            is_provably_unit_branch(&consequence, source)
+                && node
+                    .child_by_field_name("alternative")
+                    .is_none_or(|alternative| is_provably_unit_branch(&alternative, source))
+        }
+        _ => false,
+    }
+}
+
+/// Reuse the if proof after the enclosing block rules out a trailing semicolon.
+fn unsemicolonated_tail_if_is_provably_unit(node: &tree_sitter::Node, source: &[u8]) -> bool {
+    if node.kind() != "expression_statement" {
+        return false;
+    }
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor).next().is_some_and(|tail| {
+        tail.kind() == "if_expression" && is_provably_unit_branch(&tail, source)
+    })
+}
+
+/// A semicolon discards a statement value, making the containing block unit.
+fn source_ends_with_semicolon(node: &tree_sitter::Node, source: &[u8]) -> bool {
+    source
+        .get(node.byte_range())
+        .and_then(|text| text.iter().rev().find(|&&byte| !byte.is_ascii_whitespace()))
+        == Some(&b';')
 }
 
 /// Check if a node has a preceding sibling `attribute_item` matching a predicate.
