@@ -334,12 +334,21 @@ pub fn replay_mutation(
     let project_root = current_project_root()?;
     validate_project_and_source(&project_root, &validated)?;
 
+    let mut build_command = validated.recipe.build_command.clone();
+    if let Some(command) = &mut build_command {
+        normalize_auto_go_compile_output(command, crate::config::AUTO_GO_COMPILE_OUTPUT);
+    }
+    let build_command_json = build_command
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()?;
+
     let fresh = crate::runner::run_replay_mutation(
         &project_root,
         &validated.mutation,
         crate::runner::ReplayRunConfig {
             test_command: validated.recipe.test_command.clone(),
-            build_command: validated.recipe.build_command.clone(),
+            build_command,
             timeout: Duration::from_millis(validated.recipe.timeout_ms),
             env: validated
                 .recipe
@@ -371,11 +380,8 @@ pub fn replay_mutation(
         "Effective command: {}",
         serde_json::to_string(&validated.recipe.test_command)?
     );
-    if let Some(build_command) = &validated.recipe.build_command {
-        println!(
-            "Effective build command: {}",
-            serde_json::to_string(build_command)?
-        );
+    if let Some(build_command) = build_command_json {
+        println!("Effective build command: {build_command}");
     }
     if show_output {
         if let Some(output) = fresh
@@ -699,6 +705,26 @@ fn is_valid_env_key(key: &str) -> bool {
         && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
 }
 
+/// Normalize only the exact auto-detected Go compile command for replay.
+///
+/// Replay recipes retain their serialized command unchanged; this operates on
+/// the execution copy after validation, so cache identity remains host-specific.
+fn normalize_auto_go_compile_output(command: &mut [String], target_null_device: &str) {
+    const OUTPUT_INDEX: usize = 5;
+    let is_auto_go_compile = command.len() == 7
+        && command[0] == "go"
+        && command[1] == "test"
+        && command[2] == "-c"
+        && command[3] == "-vet=off"
+        && command[4] == "-o"
+        && (command[OUTPUT_INDEX] == crate::config::AUTO_GO_COMPILE_UNIX_OUTPUT
+            || command[OUTPUT_INDEX] == crate::config::AUTO_GO_COMPILE_WINDOWS_OUTPUT)
+        && command[6] == "./...";
+    if is_auto_go_compile && command[OUTPUT_INDEX] != target_null_device {
+        command[OUTPUT_INDEX] = target_null_device.to_owned();
+    }
+}
+
 fn result_name(result: MutationResult) -> &'static str {
     match result {
         MutationResult::Killed => "killed",
@@ -855,5 +881,43 @@ mod tests {
     fn command_validation_rejects_empty_commands() {
         assert!(validate_command(&[], "test").is_err());
         assert!(validate_command(&[String::new()], "test").is_err());
+    }
+
+    fn auto_go_compile_command(output: &str) -> Vec<String> {
+        vec![
+            "go".into(),
+            "test".into(),
+            "-c".into(),
+            "-vet=off".into(),
+            "-o".into(),
+            output.into(),
+            "./...".into(),
+        ]
+    }
+
+    #[test]
+    fn normalizes_auto_go_compile_output_for_either_host() {
+        let mut unix_recipe = auto_go_compile_command("/dev/null");
+        normalize_auto_go_compile_output(&mut unix_recipe, "NUL");
+        assert_eq!(unix_recipe, auto_go_compile_command("NUL"));
+
+        let mut windows_recipe = auto_go_compile_command("NUL");
+        normalize_auto_go_compile_output(&mut windows_recipe, "/dev/null");
+        assert_eq!(windows_recipe, auto_go_compile_command("/dev/null"));
+
+        let mut same_host_recipe = auto_go_compile_command("/dev/null");
+        normalize_auto_go_compile_output(&mut same_host_recipe, "/dev/null");
+        assert_eq!(same_host_recipe, auto_go_compile_command("/dev/null"));
+    }
+
+    #[test]
+    fn auto_go_compile_normalization_leaves_other_commands_unchanged() {
+        let mut configured = auto_go_compile_command("/dev/null");
+        configured.push("-tags=ci".into());
+        let original = configured.clone();
+
+        normalize_auto_go_compile_output(&mut configured, "NUL");
+
+        assert_eq!(configured, original);
     }
 }

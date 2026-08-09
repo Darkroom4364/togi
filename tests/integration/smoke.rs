@@ -71,7 +71,7 @@ fn run_fixture(case: FixtureCase) -> togi::MutationReport {
             language_commands: HashMap::new(),
             build_command: vec![],
             sandbox_command: vec![],
-            build_command_explicit: false,
+            build_command_origin: togi::config::BuildCommandOrigin::None,
             timeout: Duration::from_secs(30),
             language_timeouts: HashMap::new(),
             test_selection: None,

@@ -24,7 +24,6 @@ struct ExecuteOptions {
 struct ResolvedCheckConfig {
     config: togi::config::Config,
     fail_fast: bool,
-    has_explicit_build_cmd: bool,
     has_custom_test_cmd: bool,
     has_cli_timeout: bool,
     profile: Option<togi::config::ResourceProfile>,
@@ -336,7 +335,6 @@ fn run_check(cfg: togi::cli::CheckArgs, cancelled: Arc<AtomicBool>) -> anyhow::R
     let ResolvedCheckConfig {
         mut config,
         fail_fast,
-        has_explicit_build_cmd,
         has_custom_test_cmd,
         has_cli_timeout,
         profile,
@@ -358,7 +356,7 @@ fn run_check(cfg: togi::cli::CheckArgs, cancelled: Arc<AtomicBool>) -> anyhow::R
         }
     }
     let _lock = togi::lock::acquire(&project_root)?;
-    config.resolve_build_command(&project_root);
+    let build_command_origin = config.resolve_build_command(&project_root);
     warn_if_resource_oversubscribed(config.test.jobs);
     let profile_env = if has_custom_test_cmd {
         HashMap::new()
@@ -391,7 +389,7 @@ fn run_check(cfg: togi::cli::CheckArgs, cancelled: Arc<AtomicBool>) -> anyhow::R
     )?;
     if changed_files.is_empty() {
         if output_format == togi::cli::OutputFormat::Json {
-            print_empty_json_check_output(&config, has_explicit_build_cmd, dry_run, &project_root)?;
+            print_empty_json_check_output(&config, build_command_origin, dry_run, &project_root)?;
         }
         return Ok(());
     }
@@ -465,7 +463,7 @@ fn run_check(cfg: togi::cli::CheckArgs, cancelled: Arc<AtomicBool>) -> anyhow::R
             eprintln!("  - Changed files are in an unsupported language");
             eprintln!("  - All mutable nodes were filtered out (test files, noisy patterns)");
             eprintln!("  - max_per_run or max_per_file is set to 0 in togi.toml");
-            print_empty_json_check_output(&config, has_explicit_build_cmd, dry_run, &project_root)?;
+            print_empty_json_check_output(&config, build_command_origin, dry_run, &project_root)?;
         } else {
             println!("No mutations generated. Possible causes:");
             println!("  - Changed files are in an unsupported language");
@@ -500,7 +498,7 @@ fn run_check(cfg: togi::cli::CheckArgs, cancelled: Arc<AtomicBool>) -> anyhow::R
         let mut commands = command_config(
             &config,
             &project_root,
-            has_explicit_build_cmd,
+            build_command_origin,
             has_custom_test_cmd,
             has_cli_timeout,
         );
@@ -544,7 +542,7 @@ fn run_check(cfg: togi::cli::CheckArgs, cancelled: Arc<AtomicBool>) -> anyhow::R
                 config.test.timeout = timeout_secs;
                 commands.timeout = Duration::from_secs(timeout_secs);
                 let timing = BaselineTiming {
-                    build_command: if has_explicit_build_cmd {
+                    build_command: if build_command_origin.runs_before_tests() {
                         config.test.build_command.clone()
                     } else {
                         vec![]
@@ -574,7 +572,7 @@ fn run_check(cfg: togi::cli::CheckArgs, cancelled: Arc<AtomicBool>) -> anyhow::R
     let (mut report, run_cancelled, direct_recipes) = if classified.to_run.is_empty() {
         // Every generated mutant sits on a zero-coverage line: nothing to run.
         (
-            coverage_only_report(&config, has_explicit_build_cmd),
+            coverage_only_report(&config, build_command_origin),
             false,
             BTreeMap::new(),
         )
@@ -716,7 +714,6 @@ fn exit_with(lock: togi::lock::LockGuard, code: i32) -> ! {
 fn resolve_config(cfg: togi::cli::CheckArgs) -> anyhow::Result<ResolvedCheckConfig> {
     let mut config = togi::config::Config::load(cfg.config.as_deref())?;
     let has_custom_test_cmd = cfg.test_cmd.is_some();
-    let has_cli_build_cmd = cfg.build_cmd.is_some();
     let has_cli_timeout = cfg.timeout.is_some();
     let profile = cfg.profile.or(config.test.profile);
 
@@ -792,8 +789,9 @@ fn resolve_config(cfg: togi::cli::CheckArgs) -> anyhow::Result<ResolvedCheckConf
         config.mutations.incremental_history = false;
     }
     if let Some(cmd) = cfg.build_cmd {
-        config.test.build_command =
-            shell_words::split(&cmd).map_err(|e| anyhow::anyhow!("bad --build-cmd: {e}"))?;
+        config.test.set_build_command(
+            shell_words::split(&cmd).map_err(|e| anyhow::anyhow!("bad --build-cmd: {e}"))?,
+        );
     }
 
     if cfg.no_skip_defaults {
@@ -823,7 +821,6 @@ fn resolve_config(cfg: togi::cli::CheckArgs) -> anyhow::Result<ResolvedCheckConf
         );
     }
 
-    let has_explicit_build_cmd = has_cli_build_cmd || !config.test.build_command.is_empty();
     let profile_fail_fast = profile.is_some_and(|profile| profile.default_fail_fast());
     let requested_fail_fast = cfg.fail_fast || profile_fail_fast;
     let fail_fast = requested_fail_fast && !has_custom_test_cmd;
@@ -839,7 +836,6 @@ fn resolve_config(cfg: togi::cli::CheckArgs) -> anyhow::Result<ResolvedCheckConf
     Ok(ResolvedCheckConfig {
         config,
         fail_fast,
-        has_explicit_build_cmd,
         has_custom_test_cmd,
         has_cli_timeout,
         profile,
@@ -1431,7 +1427,7 @@ fn merge_uncovered(report: &mut togi::MutationReport, uncovered: Vec<Mutation>) 
 /// coverage-suppressed and nothing had to be executed.
 fn coverage_only_report(
     config: &togi::config::Config,
-    build_command_explicit: bool,
+    build_command_origin: togi::config::BuildCommandOrigin,
 ) -> togi::MutationReport {
     togi::MutationReport {
         results: Vec::new(),
@@ -1442,7 +1438,7 @@ fn coverage_only_report(
         baseline_timing: None,
         duration: Duration::ZERO,
         test_command: Some(config.test.command.clone()),
-        build_command: if build_command_explicit {
+        build_command: if build_command_origin.runs_before_tests() {
             config.test.build_command.clone()
         } else {
             Vec::new()
@@ -1459,14 +1455,14 @@ fn coverage_only_report(
 
 fn print_empty_json_check_output(
     config: &togi::config::Config,
-    build_command_explicit: bool,
+    build_command_origin: togi::config::BuildCommandOrigin,
     dry_run: bool,
     project_root: &Path,
 ) -> anyhow::Result<()> {
     if dry_run {
         togi::report::json::print_dry_run(&[])?;
     } else {
-        let report = coverage_only_report(config, build_command_explicit);
+        let report = coverage_only_report(config, build_command_origin);
         let mut capture = togi::replay::ReplayReportCapture::capture(project_root, &[]);
         capture.revalidate(project_root);
         togi::report::json::print_report_with_baseline_and_replay(
@@ -1500,7 +1496,7 @@ fn print_dry_run(mutations: &[Mutation]) {
 fn command_config(
     config: &togi::config::Config,
     project_root: &Path,
-    build_command_explicit: bool,
+    build_command_origin: togi::config::BuildCommandOrigin,
     force_default_command: bool,
     force_default_timeout: bool,
 ) -> togi::runner::CommandConfig {
@@ -1544,12 +1540,8 @@ fn command_config(
         force_default_timeout,
         project_commands,
         language_commands,
-        build_command: if build_command_explicit {
-            config.test.build_command.clone()
-        } else {
-            vec![]
-        },
-        build_command_explicit,
+        build_command: config.test.build_command.clone(),
+        build_command_origin,
         timeout: Duration::from_secs(config.test.timeout),
         language_timeouts,
         test_selection: load_test_selection(

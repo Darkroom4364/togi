@@ -16,13 +16,16 @@
 # Default: auto-detected from project files, or ["make", "test"] if unknown.
 command = ["go", "test", "./..."]
 
-# Optional build command run before the test command. Uncomment to enable.
-# Mutations that fail this command are reported as build errors.
-# Auto-detected build commands are shown by `togi init`, but they are not used
-# as pre-filters unless build_command is set in togi.toml or via --build-cmd.
+# Optional build command run before the test command. Mutations that fail it
+# are reported as build errors and never run the test command. Uncomment to
+# opt in; when omitted, togi runs tests directly.
+# `togi init` may suggest a safe command from project markers, but detection
+# alone never enables a build pre-filter.
 # Type: array of strings
 # Default: []
-# build_command = ["go", "build", "./..."]
+# Suggested Go command: ["go", "test", "-c", "-vet=off", "-o", <host null device>, "./..."]
+# Use "/dev/null" on Unix and "NUL" on Windows when configuring the matching command.
+# build_command = ["go", "test", "-c", "-vet=off", "-o", "/dev/null", "./..."]
 
 # Optional sandbox wrapper prefixed to every build and test command.
 # Leave unset to run directly on the host or CI runner.
