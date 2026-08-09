@@ -38,6 +38,9 @@ pub struct CheckArgs {
     /// Output format
     #[arg(short, long, default_value = "terminal")]
     pub format: OutputFormat,
+    /// Also write the replayable JSON report to this path
+    #[arg(long, value_name = "PATH", conflicts_with = "dry_run")]
+    pub json_report: Option<PathBuf>,
 
     /// Resource profile for worker count and nested runner limits
     #[arg(long, value_enum)]
@@ -233,8 +236,26 @@ pub enum Commands {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use clap::Parser;
+    #[test]
+    fn json_report_argument_is_accepted_and_conflicts_with_dry_run() {
+        let cli = Cli::try_parse_from(["togi", "check", "--json-report", "report.json"]).unwrap();
+        match cli.command {
+            Commands::Check(args) => {
+                assert_eq!(args.json_report, Some(PathBuf::from("report.json")))
+            }
+            _ => panic!("expected Check command"),
+        }
+
+        let conflict =
+            Cli::try_parse_from(["togi", "check", "--json-report", "report.json", "--dry-run"]);
+        assert!(
+            conflict.is_err(),
+            "--json-report and --dry-run should conflict"
+        );
+    }
 
     #[test]
     fn check_all_conflicts_with_base() {

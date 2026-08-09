@@ -1,6 +1,7 @@
 use anyhow::Context;
 use clap::Parser;
 use std::collections::{BTreeMap, HashMap};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::Arc;
@@ -314,6 +315,7 @@ fn run_check(cfg: togi::cli::CheckArgs, cancelled: Arc<AtomicBool>) -> anyhow::R
     let verbose = cfg.verbose;
     let show_output = cfg.show_output;
     let output_format = cfg.format;
+    let json_report_path = cfg.json_report.clone();
     let fail_under = cfg.fail_under;
     let max_survivors = match (cfg.first_survivor, cfg.max_survivors) {
         (true, _) => Some(1),
@@ -388,8 +390,15 @@ fn run_check(cfg: togi::cli::CheckArgs, cancelled: Arc<AtomicBool>) -> anyhow::R
         &project_root,
     )?;
     if changed_files.is_empty() {
-        if output_format == togi::cli::OutputFormat::Json {
-            print_empty_json_check_output(&config, build_command_origin, dry_run, &project_root)?;
+        if output_format == togi::cli::OutputFormat::Json || json_report_path.is_some() {
+            emit_empty_json_check_output(
+                &config,
+                build_command_origin,
+                dry_run,
+                &project_root,
+                output_format == togi::cli::OutputFormat::Json,
+                json_report_path.as_deref(),
+            )?;
         }
         return Ok(());
     }
@@ -463,12 +472,21 @@ fn run_check(cfg: togi::cli::CheckArgs, cancelled: Arc<AtomicBool>) -> anyhow::R
             eprintln!("  - Changed files are in an unsupported language");
             eprintln!("  - All mutable nodes were filtered out (test files, noisy patterns)");
             eprintln!("  - max_per_run or max_per_file is set to 0 in togi.toml");
-            print_empty_json_check_output(&config, build_command_origin, dry_run, &project_root)?;
         } else {
             println!("No mutations generated. Possible causes:");
             println!("  - Changed files are in an unsupported language");
             println!("  - All mutable nodes were filtered out (test files, noisy patterns)");
             println!("  - max_per_run or max_per_file is set to 0 in togi.toml");
+        }
+        if output_format == togi::cli::OutputFormat::Json || json_report_path.is_some() {
+            emit_empty_json_check_output(
+                &config,
+                build_command_origin,
+                dry_run,
+                &project_root,
+                output_format == togi::cli::OutputFormat::Json,
+                json_report_path.as_deref(),
+            )?;
         }
         return Ok(());
     }
@@ -636,14 +654,26 @@ fn run_check(cfg: togi::cli::CheckArgs, cancelled: Arc<AtomicBool>) -> anyhow::R
         }
     }
 
-    if output_format == togi::cli::OutputFormat::Json {
+    if output_format == togi::cli::OutputFormat::Json || json_report_path.is_some() {
         replay_capture.revalidate(&project_root_ref);
-        togi::report::print_report_with_baseline_and_replay(
+        let json = togi::report::json::to_json_string_with_baseline_and_replay(
             &report,
-            output_format,
             survivor_comparison.as_ref(),
-            Some((&replay_capture, &direct_recipes)),
+            &replay_capture,
+            &direct_recipes,
         )?;
+        if let Some(path) = &json_report_path {
+            write_json_report(path, &json)?;
+        }
+        if output_format == togi::cli::OutputFormat::Json {
+            println!("{json}");
+        } else {
+            togi::report::print_report_with_baseline(
+                &report,
+                output_format,
+                survivor_comparison.as_ref(),
+            )?;
+        }
     } else {
         togi::report::print_report_with_baseline(
             &report,
@@ -1455,26 +1485,73 @@ fn coverage_only_report(
     }
 }
 
-fn print_empty_json_check_output(
+fn emit_empty_json_check_output(
     config: &togi::config::Config,
     build_command_origin: togi::config::BuildCommandOrigin,
     dry_run: bool,
     project_root: &Path,
+    print_stdout: bool,
+    json_report_path: Option<&Path>,
 ) -> anyhow::Result<()> {
     if dry_run {
-        togi::report::json::print_dry_run(&[])?;
+        if print_stdout {
+            togi::report::json::print_dry_run(&[])?;
+        }
     } else {
         let report = coverage_only_report(config, build_command_origin);
         let mut capture = togi::replay::ReplayReportCapture::capture(project_root, &[]);
         capture.revalidate(project_root);
-        togi::report::json::print_report_with_baseline_and_replay(
+        let json = togi::report::json::to_json_string_with_baseline_and_replay(
             &report,
             None,
             &capture,
             &BTreeMap::new(),
         )?;
+        if let Some(path) = json_report_path {
+            write_json_report(path, &json)?;
+        }
+        if print_stdout {
+            println!("{json}");
+        }
     }
     Ok(())
+}
+
+fn write_json_report(path: &Path, json: &str) -> anyhow::Result<()> {
+    publish_json_report(path, |staged| {
+        staged.write_all(json.as_bytes())?;
+        staged.write_all(b"\n")
+    })
+}
+
+fn publish_json_report(
+    path: &Path,
+    write_contents: impl FnOnce(&mut tempfile::NamedTempFile) -> std::io::Result<()>,
+) -> anyhow::Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut staged = tempfile::NamedTempFile::new_in(parent).with_context(|| {
+        format!(
+            "could not create JSON report staging file in {}",
+            parent.display()
+        )
+    })?;
+    write_contents(&mut staged)
+        .with_context(|| format!("could not write JSON report {}", path.display()))?;
+    staged
+        .flush()
+        .with_context(|| format!("could not flush JSON report {}", path.display()))?;
+    staged
+        .as_file()
+        .sync_all()
+        .with_context(|| format!("could not sync JSON report {}", path.display()))?;
+    staged
+        .persist(path)
+        .map(|_| ())
+        .map_err(|error| error.error)
+        .with_context(|| format!("could not publish JSON report {}", path.display()))
 }
 
 fn print_dry_run(mutations: &[Mutation]) {
@@ -1972,6 +2049,7 @@ mod tests {
             base: None,
             config: None,
             format: togi::cli::OutputFormat::Terminal,
+            json_report: None,
             profile: None,
             jobs: None,
             timeout: None,
@@ -2419,5 +2497,39 @@ example.com/calc/calc.go:9.29,10.11 1 0
         let total = stats.total_lines.get(Path::new("calc.go")).unwrap();
         assert!(total.contains(&4));
         assert!(total.contains(&10));
+    }
+    #[test]
+    fn json_report_publish_replaces_existing_report_after_staging() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let report_path = dir.path().join("report.json");
+        std::fs::write(
+            &report_path,
+            "{\"kind\":\"mutation_report\",\"old\":true}\n",
+        )?;
+
+        write_json_report(&report_path, "{\"kind\":\"mutation_report\",\"new\":true}")?;
+
+        assert_eq!(
+            std::fs::read_to_string(&report_path)?,
+            "{\"kind\":\"mutation_report\",\"new\":true}\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn json_report_publish_preserves_existing_report_on_write_failure() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let report_path = dir.path().join("report.json");
+        let existing = "{\"kind\":\"mutation_report\",\"old\":true}\n";
+        std::fs::write(&report_path, existing)?;
+
+        let error = publish_json_report(&report_path, |staged| {
+            staged.write_all(b"{\"kind\":\"mutation_report\",\"partial\":")?;
+            Err(std::io::Error::other("simulated write failure"))
+        });
+
+        assert!(error.is_err());
+        assert_eq!(std::fs::read_to_string(&report_path)?, existing);
+        Ok(())
     }
 }

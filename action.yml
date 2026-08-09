@@ -30,9 +30,9 @@ inputs:
     required: false
     default: 'togi-report'
   version:
-    description: 'togi version to use'
+    description: 'Immutable released togi version to use'
     required: false
-    default: 'latest'
+    default: 'v0.5.1'
 
 outputs:
   report-path:
@@ -53,44 +53,12 @@ runs:
       env:
         TOGI_VERSION_INPUT: ${{ inputs.version }}
       run: |
-        VERSION="${TOGI_VERSION_INPUT:-latest}"
-        validate_version() {
-          local value="$1"
-          if [[ "$value" == "latest" || "$value" =~ ^v?[0-9]+[.][0-9]+[.][0-9]+([-+][A-Za-z0-9._-]+)?$ ]]; then
-            return 0
-          fi
-          echo "Invalid Togi version: ${value}" >&2
-          exit 1
-        }
-        validate_version "$VERSION"
-        if [ "$VERSION" = "latest" ]; then
-          if command -v jq >/dev/null 2>&1; then
-            VERSION=$(curl -fsSL https://api.github.com/repos/Darkroom4364/togi/releases/latest | jq -er .tag_name)
-          elif command -v gh >/dev/null 2>&1; then
-            VERSION=$(gh api repos/Darkroom4364/togi/releases/latest -q .tag_name)
-          else
-            echo "Resolving latest Togi version requires gh or jq" >&2
-            exit 1
-          fi
-          validate_version "$VERSION"
-        fi
-        if [ -z "$VERSION" ]; then
-          echo "Could not resolve latest Togi release version" >&2
+        set -euo pipefail
+        VERSION="${TOGI_VERSION_INPUT:-v0.5.1}"
+        if [[ ! "$VERSION" =~ ^v[0-9]+[.][0-9]+[.][0-9]+$ ]]; then
+          echo "Togi version must be an immutable vX.Y.Z tag" >&2
           exit 1
         fi
-
-        sha256_file() {
-          if command -v sha256sum >/dev/null 2>&1; then
-            sha256sum "$1" | awk '{print $1}'
-          elif command -v shasum >/dev/null 2>&1; then
-            shasum -a 256 "$1" | awk '{print $1}'
-          elif command -v certutil >/dev/null 2>&1; then
-            certutil -hashfile "$1" SHA256 | sed -n '2p' | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]'
-          else
-            echo "No SHA-256 tool found for release verification" >&2
-            exit 1
-          fi
-        }
 
         eval "$(bash "${{ github.action_path }}/.github/scripts/resolve-togi-asset.sh")"
         TEMP_ROOT="${RUNNER_TEMP:-.}"
@@ -98,22 +66,19 @@ runs:
           TEMP_ROOT=$(cygpath -u "$TEMP_ROOT")
         fi
         mkdir -p "$TEMP_ROOT"
+        eval "$(
+          TOGI_VERSION="$VERSION" TOGI_ARCHIVE="$TOGI_ARCHIVE" TOGI_FETCH_DIR="$TEMP_ROOT" \
+            bash "${{ github.action_path }}/.github/scripts/fetch-togi-release-asset.sh"
+        )"
+        TOGI_ARCHIVE="$TOGI_ARCHIVE" TOGI_BINARY="$TOGI_BINARY" \
+          TOGI_ARCHIVE_PATH="$TOGI_ARCHIVE_PATH" \
+          bash "${{ github.action_path }}/.github/scripts/install-togi-archive.sh"
 
-        TOGI_ARCHIVE_PATH="${TEMP_ROOT}/${TOGI_ARCHIVE}"
-        curl -fL "https://github.com/Darkroom4364/togi/releases/download/${VERSION}/${TOGI_ARCHIVE}" -o "$TOGI_ARCHIVE_PATH"
-        CHECKSUMS_PATH="${TEMP_ROOT}/togi-checksums.txt"
-        curl -fL "https://github.com/Darkroom4364/togi/releases/download/${VERSION}/checksums.txt" -o "$CHECKSUMS_PATH"
-        EXPECTED_SHA=$(awk -v file="$TOGI_ARCHIVE" '$2 == file || $2 == "./" file { print $1 }' "$CHECKSUMS_PATH")
-        if [ -z "$EXPECTED_SHA" ]; then
-          echo "No checksum found for ${TOGI_ARCHIVE}" >&2
-          exit 1
-        fi
-        ACTUAL_SHA=$(sha256_file "$TOGI_ARCHIVE_PATH")
-        if [ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]; then
-          echo "Checksum mismatch for ${TOGI_ARCHIVE}" >&2
-          exit 1
-        fi
-        TOGI_ARCHIVE="$TOGI_ARCHIVE" TOGI_BINARY="$TOGI_BINARY" TOGI_ARCHIVE_PATH="$TOGI_ARCHIVE_PATH" bash "${{ github.action_path }}/.github/scripts/install-togi-archive.sh"
+        TOGI_BIN="${TEMP_ROOT}/togi-bin/${TOGI_BINARY}"
+        {
+          printf 'TOGI_BIN=%s\n' "$TOGI_BIN"
+          printf 'TOGI_EXPECTED_VERSION=%s\n' "$VERSION"
+        } >> "$GITHUB_ENV"
 
     - name: Run togi
       id: run-togi
