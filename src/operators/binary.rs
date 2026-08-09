@@ -26,6 +26,34 @@ pub fn find_operator_child(
     None
 }
 
+pub fn find_operator_children(
+    node: &tree_sitter::Node,
+    source: &[u8],
+    operator_field: &str,
+    target: &str,
+) -> Vec<std::ops::Range<usize>> {
+    let mut ranges = Vec::new();
+    let field_range = node
+        .child_by_field_name(operator_field)
+        .filter(|op_node| &source[op_node.byte_range()] == target.as_bytes())
+        .map(|op_node| op_node.byte_range());
+    if let Some(range) = field_range.clone() {
+        ranges.push(range);
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        let range = child.byte_range();
+        if !child.is_named()
+            && field_range.as_ref() != Some(&range)
+            && &source[range.clone()] == target.as_bytes()
+        {
+            ranges.push(range);
+        }
+    }
+    ranges
+}
+
 macro_rules! binary_operator {
     ($name:ident, $id:expr, $desc:expr, $from:expr, $to:expr) => {
         pub struct $name;
@@ -43,20 +71,21 @@ macro_rules! binary_operator {
                 source: &[u8],
                 lang: &dyn crate::languages::LanguageSupport,
             ) -> Vec<MutationCandidate> {
-                if node.kind() != lang.binary_expression_node() {
+                if !lang.is_binary_operator_node(node.kind()) {
                     return vec![];
                 }
-                if let Some(range) = find_operator_child(node, source, lang.operator_field(), $from)
-                {
-                    vec![MutationCandidate {
+                let (from, to) = lang
+                    .binary_operator_tokens(self.id())
+                    .unwrap_or(($from, $to));
+                find_operator_children(node, source, lang.operator_field(), from)
+                    .into_iter()
+                    .map(|range| MutationCandidate {
                         byte_range: range,
-                        replacement: $to.to_string(),
+                        replacement: to.to_string(),
                         operator_id: self.id().to_string(),
-                        description: self.description().to_string(),
-                    }]
-                } else {
-                    vec![]
-                }
+                        description: format!("Replace {from} with {to}"),
+                    })
+                    .collect()
             }
         }
     };
@@ -75,7 +104,8 @@ binary_operator!(ModToMul, "mod_to_mul", "Replace % with *", "%", "*");
 mod tests {
     use super::*;
 
-    use crate::test_helpers::{find_node_by_kind, parse_go};
+    use crate::languages::python::Python;
+    use crate::test_helpers::{find_node_by_kind, parse_go, parse_python};
 
     fn apply_to_binary(src: &str, op: &dyn MutationOperator) -> Vec<MutationCandidate> {
         let tree = parse_go(src);
@@ -83,6 +113,26 @@ mod tests {
         let bin =
             find_node_by_kind(root, "binary_expression").expect("should find binary_expression");
         op.apply(&bin, src.as_bytes(), &crate::languages::go::Go)
+    }
+
+    fn apply_to_python_node(
+        src: &str,
+        node_kind: &str,
+        op: &dyn MutationOperator,
+    ) -> Vec<MutationCandidate> {
+        let tree = parse_python(src);
+        let node =
+            find_node_by_kind(tree.root_node(), node_kind).expect("should find Python operator");
+        op.apply(&node, src.as_bytes(), &Python)
+    }
+
+    fn apply_candidate(src: &str, candidate: &MutationCandidate) -> String {
+        let mut mutated = src.as_bytes().to_vec();
+        mutated.splice(
+            candidate.byte_range.clone(),
+            candidate.replacement.as_bytes().iter().copied(),
+        );
+        String::from_utf8(mutated).unwrap()
     }
 
     fn assert_single_candidate(
@@ -157,5 +207,69 @@ mod tests {
         let src = "package main\nfunc f() bool { return x + y }";
         let candidates = apply_to_binary(src, &LtToLte);
         assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn python_comparison_chain_yields_each_operator_range_and_parses() {
+        let src = "def check(low, value, high):\n    return low < value < high\n";
+        let candidates = apply_to_python_node(src, "comparison_operator", &LtToLte);
+        let expected_ranges = src
+            .match_indices('<')
+            .map(|(start, _)| start..start + 1)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| candidate.byte_range.clone())
+                .collect::<Vec<_>>(),
+            expected_ranges
+        );
+        for candidate in candidates {
+            assert_eq!(candidate.replacement, "<=");
+            let mutated = apply_candidate(src, &candidate);
+            assert!(
+                !parse_python(&mutated).root_node().has_error(),
+                "candidate should parse as Python:\n{mutated}"
+            );
+        }
+    }
+
+    #[test]
+    fn python_logical_operators_use_python_tokens_and_parse() {
+        for (src, op, replacement, original) in [
+            (
+                "def check(left, right):\n    return left and right\n",
+                &AndToOr as &dyn MutationOperator,
+                "or",
+                "and",
+            ),
+            (
+                "def check(left, right):\n    return left or right\n",
+                &OrToAnd as &dyn MutationOperator,
+                "and",
+                "or",
+            ),
+        ] {
+            let candidates = apply_to_python_node(src, "boolean_operator", op);
+            assert_single_candidate(&candidates, src, replacement, original);
+            assert_eq!(
+                candidates[0].description,
+                format!("Replace {original} with {replacement}")
+            );
+            let mutated = apply_candidate(src, &candidates[0]);
+            assert!(
+                !parse_python(&mutated).root_node().has_error(),
+                "candidate should parse as Python:\n{mutated}"
+            );
+        }
+    }
+
+    #[test]
+    fn python_arithmetic_binary_operator_stays_supported() {
+        let src = "def multiply(left, right):\n    return left * right\n";
+        let candidates = apply_to_python_node(src, "binary_operator", &MulToDiv);
+
+        assert_single_candidate(&candidates, src, "/", "*");
     }
 }

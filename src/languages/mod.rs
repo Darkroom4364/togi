@@ -13,6 +13,8 @@ pub mod typescript;
 /// Required: struct name, language name, extensions, tree-sitter language path.
 /// Optional overrides (with defaults matching C-family languages):
 ///   binary_expression: "binary_expression"
+///   binary_operator_nodes: []
+///   binary_operator_tokens: function path
 ///   if_statement: "if_statement"
 ///   return_statement: "return_statement"
 ///   bool_true: ["true", "True", "TRUE"]
@@ -28,6 +30,8 @@ macro_rules! define_language {
         extensions: [$($ext:expr),* $(,)?],
         ts_language: $ts_lang:expr
         $(, binary_expression: $bin:expr)?
+        $(, binary_operator_nodes: [$($binary_node:expr),* $(,)?])?
+        $(, binary_operator_tokens: $tokens:expr)?
         $(, if_statement: $if_node:expr)?
         $(, return_statement: $ret:expr)?
         $(, bool_true: [$($bt:expr),* $(,)?])?
@@ -47,6 +51,9 @@ macro_rules! define_language {
             fn tree_sitter_language(&self) -> tree_sitter::Language { $ts_lang.into() }
             fn binary_expression_node(&self) -> &str {
                 $crate::languages::define_language!(@first $($bin)? ; "binary_expression")
+            }
+            fn additional_binary_operator_node_kinds(&self) -> &[&str] {
+                $crate::languages::define_language!(@arr [$($($binary_node),*)?] ; [])
             }
             fn if_statement_node(&self) -> &str {
                 $crate::languages::define_language!(@first $($if_node)? ; "if_statement")
@@ -69,6 +76,7 @@ macro_rules! define_language {
             $crate::languages::define_language!(@negation $($negation)?);
             $crate::languages::define_language!(@filter $($filter)?);
             $crate::languages::define_language!(@fixup $($ebr)?);
+            $crate::languages::define_language!(@binary_operator_tokens $($tokens)?);
         }
     };
     // Helper: return first value if present, otherwise default
@@ -77,6 +85,16 @@ macro_rules! define_language {
     // Helper: return array if non-empty, otherwise default
     (@arr [$($val:expr),+] ; [$($default:expr),*]) => { &[$($val),+] };
     (@arr [] ; [$($default:expr),*]) => { &[$($default),*] };
+    // Helper: override binary operator tokens if binary_operator_tokens is set
+    (@binary_operator_tokens $tokens:expr) => {
+        fn binary_operator_tokens(
+            &self,
+            operator_id: &str,
+        ) -> Option<(&'static str, &'static str)> {
+            $tokens(operator_id)
+        }
+    };
+    (@binary_operator_tokens) => {};
     // Helper: override should_filter_candidate if filter_candidate is set
     (@filter $filter:expr) => {
         fn should_filter_candidate(
@@ -169,12 +187,9 @@ pub(crate) fn is_default_mutable_node_kind<L: LanguageSupport + ?Sized>(
     lang: &L,
     kind: &str,
 ) -> bool {
-    kind == lang.binary_expression_node()
+    lang.is_binary_operator_node(kind)
         || kind == lang.if_statement_node()
         || kind == lang.return_statement_node()
-        || kind == "binary_expr"
-        || kind == "comparison_expression"
-        || kind == "if_expr"
         || lang.is_boolean_true_literal_node(kind)
         || lang.is_boolean_false_literal_node(kind)
         || lang.is_integer_literal_node(kind)
@@ -327,6 +342,22 @@ pub trait LanguageSupport: Send + Sync {
 
     /// Primary binary-expression node kind for this grammar.
     fn binary_expression_node(&self) -> &str;
+
+    /// Return extra AST node kinds that binary mutation operators may inspect.
+    fn additional_binary_operator_node_kinds(&self) -> &[&str] {
+        &[]
+    }
+
+    /// Return true when binary mutation operators may inspect `kind`.
+    fn is_binary_operator_node(&self, kind: &str) -> bool {
+        kind == self.binary_expression_node()
+            || self.additional_binary_operator_node_kinds().contains(&kind)
+    }
+
+    /// Override source/replacement tokens for a binary operator ID.
+    fn binary_operator_tokens(&self, _operator_id: &str) -> Option<(&'static str, &'static str)> {
+        None
+    }
 
     /// Primary if-statement or if-expression node kind for this grammar.
     fn if_statement_node(&self) -> &str;
@@ -533,5 +564,28 @@ mod tests {
             assert!(lang.is_mutable_node_kind(kind), "{kind} should be mutable");
         }
         assert!(!lang.is_mutable_node_kind("identifier"));
+    }
+
+    #[test]
+    fn python_predicate_nodes_are_language_specific() {
+        let python = python::Python;
+        let go = go::Go;
+
+        for kind in ["comparison_operator", "boolean_operator"] {
+            assert!(
+                python.is_binary_operator_node(kind),
+                "{kind} should be supported"
+            );
+            assert!(python.is_mutable_node_kind(kind), "{kind} should be mapped");
+            assert!(
+                !go.is_binary_operator_node(kind),
+                "{kind} should not be supported"
+            );
+            assert!(
+                !go.is_mutable_node_kind(kind),
+                "{kind} should not be mapped"
+            );
+        }
+        assert!(!go.is_mutable_node_kind("comparison_expression"));
     }
 }

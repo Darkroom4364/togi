@@ -112,10 +112,21 @@ pub fn generate_mutations(
                         continue;
                     }
 
-                    // Compute line/column from the byte range, not the AST node,
-                    // so that mutation_diff() renders correctly.
+                    // Candidates from a mapped AST node may target a narrower
+                    // child token, so filter by the candidate's own source span.
                     let (line, column) =
                         byte_offset_to_line_col(&source, candidate.byte_range.start);
+                    let end_line = if candidate.byte_range.is_empty() {
+                        line
+                    } else {
+                        line + source[candidate.byte_range.start..candidate.byte_range.end - 1]
+                            .iter()
+                            .filter(|&&byte| byte == b'\n')
+                            .count()
+                    };
+                    if !crate::mapper::overlaps(line, end_line, &changed_file.hunks) {
+                        continue;
+                    }
                     // The original bytes must survive losslessly; reject
                     // candidates whose range is not valid UTF-8 (e.g. splits a
                     // multi-byte character) instead of lossy conversion.
@@ -415,7 +426,7 @@ mod tests {
 
         let changed = vec![ChangedFile {
             path: rel,
-            hunks: vec![LineRange { start: 2, end: 2 }],
+            hunks: vec![LineRange { start: 2, end: 3 }],
         }];
 
         let mutations =
@@ -642,19 +653,138 @@ mod tests {
     }
 
     #[test]
-    fn generates_mutations_for_python_file() {
+    fn generates_python_predicate_operator_mutations() {
         let tmp = TempDir::new().unwrap();
-        let py_src = "def check(x, y):\n    return x < y\n";
+        let py_src = concat!(
+            "def check(low, value, high, left, right, items):\n",
+            "    chained = low < value < high\n",
+            "    greater = left > right\n",
+            "    equal = left == right\n",
+            "    conjunction = left and right\n",
+            "    disjunction = left or right\n",
+            "    less_or_equal = left <= right\n",
+            "    greater_or_equal = left >= right\n",
+            "    not_equal = left != right\n",
+            "    identity = left is right\n",
+            "    membership = left in items\n",
+            "    not_identity = left is not right\n",
+            "    not_membership = left not in items\n",
+            "    text = \"left < right and left == right\"\n",
+            "    return left and right\n",
+        );
         let rel = write_test_file(tmp.path(), "test.py", py_src);
+        let operators = [
+            "lt_to_lte".to_string(),
+            "gt_to_gte".to_string(),
+            "eq_to_neq".to_string(),
+            "and_to_or".to_string(),
+            "or_to_and".to_string(),
+        ];
 
+        let changed = vec![ChangedFile {
+            path: rel,
+            hunks: vec![LineRange {
+                start: 1,
+                end: py_src.lines().count(),
+            }],
+        }];
+
+        let mutations = generate_mutations(&changed, tmp.path(), 100, 0, &operators).unwrap();
+        let mut actual = mutations
+            .iter()
+            .map(|mutation| {
+                (
+                    mutation.operator.as_str(),
+                    mutation.original.as_str(),
+                    mutation.replacement.as_str(),
+                )
+            })
+            .collect::<Vec<_>>();
+        actual.sort_unstable();
+
+        assert_eq!(
+            actual,
+            vec![
+                ("and_to_or", "and", "or"),
+                ("and_to_or", "and", "or"),
+                ("eq_to_neq", "==", "!="),
+                ("gt_to_gte", ">", ">="),
+                ("lt_to_lte", "<", "<="),
+                ("lt_to_lte", "<", "<="),
+                ("or_to_and", "or", "and"),
+            ]
+        );
+        for mutation in &mutations {
+            let mutated = apply_mutation(py_src, mutation);
+            assert!(
+                !parse_python(&mutated).root_node().has_error(),
+                "mutation should parse as Python:\n{mutated}"
+            );
+        }
+    }
+
+    #[test]
+    fn python_multiline_comparison_candidates_stay_in_hunk() {
+        let tmp = TempDir::new().unwrap();
+        let src = concat!(
+            "def check(a, b, c):\n",
+            "    return (\n",
+            "        a\n",
+            "        < b\n",
+            "        < c\n",
+            "    )\n",
+        );
+        let rel = write_test_file(tmp.path(), "test.py", src);
+        let mutations = generate_mutations(
+            &[ChangedFile {
+                path: rel,
+                hunks: vec![LineRange { start: 4, end: 4 }],
+            }],
+            tmp.path(),
+            100,
+            0,
+            &["lt_to_lte".into()],
+        )
+        .unwrap();
+        let first_operator = src.find("\n        < b\n").unwrap() + "\n        ".len();
+        let second_operator = src.find("\n        < c\n").unwrap() + "\n        ".len();
+
+        assert_eq!(
+            mutations.len(),
+            1,
+            "only the changed operator should mutate"
+        );
+        let mutation = &mutations[0];
+        assert_eq!(mutation.byte_range, first_operator..first_operator + 1);
+        assert_eq!(mutation.line, 4);
+        assert_eq!(mutation.original, "<");
+        assert_eq!(mutation.replacement, "<=");
+        assert_ne!(mutation.byte_range.start, second_operator);
+
+        let mutated = apply_mutation(src, mutation);
+        assert!(
+            !parse_python(&mutated).root_node().has_error(),
+            "mutation should parse as Python:\n{mutated}"
+        );
+    }
+
+    #[test]
+    fn python_boolean_operator_return_does_not_generate_return_empty() {
+        let tmp = TempDir::new().unwrap();
+        let src = "def check(left, right):\n    return left and right\n";
+        let rel = write_test_file(tmp.path(), "test.py", src);
         let changed = vec![ChangedFile {
             path: rel,
             hunks: vec![LineRange { start: 1, end: 2 }],
         }];
 
-        let mutations = generate_mutations(&changed, tmp.path(), 100, 0, &[]).unwrap();
-        assert!(!mutations.is_empty(), "expected mutations for Python file");
-        assert_eq!(mutations[0].language, "python");
+        let mutations =
+            generate_mutations(&changed, tmp.path(), 100, 0, &["return_empty".into()]).unwrap();
+
+        assert!(
+            mutations.is_empty(),
+            "and/or returns are not necessarily boolean"
+        );
     }
 
     #[test]
@@ -773,7 +903,7 @@ mod tests {
     }
 
     #[test]
-    fn go_if_condition_generates_parent_and_child_mutations() {
+    fn go_if_condition_excludes_unchanged_else_mutation() {
         let tmp = TempDir::new().unwrap();
         let src = "package main\n\nfunc f(x int) int {\n\tif x > 0 {\n\t\treturn 1\n\t} else {\n\t\treturn 0\n\t}\n}\n";
         let rel = write_test_file(tmp.path(), "main.go", src);
@@ -807,8 +937,8 @@ mod tests {
             operators
         );
         assert!(
-            operators.contains(&"remove_else"),
-            "parent if else removal mutation should be generated, got: {:?}",
+            !operators.contains(&"remove_else"),
+            "else removal must stay outside a condition-only hunk, got: {:?}",
             operators
         );
     }

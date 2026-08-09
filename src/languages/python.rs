@@ -4,6 +4,8 @@ crate::languages::define_language!(
     extensions: ["py"],
     ts_language: tree_sitter_python::LANGUAGE,
     binary_expression: "binary_operator",
+    binary_operator_nodes: ["comparison_operator", "boolean_operator"],
+    binary_operator_tokens: python_binary_operator_tokens,
     bool_true: ["True"],
     bool_false: ["False"],
     filter_candidate: should_filter_candidate,
@@ -13,6 +15,14 @@ crate::languages::define_language!(
 
 fn python_negation(condition: &str) -> String {
     format!("not ({condition})")
+}
+
+fn python_binary_operator_tokens(operator_id: &str) -> Option<(&'static str, &'static str)> {
+    match operator_id {
+        "and_to_or" => Some(("and", "or")),
+        "or_to_and" => Some(("or", "and")),
+        _ => None,
+    }
 }
 
 fn should_filter_candidate(
