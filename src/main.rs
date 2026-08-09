@@ -2,7 +2,7 @@ use anyhow::Context;
 use clap::Parser;
 use std::collections::{BTreeMap, HashMap};
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -348,6 +348,13 @@ fn run_check(cfg: togi::cli::CheckArgs, cancelled: Arc<AtomicBool>) -> anyhow::R
         }
         Err(error) => return Err(error),
     };
+    validate_json_report_destinations(
+        json_report_path.as_deref(),
+        output_format,
+        save_baseline,
+        pr_comment.as_deref(),
+        &project_root,
+    )?;
     let ambiguous_test_command = match config.resolve_test_command(&project_root) {
         togi::config::TestCommandResolution::Resolved => None,
         togi::config::TestCommandResolution::Ambiguous(ambiguity) => Some(ambiguity),
@@ -1515,6 +1522,83 @@ fn emit_empty_json_check_output(
         }
     }
     Ok(())
+}
+
+fn validate_json_report_destinations(
+    json_report_path: Option<&Path>,
+    output_format: togi::cli::OutputFormat,
+    save_baseline: bool,
+    pr_comment: Option<&Path>,
+    project_root: &Path,
+) -> anyhow::Result<()> {
+    let Some(json_report_path) = json_report_path else {
+        return Ok(());
+    };
+    let current_dir = std::env::current_dir().context("could not determine current directory")?;
+    let normalized_json_report = normalize_output_destination(json_report_path, &current_dir)?;
+    let mut destinations = Vec::with_capacity(3);
+
+    if output_format == togi::cli::OutputFormat::Html {
+        destinations.push(("HTML report", PathBuf::from("togi-report.html")));
+    }
+    if save_baseline {
+        destinations.push(("baseline", project_root.join(".togi-baseline")));
+    }
+    if let Some(path) = pr_comment {
+        destinations.push(("PR comment", path.to_path_buf()));
+    }
+
+    for (name, path) in destinations {
+        if normalized_json_report == normalize_output_destination(&path, &current_dir)? {
+            anyhow::bail!(
+                "--json-report {} conflicts with the {name} destination {}",
+                json_report_path.display(),
+                path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn normalize_output_destination(path: &Path, current_dir: &Path) -> anyhow::Result<PathBuf> {
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        current_dir.join(path)
+    };
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() && !normalized.has_root() {
+                    normalized.push(component.as_os_str());
+                }
+            }
+            Component::Normal(part) => normalized.push(part),
+        }
+    }
+
+    let mut suffix = Vec::new();
+    let mut ancestor = normalized.as_path();
+    while !ancestor.exists() {
+        let name = ancestor
+            .file_name()
+            .context("output destination has no parent")?;
+        suffix.push(name);
+        ancestor = ancestor
+            .parent()
+            .context("output destination has no parent")?;
+    }
+    let mut resolved = ancestor
+        .canonicalize()
+        .unwrap_or_else(|_| ancestor.to_path_buf());
+    for part in suffix.into_iter().rev() {
+        resolved.push(part);
+    }
+    Ok(resolved)
 }
 
 fn write_json_report(path: &Path, json: &str) -> anyhow::Result<()> {

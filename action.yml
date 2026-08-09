@@ -60,16 +60,35 @@ runs:
           exit 1
         fi
 
-        eval "$(bash "${{ github.action_path }}/.github/scripts/resolve-togi-asset.sh")"
+        unset resolver_output TOGI_ARCHIVE TOGI_BINARY TOGI_ARCHIVE_PATH
+        if ! resolver_output=$(bash "${{ github.action_path }}/.github/scripts/resolve-togi-asset.sh"); then
+          echo "Could not resolve Togi release asset" >&2
+          exit 1
+        fi
+        eval "$resolver_output"
+        if [[ -z "${TOGI_ARCHIVE:-}" || -z "${TOGI_BINARY:-}" ]]; then
+          echo "Togi release asset resolver returned incomplete metadata" >&2
+          exit 1
+        fi
+
         TEMP_ROOT="${RUNNER_TEMP:-.}"
         if command -v cygpath >/dev/null 2>&1; then
           TEMP_ROOT=$(cygpath -u "$TEMP_ROOT")
         fi
         mkdir -p "$TEMP_ROOT"
-        eval "$(
+        unset fetch_output TOGI_ARCHIVE_PATH
+        if ! fetch_output=$(
           TOGI_VERSION="$VERSION" TOGI_ARCHIVE="$TOGI_ARCHIVE" TOGI_FETCH_DIR="$TEMP_ROOT" \
             bash "${{ github.action_path }}/.github/scripts/fetch-togi-release-asset.sh"
-        )"
+        ); then
+          echo "Could not fetch and verify Togi release asset" >&2
+          exit 1
+        fi
+        eval "$fetch_output"
+        if [[ -z "${TOGI_ARCHIVE_PATH:-}" ]]; then
+          echo "Togi release asset fetch returned no archive path" >&2
+          exit 1
+        fi
         TOGI_ARCHIVE="$TOGI_ARCHIVE" TOGI_BINARY="$TOGI_BINARY" \
           TOGI_ARCHIVE_PATH="$TOGI_ARCHIVE_PATH" \
           bash "${{ github.action_path }}/.github/scripts/install-togi-archive.sh"
