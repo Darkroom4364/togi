@@ -316,8 +316,8 @@ route before they are reported, and the setting must be deleted.
 
 | Code | Meaning |
 |------|---------|
-| 0 | All mutations killed. No `--fail-under` breach and no baseline regression. |
-| 1 | Survivors found, `--fail-under` threshold not met, or baseline regression detected. |
+| 0 | Without `--fail-under`: no unaccepted survivors or fresh timeout/build-error outcomes. With `--fail-under`: score meets the threshold. No baseline regression. |
+| 1 | Without `--fail-under`: unaccepted survivors or fresh timeout/build-error outcomes; with `--fail-under`: threshold not met; or baseline regression detected. |
 | 2 | Error (configuration, git, parse failure). |
 | 130 | Interrupted by signal (SIGINT). |
 
@@ -357,3 +357,4 @@ vulnerability reporting.
 | 2026-07-28 | Initial compatibility contract. |
 | 2026-08-04 | Removed the macOS x86_64 (Intel) release target; pinned explicit per-target runners with runtime target/arch assertions; named native build/unit legs by tier and target; pinned the Tier-1 Integration Tests and Dogfood evidence jobs to `ubuntu-24.04` with the same assertion ([#485](https://github.com/Darkroom4364/togi/issues/485)). |
 | 2026-08-04 | Stated the v1 stability and deprecation policy: strict configuration parsing with stable documented keys (except the pre-v1 `confirm_survivors` removal), additive-only JSON schema 1 and SARIF 2.1.0 evolution, deprecation with migration instructions until v2, and v1 security-support scope ([#484](https://github.com/Darkroom4364/togi/issues/484)). |
+| 2026-08-10 | Fresh timeout and build-error mutation outcomes now fail the default no-`--fail-under` exit gate; exact-cache and incremental-history reuse do not invoke that fresh-outcome gate ([#503](https://github.com/Darkroom4364/togi/issues/503)). |

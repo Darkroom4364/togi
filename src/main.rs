@@ -745,11 +745,21 @@ fn run_check(cfg: togi::cli::CheckArgs, cancelled: Arc<AtomicBool>) -> anyhow::R
             );
             exit_with(_lock, 1);
         }
-    } else if report.survived > 0 && !loaded_baseline {
+    } else if has_fresh_timeout_or_build_error(&report) || (report.survived > 0 && !loaded_baseline)
+    {
         exit_with(_lock, 1);
     }
 
     Ok(())
+}
+
+fn has_fresh_timeout_or_build_error(report: &togi::MutationReport) -> bool {
+    report.results.iter().any(|(mutation, result)| {
+        matches!(
+            *result,
+            togi::MutationResult::Timeout | togi::MutationResult::BuildError
+        ) && !report.execution_for(mutation.id, *result).is_reused()
+    })
 }
 
 fn exit_with(lock: togi::lock::LockGuard, code: i32) -> ! {
@@ -2270,6 +2280,88 @@ mod tests {
             save_baseline: false,
             check_baseline: false,
             pr_comment: None,
+        }
+    }
+
+    fn report_with_outcome(
+        result: togi::MutationResult,
+        execution: Option<togi::MutationExecution>,
+    ) -> togi::MutationReport {
+        let mutation = togi::Mutation {
+            id: 0,
+            file: std::path::PathBuf::from("src/lib.rs"),
+            language: "rust".to_owned(),
+            line: 1,
+            column: 1,
+            operator: "op".to_owned(),
+            description: "description".to_owned(),
+            original: "a".to_owned(),
+            replacement: "b".to_owned(),
+            byte_range: 0..1,
+        };
+        let mut execution_provenance = std::collections::BTreeMap::new();
+        if let Some(execution) = execution {
+            execution_provenance.insert(mutation.id, execution);
+        }
+        togi::MutationReport {
+            results: vec![(mutation, result)],
+            execution_provenance,
+            selection_provenance: std::collections::BTreeMap::new(),
+            build_error_diagnostics: vec![],
+            schemata: None,
+            baseline_timing: None,
+            duration: std::time::Duration::ZERO,
+            test_command: None,
+            build_command: vec![],
+            planned_total: 1,
+            early_stop_reason: None,
+            total: 1,
+            killed: 0,
+            survived: 0,
+            timeout: if result == togi::MutationResult::Timeout {
+                1
+            } else {
+                0
+            },
+            build_errors: if result == togi::MutationResult::BuildError {
+                1
+            } else {
+                0
+            },
+        }
+    }
+
+    #[test]
+    fn fresh_timeout_and_build_error_trigger_default_outcome_gate() {
+        for result in [
+            togi::MutationResult::Timeout,
+            togi::MutationResult::BuildError,
+        ] {
+            assert!(
+                has_fresh_timeout_or_build_error(&report_with_outcome(result, None)),
+                "{result:?} should trigger the default outcome gate"
+            );
+        }
+    }
+
+    #[test]
+    fn reused_timeout_and_build_error_do_not_trigger_default_outcome_gate() {
+        for execution in [
+            togi::MutationExecution::ExactCache,
+            togi::MutationExecution::IncrementalHistory,
+        ] {
+            for result in [
+                togi::MutationResult::Timeout,
+                togi::MutationResult::BuildError,
+            ] {
+                assert!(
+                    !has_fresh_timeout_or_build_error(&report_with_outcome(
+                        result,
+                        Some(execution),
+                    )),
+                    "{execution:?} {result:?} should not trigger the default outcome gate"
+                );
+            }
         }
     }
 
