@@ -117,10 +117,12 @@ git rev-parse --verify HEAD~1
 togi check --base HEAD~1
 ```
 
-Exit `0` means all mutations were killed. Exit `1` means the mutation run
-completed and found surviving mutants. Exit `2` means an execution error (for
-example configuration, Git, or parsing) that you should fix before relying on
-the result.
+Without `--fail-under`, exit `0` means the default mutation gate passed: no
+unaccepted survivors and no fresh timeouts or build errors; exit `1` means an
+unaccepted survivor or fresh timeout/build error. With an explicit `--fail-under`,
+its score threshold determines that gate instead; a baseline regression still exits
+`1`. Exit `2` means an execution error (for example configuration, Git, or parsing)
+that you should fix before relying on the result.
 
 If you intentionally want a source-based install tied to a reviewed revision:
 
@@ -575,7 +577,8 @@ settings such as `jobs` keep taking precedence.
 
 A nonempty `[test] build_command` or `--build-cmd` opts in to a build check
 before each mutant's test command. A failed configured build is reported as a
-build error and does not count as a test kill.
+build error rather than a test kill; a fresh build error fails the default
+no-`--fail-under` gate.
 
 `togi init` suggests a safe `build_command` when it detects exactly one root
 build system, but detection alone never runs a build before tests. Uncomment
@@ -904,8 +907,8 @@ reporting instructions.
 
 | Code | Meaning |
 |------|---------|
-| 0 | All mutations killed — tests are solid |
-| 1 | Survivors found, `--fail-under` threshold not met, or baseline regression |
+| 0 | Without `--fail-under`: no unaccepted survivors or fresh timeout/build-error outcomes. With `--fail-under`: score meets the threshold. No baseline regression. |
+| 1 | Without `--fail-under`: unaccepted survivors or fresh timeout/build-error outcomes; with `--fail-under`: threshold not met; or baseline regression. |
 | 2 | Error (config, git, parse failure) |
 | 130 | Interrupted (SIGINT) |
 
@@ -1040,13 +1043,15 @@ unique `report-artifact-name` in a matrix or when invoking the Action more than
 once, and use that same name when downloading. Set `upload-report: 'false'`
 only when you intentionally do not need the artifact. The `report-path`,
 `mutation-score`, and `survivor-count` outputs are runner-local evidence; the
-post-Action `if: always()` step records them after an intentional survivor
+post-Action `if: always()` step records them after an intentional mutation-gate
 failure without changing the failed Action result.
 
-Exit `1` means survivors, a `--fail-under` threshold miss, or a saved-baseline
-regression, so the example remains a PR gate. A failed baseline test or build
-is a fatal exit `2`, produces no normal mutation report, and leaves no valid
-Action outputs or artifact; `always()` does not make that error successful.
+Without `--fail-under`, exit `1` means an unaccepted survivor or fresh timeout/build
+error. With `--fail-under`, it means the score threshold was missed. A saved-baseline
+regression also exits `1`, so the example remains a PR gate.
+A failed baseline test or build is a fatal exit `2`, produces no normal mutation
+report, and leaves no valid Action outputs or artifact; `always()` does not make
+that error successful.
 
 Use `pull_request` for untrusted forks, keep the read-only permissions and
 disabled persisted credentials shown above, and do not expose secrets to this

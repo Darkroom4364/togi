@@ -2891,7 +2891,7 @@ fn check_aborts_before_report_when_baseline_build_fails() {
 
 #[cfg(unix)]
 #[test]
-fn check_terminal_includes_build_error_diagnostics() {
+fn check_fresh_build_error_fails_default_gate_with_diagnostics() {
     let dir = setup_git_repo();
     let expected = tempfile::NamedTempFile::new().unwrap();
     fs::write(
@@ -2927,13 +2927,103 @@ fn check_terminal_includes_build_error_diagnostics() {
             "1",
             "--jobs",
             "1",
+            "--force-rerun",
+            "--no-incremental-history",
         ])
         .current_dir(dir.path())
         .assert()
-        .success()
+        .code(1)
+        .stdout(predicate::str::contains(
+            "Results: 0 killed, 0 survived, 0 timeout, 1 build errors",
+        ))
         .stdout(predicate::str::contains("Build error diagnostics:"))
         .stdout(predicate::str::contains("build_command"))
         .stdout(predicate::str::contains("not-a-togi-command"));
+}
+
+#[cfg(unix)]
+#[test]
+fn check_fresh_timeout_fails_default_gate_with_or_without_baseline() {
+    for with_baseline in [false, true] {
+        let dir = setup_git_repo();
+        if with_baseline {
+            write_baseline(dir.path(), 0, 1);
+        }
+        let expected = tempfile::NamedTempFile::new().unwrap();
+        fs::write(
+            expected.path(),
+            fs::read(dir.path().join("main.go")).unwrap(),
+        )
+        .unwrap();
+        let test_cmd = format!(
+            "sh -c {}",
+            shell_quote_text(&format!(
+                "if cmp -s main.go {}; then exit 0; else sleep 2; fi",
+                shell_quote(expected.path())
+            ))
+        );
+
+        let mut command = togi();
+        command
+            .args([
+                "check",
+                "--base",
+                "HEAD",
+                "--format",
+                "json",
+                "--test-cmd",
+                &test_cmd,
+                "--timeout",
+                "1",
+                "--no-schemata",
+                "--operators",
+                "gt_to_gte",
+                "--max-per-run",
+                "1",
+                "--jobs",
+                "1",
+                "--force-rerun",
+                "--no-incremental-history",
+            ])
+            .current_dir(dir.path());
+        if with_baseline {
+            command.arg("--check-baseline");
+        }
+        let output = command.output().unwrap();
+
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "with_baseline={with_baseline}\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if with_baseline {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                !stderr.contains("warning: no baseline found"),
+                "baseline should load: {stderr}"
+            );
+            assert!(
+                !stderr.contains("Mutation score regression detected!"),
+                "fresh timeout should fail independently of baseline regression: {stderr}"
+            );
+        }
+        let report: serde_json::Value =
+            serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+                panic!(
+                    "invalid JSON report: {error}\nstdout:\n{}",
+                    String::from_utf8_lossy(&output.stdout)
+                )
+            });
+        assert_eq!(report["total"], 1);
+        assert_eq!(report["survived"], 0);
+        assert_eq!(report["timeout"], 1);
+        assert_eq!(report["build_errors"], 0);
+        assert_eq!(report["mutation_score"], 0.0);
+        assert_eq!(report["mutations"][0]["result"], "timeout");
+        assert_eq!(report["mutations"][0]["execution"]["state"], "executed");
+    }
 }
 
 fn write_baseline(dir: &Path, killed: usize, total: usize) {
@@ -5291,7 +5381,7 @@ fn github_action_guide_and_advisory_pin_released_contract() {
     for expected in [
         "Those inputs override `togi.toml`",
         "`format: github`; the Action preserves that review run and performs a second\nfull JSON mutation run",
-        "A failed baseline test or build\nis a fatal exit `2`",
+        "A failed baseline test or build is a fatal exit `2`",
         "Never use `pull_request_target` to run PR code.",
     ] {
         assert!(
