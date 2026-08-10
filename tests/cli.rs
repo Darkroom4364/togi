@@ -4235,7 +4235,7 @@ if [[ "${args[0]:-}" == "--version" ]]; then
   if [[ -n "${FAKE_TOGI_VERSION_STDERR:-}" ]]; then
     printf '%s\n' "$FAKE_TOGI_VERSION_STDERR" >&2
   fi
-  printf 'togi %s\n' "${FAKE_TOGI_VERSION:-0.5.1}"
+  printf 'togi %s\n' "${FAKE_TOGI_VERSION:-0.5.2}"
   exit "${FAKE_TOGI_VERSION_STATUS:-0}"
 fi
 if [[ "${args[0]:-}" == "help" && "${args[1]:-}" == "check" ]]; then
@@ -4296,7 +4296,7 @@ fn action_helper_command(
         .arg(helper)
         .current_dir(fixture.dir.path())
         .env("TOGI_BIN", &fixture.fake_togi)
-        .env("TOGI_EXPECTED_VERSION", "v0.5.1")
+        .env("TOGI_EXPECTED_VERSION", "v0.5.2")
         .env("RUNNER_TEMP", fixture.dir.path())
         .env("GITHUB_OUTPUT", &fixture.github_output)
         .env("TOGI_REPORT_PATH", &fixture.report_path)
@@ -4503,7 +4503,7 @@ fn github_action_run_helper_rejects_version_mismatches_before_check() {
         return;
     }
 
-    for version in ["0.5.0", "0.5.2"] {
+    for version in ["0.5.0", "0.5.1"] {
         let fixture = action_helper_fixture();
         let existing = "{\"kind\":\"mutation_report\",\"schema_version\":1}\n";
         fs::write(&fixture.report_path, existing).unwrap();
@@ -4689,7 +4689,7 @@ fn github_action_run_helper_keeps_native_report_output_path() {
         .current_dir(fixture.dir.path())
         .env("PATH", path)
         .env("TOGI_BIN", &fixture.fake_togi)
-        .env("TOGI_EXPECTED_VERSION", "v0.5.1")
+        .env("TOGI_EXPECTED_VERSION", "v0.5.2")
         .env("TOGI_REPORT_PATH", r"C:\runner\temp\togi-report.json")
         .env("RUNNER_TEMP", fixture.dir.path())
         .env("GITHUB_OUTPUT", &fixture.github_output)
@@ -4849,7 +4849,7 @@ fn github_action_report_replays_a_direct_mutation() {
         .arg(helper)
         .current_dir(repo.path())
         .env("TOGI_BIN", assert_cmd::cargo::cargo_bin("togi"))
-        .env("TOGI_EXPECTED_VERSION", "v0.5.1")
+        .env("TOGI_EXPECTED_VERSION", "v0.5.2")
         .env("RUNNER_TEMP", report_dir.path())
         .env("GITHUB_OUTPUT", &github_output)
         .env("TOGI_BASE", "HEAD")
@@ -4935,7 +4935,7 @@ fn github_action_install_rejects_failed_fetch_without_ambient_archive_fallback()
         .args(["-c", &action_install_run_script(&action_path)])
         .current_dir(dir.path())
         .env("GITHUB_OUTPUT", &github_output)
-        .env("TOGI_VERSION_INPUT", "v0.5.1")
+        .env("TOGI_VERSION_INPUT", "v0.5.2")
         .env("RUNNER_TEMP", &runner_temp)
         .env("GITHUB_ENV", &github_env)
         .env("TOGI_ARCHIVE", "ambient-archive.tar.gz")
@@ -4956,7 +4956,7 @@ fn github_action_install_rejects_failed_fetch_without_ambient_archive_fallback()
         String::from_utf8_lossy(&output.stderr)
     );
 
-    assert_eq!(fs::read_to_string(&fetch_log).unwrap(), "v0.5.1\n");
+    assert_eq!(fs::read_to_string(&fetch_log).unwrap(), "v0.5.2\n");
     assert_eq!(
         fs::read_to_string(&resolver_log).unwrap(),
         "__unset__/__unset__\n"
@@ -5033,7 +5033,7 @@ fn github_action_install_uses_the_resolved_temp_root() {
     let output = std::process::Command::new("bash")
         .args(["-c", install_script.as_str()])
         .current_dir(dir.path())
-        .env("TOGI_VERSION_INPUT", "v0.5.1")
+        .env("TOGI_VERSION_INPUT", "v0.5.2")
         .env("RUNNER_TEMP", &raw_runner_temp)
         .env("GITHUB_ENV", &github_env)
         .env("GITHUB_PATH", &github_path)
@@ -5057,7 +5057,7 @@ fn github_action_install_uses_the_resolved_temp_root() {
     assert_eq!(
         fs::read_to_string(&github_env).unwrap(),
         format!(
-            "TOGI_BIN={}/togi-bin/togi\nTOGI_EXPECTED_VERSION=v0.5.1\n",
+            "TOGI_BIN={}/togi-bin/togi\nTOGI_EXPECTED_VERSION=v0.5.2\n",
             resolved_temp_root.display()
         )
     );
@@ -5107,7 +5107,7 @@ fn github_action_inputs_have_no_baked_in_defaults() {
     }
 
     for (name, default) in [
-        ("version", "'v0.5.1'"),
+        ("version", "'v0.5.2'"),
         ("upload-report", "'true'"),
         ("report-retention-days", "'14'"),
         ("report-artifact-name", "'togi-report'"),
@@ -5136,7 +5136,7 @@ fn github_action_inputs_have_no_baked_in_defaults() {
         "Action releases must not resolve a mutable version"
     );
     for expected in [
-        "VERSION=\"${TOGI_VERSION_INPUT:-v0.5.1}\"",
+        "VERSION=\"${TOGI_VERSION_INPUT:-v0.5.2}\"",
         "^v[0-9]+[.][0-9]+[.][0-9]+$",
         "resolve-togi-asset.sh",
         "fetch-togi-release-asset.sh",
@@ -6427,6 +6427,75 @@ fn released_archive_install_smoke_verifies_published_asset() {
     assert!(
         github_path_entry.contains("togi-bin"),
         "GITHUB_PATH did not gain the install dir: {github_path_entry}"
+    );
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+#[ignore]
+fn released_binary_smoke_stages_complete_go_fixture() {
+    if !bash_available() {
+        eprintln!("skipping released-binary smoke test because bash is unavailable");
+        return;
+    }
+
+    let asset = action_asset("togi-linux-x86_64.tar.gz", "togi");
+    let dir = TempDir::new().unwrap();
+    let payload_dir = dir.path().join("payload");
+    fs::create_dir_all(&payload_dir).unwrap();
+    let payload_binary = payload_dir.join(&asset.binary);
+    fs::copy(assert_cmd::cargo::cargo_bin("togi"), &payload_binary).unwrap();
+    chmod_executable(&payload_binary);
+
+    let release_dir = dir.path().join("release");
+    fs::create_dir_all(&release_dir).unwrap();
+    let archive_path = release_dir.join(&asset.archive);
+    create_action_archive(&asset, &payload_dir, &archive_path);
+    let sha = sha256_hex(&archive_path);
+    fs::write(
+        release_dir.join("checksums.txt"),
+        format!("{sha}  ./{}\n", asset.archive),
+    )
+    .unwrap();
+
+    let bin_dir = dir.path().join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    write_fake_curl(&bin_dir);
+    let mut paths = vec![bin_dir];
+    paths.extend(
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+            .filter(|path| !path.join("togi").exists()),
+    );
+
+    let runner_temp = dir.path().join("runner-temp");
+    fs::create_dir_all(&runner_temp).unwrap();
+    let github_path = dir.path().join("github-path");
+    fs::write(&github_path, "").unwrap();
+    let version = format!("v{}", env!("CARGO_PKG_VERSION"));
+    let output = std::process::Command::new("bash")
+        .arg(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join(".github/scripts/run-released-binary-smoke.sh"),
+        )
+        .env("GITHUB_WORKSPACE", env!("CARGO_MANIFEST_DIR"))
+        .env("TOGI_VERSION", &version)
+        .env("TOGI_EXPECTED_ARCH", "x86_64")
+        .env("TOGI_EXPECTED_ARCHIVE", &asset.archive)
+        .env("TOGI_EXPECTED_BINARY", &asset.binary)
+        .env("RUNNER_TEMP", &runner_temp)
+        .env("GITHUB_PATH", &github_path)
+        .env("FAKE_RELEASE_DIR", &release_dir)
+        .env("PATH", std::env::join_paths(paths).unwrap())
+        .env_remove("TOGI_OS")
+        .env_remove("TOGI_ARCH")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "released-binary smoke failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
     );
 }
 

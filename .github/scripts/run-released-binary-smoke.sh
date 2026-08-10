@@ -45,12 +45,12 @@ fi
 fixture_dir="${GITHUB_WORKSPACE}/tests/fixtures/go"
 project_root=$(mktemp -d "${RUNNER_TEMP}/togi-released-binary-fixture.XXXXXX")
 trap 'rm -rf "$project_root"' EXIT
-cp "$fixture_dir/go.mod" "$fixture_dir/calc.go" "$fixture_dir/calc_test.go" "$project_root/"
+cp -R "$fixture_dir/." "$project_root/"
 git -C "$project_root" init -q
 git -C "$project_root" config user.name "Togi Released Binary Smoke"
 git -C "$project_root" config user.email "togi-smoke@example.invalid"
 sed -i 's/if n > 0/if n < 0/' "$project_root/calc.go"
-git -C "$project_root" add go.mod calc.go calc_test.go
+git -C "$project_root" add -- .
 git -C "$project_root" commit -qm "Seed fixture"
 sed -i 's/if n < 0/if n > 0/' "$project_root/calc.go"
 git -C "$project_root" add calc.go
