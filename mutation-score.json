@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
   "label": "mutation score (dogfood: src/report/json.rs)",
-  "message": "100% (15 tested)",
+  "message": "100% (13 tested)",
   "color": "brightgreen"
 }
