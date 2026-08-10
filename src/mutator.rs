@@ -134,6 +134,11 @@ pub fn generate_mutations(
                     else {
                         continue;
                     };
+                    if candidate.operator_id == "return_empty"
+                        && candidate.replacement.as_bytes() == original.as_bytes()
+                    {
+                        continue;
+                    }
 
                     file_mutations.push(Mutation {
                         id: 0,
@@ -803,6 +808,85 @@ mod tests {
             mutations.is_empty(),
             "and/or returns are not necessarily boolean"
         );
+    }
+
+    #[test]
+    fn return_empty_skips_post_fixup_identity_candidates() {
+        let tmp = TempDir::new().unwrap();
+        let go_src = concat!(
+            "package main\n\n",
+            "func false_identity() bool { return false }\n",
+            "func zero_identity() int { return 0 }\n",
+            "func empty_identity() string { return \"\" }\n",
+            "func true_mutation() bool { return true }\n",
+            "func nonzero_mutation() int { return 1 }\n",
+            "func nonempty_mutation() string { return \"value\" }\n",
+        );
+        let go_rel = write_test_file(tmp.path(), "main.go", go_src);
+        let go_mutations = generate_mutations(
+            &[ChangedFile {
+                path: go_rel,
+                hunks: vec![LineRange {
+                    start: 1,
+                    end: go_src.lines().count(),
+                }],
+            }],
+            tmp.path(),
+            100,
+            0,
+            &["return_empty".into()],
+        )
+        .unwrap();
+
+        assert_eq!(
+            go_mutations.len(),
+            3,
+            "only non-identity Go return_empty candidates should remain: {go_mutations:?}"
+        );
+        for (original, replacement) in [("true", "false"), ("1", "0"), ("\"value\"", "\"\"")] {
+            assert!(
+                go_mutations.iter().any(|mutation| {
+                    mutation.original == original && mutation.replacement == replacement
+                }),
+                "expected return_empty {original:?} -> {replacement:?}, got: {go_mutations:?}"
+            );
+        }
+        assert!(
+            go_mutations
+                .iter()
+                .all(|mutation| mutation.original != mutation.replacement),
+            "return_empty should not emit identical Go mutations: {go_mutations:?}"
+        );
+
+        let python_src = concat!(
+            "def false_identity():\n",
+            "    return False\n\n",
+            "def true_mutation():\n",
+            "    return True\n",
+        );
+        let python_rel = write_test_file(tmp.path(), "main.py", python_src);
+        let python_mutations = generate_mutations(
+            &[ChangedFile {
+                path: python_rel,
+                hunks: vec![LineRange {
+                    start: 1,
+                    end: python_src.lines().count(),
+                }],
+            }],
+            tmp.path(),
+            100,
+            0,
+            &["return_empty".into()],
+        )
+        .unwrap();
+
+        assert_eq!(
+            python_mutations.len(),
+            1,
+            "only the non-identity Python return_empty candidate should remain: {python_mutations:?}"
+        );
+        assert_eq!(python_mutations[0].original, "True");
+        assert_eq!(python_mutations[0].replacement, "False");
     }
 
     #[test]
