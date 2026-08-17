@@ -148,6 +148,18 @@ Before running `togi check`, use a trusted Git checkout with a resolvable base:
 the default is `origin/main`, or choose one with `--base`. Install the project's
 normal dependencies and ensure the selected test command passes.
 
+**First run in a clean clone:** The selected diff is empty; that is normal for a
+clean clone, not an error. Preview all supported files without tests (bounded):
+
+```bash
+togi check --all --dry-run --max-per-run 10
+```
+
+After a supported source change, run `togi check`, or `togi check --base <ref>`
+for another intended base. `--all` and `--base` are alternatives; do not combine
+them. If command detection is ambiguous, run `togi init` from the repository
+root.
+
 The [compatibility contract](docs/COMPATIBILITY.md) contains the supported
 marker defaults. When no supported marker is present, togi's best-effort fallback
 is `make test`, which requires a `Makefile` with a `test` target. If detection is
@@ -163,7 +175,6 @@ install, version, and a real Go mutation smoke, while the Tier 2 macOS arm64
 and Windows x86_64 archives pass checksum, install, and version smoke. Linux
 and Windows ARM64 (aarch64) are not supported. macOS x86_64 (Intel) is not
 supported and has no release asset: the only macOS target is arm64.
-
 
 ## Usage
 
