@@ -393,7 +393,6 @@ fn run_check(cfg: togi::cli::CheckArgs, cancelled: Arc<AtomicBool>) -> anyhow::R
         &config,
         all,
         &paths,
-        dry_run,
         output_format == togi::cli::OutputFormat::Json,
         &project_root,
     )?;
@@ -1288,7 +1287,6 @@ fn collect_files(
     config: &togi::config::Config,
     all: bool,
     paths: &[PathBuf],
-    dry_run: bool,
     json_output: bool,
     project_root: &Path,
 ) -> anyhow::Result<Vec<ChangedFile>> {
@@ -1321,20 +1319,24 @@ fn collect_files(
     if diff_output.is_empty() {
         if json_output {
             eprintln!(
-                "No changes found in diff against `{}`. Nothing to mutate.",
+                "No changes found in diff against `{}`. The selected diff is empty; that is normal for a clean clone, not an error.\n\
+Preview all supported files without tests (bounded):\n\
+  togi check --all --dry-run --max-per-run 10\n\
+After a supported source change, run `togi check`, or `togi check --base <ref>` for another intended base.\n\
+`--all` and `--base` are alternatives; do not combine them.\n\
+If command detection is ambiguous, run `togi init` from the repository root.",
                 config.diff.base
             );
-            if dry_run {
-                eprintln!("Hint: use --all --dry-run to preview mutations across all files.");
-            }
         } else {
             println!(
-                "No changes found in diff against `{}`. Nothing to mutate.",
+                "No changes found in diff against `{}`. The selected diff is empty; that is normal for a clean clone, not an error.\n\
+Preview all supported files without tests (bounded):\n\
+  togi check --all --dry-run --max-per-run 10\n\
+After a supported source change, run `togi check`, or `togi check --base <ref>` for another intended base.\n\
+`--all` and `--base` are alternatives; do not combine them.\n\
+If command detection is ambiguous, run `togi init` from the repository root.",
                 config.diff.base
             );
-            if dry_run {
-                println!("Hint: use --all --dry-run to preview mutations across all files.");
-            }
         }
         return Ok(vec![]);
     }

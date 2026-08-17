@@ -495,7 +495,7 @@ fn init_fails_if_config_exists() {
 }
 
 #[test]
-fn check_no_diff_exits_zero() {
+fn check_empty_diff_prints_activation_path_and_exits_zero() {
     let dir = setup_git_repo();
 
     // Commit the working change so there's no unstaged diff against HEAD
@@ -511,12 +511,37 @@ fn check_no_diff_exits_zero() {
         .unwrap();
 
     // Diff HEAD against HEAD = no changes
-    togi()
+    let output = togi()
         .args(["check", "--base", "HEAD"])
         .current_dir(dir.path())
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("No changes found"));
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("selected diff is empty; that is normal for a clean clone, not an error."),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("togi check --all --dry-run --max-per-run 10"),
+        "stdout: {stdout}"
+    );
+    for expected in [
+        "After a supported source change, run `togi check`, or `togi check --base <ref>` for another intended base.",
+        "`--all` and `--base` are alternatives; do not combine them.",
+        "If command detection is ambiguous, run `togi init` from the repository root.",
+    ] {
+        assert!(stdout.contains(expected), "stdout: {stdout}");
+    }
+    assert!(
+        !dir.path().join(".togi-cache").exists(),
+        "an empty diff must not start a mutation run"
+    );
 }
 
 #[test]
@@ -1607,6 +1632,65 @@ fn check_format_json_dry_run_outputs_a_single_preview_document() {
 }
 
 #[test]
+fn check_all_dry_run_max_per_run_preview_is_bounded() {
+    let dir = setup_git_repo();
+    // Eleven comparison expressions provide more candidate mutations than the cap.
+    fs::write(
+        dir.path().join("main.go"),
+        r#"package main
+
+func compare0(a, b int) bool { return a > b }
+func compare1(a, b int) bool { return a > b }
+func compare2(a, b int) bool { return a > b }
+func compare3(a, b int) bool { return a > b }
+func compare4(a, b int) bool { return a > b }
+func compare5(a, b int) bool { return a > b }
+func compare6(a, b int) bool { return a > b }
+func compare7(a, b int) bool { return a > b }
+func compare8(a, b int) bool { return a > b }
+func compare9(a, b int) bool { return a > b }
+func compare10(a, b int) bool { return a > b }
+"#,
+    )
+    .unwrap();
+
+    let output = togi()
+        .args([
+            "check",
+            "--all",
+            "--dry-run",
+            "--max-per-run",
+            "10",
+            "--format",
+            "json",
+        ])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|e| {
+        panic!(
+            "invalid capped dry-run JSON output: {e}\nstdout: {}",
+            String::from_utf8_lossy(&output.stdout)
+        )
+    });
+    assert_eq!(value["kind"], "dry_run");
+    assert_eq!(value["dry_run"], true);
+    assert_eq!(value["planned_total"], 10);
+    assert_eq!(value["mutations"].as_array().unwrap().len(), 10);
+    assert!(value.get("mutation_score").is_none());
+    assert!(
+        !dir.path().join(".togi-cache").exists(),
+        "a dry run must not start a mutation run"
+    );
+}
+
+#[test]
 fn check_dry_run_rejects_json_report_and_preserves_existing_report() {
     for has_mutations in [false, true] {
         let dir = setup_git_repo();
@@ -1764,10 +1848,98 @@ fn check_format_json_no_mutations_outputs_an_empty_report() {
     assert_eq!(value["kind"], "mutation_report");
     assert_eq!(value["schema_version"], 1);
     assert_eq!(output.stdout, fs::read(&report_path).unwrap());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("No changes found"), "stderr: {stderr}");
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("No changes found"),
+        stderr.contains("selected diff is empty; that is normal for a clean clone, not an error."),
+        "stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("togi check --all --dry-run --max-per-run 10"),
+        "stderr: {stderr}"
+    );
+    for expected in [
+        "After a supported source change, run `togi check`, or `togi check --base <ref>` for another intended base.",
+        "`--all` and `--base` are alternatives; do not combine them.",
+        "If command detection is ambiguous, run `togi init` from the repository root.",
+    ] {
+        assert!(stderr.contains(expected), "stderr: {stderr}");
+    }
+    assert!(
+        !dir.path().join(".togi-cache").exists(),
+        "an empty diff must not start a mutation run"
+    );
+}
+
+#[test]
+fn check_format_json_dry_run_empty_diff_keeps_stdout_machine_readable() {
+    let dir = setup_git_repo();
+    assert_command_success(
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(dir.path())
+            .output()
+            .unwrap(),
+        "commit no-diff setup",
+    );
+    assert_command_success(
+        std::process::Command::new("git")
+            .args(["commit", "-m", "second"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap(),
+        "commit no-diff setup",
+    );
+
+    let output = togi()
+        .args([
+            "check",
+            "--base",
+            "HEAD",
+            "--format",
+            "json",
+            "--dry-run",
+            "--test-cmd",
+            "true",
+        ])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
         "stderr: {}",
         String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|e| {
+        panic!(
+            "invalid empty dry-run JSON output: {e}\nstdout: {}",
+            String::from_utf8_lossy(&output.stdout)
+        )
+    });
+    assert_eq!(
+        value,
+        serde_json::json!({
+            "kind": "dry_run",
+            "dry_run": true,
+            "planned_total": 0,
+            "mutations": [],
+        })
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for expected in [
+        "No changes found",
+        "selected diff is empty; that is normal for a clean clone, not an error.",
+        "togi check --all --dry-run --max-per-run 10",
+        "After a supported source change, run `togi check`, or `togi check --base <ref>` for another intended base.",
+        "`--all` and `--base` are alternatives; do not combine them.",
+        "If command detection is ambiguous, run `togi init` from the repository root.",
+    ] {
+        assert!(stderr.contains(expected), "stderr: {stderr}");
+    }
+    assert!(
+        !dir.path().join(".togi-cache").exists(),
+        "an empty diff must not start a mutation run"
     );
 }
 
@@ -5422,10 +5594,41 @@ fn before_first_run_documents_zero_config_contract() {
     let section_start = readme
         .find("### Before first run\n")
         .expect("README must contain a Before first run section");
-    let section = &readme[section_start..];
-    let (section, _) = section
-        .split_once("\n## Usage\n")
-        .expect("Before first run section must end before Usage");
+    let activation = "**First run in a clean clone:";
+    let preview = "togi check --all --dry-run --max-per-run 10";
+    let usage_start = readme
+        .find("\n## Usage\n")
+        .expect("README must contain a Usage section");
+    let section = &readme[section_start..usage_start];
+    let activation_start = section
+        .find(activation)
+        .map(|start| section_start + start)
+        .expect("Before first run section must contain the activation guidance");
+    let preview_start = section
+        .find(preview)
+        .map(|start| section_start + start)
+        .expect("Before first run section must contain the bounded preview");
+    let prerequisites = "normal dependencies and ensure the selected test command passes.\n\n";
+    let prerequisites_end = section
+        .find(prerequisites)
+        .map(|start| section_start + start + prerequisites.len())
+        .expect("README must end the prerequisites paragraph before the preview");
+    let compatibility_start = section
+        .find("The [compatibility contract](docs/COMPATIBILITY.md)")
+        .map(|start| section_start + start)
+        .expect("README must contain compatibility guidance");
+    assert_eq!(
+        activation_start, prerequisites_end,
+        "activation guidance must immediately follow the prerequisites paragraph"
+    );
+    assert!(
+        activation_start < preview_start && preview_start < compatibility_start,
+        "bounded preview must follow the activation guidance and precede compatibility guidance"
+    );
+    assert!(
+        section_start < preview_start && preview_start < usage_start,
+        "bounded preview must appear in Before first run before Usage"
+    );
     let section = section.split_whitespace().collect::<Vec<_>>().join(" ");
 
     for expected in [
@@ -5433,6 +5636,9 @@ fn before_first_run_documents_zero_config_contract() {
         "It does not provision your project's dependencies, runtimes, or test runner, or make an unsupported platform or language supported.",
         "Before running `togi check`, use a trusted Git checkout with a resolvable base: the default is `origin/main`, or choose one with `--base`.",
         "Install the project's normal dependencies and ensure the selected test command passes.",
+        "**First run in a clean clone:** The selected diff is empty; that is normal for a clean clone, not an error. Preview all supported files without tests (bounded):",
+        "togi check --all --dry-run --max-per-run 10",
+        "After a supported source change, run `togi check`, or `togi check --base <ref>` for another intended base. `--all` and `--base` are alternatives; do not combine them. If command detection is ambiguous, run `togi init` from the repository root.",
         "The [compatibility contract](docs/COMPATIBILITY.md) contains the supported marker defaults.",
         "When no supported marker is present, togi's best-effort fallback is `make test`, which requires a `Makefile` with a `test` target.",
         "run `togi init` and review or edit the generated `togi.toml`, configure `togi.toml` directly, or use one-shot `--test-cmd`.",
