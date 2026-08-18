@@ -1,0 +1,610 @@
+name: Dependabot Post-merge Verification
+
+on:
+  workflow_run:
+    workflows: [Dependabot Auto-merge]
+    types: [completed]
+
+permissions: {}
+
+jobs:
+  resolve:
+    name: Resolve authorized Dependabot merge
+    if: ${{ github.run_attempt == '1' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 340
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: read
+    outputs:
+      resolved: ${{ steps.resolve.outputs.resolved }}
+      repository: ${{ steps.resolve.outputs.repository }}
+      source_run_id: ${{ steps.resolve.outputs.source_run_id }}
+      pr_number: ${{ steps.resolve.outputs.pr_number }}
+      source_head_sha: ${{ steps.resolve.outputs.source_head_sha }}
+      merge_sha: ${{ steps.resolve.outputs.merge_sha }}
+      first_parent_sha: ${{ steps.resolve.outputs.first_parent_sha }}
+    steps:
+      - name: Resolve one verified merged pull request
+        id: resolve
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          SOURCE_RUN_ID: ${{ github.event.workflow_run.id }}
+          DOWNSTREAM_RUN_ID: ${{ github.run_id }}
+          DOWNSTREAM_RUN_ATTEMPT: ${{ github.run_attempt }}
+          LOCATOR_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+
+          readonly EXPECTED_WORKFLOW_ID=317348089
+          readonly EXPECTED_WORKFLOW_PATH='.github/workflows/dependabot-auto-merge.yml'
+          readonly EXPECTED_WORKFLOW_NAME='Dependabot Auto-merge'
+          readonly EXPECTED_EVENT='pull_request_target'
+          readonly DOWNSTREAM_EVENT='workflow_run'
+          readonly DEPENDABOT_LOGIN='dependabot[bot]'
+          readonly AUTO_MERGE_JOB='auto-merge'
+          readonly ENABLE_STEP='Enable native auto-merge'
+          readonly POLL_INTERVAL_SECONDS=30
+          # Thirty minutes admits workflow_run delivery; 60 seconds tolerates clock skew.
+          # This anchors admission to the platform-created downstream run, not runner delay.
+          readonly SOURCE_TO_DOWNSTREAM_CREATION_WINDOW_SECONDS=1800
+          readonly CLOCK_SKEW_TOLERANCE_SECONDS=60
+          readonly RESOLVER_WAIT_SECONDS=19800
+
+          die() {
+            printf '%s\n' "$1" >&2
+            exit 1
+          }
+
+          require_identifier() {
+            [[ "$1" =~ ^[1-9][0-9]{0,18}$ ]] || die 'invalid numeric identifier'
+          }
+
+          require_pr_number() {
+            [[ "$1" =~ ^[1-9][0-9]{0,9}$ ]] || die 'invalid pull request number'
+          }
+
+          require_sha() {
+            [[ "$1" =~ ^[0-9a-f]{40}$ ]] || die 'invalid commit SHA'
+          }
+
+          require_repository() {
+            [[ "$1" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die 'invalid repository identity'
+          }
+
+          require_epoch() {
+            [[ "$1" =~ ^[0-9]{1,12}$ ]] || die 'invalid timestamp'
+          }
+
+          require_utc_timestamp() {
+            [[ "$1" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]+)?Z$ ]] || die 'invalid UTC timestamp'
+          }
+
+          scratch="$(mktemp -d "${RUNNER_TEMP:-/tmp}/togi-postmerge-resolver.XXXXXX")"
+          trap 'rm -rf "$scratch"' EXIT
+          api_error="$scratch/api-error"
+
+          api_get() {
+            local destination="$1"
+            local endpoint="$2"
+            if ! timeout 60s gh api "$endpoint" >"$destination" 2>"$api_error"; then
+              die 'GitHub API request failed'
+            fi
+          }
+
+          api_pages() {
+            local destination="$1"
+            local endpoint="$2"
+            if ! timeout 60s gh api --paginate --slurp "$endpoint" >"$destination" 2>"$api_error"; then
+              die 'GitHub API pagination request failed'
+            fi
+          }
+
+          require_repository "$REPOSITORY"
+          require_identifier "$DOWNSTREAM_RUN_ID"
+          require_identifier "$DOWNSTREAM_RUN_ATTEMPT"
+          [[ "$DOWNSTREAM_RUN_ATTEMPT" == '1' ]] || die 'downstream workflow run is not the initial attempt'
+          require_identifier "$SOURCE_RUN_ID"
+          require_sha "$LOCATOR_HEAD_SHA"
+
+          resolver_started_epoch="$(date -u +%s)"
+          require_epoch "$resolver_started_epoch"
+          resolver_deadline_epoch=$((resolver_started_epoch + RESOLVER_WAIT_SECONDS))
+
+          downstream_run_json="$scratch/downstream-run.json"
+          api_get "$downstream_run_json" "repos/${REPOSITORY}/actions/runs/${DOWNSTREAM_RUN_ID}"
+
+          if ! jq -e \
+            --argjson downstream_run_id "$DOWNSTREAM_RUN_ID" \
+            --argjson downstream_run_attempt "$DOWNSTREAM_RUN_ATTEMPT" \
+            --arg repository "$REPOSITORY" \
+            --arg expected_event "$DOWNSTREAM_EVENT" '
+              .id == $downstream_run_id
+              and .repository.full_name == $repository
+              and .event == $expected_event
+              and .run_attempt == $downstream_run_attempt
+              and (.created_at | type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]+)?Z$"))
+            ' "$downstream_run_json" >/dev/null 2>"$api_error"; then
+            die 'downstream workflow run identity validation failed'
+          fi
+
+          downstream_created_at="$(jq -r '.created_at' "$downstream_run_json")"
+          require_utc_timestamp "$downstream_created_at"
+          if ! downstream_created_epoch="$(date -u --date="$downstream_created_at" +%s 2>"$api_error")"; then
+            die 'downstream workflow creation timestamp conversion failed'
+          fi
+          require_epoch "$downstream_created_epoch"
+
+          source_run_json="$scratch/source-run.json"
+          api_get "$source_run_json" "repos/${REPOSITORY}/actions/runs/${SOURCE_RUN_ID}"
+
+          if ! jq -e \
+            --argjson source_run_id "$SOURCE_RUN_ID" \
+            --argjson workflow_id "$EXPECTED_WORKFLOW_ID" \
+            --arg repository "$REPOSITORY" \
+            --arg source_head "$LOCATOR_HEAD_SHA" \
+            --arg workflow_path "$EXPECTED_WORKFLOW_PATH" \
+            --arg workflow_name "$EXPECTED_WORKFLOW_NAME" \
+            --arg expected_event "$EXPECTED_EVENT" '
+              .id == $source_run_id
+              and .workflow_id == $workflow_id
+              and .name == $workflow_name
+              and .path == $workflow_path
+              and .event == $expected_event
+              and .status == "completed"
+              and .conclusion == "success"
+              and .run_attempt == 1
+              and .repository.full_name == $repository
+              and .head_repository.full_name == $repository
+              and .head_sha == $source_head
+              and (.head_sha | type == "string" and test("^[0-9a-f]{40}$"))
+              and (.updated_at | type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]+)?Z$"))
+            ' "$source_run_json" >/dev/null 2>"$api_error"; then
+            die 'source workflow identity validation failed'
+          fi
+
+          source_head_sha="$(jq -r '.head_sha' "$source_run_json")"
+          source_run_attempt="$(jq -r '.run_attempt' "$source_run_json")"
+          source_updated_at="$(jq -r '.updated_at' "$source_run_json")"
+          require_sha "$source_head_sha"
+          require_identifier "$source_run_attempt"
+          [[ "$source_run_attempt" == '1' ]] || die 'source workflow run is not the initial attempt'
+          require_utc_timestamp "$source_updated_at"
+          if ! source_updated_epoch="$(date -u --date="$source_updated_at" +%s 2>"$api_error")"; then
+            die 'source workflow update timestamp conversion failed'
+          fi
+          require_epoch "$source_updated_epoch"
+          completion_to_downstream_creation_seconds=$((downstream_created_epoch - source_updated_epoch))
+          (( completion_to_downstream_creation_seconds >= -CLOCK_SKEW_TOLERANCE_SECONDS )) || die 'downstream workflow run predates source completion'
+          (( completion_to_downstream_creation_seconds <= SOURCE_TO_DOWNSTREAM_CREATION_WINDOW_SECONDS )) || die 'source completion is too old for downstream admission'
+
+          source_jobs_json="$scratch/source-jobs.json"
+          api_pages \
+            "$source_jobs_json" \
+            "repos/${REPOSITORY}/actions/runs/${SOURCE_RUN_ID}/attempts/${source_run_attempt}/jobs?per_page=100"
+
+          if ! jq -e \
+            --argjson source_run_id "$SOURCE_RUN_ID" \
+            --argjson source_run_attempt "$source_run_attempt" \
+            --arg source_head "$source_head_sha" \
+            --arg workflow_name "$EXPECTED_WORKFLOW_NAME" \
+            --arg auto_merge_job "$AUTO_MERGE_JOB" \
+            --arg enable_step "$ENABLE_STEP" '
+              [ .[]? | .jobs[]? | select(.name == $auto_merge_job) ] as $auto_merge_jobs
+              | ($auto_merge_jobs | length == 1)
+              and (
+                $auto_merge_jobs[0]
+                | .run_id == $source_run_id
+                and .run_attempt == $source_run_attempt
+                and .workflow_name == $workflow_name
+                and .head_sha == $source_head
+                and .status == "completed"
+                and .conclusion == "success"
+                and ([.steps[]? | select(.name == $enable_step)] | length == 1)
+                and ([.steps[]? | select(.name == $enable_step and .status == "completed" and .conclusion == "success")] | length == 1)
+              )
+            ' "$source_jobs_json" >/dev/null 2>"$api_error"; then
+            die 'source auto-merge job validation failed'
+          fi
+
+          associated_prs_json="$scratch/associated-prs.json"
+          api_pages \
+            "$associated_prs_json" \
+            "repos/${REPOSITORY}/commits/${source_head_sha}/pulls?per_page=100"
+
+          if ! jq -e \
+            --arg repository "$REPOSITORY" \
+            --arg source_head "$source_head_sha" \
+            --arg dependabot "$DEPENDABOT_LOGIN" '
+              [ .[]? | .[]? ] as $pulls
+              | ($pulls | length == 1)
+              and (
+                $pulls[0]
+                | (.number | if type == "number" then (. > 0 and floor == .) else false end)
+                and .head.sha == $source_head
+                and .head.repo.full_name == $repository
+                and .base.ref == "main"
+                and .base.repo.full_name == $repository
+                and .user.login == $dependabot
+                and (.state == "open" or .state == "closed")
+              )
+            ' "$associated_prs_json" >/dev/null 2>"$api_error"; then
+            die 'associated pull request validation failed'
+          fi
+
+          pr_number="$(jq -r '[ .[]? | .[]? ][0].number' "$associated_prs_json")"
+          require_pr_number "$pr_number"
+
+          pr_json="$scratch/pull-request.json"
+          while :; do
+            api_get "$pr_json" "repos/${REPOSITORY}/pulls/${pr_number}"
+
+            if ! jq -e \
+              --argjson expected_pr_number "$pr_number" \
+              --arg repository "$REPOSITORY" \
+              --arg source_head "$source_head_sha" \
+              --arg dependabot "$DEPENDABOT_LOGIN" '
+                .number == $expected_pr_number
+                and .head.sha == $source_head
+                and .head.repo.full_name == $repository
+                and .base.ref == "main"
+                and .base.repo.full_name == $repository
+                and .user.login == $dependabot
+                and (.state == "open" or .state == "closed")
+              ' "$pr_json" >/dev/null 2>"$api_error"; then
+              die 'pull request identity validation failed'
+            fi
+
+            pr_state="$(jq -r '.state' "$pr_json")"
+            case "$pr_state" in
+              open)
+                now_epoch="$(date -u +%s)"
+                require_epoch "$now_epoch"
+                (( now_epoch < resolver_deadline_epoch )) || die 'resolver wait deadline elapsed'
+                remaining_seconds=$((resolver_deadline_epoch - now_epoch))
+                if (( remaining_seconds < POLL_INTERVAL_SECONDS )); then
+                  sleep "$remaining_seconds"
+                else
+                  sleep "$POLL_INTERVAL_SECONDS"
+                fi
+                ;;
+              closed)
+                break
+                ;;
+              *)
+                die 'unexpected pull request state'
+                ;;
+            esac
+          done
+
+          if ! jq -e \
+            --argjson expected_pr_number "$pr_number" \
+            --arg repository "$REPOSITORY" \
+            --arg source_head "$source_head_sha" \
+            --arg dependabot "$DEPENDABOT_LOGIN" '
+              .number == $expected_pr_number
+              and .state == "closed"
+              and .merged == true
+              and (.merged_at | type == "string")
+              and (.merged_by.login == "github-actions[bot]")
+              and .head.sha == $source_head
+              and .head.repo.full_name == $repository
+              and .base.ref == "main"
+              and .base.repo.full_name == $repository
+              and .user.login == $dependabot
+              and (.merge_commit_sha | type == "string")
+              and (.merge_commit_sha | test("^[0-9a-f]{40}$"))
+            ' "$pr_json" >/dev/null 2>"$api_error"; then
+            die 'merged pull request validation failed'
+          fi
+
+          merged_at="$(jq -r '.merged_at' "$pr_json")"
+          merge_sha="$(jq -r '.merge_commit_sha' "$pr_json")"
+          require_utc_timestamp "$merged_at"
+          require_sha "$merge_sha"
+          if ! merged_at_epoch="$(date -u --date="$merged_at" +%s 2>"$api_error")"; then
+            die 'merge timestamp conversion failed'
+          fi
+          require_epoch "$merged_at_epoch"
+          (( merged_at_epoch < resolver_deadline_epoch )) || die 'merge completed after resolver deadline'
+
+          merge_commit_json="$scratch/merge-commit.json"
+          api_get "$merge_commit_json" "repos/${REPOSITORY}/commits/${merge_sha}"
+
+          if ! jq -e \
+            --arg merge_sha "$merge_sha" \
+            --arg source_head "$source_head_sha" '
+              .sha == $merge_sha
+              and .author.login == "github-actions[bot]"
+              and (.parents | type == "array" and length == 2)
+              and .parents[1].sha == $source_head
+              and (.parents[0].sha | type == "string" and test("^[0-9a-f]{40}$"))
+            ' "$merge_commit_json" >/dev/null 2>"$api_error"; then
+            die 'merge commit identity validation failed'
+          fi
+
+          first_parent_sha="$(jq -r '.parents[0].sha' "$merge_commit_json")"
+          require_sha "$first_parent_sha"
+
+          {
+            printf 'resolved=true\n'
+            printf 'repository=%s\n' "$REPOSITORY"
+            printf 'source_run_id=%s\n' "$SOURCE_RUN_ID"
+            printf 'pr_number=%s\n' "$pr_number"
+            printf 'source_head_sha=%s\n' "$source_head_sha"
+            printf 'merge_sha=%s\n' "$merge_sha"
+            printf 'first_parent_sha=%s\n' "$first_parent_sha"
+          } >> "$GITHUB_OUTPUT"
+
+  verify:
+    name: Verify resolved merge on Linux
+    needs: resolve
+    if: ${{ github.run_attempt == '1' && needs.resolve.outputs.resolved == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    env:
+      EXPECTED_MERGE_SHA: ${{ needs.resolve.outputs.merge_sha }}
+    steps:
+      - name: Check out resolved merge commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.resolve.outputs.merge_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Install pinned stable Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+        with:
+          toolchain: stable
+          components: clippy, rustfmt
+      - name: Assert resolved checkout identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$EXPECTED_MERGE_SHA" =~ ^[0-9a-f]{40}$ ]] || {
+            echo 'invalid resolved merge SHA' >&2
+            exit 1
+          }
+          actual_sha="$(git rev-parse HEAD)"
+          [[ "$actual_sha" == "$EXPECTED_MERGE_SHA" ]] || {
+            echo 'checked-out commit did not match the resolved merge SHA' >&2
+            exit 1
+          }
+      - name: Build
+        run: cargo build --locked
+      - name: Test
+        run: cargo test --locked
+      - name: Clippy
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - name: Format
+        run: cargo fmt -- --check
+
+  publish:
+    name: Publish resolved merge evidence
+    needs: [resolve, verify]
+    if: ${{ always() && github.run_attempt == '1' && needs.resolve.result == 'success' && needs.resolve.outputs.resolved == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      checks: write
+    concurrency:
+      group: postmerge-dependabot-check-${{ needs.resolve.outputs.merge_sha }}
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPOSITORY: ${{ needs.resolve.outputs.repository }}
+      SOURCE_RUN_ID: ${{ needs.resolve.outputs.source_run_id }}
+      PR_NUMBER: ${{ needs.resolve.outputs.pr_number }}
+      SOURCE_HEAD_SHA: ${{ needs.resolve.outputs.source_head_sha }}
+      MERGE_SHA: ${{ needs.resolve.outputs.merge_sha }}
+      FIRST_PARENT_SHA: ${{ needs.resolve.outputs.first_parent_sha }}
+      VERIFIER_RESULT: ${{ needs.verify.result }}
+    steps:
+      - name: Publish one direct merge check
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          readonly CHECK_NAME='Post-merge Dependabot CI'
+          readonly CHECK_APP='github-actions'
+          readonly COMMANDS='cargo build --locked; cargo test --locked; cargo clippy --locked --all-targets --all-features -- -D warnings; cargo fmt -- --check'
+
+          die() {
+            printf '%s\n' "$1" >&2
+            exit 1
+          }
+
+          require_identifier() {
+            [[ "$1" =~ ^[1-9][0-9]{0,18}$ ]] || die 'invalid numeric identifier'
+          }
+
+          require_pr_number() {
+            [[ "$1" =~ ^[1-9][0-9]{0,9}$ ]] || die 'invalid pull request number'
+          }
+
+          require_sha() {
+            [[ "$1" =~ ^[0-9a-f]{40}$ ]] || die 'invalid commit SHA'
+          }
+
+          require_repository() {
+            [[ "$1" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die 'invalid repository identity'
+          }
+
+          scratch="$(mktemp -d "${RUNNER_TEMP:-/tmp}/togi-postmerge-publish.XXXXXX")"
+          trap 'rm -rf "$scratch"' EXIT
+          api_error="$scratch/api-error"
+
+          list_named_checks() {
+            local destination="$1"
+            if ! timeout 60s gh api --method GET --paginate --slurp \
+              --raw-field "check_name=$CHECK_NAME" \
+              --raw-field 'filter=all' \
+              --raw-field 'per_page=100' \
+              "repos/${REPOSITORY}/commits/${MERGE_SHA}/check-runs" \
+              >"$destination" 2>"$api_error"; then
+              die 'check lookup API request failed'
+            fi
+          }
+
+          require_repository "$REPOSITORY"
+          require_identifier "$SOURCE_RUN_ID"
+          require_pr_number "$PR_NUMBER"
+          require_sha "$SOURCE_HEAD_SHA"
+          require_sha "$MERGE_SHA"
+          require_sha "$FIRST_PARENT_SHA"
+
+          case "$VERIFIER_RESULT" in
+            success)
+              check_conclusion='success'
+              checkout_assertion="\`${MERGE_SHA}\`"
+              ;;
+            failure)
+              check_conclusion='failure'
+              checkout_assertion='not successful'
+              ;;
+            cancelled)
+              check_conclusion='cancelled'
+              checkout_assertion='not successful'
+              ;;
+            skipped)
+              check_conclusion='failure'
+              checkout_assertion='not successful'
+              ;;
+            *)
+              die 'unexpected verifier result'
+              ;;
+          esac
+
+          external_id="togi-postmerge-dependabot-${MERGE_SHA}"
+          source_run_url="https://github.com/${REPOSITORY}/actions/runs/${SOURCE_RUN_ID}"
+          pr_url="https://github.com/${REPOSITORY}/pull/${PR_NUMBER}"
+
+          render_summary() {
+            {
+              printf 'Result: `%s`\n\n' "$check_conclusion"
+              printf -- '- Source workflow run: [%s](%s)\n' "$SOURCE_RUN_ID" "$source_run_url"
+              printf -- '- Pull request: [#%s](%s)\n' "$PR_NUMBER" "$pr_url"
+              printf -- '- Validated source head: `%s`\n' "$SOURCE_HEAD_SHA"
+              printf -- '- Resolved merge SHA: `%s`\n' "$MERGE_SHA"
+              printf -- '- Resolved first parent: `%s`\n' "$FIRST_PARENT_SHA"
+              printf -- '- Checkout assertion: %s\n' "$checkout_assertion"
+              printf -- '- Commands: `%s`\n' "$COMMANDS"
+            }
+          }
+
+          checks_json="$scratch/checks.json"
+          checks_decision="$scratch/checks-decision.json"
+          list_named_checks "$checks_json"
+          if ! jq -e \
+            --arg check_name "$CHECK_NAME" \
+            --arg check_app "$CHECK_APP" \
+            --arg merge_sha "$MERGE_SHA" \
+            --arg external_id "$external_id" '
+              [ .[]? | .check_runs[]? | select(.name == $check_name) ] as $named_checks
+              | if ($named_checks | length) == 0 then
+                  {action: "create"}
+                elif ($named_checks | length) == 1 then
+                  $named_checks[0] as $check
+                  | if (
+                    $check.head_sha == $merge_sha
+                    and $check.external_id == $external_id
+                    and ($check.app.slug // "") == $check_app
+                    and $check.status == "completed"
+                    and ($check.id | if type == "number" then (. > 0 and floor == .) else false end)
+                  ) then
+                    {action: "deduplicate", id: $check.id}
+                  else
+                    {action: "conflict"}
+                  end
+                else
+                  {action: "conflict"}
+                end
+            ' "$checks_json" >"$checks_decision" 2>"$api_error"; then
+            die 'check lookup validation failed'
+          fi
+
+          publication_action="$(jq -r '.action' "$checks_decision")"
+          case "$publication_action" in
+            deduplicate)
+              existing_check_id="$(jq -r '.id' "$checks_decision")"
+              require_identifier "$existing_check_id"
+              existing_check_url="https://github.com/${REPOSITORY}/runs/${existing_check_id}"
+              {
+                printf '## Post-merge verifier publication\n\n'
+                printf -- '- Publication: existing exact identity retained\n'
+                printf -- '- Source workflow run: [%s](%s)\n' "$SOURCE_RUN_ID" "$source_run_url"
+                printf -- '- Pull request: [#%s](%s)\n' "$PR_NUMBER" "$pr_url"
+                printf -- '- Validated source head: `%s`\n' "$SOURCE_HEAD_SHA"
+                printf -- '- Resolved merge SHA: `%s`\n' "$MERGE_SHA"
+                printf -- '- Direct check: [view](%s)\n' "$existing_check_url"
+              } >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+              ;;
+            create)
+              ;;
+            *)
+              die 'conflicting exact-name check identity'
+              ;;
+          esac
+
+          completed_summary="$(render_summary)"
+          create_payload="$scratch/create-payload.json"
+          jq -n \
+            --arg check_name "$CHECK_NAME" \
+            --arg merge_sha "$MERGE_SHA" \
+            --arg external_id "$external_id" \
+            --arg check_conclusion "$check_conclusion" \
+            --arg summary "$completed_summary" \
+            '{
+              name: $check_name,
+              head_sha: $merge_sha,
+              external_id: $external_id,
+              status: "completed",
+              conclusion: $check_conclusion,
+              output: {
+                title: "Post-merge Dependabot verification",
+                summary: $summary
+              }
+            }' >"$create_payload"
+
+          created_check_json="$scratch/created-check.json"
+          if ! timeout 60s gh api --method POST "repos/${REPOSITORY}/check-runs" --input "$create_payload" \
+            >"$created_check_json" 2>"$api_error"; then
+            die 'check creation API request failed'
+          fi
+
+          if ! jq -e \
+            --arg check_name "$CHECK_NAME" \
+            --arg check_app "$CHECK_APP" \
+            --arg merge_sha "$MERGE_SHA" \
+            --arg external_id "$external_id" \
+            --arg check_conclusion "$check_conclusion" '
+              .name == $check_name
+              and .head_sha == $merge_sha
+              and .external_id == $external_id
+              and (.app.slug // "") == $check_app
+              and .status == "completed"
+              and .conclusion == $check_conclusion
+              and (.id | if type == "number" then (. > 0 and floor == .) else false end)
+            ' "$created_check_json" >/dev/null 2>"$api_error"; then
+            die 'created check identity validation failed'
+          fi
+
+          check_id="$(jq -r '.id' "$created_check_json")"
+          require_identifier "$check_id"
+
+          direct_check_url="https://github.com/${REPOSITORY}/runs/${check_id}"
+
+          {
+            printf '## Post-merge verifier publication\n\n'
+            printf -- '- Publication: direct check created\n'
+            printf -- '- Source workflow run: [%s](%s)\n' "$SOURCE_RUN_ID" "$source_run_url"
+            printf -- '- Pull request: [#%s](%s)\n' "$PR_NUMBER" "$pr_url"
+            printf -- '- Validated source head: `%s`\n' "$SOURCE_HEAD_SHA"
+            printf -- '- Resolved merge SHA: `%s`\n' "$MERGE_SHA"
+            printf -- '- Direct check: [view](%s)\n' "$direct_check_url"
+          } >> "$GITHUB_STEP_SUMMARY"
