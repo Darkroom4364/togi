@@ -5504,8 +5504,8 @@ fn github_action_guide_and_advisory_pin_released_contract() {
         "actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0",
         "node-version: 24 # Choose the version required by this repository.",
         "name: Install project test dependencies\n        run: npm ci",
-        "Darkroom4364/togi@a1503b2ebac4c63d377b015c4825b97cab25ec68 # v0.4.1",
-        "version: v0.4.1",
+        "Darkroom4364/togi@e692e2d169b7a717c6b911884e90c0bcd0d133b1 # v0.5.2",
+        "version: v0.5.2",
         "base: origin/${{ github.base_ref }}",
         "test-cmd: npm test",
         "format: json",
@@ -5541,7 +5541,7 @@ fn github_action_guide_and_advisory_pin_released_contract() {
         ),
         (
             "run: npm ci",
-            "Darkroom4364/togi@a1503b2ebac4c63d377b015c4825b97cab25ec68",
+            "Darkroom4364/togi@e692e2d169b7a717c6b911884e90c0bcd0d133b1",
         ),
     ] {
         assert!(
@@ -5555,12 +5555,17 @@ fn github_action_guide_and_advisory_pin_released_contract() {
         "`format: github`; the Action preserves that review run and performs a second\nfull JSON mutation run",
         "A failed baseline test or build is a fatal exit `2`",
         "Never use `pull_request_target` to run PR code.",
+        "immutable version identifiers for v0.5.2",
     ] {
         assert!(
             readme.contains(expected),
             "README Action guidance is missing `{expected}`"
         );
     }
+    assert!(
+        !readme.contains("mutable `latest` default"),
+        "README Action guidance must not describe a mutable latest default"
+    );
 
     let advisory = fs::read_to_string(
         Path::new(env!("CARGO_MANIFEST_DIR")).join(".github/workflows/togi-action-advisory.yml"),
@@ -5584,6 +5589,47 @@ fn github_action_guide_and_advisory_pin_released_contract() {
             "advisory workflow is missing `{expected}`"
         );
     }
+}
+
+#[test]
+fn github_release_install_guide_documents_v0_5_2_contract() {
+    let readme = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md"))
+        .unwrap()
+        .replace("\r\n", "\n");
+    let install_start = readme
+        .find("## Install\n")
+        .expect("README must contain an Install section");
+    let install_end = readme
+        .find("\n### Before first run\n")
+        .expect("Install section must end before Before first run");
+    let install = &readme[install_start..install_end];
+
+    for expected in [
+        "GitHub Releases are the supported binary-install path.",
+        "TOGI_VERSION=v0.5.2",
+        "TOGI_ARCHIVE=togi-linux-x86_64.tar.gz",
+        "https://github.com/Darkroom4364/togi/releases/download/${TOGI_VERSION}",
+        "curl -fsSLo \"$TOGI_ARCHIVE\"",
+        "curl -fsSLo checksums.txt",
+        "EXPECTED_SHA=$(awk",
+        "ACTUAL_SHA=$(sha256sum",
+        "Checksum mismatch",
+        "`togi` is not currently published on crates.io.",
+        "cargo install --git https://github.com/Darkroom4364/togi --rev <commit-sha> --locked",
+    ] {
+        assert!(
+            install.contains(expected),
+            "Install section is missing `{expected}`"
+        );
+    }
+    assert!(
+        !install.contains("TOGI_VERSION=v0.4.1"),
+        "Install section must not point the release archive at v0.4.1"
+    );
+    assert!(
+        !install.contains("cargo install togi"),
+        "Install section must not present an unavailable crates.io install"
+    );
 }
 
 #[test]

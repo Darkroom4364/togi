@@ -76,7 +76,8 @@ Try it: `examples/polyglot-demo.sh` runs a PR-sized Go + Rust + Python change th
 
 ### Linux x86_64 (Tier 1) first success
 
-This tested released-binary path is for Linux x86_64 only. See the
+GitHub Releases are the supported binary-install path. This tested release
+archive path is for Linux x86_64 only. See the
 [compatibility contract](docs/COMPATIBILITY.md) for other platforms and support
 tiers.
 
@@ -88,7 +89,7 @@ with a parent commit and at least one changed supported source line.
 ```bash
 (
   set -euo pipefail
-  TOGI_VERSION=v0.4.1
+  TOGI_VERSION=v0.5.2
   TOGI_ARCHIVE=togi-linux-x86_64.tar.gz
   RELEASE_BASE="https://github.com/Darkroom4364/togi/releases/download/${TOGI_VERSION}"
   TEMP_DIR="$(mktemp -d)"
@@ -124,8 +125,8 @@ its score threshold determines that gate instead; a baseline regression still ex
 `1`. Exit `2` means an execution error (for example configuration, Git, or parsing)
 that you should fix before relying on the result.
 
-If you intentionally want a source-based install tied to a reviewed revision:
-
+`togi` is not currently published on crates.io. If you intentionally want a
+source-based install tied to a reviewed revision:
 ```bash
 cargo install --git https://github.com/Darkroom4364/togi --rev <commit-sha> --locked
 ```
@@ -992,9 +993,9 @@ jobs:
       - name: Install project test dependencies
         run: npm ci
       - id: togi
-        uses: Darkroom4364/togi@a1503b2ebac4c63d377b015c4825b97cab25ec68 # v0.4.1
+        uses: Darkroom4364/togi@e692e2d169b7a717c6b911884e90c0bcd0d133b1 # v0.5.2
         with:
-          version: v0.4.1
+          version: v0.5.2
           base: origin/${{ github.base_ref }}
           test-cmd: npm test
           format: json
@@ -1022,9 +1023,10 @@ using another runner or architecture.
 `fetch-depth: 0` makes the PR base available for
 `origin/${{ github.base_ref }}`. The checkout therefore needs a Git history
 that contains the base branch and a project with changed supported source
-lines. The Action source and downloaded binary are both pinned to v0.4.1; do
-not replace `version: v0.4.1` with the mutable `latest` default unless that is
-an intentional upgrade policy.
+lines. The Action source commit and downloaded binary version are both pinned to
+the immutable version identifiers for v0.5.2: its release commit and `v0.5.2`
+release tag. When upgrading, update both together to a reviewed release commit
+and immutable version tag.
 
 The Action passes `--base`, `--timeout`, `--format`, and `--test-cmd` only for
 non-empty inputs. Those inputs override `togi.toml`; remove `test-cmd` to use
