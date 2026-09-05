@@ -267,6 +267,9 @@ mod tests {
         created.recv().unwrap();
 
         // A separate process owns the advisory lock on the inode A just created.
+        // foxguard: ignore[rs/no-command-injection]
+        // `current_exe` is this active test binary; fixed child-test arguments and
+        // its subprocess are required to exercise the lock race.
         let mut holder = Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",

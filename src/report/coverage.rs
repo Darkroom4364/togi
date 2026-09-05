@@ -250,6 +250,9 @@ mod tests {
     }
 
     fn invoke(api: &str, format: &str, directory: &Path) -> Output {
+        // foxguard: ignore[rs/no-command-injection]
+        // `current_exe` is this active test binary; fixed child-test arguments
+        // isolate stdout and current-directory behavior in a subprocess.
         Command::new(std::env::current_exe().unwrap())
             .args(["--exact", CHILD_TEST, "--nocapture"])
             .env("TOGI_COVERAGE_ROUTER_API", api)

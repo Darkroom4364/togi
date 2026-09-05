@@ -278,13 +278,16 @@ fn polyglot_demo_routes_mutations_to_each_language_test_suite() {
 
 #[cfg(unix)]
 fn demo_test_tools_available() -> bool {
-    ["bash", "git"].into_iter().all(|tool| {
-        Command::new(tool)
+    Command::new("bash")
+        .arg("--version")
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+        && Command::new("git")
             .arg("--version")
             .output()
             .map(|output| output.status.success())
             .unwrap_or(false)
-    })
 }
 
 #[cfg(unix)]
