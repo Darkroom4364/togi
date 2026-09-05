@@ -875,6 +875,29 @@ dependency/build directories such as `node_modules`, `.venv`, `dist`, `build`,
 and `target`. Set `[mutations] respect_workspace_ignores = false` only when a
 test command genuinely needs ignored files copied into the mutation workspace.
 
+For copy-based workspaces, exact and incremental result reuse is bound to every
+copied source entry and its copied observable metadata. Git-worktree reuse is
+bound to the checked-out `HEAD`, a versioned tracked-file index, and the same
+dirty overlay applied to the workspace, including tracked files that match
+`.gitignore`, plus regular-file standard permissions (full Windows file
+attributes included) and regular-file and non-root directory mtimes actually
+materialized by that Git checkout and overlay. A dirty overlay symlink that
+resolves inside the project is copied as a regular file and keys its resolved
+target metadata at that destination; clean Git symlink leaves remain excluded,
+while their materialized non-root parent directories remain covered.
+Source-only untracked empty directories stay absent from Git worktrees and do
+not affect Git identity. Workspace-root mtimes and `.git` metadata are
+intentionally excluded. Clean tracked paths normally excluded from copies are
+included when Git materializes them; dirty changes to those paths force
+normal-copy fallback. If Git workspace creation or snapshotting fails, the
+whole campaign uses the separate copy-workspace cache domain.
+
+Regular workspace files are canonical execution inputs: Togi preserves bytes,
+the standard `std::fs::Permissions` value (including Windows file attributes),
+and mtime, but intentionally does not carry source ACLs, xattrs, ADS/resource
+forks, ownership, or link relationships into the sandbox. Those
+platform-specific metadata channels are therefore not cache inputs.
+
 ## Security model
 
 togi executes repository-defined build and test commands with the permissions of
