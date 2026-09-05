@@ -1290,7 +1290,10 @@ fn validate_pr_loop_benchmark_step_set(job: &serde_yaml::Value) -> Result<(), St
         .and_then(|value| value.as_sequence())
         .ok_or_else(|| "benchmark job has no step sequence".to_string())?;
     let expected = [
-        ("uses", "actions/checkout@v7"),
+        (
+            "uses",
+            "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+        ),
         (
             "uses",
             "dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8",
@@ -1300,7 +1303,10 @@ fn validate_pr_loop_benchmark_step_set(job: &serde_yaml::Value) -> Result<(), St
             "uses",
             "Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32",
         ),
-        ("uses", "actions/setup-go@v7"),
+        (
+            "uses",
+            "actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e",
+        ),
         ("name", "Create job-private Go build cache"),
         ("name", "Check benchmark prerequisites"),
         ("name", "Build release binary"),
@@ -1478,7 +1484,8 @@ fn ci_pr_loop_benchmark_contract_is_structural() {
     let checkout = steps
         .iter()
         .find(|step| {
-            step.get("uses").and_then(|value| value.as_str()) == Some("actions/checkout@v7")
+            step.get("uses").and_then(|value| value.as_str())
+                == Some("actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1")
         })
         .expect("benchmark job must check out the repository");
     assert_eq!(
@@ -2165,7 +2172,10 @@ fn pr_loop_calibration_workflow_is_manual_read_only_and_retained() {
     };
     let setup_go = steps
         .iter()
-        .find(|item| item["uses"].as_str() == Some("actions/setup-go@v7"))
+        .find(|item| {
+            item["uses"].as_str()
+                == Some("actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e")
+        })
         .expect("calibration must set up Go");
     assert_eq!(
         setup_go["with"]["go-version"].as_str(),
@@ -4199,7 +4209,10 @@ fn pr_loop_regression_gate_workflow_is_fail_closed_and_comparator_driven() {
 
     let checkout = steps
         .iter()
-        .find(|item| item["uses"].as_str() == Some("actions/checkout@v7"))
+        .find(|item| {
+            item["uses"].as_str()
+                == Some("actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1")
+        })
         .expect("gate must check out the repository");
     assert_eq!(
         checkout["with"]["persist-credentials"].as_bool(),
@@ -4238,7 +4251,10 @@ fn pr_loop_regression_gate_workflow_is_fail_closed_and_comparator_driven() {
     }
     let setup_go = steps
         .iter()
-        .find(|item| item["uses"].as_str() == Some("actions/setup-go@v7"))
+        .find(|item| {
+            item["uses"].as_str()
+                == Some("actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e")
+        })
         .expect("gate must set up Go");
     assert_eq!(
         setup_go["with"]["go-version"].as_str(),

@@ -936,13 +936,13 @@ jobs:
   togi:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
         with:
           toolchain: stable
-      - uses: actions/cache@v4
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cargo/registry
@@ -1075,7 +1075,7 @@ Download and replay a report only in a checkout at the report's recorded source
 revision and only when the artifact is trusted:
 
 ```yaml
-- uses: actions/download-artifact@v8
+- uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
   if: ${{ always() }}
   with:
     name: togi-report
@@ -1104,12 +1104,12 @@ jobs:
   togi:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
       # Install togi as shown in "CI Integration" above
       - run: togi check --base origin/main --format sarif > togi-report.sarif
-      - uses: github/codeql-action/upload-sarif@v3
+      - uses: github/codeql-action/upload-sarif@6f5948dfacef28e207b48d0905cf90c03365536d # v3
         if: always()  # upload even when togi exits 1 on surviving mutants
         with:
           sarif_file: togi-report.sarif
