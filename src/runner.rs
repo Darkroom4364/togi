@@ -10159,6 +10159,7 @@ test "$runs" -eq 1
                 "-count=1".into(),
                 "./...".into(),
             ];
+            commands.timeout = Duration::from_secs(90);
             commands.test_selection = Some(selection.clone());
             commands
         };
@@ -10343,6 +10344,7 @@ test "$runs" -eq 1
                 "-count=1".into(),
                 "./...".into(),
             ];
+            commands.timeout = Duration::from_secs(90);
             commands.test_selection = Some(selection.clone());
             commands
         };
@@ -10436,6 +10438,7 @@ test "$runs" -eq 1
         run_git(root, &["init"]);
         run_git(root, &["config", "user.email", "test@example.com"]);
         run_git(root, &["config", "user.name", "Test"]);
+        run_git(root, &["config", "core.autocrlf", "false"]);
         let source = "package calc\n\nfunc Equal(a, b int) bool { return a == b }\nfunc Other(a, b int) bool { return a == b }\n";
         std::fs::write(
             root.join("go.mod"),
@@ -10684,6 +10687,7 @@ test "$runs" -eq 1
                 "-count=1".into(),
                 "./...".into(),
             ];
+            commands.timeout = Duration::from_secs(90);
             commands.test_selection = Some(selection.clone());
             commands
         };
