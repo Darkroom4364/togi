@@ -10510,6 +10510,7 @@ test "$runs" -eq 1
                 "-count=1".into(),
                 "./...".into(),
             ];
+            commands.timeout = Duration::from_secs(90);
             commands.test_selection = Some(selection.clone());
             commands
         };
