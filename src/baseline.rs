@@ -6,7 +6,7 @@ use crate::{Mutation, MutationReport, MutationResult};
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Write};
 use std::path::Path;
 
 const BASELINE_FILE: &str = ".togi-baseline";
@@ -201,8 +201,38 @@ fn compare_baseline_mutants(left: &BaselineMutant, right: &BaselineMutant) -> st
 /// Persist a baseline snapshot to `.togi-baseline` inside `dir`.
 pub fn save_baseline(baseline: &Baseline, dir: &Path) -> anyhow::Result<()> {
     let json = serde_json::to_string_pretty(baseline)?;
-    std::fs::write(dir.join(BASELINE_FILE), json)?;
-    Ok(())
+    let path = dir.join(BASELINE_FILE);
+    publish_baseline(&path, |staged| staged.write_all(json.as_bytes()))
+}
+
+fn publish_baseline(
+    path: &Path,
+    write_contents: impl FnOnce(&mut tempfile::NamedTempFile) -> std::io::Result<()>,
+) -> anyhow::Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut staged = tempfile::NamedTempFile::new_in(parent).with_context(|| {
+        format!(
+            "could not create baseline staging file in {}",
+            parent.display()
+        )
+    })?;
+    write_contents(&mut staged)
+        .with_context(|| format!("could not write baseline {}", path.display()))?;
+    staged
+        .flush()
+        .with_context(|| format!("could not flush baseline {}", path.display()))?;
+    staged
+        .as_file()
+        .sync_all()
+        .with_context(|| format!("could not sync baseline {}", path.display()))?;
+    staged
+        .persist(path)
+        .map(|_| ())
+        .map_err(|error| error.error)
+        .with_context(|| format!("could not publish baseline {}", path.display()))
 }
 
 /// Build and persist a baseline only when a report is baseline-eligible.
@@ -667,6 +697,7 @@ mod tests {
             total: 5,
             mutant_snapshot: None,
         };
+        save_baseline(&make_baseline(0, 1), dir.path()).unwrap();
 
         save_baseline(&baseline, dir.path()).unwrap();
         let loaded = load_baseline(dir.path()).unwrap().unwrap();
@@ -674,6 +705,28 @@ mod tests {
         assert_eq!(loaded.killed, 3);
         assert_eq!(loaded.total, 5);
         assert_eq!(loaded.files["src/main.rs"].killed, 3);
+    }
+
+    #[test]
+    fn baseline_publish_preserves_existing_baseline_on_write_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let previous = make_baseline(2, 4);
+        save_baseline(&previous, dir.path()).unwrap();
+        let path = dir.path().join(BASELINE_FILE);
+        let previous_bytes = std::fs::read(&path).unwrap();
+
+        let error = publish_baseline(&path, |staged| {
+            staged.write_all(b"{\"files\":")?;
+            Err(std::io::Error::other("simulated write failure"))
+        });
+
+        assert!(error.is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), previous_bytes);
+        let loaded = load_baseline(dir.path()).unwrap().unwrap();
+        assert_eq!(
+            (loaded.killed, loaded.total),
+            (previous.killed, previous.total)
+        );
     }
 
     #[test]
