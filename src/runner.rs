@@ -221,6 +221,33 @@ pub struct RunOutcome {
     pub cancelled: bool,
 }
 
+#[cfg(test)]
+type MutationWorkerAfterDequeueHook = Arc<dyn Fn(&Path, &Mutation) + Send + Sync>;
+
+#[cfg(test)]
+static MUTATION_WORKER_AFTER_DEQUEUE_HOOK: std::sync::LazyLock<
+    Mutex<Option<MutationWorkerAfterDequeueHook>>,
+> = std::sync::LazyLock::new(|| Mutex::new(None));
+
+#[cfg(test)]
+fn set_mutation_worker_after_dequeue_hook(hook: Option<MutationWorkerAfterDequeueHook>) {
+    let hook_slot = &*MUTATION_WORKER_AFTER_DEQUEUE_HOOK;
+    *hook_slot
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = hook;
+}
+
+#[cfg(test)]
+fn run_mutation_worker_after_dequeue_hook(project_root: &Path, mutation: &Mutation) {
+    let hook = MUTATION_WORKER_AFTER_DEQUEUE_HOOK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    if let Some(hook) = hook {
+        hook(project_root, mutation);
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BaselineMeasurement {
     pub build_duration: Option<Duration>,
@@ -5459,6 +5486,7 @@ impl TestRunner {
         let build_command_origin = self.commands.build_command_origin;
         let queue = Arc::new(Mutex::new(mutations.into_iter().collect::<VecDeque<_>>()));
         let results = Arc::new(Mutex::new(restored));
+        let worker_failed = Arc::new(AtomicBool::new(false));
         let worker_count = workspace_pool.len().min(fresh_total).max(1);
         let history = self
             .incremental_history
@@ -5467,6 +5495,7 @@ impl TestRunner {
         thread::scope(|scope| {
             for _ in 0..worker_count {
                 let queue = queue.clone();
+                let worker_failed = worker_failed.clone();
                 let results = results.clone();
                 let workspace_pool = workspace_pool.clone();
                 let project_root = project_root.clone();
@@ -5486,7 +5515,10 @@ impl TestRunner {
 
                 scope.spawn(move || {
                     loop {
-                        if cancelled.load(Ordering::Relaxed) || should_stop_early(&early_stop) {
+                        if cancelled.load(Ordering::Relaxed)
+                            || worker_failed.load(Ordering::Acquire)
+                            || should_stop_early(&early_stop)
+                        {
                             break;
                         }
 
@@ -5495,12 +5527,18 @@ impl TestRunner {
                         else {
                             break;
                         };
-                        if should_stop_early(&early_stop) {
+                        if worker_failed.load(Ordering::Acquire) || should_stop_early(&early_stop) {
                             reservation.release();
                             break;
                         }
                         let next = match queue.lock() {
-                            Ok(mut queue) => queue.pop_front(),
+                            Ok(mut queue) => {
+                                if worker_failed.load(Ordering::Acquire) {
+                                    None
+                                } else {
+                                    queue.pop_front()
+                                }
+                            }
                             Err(_) => {
                                 eprintln!("warning: mutation queue mutex poisoned");
                                 break;
@@ -5509,8 +5547,18 @@ impl TestRunner {
                         let Some(queued) = next else {
                             break;
                         };
+                        let panic_index = queued.index;
+                        let panic_mutation = queued.mutation.clone();
 
                         let outcome = catch_unwind(PanicBoundary(|| {
+                            if worker_failed.load(Ordering::Acquire) {
+                                return None;
+                            }
+                            #[cfg(test)]
+                            run_mutation_worker_after_dequeue_hook(
+                                project_root.as_ref().as_path(),
+                                &queued.mutation,
+                            );
                             run_queued_mutation(
                                 queued,
                                 reservation,
@@ -5550,7 +5598,28 @@ impl TestRunner {
                                 }
                             },
                             Ok(None) => {}
-                            Err(_) => eprintln!("warning: mutation task panicked"),
+                            Err(_) => {
+                                worker_failed.store(true, Ordering::Release);
+                                let diagnostic = BuildErrorDiagnostic::new(
+                                    panic_mutation.id,
+                                    "regular",
+                                    "mutation_worker_panic",
+                                    vec![],
+                                    "mutation worker panicked after dequeuing this mutation",
+                                );
+                                let mut results = results
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                                results.push((
+                                    panic_index,
+                                    MutationRunRecord::new(
+                                        panic_mutation,
+                                        MutationResult::BuildError,
+                                        Some(diagnostic),
+                                    ),
+                                ));
+                                break;
+                            }
                         }
                     }
                 });
@@ -16276,6 +16345,75 @@ mod tests {
 
         let report = runner.run(mutations).report;
         assert_eq!(report.total, 2, "should stop after max_tested");
+    }
+
+    #[test]
+    fn worker_panic_records_build_error_and_stops_campaign() {
+        let (dir, file, first) = make_test_setup();
+        let mut second = make_test_mutation(&file);
+        second.id = 2;
+        second.description = "second mutation".into();
+        let project_root = dir.path().to_path_buf();
+        let mutation_id = first.id;
+        let panicked = Arc::new(AtomicBool::new(false));
+        let hook_root = project_root.clone();
+        let hook_panicked = panicked.clone();
+        set_mutation_worker_after_dequeue_hook(Some(Arc::new(move |root, mutation| {
+            if root == hook_root.as_path()
+                && mutation.id == mutation_id
+                && !hook_panicked.swap(true, Ordering::AcqRel)
+            {
+                panic!("simulated mutation worker panic after dequeue");
+            }
+        })));
+
+        let command_log = dir.path().join("worker-command.log");
+        let mut commands = test_command_config();
+        commands.command = appending_log_command(&command_log);
+        let runner = TestRunner {
+            commands,
+            parallelism: 1,
+            project_root,
+            verbose: false,
+            show_output: false,
+            max_tested: None,
+            early_stop: Default::default(),
+            respect_workspace_ignores: true,
+            env: HashMap::new(),
+            incremental_history: false,
+            force_rerun: true,
+            learned_selection: false,
+            cancelled: Arc::new(AtomicBool::new(false)),
+        };
+
+        let outcome = runner.run(vec![first, second]);
+        set_mutation_worker_after_dequeue_hook(None);
+
+        assert!(panicked.load(Ordering::Acquire));
+        assert!(!outcome.cancelled);
+        let report = outcome.report;
+        assert_eq!(report.planned_total, 2);
+        assert_eq!(report.total, 1);
+        let (recorded, result) = report
+            .results
+            .first()
+            .expect("the panicked mutation should be recorded");
+        assert_eq!(recorded.id, mutation_id);
+        assert_eq!(*result, MutationResult::BuildError);
+        assert_eq!(report.build_errors, 1);
+        let diagnostic = report
+            .build_error_diagnostics
+            .first()
+            .expect("the panic should retain a build-error diagnostic");
+        assert_eq!(diagnostic.mutation_id, mutation_id);
+        assert_eq!(diagnostic.runner, "regular");
+        assert_eq!(diagnostic.phase, "mutation_worker_panic");
+        assert!(diagnostic.message.contains("mutation worker panicked"));
+        assert!(
+            !command_log.exists(),
+            "no later mutation should be scheduled"
+        );
+        assert!(!crate::baseline::is_baseline_eligible(&report));
     }
 
     #[test]

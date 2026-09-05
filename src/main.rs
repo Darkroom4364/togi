@@ -629,9 +629,10 @@ fn run_check(cfg: togi::cli::CheckArgs, cancelled: Arc<AtomicBool>) -> anyhow::R
     merge_uncovered(&mut report, classified.uncovered);
 
     let baseline_eligible = togi::baseline::is_baseline_eligible(&report);
+    let worker_panic = has_fresh_mutation_worker_panic(&report);
     let mut should_fail = false;
     let partial_report = report.total < report.planned_total;
-    let baseline_actions_allowed = baseline_eligible;
+    let baseline_actions_allowed = baseline_eligible && !worker_panic;
     let mut baseline_score: Option<f64> = None;
     let mut loaded_baseline = false;
     let mut survivor_comparison = None;
@@ -734,19 +735,21 @@ fn run_check(cfg: togi::cli::CheckArgs, cancelled: Arc<AtomicBool>) -> anyhow::R
         eprintln!("PR comment written to {}", path.display());
     }
 
-    if should_fail {
-        exit_with(_lock, 1);
-    } else if let Some(threshold) = fail_under {
-        let gate_score = togi::report::fail_under_score(&report);
-        if gate_score < threshold {
+    match check_exit_action(
+        &report,
+        worker_panic,
+        should_fail,
+        fail_under,
+        loaded_baseline,
+    ) {
+        Some(CheckExitAction::Code(code)) => exit_with(_lock, code),
+        Some(CheckExitAction::FailUnder { score, threshold }) => {
             eprintln!(
-                "Fail-under gate score {gate_score:.1}% is below --fail-under threshold {threshold:.1}% (displayed mutation score is fresh-only)."
+                "Fail-under gate score {score:.1}% is below --fail-under threshold {threshold:.1}% (displayed mutation score is fresh-only)."
             );
             exit_with(_lock, 1);
         }
-    } else if has_fresh_timeout_or_build_error(&report) || (report.survived > 0 && !loaded_baseline)
-    {
-        exit_with(_lock, 1);
+        None => {}
     }
 
     Ok(())
@@ -759,6 +762,49 @@ fn has_fresh_timeout_or_build_error(report: &togi::MutationReport) -> bool {
             togi::MutationResult::Timeout | togi::MutationResult::BuildError
         ) && !report.execution_for(mutation.id, *result).is_reused()
     })
+}
+
+fn has_fresh_mutation_worker_panic(report: &togi::MutationReport) -> bool {
+    report.build_error_diagnostics.iter().any(|diagnostic| {
+        diagnostic.runner == "regular"
+            && diagnostic.phase == "mutation_worker_panic"
+            && report.results.iter().any(|(mutation, result)| {
+                mutation.id == diagnostic.mutation_id
+                    && *result == togi::MutationResult::BuildError
+                    && !report.execution_for(mutation.id, *result).is_reused()
+            })
+    })
+}
+
+#[derive(Debug, PartialEq)]
+enum CheckExitAction {
+    Code(i32),
+    FailUnder { score: f64, threshold: f64 },
+}
+
+fn check_exit_action(
+    report: &togi::MutationReport,
+    worker_panic: bool,
+    should_fail: bool,
+    fail_under: Option<f64>,
+    loaded_baseline: bool,
+) -> Option<CheckExitAction> {
+    if worker_panic {
+        return Some(CheckExitAction::Code(2));
+    }
+    if should_fail {
+        return Some(CheckExitAction::Code(1));
+    }
+    if let Some(threshold) = fail_under {
+        let score = togi::report::fail_under_score(report);
+        if score < threshold {
+            return Some(CheckExitAction::FailUnder { score, threshold });
+        }
+    } else if has_fresh_timeout_or_build_error(report) || (report.survived > 0 && !loaded_baseline)
+    {
+        return Some(CheckExitAction::Code(1));
+    }
+    None
 }
 
 fn exit_with(lock: togi::lock::LockGuard, code: i32) -> ! {
@@ -2344,6 +2390,56 @@ mod tests {
                 "{result:?} should trigger the default outcome gate"
             );
         }
+    }
+
+    #[test]
+    fn mutation_worker_panic_preempts_default_and_fail_under_gates() {
+        for (mode, should_fail, fail_under) in
+            [("default", true, None), ("--fail-under", false, Some(80.0))]
+        {
+            let mut report = report_with_outcome(togi::MutationResult::BuildError, None);
+            report
+                .build_error_diagnostics
+                .push(togi::BuildErrorDiagnostic::new(
+                    0,
+                    "regular",
+                    "mutation_worker_panic",
+                    vec![],
+                    "mutation worker panicked after dequeuing this mutation",
+                ));
+            let worker_panic = has_fresh_mutation_worker_panic(&report);
+
+            assert!(worker_panic, "{mode} should recognize the worker panic");
+            assert_eq!(
+                check_exit_action(&report, worker_panic, should_fail, fail_under, true),
+                Some(CheckExitAction::Code(2)),
+                "{mode} should take the terminal worker-panic branch"
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_build_error_keeps_existing_exit_behavior() {
+        let mut report = report_with_outcome(togi::MutationResult::BuildError, None);
+        report
+            .build_error_diagnostics
+            .push(togi::BuildErrorDiagnostic::new(
+                0,
+                "regular",
+                "build_command",
+                vec![],
+                "configured build command failed",
+            ));
+
+        assert!(!has_fresh_mutation_worker_panic(&report));
+        assert_eq!(
+            check_exit_action(&report, false, false, None, false),
+            Some(CheckExitAction::Code(1))
+        );
+        assert_eq!(
+            check_exit_action(&report, false, false, Some(0.0), false),
+            None
+        );
     }
 
     #[test]
