@@ -862,6 +862,79 @@ fn setup_two_line_mutation_repo() -> TempDir {
     dir
 }
 
+#[test]
+fn check_coverage_gate_preserves_each_output_format() {
+    for (format, expected_stdout, writes_html) in [
+        ("terminal", "Coverage gate failed", false),
+        ("json", "", false),
+        ("github", "## Coverage gate failed", false),
+        ("html", "", true),
+        ("sarif", "Coverage gate failed", false),
+    ] {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("main.go"),
+            "package main\n\nfunc main() {\n\tprintln(\"hello\")\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("lcov.info"),
+            "SF:main.go\nDA:4,0\nend_of_record\n",
+        )
+        .unwrap();
+
+        let output = togi()
+            .args([
+                "check",
+                "--all",
+                "--format",
+                format,
+                "--test-cmd",
+                "true",
+                "--coverage-file",
+                "lcov.info",
+                "--min-line-coverage",
+                "100",
+            ])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+
+        assert_eq!(output.status.code(), Some(1), "{format}: {output:?}");
+        if format == "json" {
+            let report: serde_json::Value = serde_json::from_slice(&output.stdout)
+                .unwrap_or_else(|error| panic!("invalid coverage JSON: {error}"));
+            assert_eq!(report["line_coverage"]["covered"], 0);
+        } else {
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains(expected_stdout),
+                "{format} stdout: {}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+        }
+
+        let html = dir.path().join("togi-coverage-report.html");
+        assert_eq!(html.exists(), writes_html, "{format} HTML destination");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if writes_html {
+            assert!(
+                fs::read_to_string(html)
+                    .unwrap()
+                    .contains("Coverage gate failed")
+            );
+            assert!(
+                stderr.ends_with("HTML coverage report written to togi-coverage-report.html\n"),
+                "{format} stderr: {stderr}"
+            );
+        } else {
+            assert!(
+                !stderr.contains("HTML coverage report written to togi-coverage-report.html"),
+                "{format} stderr: {stderr}"
+            );
+        }
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn check_classifies_zero_coverage_mutants_as_uncovered() {
