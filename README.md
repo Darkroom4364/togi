@@ -72,6 +72,8 @@ command = ["python3", "-m", "unittest", "discover"]
 
 Try it: `examples/polyglot-demo.sh` runs a PR-sized Go + Rust + Python change through one `togi check` — mutants from all three languages appear in the same report, the same mutation score, and the same `--fail-under` gate. No per-language glue, no stitched-together CI jobs.
 
+Both demos honor `CARGO_TARGET_DIR`; set `TOGI_BIN` to an executable Togi binary to skip their local build.
+
 ## Install
 
 ### Linux x86_64 (Tier 1) first success
