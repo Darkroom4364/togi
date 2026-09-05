@@ -6016,7 +6016,7 @@ fn github_action_guide_and_advisory_pin_released_contract() {
 
     for expected in [
         "Those inputs override `togi.toml`",
-        "`format: github`; the Action preserves that review run and performs a second\nfull JSON mutation run",
+        "`format: github`; the Action runs one GitHub-format mutation campaign and writes\na replayable JSON sidecar with `--json-report`",
         "A failed baseline test or build is a fatal exit `2`",
         "Never use `pull_request_target` to run PR code.",
         "immutable version identifiers for v0.5.2",

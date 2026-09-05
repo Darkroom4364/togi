@@ -1072,8 +1072,8 @@ command = ["npm", "test"]
 
 `format: json` is the one-run path: its JSON stream becomes the replayable
 `togi-report.json`. To opt into GitHub annotations instead, set
-`format: github`; the Action preserves that review run and performs a second
-full JSON mutation run to create the replayable report.
+`format: github`; the Action runs one GitHub-format mutation campaign and writes
+a replayable JSON sidecar with `--json-report`.
 
 For a normal mutation report, the Action uploads `togi-report.json` as the
 `togi-report` artifact. This example explicitly retains it for 14 days. Set a
