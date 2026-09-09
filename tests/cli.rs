@@ -862,6 +862,79 @@ fn setup_two_line_mutation_repo() -> TempDir {
     dir
 }
 
+#[test]
+fn check_coverage_gate_preserves_each_output_format() {
+    for (format, expected_stdout, writes_html) in [
+        ("terminal", "Coverage gate failed", false),
+        ("json", "", false),
+        ("github", "## Coverage gate failed", false),
+        ("html", "", true),
+        ("sarif", "Coverage gate failed", false),
+    ] {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("main.go"),
+            "package main\n\nfunc main() {\n\tprintln(\"hello\")\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("lcov.info"),
+            "SF:main.go\nDA:4,0\nend_of_record\n",
+        )
+        .unwrap();
+
+        let output = togi()
+            .args([
+                "check",
+                "--all",
+                "--format",
+                format,
+                "--test-cmd",
+                "true",
+                "--coverage-file",
+                "lcov.info",
+                "--min-line-coverage",
+                "100",
+            ])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+
+        assert_eq!(output.status.code(), Some(1), "{format}: {output:?}");
+        if format == "json" {
+            let report: serde_json::Value = serde_json::from_slice(&output.stdout)
+                .unwrap_or_else(|error| panic!("invalid coverage JSON: {error}"));
+            assert_eq!(report["line_coverage"]["covered"], 0);
+        } else {
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains(expected_stdout),
+                "{format} stdout: {}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+        }
+
+        let html = dir.path().join("togi-coverage-report.html");
+        assert_eq!(html.exists(), writes_html, "{format} HTML destination");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if writes_html {
+            assert!(
+                fs::read_to_string(html)
+                    .unwrap()
+                    .contains("Coverage gate failed")
+            );
+            assert!(
+                stderr.ends_with("HTML coverage report written to togi-coverage-report.html\n"),
+                "{format} stderr: {stderr}"
+            );
+        } else {
+            assert!(
+                !stderr.contains("HTML coverage report written to togi-coverage-report.html"),
+                "{format} stderr: {stderr}"
+            );
+        }
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn check_classifies_zero_coverage_mutants_as_uncovered() {
@@ -5481,6 +5554,397 @@ fn production_upload_artifact_pins_are_immutable() {
     }
 }
 
+fn initialize_fixture_git_index(fixture: &TempDir) {
+    assert!(
+        std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(fixture.path())
+            .status()
+            .expect("initialize fixture Git index")
+            .success(),
+        "fixture Git initialization must succeed"
+    );
+    assert!(
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(fixture.path())
+            .status()
+            .expect("stage fixture manifests")
+            .success(),
+        "fixture manifests must stage"
+    );
+}
+
+#[test]
+fn pinned_actions_checker_semantically_checks_local_composites() {
+    if !bash_available() {
+        eprintln!("skipping pinned-actions checker test because bash is unavailable");
+        return;
+    }
+
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let checker = root.join(".github/scripts/check-pinned-actions.sh");
+    let production = std::process::Command::new("bash")
+        .arg(&checker)
+        .current_dir(root)
+        .output()
+        .expect("run production pinned-actions checker");
+    assert!(
+        production.status.success(),
+        "production actions must be pinned\nstderr:\n{}",
+        String::from_utf8_lossy(&production.stderr)
+    );
+
+    let non_git_fixture = TempDir::new().expect("create non-Git fixture");
+    let non_git = std::process::Command::new("bash")
+        .arg(&checker)
+        .current_dir(non_git_fixture.path())
+        .output()
+        .expect("run checker outside a Git work tree");
+    assert!(
+        !non_git.status.success(),
+        "checker must reject a non-Git worktree"
+    );
+    assert!(
+        String::from_utf8_lossy(&non_git.stderr)
+            .contains("check-pinned-actions.sh must run inside a Git work tree"),
+        "unexpected non-Git checker stderr:\n{}",
+        String::from_utf8_lossy(&non_git.stderr)
+    );
+
+    let fixture = TempDir::new().expect("create mutable-action fixture");
+    fs::create_dir_all(fixture.path().join(".github/workflows"))
+        .expect("create mutable-action workflow directory");
+    fs::create_dir_all(fixture.path().join(".github/actions/unpinned/inner"))
+        .expect("create nested mutable-action directory");
+    fs::write(
+        fixture.path().join(".github/workflows/mutable.yml"),
+        r#"name: mutable
+inputs:
+  uses: actions/setup-go@v7
+jobs:
+  reusable:
+    uses: actions/checkout@v7
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: ./.github/actions/unpinned
+      - uses: docker://alpine:3.20
+      - name: ignored input
+        with:
+          uses: actions/setup-go@v7
+          <<: ignored
+"#,
+    )
+    .expect("write fixture workflow");
+    fs::write(
+        fixture.path().join(".github/workflows/spaced name.yml"),
+        "name: spaced\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v7\n",
+    )
+    .expect("write spaced workflow");
+    fs::write(
+        fixture.path().join(".github/actions/unpinned/action.yml"),
+        r#"name: outer
+runs:
+  using: composite
+  steps:
+    - uses : actions/checkout@v7
+    - "uses": "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
+    - uses: ./inner
+"#,
+    )
+    .expect("write outer composite action");
+    fs::write(
+        fixture.path().join("action.yml"),
+        "name: root\nruns:\n  using: composite\n  steps:\n    - uses: actions/cache@v4\n",
+    )
+    .expect("write root composite action");
+    fs::write(
+        fixture
+            .path()
+            .join(".github/actions/unpinned/inner/action.yaml"),
+        r#"name: inner
+description: "uses : actions/setup-go@v7"
+inputs:
+  uses:
+    default: actions/setup-go@v7
+runs:
+  using: composite
+  steps:
+    # uses : actions/upload-artifact@v7
+    - "uses": actions/attest-build-provenance@8beda2b7ed98355c0e97c0a63bec38ae472e66c4
+    - 'uses' : actions/checkout@v7
+    - "u\u0073es": actions/setup-node@v7
+    - uses: !action actions/setup-dotnet@v6
+"#,
+    )
+    .expect("write nested composite action");
+    initialize_fixture_git_index(&fixture);
+
+    let rejection = std::process::Command::new("bash")
+        .arg(&checker)
+        .current_dir(fixture.path())
+        .output()
+        .expect("run mutable-action fixture checker");
+    assert!(
+        !rejection.status.success(),
+        "nested composite action pins must be rejected"
+    );
+    let stderr = String::from_utf8_lossy(&rejection.stderr);
+    for expected in [
+        ".github/workflows/mutable.yml: jobs.reusable.uses: external action must be pinned to a full commit SHA: actions/checkout@v7",
+        ".github/workflows/spaced name.yml: jobs.test.steps[0].uses: external action must be pinned to a full commit SHA: actions/checkout@v7",
+        "action.yml: runs.steps[0].uses: external action must be pinned to a full commit SHA: actions/cache@v4",
+        ".github/actions/unpinned/action.yml: runs.steps[0].uses: external action must be pinned to a full commit SHA: actions/checkout@v7",
+        ".github/actions/unpinned/inner/action.yaml: runs.steps[0].uses: external action must use a reviewed commit SHA: actions/attest-build-provenance@8beda2b7ed98355c0e97c0a63bec38ae472e66c4",
+        ".github/actions/unpinned/inner/action.yaml: runs.steps[1].uses: external action must be pinned to a full commit SHA: actions/checkout@v7",
+        ".github/actions/unpinned/inner/action.yaml: runs.steps[2].uses: external action must be pinned to a full commit SHA: actions/setup-node@v7",
+        ".github/actions/unpinned/inner/action.yaml: runs.steps[3].uses: external action must be pinned to a full commit SHA: actions/setup-dotnet@v6",
+    ] {
+        assert!(
+            stderr.contains(expected),
+            "checker must report semantic action location `{expected}`\nstderr:\n{stderr}"
+        );
+    }
+    assert!(
+        !stderr.contains("actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"),
+        "checker must accept a quoted reviewed SHA\nstderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("actions/setup-go@v7")
+            && !stderr.contains("actions/upload-artifact@v7")
+            && !stderr.contains("./.github/actions/unpinned")
+            && !stderr.contains("docker://alpine:3.20")
+            && !stderr.contains("YAML merge keys are unsupported"),
+        "checker must ignore non-action data and exempt local and Docker actions\nstderr:\n{stderr}"
+    );
+}
+
+#[test]
+fn pinned_actions_checker_reads_worktree_content_for_staged_manifests() {
+    if !bash_available() {
+        eprintln!("skipping pinned-actions checker test because bash is unavailable");
+        return;
+    }
+
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let checker = root.join(".github/scripts/check-pinned-actions.sh");
+    let fixture = TempDir::new().expect("create staged-manifest fixture");
+    let workflow = fixture.path().join(".github/workflows/staged.yml");
+    fs::create_dir_all(workflow.parent().expect("workflow parent"))
+        .expect("create staged-manifest workflow directory");
+    fs::write(
+        &workflow,
+        "name: staged\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1\n",
+    )
+    .expect("write staged workflow");
+    initialize_fixture_git_index(&fixture);
+    fs::write(
+        &workflow,
+        "name: staged\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v7\n",
+    )
+    .expect("change staged workflow in the working tree");
+
+    let rejection = std::process::Command::new("bash")
+        .arg(&checker)
+        .current_dir(fixture.path())
+        .output()
+        .expect("run staged-manifest fixture checker");
+    assert!(
+        !rejection.status.success(),
+        "checker must inspect working-tree content for staged manifest paths"
+    );
+    assert!(
+        String::from_utf8_lossy(&rejection.stderr).contains(
+            ".github/workflows/staged.yml: jobs.test.steps[0].uses: external action must be pinned to a full commit SHA: actions/checkout@v7"
+        ),
+        "checker must reject the unstaged working-tree mutation\nstderr:\n{}",
+        String::from_utf8_lossy(&rejection.stderr)
+    );
+}
+
+#[test]
+fn pinned_actions_checker_fails_closed_on_aliases_and_merges() {
+    if !bash_available() {
+        eprintln!("skipping pinned-actions checker test because bash is unavailable");
+        return;
+    }
+
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let checker = root.join(".github/scripts/check-pinned-actions.sh");
+    let fixture = TempDir::new().expect("create alias fixture");
+    fs::create_dir_all(fixture.path().join(".github/workflows"))
+        .expect("create alias workflow directory");
+    fs::create_dir_all(fixture.path().join(".github/actions/merge"))
+        .expect("create merge action directory");
+    fs::write(
+        fixture.path().join(".github/workflows/aliases.yml"),
+        r#"name: aliases
+root_template: &root_template
+  ignored: true
+<<: *root_template
+jobs:
+  job_template: &job_template
+    ignored: true
+  <<: *job_template
+  test:
+    <<: &job_merge
+      ignored: true
+    runs-on: ubuntu-latest
+    steps:
+      - &shared_step
+        uses: actions/setup-dotnet@v6
+      - *shared_step
+      - &shared_merge
+        uses: actions/download-artifact@v8
+      - <<: *shared_merge
+"#,
+    )
+    .expect("write alias workflow");
+    fs::write(
+        fixture.path().join(".github/actions/merge/action.yml"),
+        r#"name: merge action
+runs:
+  <<: &runs_merge
+    ignored: true
+  using: composite
+  steps: []
+"#,
+    )
+    .expect("write merge action");
+    initialize_fixture_git_index(&fixture);
+
+    let rejection = std::process::Command::new("bash")
+        .arg(&checker)
+        .current_dir(fixture.path())
+        .output()
+        .expect("run alias fixture checker");
+    assert!(
+        !rejection.status.success(),
+        "aliases and merges must not bypass the checker"
+    );
+    let stderr = String::from_utf8_lossy(&rejection.stderr);
+    assert!(
+        stderr.contains(
+            ".github/workflows/aliases.yml: jobs.test.steps[1].uses: external action must be pinned to a full commit SHA: actions/setup-dotnet@v6"
+        ),
+        "checker must inspect a direct aliased executable step\nstderr:\n{stderr}"
+    );
+    for expected in [
+        ".github/workflows/aliases.yml: $: YAML merge keys are unsupported in executable action mappings",
+        ".github/workflows/aliases.yml: jobs: YAML merge keys are unsupported in executable action mappings",
+        ".github/workflows/aliases.yml: jobs.test: YAML merge keys are unsupported in executable action mappings",
+        ".github/workflows/aliases.yml: jobs.test.steps[3]: YAML merge keys are unsupported in executable action mappings",
+        ".github/actions/merge/action.yml: runs: YAML merge keys are unsupported in executable action mappings",
+    ] {
+        assert!(
+            stderr.contains(expected),
+            "checker must reject traversal-relevant merge key `{expected}`\nstderr:\n{stderr}"
+        );
+    }
+}
+
+#[test]
+fn pinned_actions_checker_rejects_unreadable_and_invalid_manifests() {
+    if !bash_available() {
+        eprintln!("skipping pinned-actions checker test because bash is unavailable");
+        return;
+    }
+
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let checker = root.join(".github/scripts/check-pinned-actions.sh");
+    let fixture = TempDir::new().expect("create invalid-manifest fixture");
+    let workflows = fixture.path().join(".github/workflows");
+    fs::create_dir_all(&workflows).expect("create invalid-manifest workflow directory");
+    fs::write(
+        workflows.join("duplicate.yml"),
+        "name: duplicate\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1\n        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1\n",
+    )
+    .expect("write duplicate-key workflow");
+    fs::write(
+        workflows.join("multi.yml"),
+        "name: first\n---\nname: second\n",
+    )
+    .expect("write multi-document workflow");
+    fs::write(
+        workflows.join("unknown-alias.yml"),
+        "name: unknown alias\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - *missing\n",
+    )
+    .expect("write unknown-alias workflow");
+    fs::write(
+        workflows.join("recursive-alias.yml"),
+        "name: recursive alias\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - &loop [*loop]\n",
+    )
+    .expect("write recursive-alias workflow");
+    fs::write(
+        workflows.join("oversized.yml"),
+        format!("name: oversized\n# {}\n", "a".repeat(1024 * 1024)),
+    )
+    .expect("write oversized workflow");
+    let removed = workflows.join("removed.yml");
+    fs::write(
+        &removed,
+        "name: removed\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1\n",
+    )
+    .expect("write removable workflow");
+    initialize_fixture_git_index(&fixture);
+    fs::remove_file(&removed).expect("remove staged workflow from the working tree");
+
+    let rejection = std::process::Command::new("bash")
+        .arg(&checker)
+        .current_dir(fixture.path())
+        .output()
+        .expect("run invalid-manifest fixture checker");
+    assert!(
+        !rejection.status.success(),
+        "invalid selected manifests must fail closed"
+    );
+    let stderr = String::from_utf8_lossy(&rejection.stderr);
+    for expected in [
+        ".github/workflows/duplicate.yml: invalid YAML:",
+        ".github/workflows/multi.yml: expected exactly one YAML document, found 2",
+        ".github/workflows/unknown-alias.yml: invalid YAML:",
+        ".github/workflows/oversized.yml: manifest exceeds the 1048576-byte size limit",
+        ".github/workflows/removed.yml: unable to read manifest:",
+    ] {
+        assert!(
+            stderr.contains(expected),
+            "checker must fail closed for `{expected}`\nstderr:\n{stderr}"
+        );
+    }
+    assert!(
+        stderr.contains(".github/workflows/recursive-alias.yml: invalid YAML:")
+            || stderr.contains(
+                ".github/workflows/recursive-alias.yml: jobs.test.steps[0]: expected an executable step mapping"
+            ),
+        "checker must reject recursive aliases with a clear diagnostic\nstderr:\n{stderr}"
+    );
+}
+
+#[test]
+fn readme_action_examples_use_commit_pins() {
+    let readme = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md"))
+        .unwrap()
+        .replace("\r\n", "\n");
+
+    for expected in [
+        "actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0",
+        "actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0",
+        "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1",
+        "github/codeql-action/upload-sarif@6f5948dfacef28e207b48d0905cf90c03365536d # v3",
+    ] {
+        assert!(
+            readme.contains(expected),
+            "README action example must contain commit pin `{expected}`"
+        );
+    }
+    assert!(
+        !readme
+            .contains("github/codeql-action/upload-sarif@5ba2889ada762081db2c4f32a729827dce632c7b"),
+        "README must not use the v3 annotated tag object as a pin"
+    );
+}
+
 #[test]
 fn github_action_guide_and_advisory_pin_released_contract() {
     let readme = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md"))
@@ -5552,7 +6016,7 @@ fn github_action_guide_and_advisory_pin_released_contract() {
 
     for expected in [
         "Those inputs override `togi.toml`",
-        "`format: github`; the Action preserves that review run and performs a second\nfull JSON mutation run",
+        "`format: github`; the Action runs one GitHub-format mutation campaign and writes\na replayable JSON sidecar with `--json-report`",
         "A failed baseline test or build is a fatal exit `2`",
         "Never use `pull_request_target` to run PR code.",
         "immutable version identifiers for v0.5.2",
@@ -6305,7 +6769,8 @@ fn pr_loop_benchmark_workflow_collects_observational_evidence() {
     let checkout = steps
         .iter()
         .find(|step| {
-            step.get("uses").and_then(|value| value.as_str()) == Some("actions/checkout@v7")
+            step.get("uses").and_then(|value| value.as_str())
+                == Some("actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1")
         })
         .expect("benchmark job must checkout");
     assert_eq!(
@@ -6327,7 +6792,10 @@ fn pr_loop_benchmark_workflow_collects_observational_evidence() {
             "dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8",
             Some("stable"),
         ),
-        ("actions/setup-go@v7", Some("1.26.5")),
+        (
+            "actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e",
+            Some("1.26.5"),
+        ),
     ] {
         let step = steps
             .iter()

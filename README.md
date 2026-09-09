@@ -72,6 +72,8 @@ command = ["python3", "-m", "unittest", "discover"]
 
 Try it: `examples/polyglot-demo.sh` runs a PR-sized Go + Rust + Python change through one `togi check` — mutants from all three languages appear in the same report, the same mutation score, and the same `--fail-under` gate. No per-language glue, no stitched-together CI jobs.
 
+Both demos honor `CARGO_TARGET_DIR`; set `TOGI_BIN` to an executable Togi binary to skip their local build.
+
 ## Install
 
 ### Linux x86_64 (Tier 1) first success
@@ -875,6 +877,29 @@ dependency/build directories such as `node_modules`, `.venv`, `dist`, `build`,
 and `target`. Set `[mutations] respect_workspace_ignores = false` only when a
 test command genuinely needs ignored files copied into the mutation workspace.
 
+For copy-based workspaces, exact and incremental result reuse is bound to every
+copied source entry and its copied observable metadata. Git-worktree reuse is
+bound to the checked-out `HEAD`, a versioned tracked-file index, and the same
+dirty overlay applied to the workspace, including tracked files that match
+`.gitignore`, plus regular-file standard permissions (full Windows file
+attributes included) and regular-file and non-root directory mtimes actually
+materialized by that Git checkout and overlay. A dirty overlay symlink that
+resolves inside the project is copied as a regular file and keys its resolved
+target metadata at that destination; clean Git symlink leaves remain excluded,
+while their materialized non-root parent directories remain covered.
+Source-only untracked empty directories stay absent from Git worktrees and do
+not affect Git identity. Workspace-root mtimes and `.git` metadata are
+intentionally excluded. Clean tracked paths normally excluded from copies are
+included when Git materializes them; dirty changes to those paths force
+normal-copy fallback. If Git workspace creation or snapshotting fails, the
+whole campaign uses the separate copy-workspace cache domain.
+
+Regular workspace files are canonical execution inputs: Togi preserves bytes,
+the standard `std::fs::Permissions` value (including Windows file attributes),
+and mtime, but intentionally does not carry source ACLs, xattrs, ADS/resource
+forks, ownership, or link relationships into the sandbox. Those
+platform-specific metadata channels are therefore not cache inputs.
+
 ## Security model
 
 togi executes repository-defined build and test commands with the permissions of
@@ -936,13 +961,13 @@ jobs:
   togi:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
         with:
           toolchain: stable
-      - uses: actions/cache@v4
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cargo/registry
@@ -1047,8 +1072,8 @@ command = ["npm", "test"]
 
 `format: json` is the one-run path: its JSON stream becomes the replayable
 `togi-report.json`. To opt into GitHub annotations instead, set
-`format: github`; the Action preserves that review run and performs a second
-full JSON mutation run to create the replayable report.
+`format: github`; the Action runs one GitHub-format mutation campaign and writes
+a replayable JSON sidecar with `--json-report`.
 
 For a normal mutation report, the Action uploads `togi-report.json` as the
 `togi-report` artifact. This example explicitly retains it for 14 days. Set a
@@ -1075,7 +1100,7 @@ Download and replay a report only in a checkout at the report's recorded source
 revision and only when the artifact is trusted:
 
 ```yaml
-- uses: actions/download-artifact@v8
+- uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
   if: ${{ always() }}
   with:
     name: togi-report
@@ -1104,12 +1129,12 @@ jobs:
   togi:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
       # Install togi as shown in "CI Integration" above
       - run: togi check --base origin/main --format sarif > togi-report.sarif
-      - uses: github/codeql-action/upload-sarif@v3
+      - uses: github/codeql-action/upload-sarif@6f5948dfacef28e207b48d0905cf90c03365536d # v3
         if: always()  # upload even when togi exits 1 on surviving mutants
         with:
           sarif_file: togi-report.sarif

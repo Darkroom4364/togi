@@ -151,11 +151,14 @@ impl IncrementalHistoryStore {
             .and_then(|entry| reusable_history_result(entry.result))
     }
 
+    /// Returns a recorded killer only when its current relevant-test context
+    /// matches the workspace context under which it was learned.
     pub fn preferred_killer_test(
         &self,
         mutation_identity: &str,
         mutation_description: &str,
         tests: &[String],
+        relevant_test_hash_for_killer: impl Fn(&str) -> Option<u64>,
     ) -> Option<String> {
         let history = self.state.lock().ok()?;
         history
@@ -166,22 +169,27 @@ impl IncrementalHistoryStore {
                 entry.mutation_identity == mutation_identity
                     && entry.mutation_description == mutation_description
             })
-            .filter_map(|entry| entry.killer_test.as_ref())
-            .find(|killer| tests.iter().any(|test| test == *killer))
-            .cloned()
+            .filter_map(|entry| {
+                let killer = entry.killer_test.as_ref()?;
+                (tests.iter().any(|test| test == killer)
+                    && relevant_test_hash_for_killer(killer) == Some(entry.relevant_test_hash))
+                .then(|| killer.clone())
+            })
+            .next()
     }
 
     /// Killer test from the latest `Killed` history entry for this mutation
-    /// whose source and command hashes still match the current run — the
-    /// evidence learned selection clusters on. Returns `None` when there is
-    /// no such entry, the verdict was not `Killed`, or no killer test was
-    /// recorded.
+    /// whose source, command, and relevant-test hashes still match the current
+    /// run — the evidence learned selection clusters on. Returns `None` when
+    /// there is no such entry, the verdict was not `Killed`, or no killer test
+    /// was recorded.
     pub fn learned_killer_test(
         &self,
         mutation_identity: &str,
         mutation_description: &str,
         source_hash: u64,
         command_hash: u64,
+        relevant_test_hash: u64,
     ) -> Option<String> {
         let history = self.state.lock().ok()?;
         history
@@ -193,6 +201,7 @@ impl IncrementalHistoryStore {
                     && entry.mutation_description == mutation_description
                     && entry.source_hash == source_hash
                     && entry.command_hash == command_hash
+                    && entry.relevant_test_hash == relevant_test_hash
                     && entry.result == MutationResult::Killed
             })
             .and_then(|entry| entry.killer_test.clone())
@@ -581,9 +590,20 @@ mod tests {
             store.preferred_killer_test(
                 "src/lib.rs:0..1:op",
                 "desc",
-                &["test_add".into(), "test_max".into()]
+                &["test_add".into(), "test_max".into()],
+                |killer| (killer == "test_max").then_some(3),
             ),
             Some("test_max".into())
+        );
+        assert_eq!(
+            store.preferred_killer_test(
+                "src/lib.rs:0..1:op",
+                "desc",
+                &["test_add".into(), "test_max".into()],
+                |_| Some(4),
+            ),
+            None,
+            "a killer from another workspace context must not steer selection"
         );
         Ok(())
     }
@@ -609,7 +629,7 @@ mod tests {
 
         let reloaded = IncrementalHistoryStore::load(tmp.path());
         assert_eq!(
-            reloaded.learned_killer_test("src/lib.rs:0..1:op", "desc", 1, 2),
+            reloaded.learned_killer_test("src/lib.rs:0..1:op", "desc", 1, 2, 3),
             Some("test_add".into())
         );
         Ok(())
@@ -622,11 +642,15 @@ mod tests {
         store.record(killed_entry(Some("test_add")));
 
         assert_eq!(
-            store.learned_killer_test("src/lib.rs:0..1:op", "desc", 9, 2),
+            store.learned_killer_test("src/lib.rs:0..1:op", "desc", 9, 2, 3),
             None
         );
         assert_eq!(
-            store.learned_killer_test("src/lib.rs:0..1:op", "desc", 1, 9),
+            store.learned_killer_test("src/lib.rs:0..1:op", "desc", 1, 9, 3),
+            None
+        );
+        assert_eq!(
+            store.learned_killer_test("src/lib.rs:0..1:op", "desc", 1, 2, 9),
             None
         );
         Ok(())
@@ -641,7 +665,7 @@ mod tests {
         store.record(entry);
 
         assert_eq!(
-            store.learned_killer_test("src/lib.rs:0..1:op", "desc", 1, 2),
+            store.learned_killer_test("src/lib.rs:0..1:op", "desc", 1, 2, 3),
             None
         );
         Ok(())
@@ -654,7 +678,7 @@ mod tests {
         store.record(killed_entry(None));
 
         assert_eq!(
-            store.learned_killer_test("src/lib.rs:0..1:op", "desc", 1, 2),
+            store.learned_killer_test("src/lib.rs:0..1:op", "desc", 1, 2, 3),
             None
         );
         Ok(())

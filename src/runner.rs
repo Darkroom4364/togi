@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 const CAPTURED_OUTPUT_LIMIT: usize = 1024 * 1024;
 const CAPTURE_CLEANUP_TIMEOUT: Duration = Duration::from_millis(100);
@@ -219,6 +219,33 @@ pub struct RunOutcome {
     /// replay-specific data.
     pub replay_recipes: BTreeMap<u32, RegularDirectRecipe>,
     pub cancelled: bool,
+}
+
+#[cfg(test)]
+type MutationWorkerAfterDequeueHook = Arc<dyn Fn(&Path, &Mutation) + Send + Sync>;
+
+#[cfg(test)]
+static MUTATION_WORKER_AFTER_DEQUEUE_HOOK: std::sync::LazyLock<
+    Mutex<Option<MutationWorkerAfterDequeueHook>>,
+> = std::sync::LazyLock::new(|| Mutex::new(None));
+
+#[cfg(test)]
+fn set_mutation_worker_after_dequeue_hook(hook: Option<MutationWorkerAfterDequeueHook>) {
+    let hook_slot = &*MUTATION_WORKER_AFTER_DEQUEUE_HOOK;
+    *hook_slot
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = hook;
+}
+
+#[cfg(test)]
+fn run_mutation_worker_after_dequeue_hook(project_root: &Path, mutation: &Mutation) {
+    let hook = MUTATION_WORKER_AFTER_DEQUEUE_HOOK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    if let Some(hook) = hook {
+        hook(project_root, mutation);
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -427,27 +454,34 @@ fn select_test_command(
     commands: &CommandConfig,
     mutation: &Mutation,
 ) -> SelectedTestCommand {
-    select_test_command_with_history(project_root, commands, mutation, None)
+    select_test_command_with_history(project_root, commands, mutation, None, None)
 }
 
+/// Use a learned killer only when it matches the actual workspace-pool context.
 fn select_test_command_with_history(
     project_root: &Path,
     commands: &CommandConfig,
     mutation: &Mutation,
     history: Option<&cache::IncrementalHistoryStore>,
+    learned_selection_context: Option<LearnedSelectionContext<'_>>,
 ) -> SelectedTestCommand {
     let mut selected = select_unnarrowed_test_command(project_root, commands, mutation);
     selected.selection_active = commands.test_selection.is_some();
 
     if let Some(test_selection) = &commands.test_selection {
         if let Some(mut tests) = test_selection.tests_for(project_root, mutation) {
-            if let Some(preferred) = history.and_then(|history| {
-                history.preferred_killer_test(
-                    &cache_identity(project_root, mutation),
-                    &mutation.description,
-                    &tests,
-                )
-            }) {
+            if let Some(preferred) =
+                history
+                    .zip(learned_selection_context)
+                    .and_then(|(history, context)| {
+                        history.preferred_killer_test(
+                            &cache_identity(project_root, mutation),
+                            &mutation.description,
+                            &tests,
+                            |killer| context.relevant_test_hash_for_killer(&tests, killer),
+                        )
+                    })
+            {
                 tests.sort_by_key(|test| if *test == preferred { 0 } else { 1 });
             }
             let narrowed = narrow_test_command(selected.argv.clone(), &tests);
@@ -753,10 +787,47 @@ enum WorkspaceResetStrategy {
     },
 }
 
-#[derive(Clone)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WorkspaceStrategy {
+    GitWorktree,
+    Copy,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GitWorkspaceMtimeEntryKind {
+    RegularFile,
+    Directory,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct GitWorkspaceMtimeEntry {
+    relative: PathBuf,
+    kind: GitWorkspaceMtimeEntryKind,
+    /// Canonical regular-file permissions when this is a regular file.
+    permissions: Option<fs::Permissions>,
+    permission_fingerprint: Option<u32>,
+    modified: SystemTime,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct GitIndexEntry {
+    relative: PathBuf,
+    mode: String,
+    object_id: String,
+}
+
+struct GitWorkspaceMtimeSource {
+    kind: GitWorkspaceMtimeEntryKind,
+    source: PathBuf,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct GitWorktreeOverlay {
+    head: String,
+    index_entries: Vec<GitIndexEntry>,
     copy_paths: Vec<PathBuf>,
     remove_paths: Vec<PathBuf>,
+    mtime_entries: Vec<GitWorkspaceMtimeEntry>,
 }
 
 impl GitWorktreeOverlay {
@@ -767,7 +838,7 @@ impl GitWorktreeOverlay {
         for relative in &self.copy_paths {
             copy_overlay_file(project_root, workspace_root, relative)?;
         }
-        Ok(())
+        normalize_git_workspace_mtimes(workspace_root, &self.mtime_entries)
     }
 
     fn apply_replay(
@@ -794,6 +865,20 @@ impl GitWorktreeOverlay {
 impl WorkspaceCopy {
     pub(crate) fn root(&self) -> &Path {
         &self.root
+    }
+
+    fn strategy(&self) -> WorkspaceStrategy {
+        match &self.reset_strategy {
+            WorkspaceResetStrategy::Copy => WorkspaceStrategy::Copy,
+            WorkspaceResetStrategy::GitWorktree { .. } => WorkspaceStrategy::GitWorktree,
+        }
+    }
+
+    fn git_overlay(&self) -> Option<&GitWorktreeOverlay> {
+        match &self.reset_strategy {
+            WorkspaceResetStrategy::GitWorktree { overlay, .. } => Some(overlay),
+            WorkspaceResetStrategy::Copy => None,
+        }
     }
 
     fn reset(&self, project_root: &Path, respect_ignores: bool) -> std::io::Result<()> {
@@ -1454,6 +1539,7 @@ pub(crate) fn should_skip_workspace_entry(relative: &Path) -> bool {
                     | ".togi"
                     | ".togi-cache"
                     | ".togi.lock"
+                    | ".togi-baseline"
                     | ".codex"
                     | ".claude"
                     | "target"
@@ -1512,73 +1598,354 @@ fn should_copy_replay_workspace_entry(project_root: &Path, path: &Path) -> bool 
 /// Any stale stash from an interrupted prior reset is reclaimed before rename.
 const PRESERVED_WORKSPACE_DIRS: &[&str] = &["target"];
 
-fn cache_context_fingerprint(project_root: &Path) -> u64 {
-    git_cache_context_fingerprint(project_root)
-        .unwrap_or_else(|| filesystem_cache_context_fingerprint(project_root))
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WorkspaceCacheContextProvenance {
+    GitWorktreeV4,
+    WorkspaceCopy { respect_workspace_ignores: bool },
 }
 
-fn filesystem_cache_context_fingerprint(project_root: &Path) -> u64 {
-    let mut files = Vec::new();
-    collect_cache_context_files(project_root, project_root, &mut files);
-    files.sort_by_key(|path| normalized_cache_path(project_root, path));
+#[derive(Clone, Copy)]
+struct WorkspaceCacheContext {
+    fingerprint: u64,
+    provenance: WorkspaceCacheContextProvenance,
+}
 
-    let mut hasher = StableCacheHasher::default();
-    update_cache_hash(&mut hasher, b"filesystem");
-    for relative in files {
-        let path_key = normalized_cache_path(project_root, &relative);
-        update_cache_hash(&mut hasher, path_key.as_bytes());
-        if let Ok(content) = fs::read(project_root.join(&relative)) {
-            update_cache_hash(&mut hasher, &content);
+#[cfg(test)]
+fn cache_context_fingerprint(project_root: &Path) -> u64 {
+    workspace_cache_context(project_root, true).fingerprint
+}
+
+/// Fingerprint the actual strategy selected by a prebuilt workspace pool.
+///
+/// A Git worktree and a normal copy have intentionally distinct cache domains:
+/// their filesystem shapes differ even when their source bytes match.
+fn workspace_cache_context_for_strategy(
+    project_root: &Path,
+    respect_workspace_ignores: bool,
+    strategy: WorkspaceStrategy,
+    git_overlay: Option<&GitWorktreeOverlay>,
+) -> Option<WorkspaceCacheContext> {
+    match strategy {
+        WorkspaceStrategy::GitWorktree => git_overlay
+            .and_then(|overlay| git_cache_context_fingerprint_for_overlay(project_root, overlay))
+            .map(|fingerprint| WorkspaceCacheContext {
+                fingerprint,
+                provenance: WorkspaceCacheContextProvenance::GitWorktreeV4,
+            }),
+        WorkspaceStrategy::Copy => Some(WorkspaceCacheContext {
+            fingerprint: copied_workspace_fingerprint(project_root, respect_workspace_ignores),
+            provenance: WorkspaceCacheContextProvenance::WorkspaceCopy {
+                respect_workspace_ignores,
+            },
+        }),
+    }
+}
+
+#[cfg(test)]
+fn workspace_cache_context(
+    project_root: &Path,
+    respect_workspace_ignores: bool,
+) -> WorkspaceCacheContext {
+    if respect_workspace_ignores {
+        if let Some(fingerprint) = git_cache_context_fingerprint(project_root) {
+            return WorkspaceCacheContext {
+                fingerprint,
+                provenance: WorkspaceCacheContextProvenance::GitWorktreeV4,
+            };
         }
+    }
+
+    WorkspaceCacheContext {
+        fingerprint: copied_workspace_fingerprint(project_root, respect_workspace_ignores),
+        provenance: WorkspaceCacheContextProvenance::WorkspaceCopy {
+            respect_workspace_ignores,
+        },
+    }
+}
+
+#[cfg(test)]
+fn cache_context_fingerprint_for_workspace(
+    project_root: &Path,
+    respect_workspace_ignores: bool,
+) -> u64 {
+    workspace_cache_context(project_root, respect_workspace_ignores).fingerprint
+}
+
+/// Every Git worktree and copy-based workspace has an explicit format domain.
+/// V4 Git snapshots broad checkout metadata; V7 copy keys include full Windows
+/// file attributes rather than the prior readonly-only approximation.
+fn exact_cache_context(
+    command_context: &str,
+    cache_context_fingerprint: u64,
+    provenance: WorkspaceCacheContextProvenance,
+) -> String {
+    match provenance {
+        WorkspaceCacheContextProvenance::GitWorktreeV4 => format!(
+            "{command_context};workspace-git-worktree=v4;context={cache_context_fingerprint:016x}"
+        ),
+        WorkspaceCacheContextProvenance::WorkspaceCopy {
+            respect_workspace_ignores,
+        } => format!(
+            "{command_context};workspace-ignores={respect_workspace_ignores};workspace-copy=v7;context={cache_context_fingerprint:016x}"
+        ),
+    }
+}
+
+/// Frame a copied regular file's modification time with a stable
+/// representation, including explicit unavailable/error markers.
+fn update_copied_workspace_mtime_hash(hasher: &mut impl Hasher, metadata: Option<&fs::Metadata>) {
+    update_cache_hash(hasher, b"mtime-v1");
+    let Some(metadata) = metadata else {
+        update_cache_hash(hasher, b"metadata-unavailable");
+        return;
+    };
+    let Ok(modified) = metadata.modified() else {
+        update_cache_hash(hasher, b"mtime-unavailable");
+        return;
+    };
+    update_workspace_modified_time_hash(hasher, modified);
+}
+
+fn update_workspace_modified_time_hash(hasher: &mut impl Hasher, modified: SystemTime) {
+    match modified.duration_since(std::time::UNIX_EPOCH) {
+        Ok(duration) => {
+            update_cache_hash(hasher, b"after-unix-epoch");
+            update_cache_hash(hasher, &duration.as_secs().to_le_bytes());
+            update_cache_hash(hasher, &duration.subsec_nanos().to_le_bytes());
+        }
+        Err(error) => {
+            let duration = error.duration();
+            update_cache_hash(hasher, b"before-unix-epoch");
+            update_cache_hash(hasher, &duration.as_secs().to_le_bytes());
+            update_cache_hash(hasher, &duration.subsec_nanos().to_le_bytes());
+        }
+    }
+}
+fn copied_regular_file_permissions_value(metadata: Option<&fs::Metadata>) -> u32 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        metadata
+            .map(|metadata| metadata.permissions().mode())
+            .unwrap_or_default()
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+
+        metadata
+            .map(|metadata| metadata.file_attributes())
+            .unwrap_or_default()
+    }
+    #[cfg(all(not(unix), not(windows)))]
+    {
+        u32::from(
+            metadata
+                .map(|metadata| metadata.permissions().readonly())
+                .unwrap_or(false),
+        )
+    }
+}
+
+fn update_copied_regular_file_permissions_hash(
+    hasher: &mut impl Hasher,
+    metadata: Option<&fs::Metadata>,
+) {
+    update_cache_hash(
+        hasher,
+        &copied_regular_file_permissions_value(metadata).to_le_bytes(),
+    );
+}
+
+fn update_copied_regular_file_metadata_hash(hasher: &mut impl Hasher, source: &Path) {
+    let metadata = fs::symlink_metadata(source);
+    update_copied_regular_file_permissions_hash(hasher, metadata.as_ref().ok());
+    update_copied_workspace_mtime_hash(hasher, metadata.as_ref().ok());
+}
+
+fn update_copied_regular_file_hash(hasher: &mut impl Hasher, source: &Path) {
+    update_cache_hash(hasher, b"regular-file");
+    update_copied_regular_file_metadata_hash(hasher, source);
+    if let Ok(content) = fs::read(source) {
+        update_cache_hash(hasher, &content);
+    }
+}
+
+#[derive(Clone, Copy)]
+enum WorkspaceCopyEntryKind {
+    Directory,
+    RegularFile,
+}
+
+fn copied_workspace_entries(
+    project_root: &Path,
+    respect_workspace_ignores: bool,
+) -> Vec<(PathBuf, WorkspaceCopyEntryKind)> {
+    let mut builder = ignore::WalkBuilder::new(project_root);
+    configure_workspace_copy_walk(&mut builder, project_root, respect_workspace_ignores);
+
+    let mut entries = Vec::new();
+    for entry in builder.build() {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let path = entry.path();
+        if path == project_root {
+            continue;
+        }
+        let Ok(relative) = path.strip_prefix(project_root) else {
+            continue;
+        };
+        if entry
+            .file_type()
+            .is_some_and(|file_type| file_type.is_dir())
+        {
+            entries.push((relative.to_path_buf(), WorkspaceCopyEntryKind::Directory));
+        } else if entry
+            .file_type()
+            .is_some_and(|file_type| file_type.is_file())
+            && fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_file())
+        {
+            entries.push((relative.to_path_buf(), WorkspaceCopyEntryKind::RegularFile));
+        }
+    }
+    entries.sort_by_key(|(path, _)| normalized_cache_path(project_root, path));
+    entries
+}
+
+fn update_copied_workspace_entry_hash(
+    hasher: &mut impl Hasher,
+    project_root: &Path,
+    relative: &Path,
+    kind: WorkspaceCopyEntryKind,
+) {
+    let source = project_root.join(relative);
+    let path_key = normalized_cache_path(project_root, relative);
+    update_cache_hash(hasher, path_key.as_bytes());
+    match kind {
+        WorkspaceCopyEntryKind::Directory => {
+            update_cache_hash(hasher, b"directory");
+            let metadata = fs::symlink_metadata(&source);
+            update_copied_workspace_mtime_hash(hasher, metadata.as_ref().ok());
+        }
+        WorkspaceCopyEntryKind::RegularFile => update_copied_regular_file_hash(hasher, &source),
+    }
+}
+
+/// Hash the canonical metadata snapshot applied to a Git workspace.
+fn update_git_workspace_mtime_entries_hash(
+    hasher: &mut impl Hasher,
+    project_root: &Path,
+    entries: &[GitWorkspaceMtimeEntry],
+) {
+    update_cache_hash(hasher, b"git-worktree-metadata-v2");
+    for entry in entries {
+        let path_key = if entry.relative.as_os_str().is_empty() {
+            "."
+        } else {
+            &normalized_cache_path(project_root, &entry.relative)
+        };
+        update_cache_hash(hasher, path_key.as_bytes());
+        update_cache_hash(
+            hasher,
+            match entry.kind {
+                GitWorkspaceMtimeEntryKind::RegularFile => b"regular-file",
+                GitWorkspaceMtimeEntryKind::Directory => b"directory",
+            },
+        );
+        if let Some(permission_fingerprint) = entry.permission_fingerprint {
+            update_cache_hash(hasher, &permission_fingerprint.to_le_bytes());
+        }
+        update_cache_hash(hasher, b"mtime-v1");
+        update_workspace_modified_time_hash(hasher, entry.modified);
+    }
+}
+
+/// Hash every non-root source entry that the workspace copier materializes.
+///
+/// This matches the canonical regular-file copy contract: bytes,
+/// `std::fs::Permissions` (including full Windows file attributes), and mtime
+/// are inputs; source-native ACLs, xattrs, ADS/resource forks, ownership, and
+/// links are deliberately not. Non-root directories include their source mtime
+/// because the copier restores it after descendants are materialized.
+fn copied_workspace_fingerprint(project_root: &Path, respect_workspace_ignores: bool) -> u64 {
+    let mut hasher = StableCacheHasher::default();
+    update_cache_hash(&mut hasher, b"workspace-copy-v7");
+    update_cache_hash(
+        &mut hasher,
+        if respect_workspace_ignores {
+            b"workspace-ignores=true"
+        } else {
+            b"workspace-ignores=false"
+        },
+    );
+    for (relative, kind) in copied_workspace_entries(project_root, respect_workspace_ignores) {
+        update_copied_workspace_entry_hash(&mut hasher, project_root, &relative, kind);
     }
     hasher.finish()
 }
 
+/// Fingerprint the `HEAD`, index, dirty overlay, and mtime snapshot actually
+/// materialized into an isolated Git workspace.
+///
+/// The mtime snapshot covers regular files and represented directories from the
+/// Git index and overlay. Source-only empty directories, `.git` internals,
+/// clean Git symlink leaves, and submodule internals are excluded, while their
+/// materialized non-root parent directories remain covered. A dirty overlay
+/// symlink contributes its resolved in-root regular target at its destination.
+#[cfg(test)]
 fn git_cache_context_fingerprint(project_root: &Path) -> Option<u64> {
-    if git_cache_context_is_dirty(project_root)? {
+    if !git_worktree_workspace_is_available(project_root) {
         return None;
     }
+    let overlay = collect_git_worktree_overlay(project_root).ok()?;
+    git_cache_context_fingerprint_for_overlay(project_root, &overlay)
+}
 
-    let output = std::process::Command::new("git")
-        .args(["ls-files", "-z", "-s", "--"])
-        .current_dir(project_root)
-        .output()
-        .ok()?;
-    if !output.status.success() {
+fn git_cache_context_fingerprint_for_overlay(
+    project_root: &Path,
+    overlay: &GitWorktreeOverlay,
+) -> Option<u64> {
+    if overlay.head.is_empty() {
         return None;
     }
-
-    let mut files = Vec::new();
-    for entry in output.stdout.split(|byte| *byte == 0) {
-        if entry.is_empty() {
-            continue;
-        }
-        let tab = entry.iter().position(|byte| *byte == b'\t')?;
-        let metadata = String::from_utf8_lossy(&entry[..tab]);
-        let mut fields = metadata.split_whitespace();
-        let _mode = fields.next()?;
-        let object_id = fields.next()?.to_string();
-        let relative = PathBuf::from(String::from_utf8_lossy(&entry[tab + 1..]).into_owned());
-        if is_cache_context_file(&relative) {
-            files.push((relative, object_id));
-        }
-    }
-
-    files.sort_by_key(|(path, _)| normalized_cache_path(project_root, path));
 
     let mut hasher = StableCacheHasher::default();
-    update_cache_hash(&mut hasher, b"git-index");
-    for (relative, object_id) in files {
-        let path_key = normalized_cache_path(project_root, &relative);
+    update_cache_hash(&mut hasher, b"git-worktree-v4");
+    update_cache_hash(&mut hasher, b"head");
+    update_cache_hash(&mut hasher, overlay.head.as_bytes());
+    update_cache_hash(&mut hasher, b"index");
+    for entry in &overlay.index_entries {
+        let path_key = normalized_cache_path(project_root, &entry.relative);
         update_cache_hash(&mut hasher, path_key.as_bytes());
-        update_cache_hash(&mut hasher, object_id.as_bytes());
+        update_cache_hash(&mut hasher, entry.mode.as_bytes());
+        update_cache_hash(&mut hasher, entry.object_id.as_bytes());
     }
+    update_cache_hash(&mut hasher, b"overlay-removals");
+    for relative in &overlay.remove_paths {
+        let path_key = normalized_cache_path(project_root, relative);
+        update_cache_hash(&mut hasher, path_key.as_bytes());
+    }
+    update_cache_hash(&mut hasher, b"overlay-copies");
+    for relative in &overlay.copy_paths {
+        let path_key = normalized_cache_path(project_root, relative);
+        update_cache_hash(&mut hasher, path_key.as_bytes());
+        match resolve_normal_overlay_source(project_root, relative) {
+            Ok(Some(source)) => match fs::read(source) {
+                Ok(content) => update_cache_hash(&mut hasher, &content),
+                Err(_) => return None,
+            },
+            Ok(None) => update_cache_hash(&mut hasher, b"removed"),
+            Err(_) => return None,
+        }
+    }
+    update_git_workspace_mtime_entries_hash(&mut hasher, project_root, &overlay.mtime_entries);
     Some(hasher.finish())
 }
 
+#[cfg(test)]
 fn git_cache_context_is_dirty(project_root: &Path) -> Option<bool> {
-    // No -M/--find-renames here: porcelain v1 -z then stays in the
-    // single-token "XY path\0" form this parser expects.
     let output = std::process::Command::new("git")
         .args([
             "status",
@@ -1593,17 +1960,7 @@ fn git_cache_context_is_dirty(project_root: &Path) -> Option<bool> {
     if !output.status.success() {
         return None;
     }
-
-    for entry in output.stdout.split(|byte| *byte == 0) {
-        if entry.len() <= 3 || entry[2] != b' ' {
-            continue;
-        }
-        let relative = PathBuf::from(String::from_utf8_lossy(&entry[3..]).into_owned());
-        if is_cache_context_file(&relative) {
-            return Some(true);
-        }
-    }
-    Some(false)
+    Some(!output.stdout.is_empty())
 }
 
 fn collect_cache_context_files(project_root: &Path, dir: &Path, out: &mut Vec<PathBuf>) {
@@ -1850,13 +2207,17 @@ impl TestContextIndex {
         Self { files }
     }
 
+    /// Relevant-test identity is order-independent; command hashing preserves
+    /// the configured execution order.
     fn fingerprint_for_tests(&self, tests: &[String], fallback: u64) -> u64 {
         if tests.is_empty() || self.files.is_empty() {
             return fallback;
         }
 
+        let mut canonical_tests: Vec<&String> = tests.iter().collect();
+        canonical_tests.sort_unstable();
         let mut matched = BTreeSet::new();
-        for test in tests {
+        for test in &canonical_tests {
             let matches = self.files_for_test(test);
             if matches.is_empty() {
                 return fallback;
@@ -1865,8 +2226,8 @@ impl TestContextIndex {
         }
 
         let mut hasher = StableCacheHasher::default();
-        update_cache_hash(&mut hasher, b"selected-test-context-v1");
-        for test in tests {
+        update_cache_hash(&mut hasher, b"selected-test-context-v2");
+        for test in canonical_tests {
             update_cache_hash(&mut hasher, test.as_bytes());
         }
         for index in matched {
@@ -1904,6 +2265,26 @@ impl TestContextIndex {
                     .then_some(index)
             })
             .collect()
+    }
+}
+
+#[derive(Clone, Copy)]
+struct LearnedSelectionContext<'a> {
+    test_context_index: &'a TestContextIndex,
+    cache_context_fingerprint: u64,
+    cache_context_provenance: WorkspaceCacheContextProvenance,
+}
+
+impl LearnedSelectionContext<'_> {
+    fn relevant_test_hash_for_killer(&self, tests: &[String], killer: &str) -> Option<u64> {
+        tests.iter().any(|test| test == killer).then(|| {
+            incremental_history_relevant_test_hash(
+                self.test_context_index
+                    .fingerprint_for_tests(tests, self.cache_context_fingerprint),
+                self.cache_context_fingerprint,
+                self.cache_context_provenance,
+            )
+        })
     }
 }
 
@@ -2011,6 +2392,15 @@ fn copy_workspace_with_options(
         }
     }
 
+    finish_copy_workspace(project_root, tempdir, root, respect_ignores)
+}
+
+fn copy_workspace_without_git(
+    project_root: &Path,
+    respect_ignores: bool,
+) -> std::io::Result<WorkspaceCopy> {
+    let tempdir = tempfile::tempdir()?;
+    let root = tempdir.path().join("workspace");
     finish_copy_workspace(project_root, tempdir, root, respect_ignores)
 }
 
@@ -2397,7 +2787,7 @@ fn create_git_worktree_workspace(
     let output = std::process::Command::new("git")
         .args(["worktree", "add", "--detach", "--quiet"])
         .arg(root)
-        .arg("HEAD")
+        .arg(&overlay.head)
         .current_dir(project_root)
         .output()?;
     if output.status.success() {
@@ -2445,10 +2835,104 @@ fn git_top_level(project_root: &Path) -> Option<PathBuf> {
     PathBuf::from(top_level.trim()).canonicalize().ok()
 }
 
+fn git_head_revision(project_root: &Path) -> std::io::Result<String> {
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "--verify", "HEAD"])
+        .current_dir(project_root)
+        .output()?;
+    if !output.status.success() {
+        return Err(std::io::Error::other(format!(
+            "could not resolve Git HEAD in {}\nstderr:\n{}",
+            project_root.display(),
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+    let head = String::from_utf8(output.stdout)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    let head = head.trim();
+    if head.is_empty() {
+        return Err(std::io::Error::other(format!(
+            "could not resolve a non-empty Git HEAD in {}",
+            project_root.display()
+        )));
+    }
+    Ok(head.to_owned())
+}
+
+fn git_index_entries(project_root: &Path) -> std::io::Result<Vec<GitIndexEntry>> {
+    let output = std::process::Command::new("git")
+        .args(["ls-files", "-z", "-s", "--"])
+        .current_dir(project_root)
+        .output()?;
+    if !output.status.success() {
+        return Err(std::io::Error::other(format!(
+            "could not read Git index in {}\nstderr:\n{}",
+            project_root.display(),
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+
+    let mut entries = Vec::new();
+    for entry in output.stdout.split(|byte| *byte == 0) {
+        if entry.is_empty() {
+            continue;
+        }
+        let tab = entry
+            .iter()
+            .position(|byte| *byte == b'\t')
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "malformed Git index entry")
+            })?;
+        let metadata = String::from_utf8_lossy(&entry[..tab]);
+        let mut fields = metadata.split_whitespace();
+        let mode = fields
+            .next()
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "missing Git mode")
+            })?
+            .to_owned();
+        let object_id = fields
+            .next()
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "missing Git object id")
+            })?
+            .to_owned();
+        if fields.next() != Some("0") || fields.next().is_some() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "unsupported Git index stage",
+            ));
+        }
+        let relative = safe_git_relative_path(&entry[tab + 1..]).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "unsafe Git index path")
+        })?;
+        entries.push(GitIndexEntry {
+            relative,
+            mode,
+            object_id,
+        });
+    }
+    entries.sort_by_key(|entry| normalized_cache_path(project_root, &entry.relative));
+    Ok(entries)
+}
+
+fn git_index_entry_is_regular(entry: &GitIndexEntry) -> bool {
+    entry.mode.starts_with("100")
+}
+
 fn collect_git_worktree_overlay(project_root: &Path) -> std::io::Result<GitWorktreeOverlay> {
+    let head = git_head_revision(project_root)?;
+    let index_entries = git_index_entries(project_root)?;
     let changed_paths = git_z_output_paths(
         project_root,
-        &["diff", "--name-only", "-z", "--no-renames", "HEAD", "--"],
+        &[
+            "diff",
+            "--name-only",
+            "-z",
+            "--no-renames",
+            head.as_str(),
+            "--",
+        ],
     )?;
     let untracked_paths = git_z_output_paths(
         project_root,
@@ -2460,7 +2944,10 @@ fn collect_git_worktree_overlay(project_root: &Path) -> std::io::Result<GitWorkt
 
     for relative in changed_paths {
         if !should_overlay_workspace_entry(&relative) {
-            continue;
+            return Err(std::io::Error::other(format!(
+                "dirty copy-excluded path {} cannot be represented by a Git workspace",
+                relative.display()
+            )));
         }
         if project_root.join(&relative).is_file() {
             copy_paths.insert(relative);
@@ -2481,11 +2968,159 @@ fn collect_git_worktree_overlay(project_root: &Path) -> std::io::Result<GitWorkt
     for copied in &copy_paths {
         remove_paths.remove(copied);
     }
+    let mtime_entries = collect_git_workspace_mtime_entries(
+        project_root,
+        &index_entries,
+        &copy_paths,
+        &remove_paths,
+    )?;
 
     Ok(GitWorktreeOverlay {
+        head,
+        index_entries,
         copy_paths: copy_paths.into_iter().collect(),
         remove_paths: remove_paths.into_iter().collect(),
+        mtime_entries,
     })
+}
+
+/// Snapshot canonical source metadata for regular Git index/overlay files and
+/// the non-root parent directories materialized for every index or overlay
+/// entry.
+///
+/// This follows Git-worktree shape: source-only empty directories, clean Git
+/// symlink leaves, submodules, workspace roots, and `.git` internals are
+/// excluded, but represented parent directories are included. A dirty overlay
+/// symlink instead uses its resolved in-root regular target. Clean tracked paths
+/// excluded from normal copies remain included when Git checks them out; dirty
+/// excluded paths force normal-copy fallback.
+fn collect_git_workspace_mtime_entries(
+    project_root: &Path,
+    index_entries: &[GitIndexEntry],
+    overlay_copy_paths: &BTreeSet<PathBuf>,
+    overlay_remove_paths: &BTreeSet<PathBuf>,
+) -> std::io::Result<Vec<GitWorkspaceMtimeEntry>> {
+    let mut entries = BTreeMap::new();
+
+    for entry in index_entries {
+        insert_git_workspace_parent_directories(project_root, &mut entries, &entry.relative)?;
+    }
+    for relative in overlay_remove_paths {
+        insert_git_workspace_parent_directories(project_root, &mut entries, relative)?;
+    }
+
+    for entry in index_entries {
+        if !git_index_entry_is_regular(entry)
+            || overlay_copy_paths.contains(&entry.relative)
+            || overlay_remove_paths.contains(&entry.relative)
+        {
+            continue;
+        }
+        insert_git_workspace_regular_entry(
+            &mut entries,
+            entry.relative.clone(),
+            project_root.join(&entry.relative),
+        )?;
+    }
+    for relative in overlay_copy_paths {
+        if let Some(source) = resolve_normal_overlay_source(project_root, relative)? {
+            insert_git_workspace_regular_entry(&mut entries, relative.clone(), source)?;
+        }
+    }
+
+    let regular_paths: Vec<PathBuf> = entries
+        .iter()
+        .filter(|(_, entry)| entry.kind == GitWorkspaceMtimeEntryKind::RegularFile)
+        .map(|(relative, _)| relative.clone())
+        .collect();
+    for relative in regular_paths {
+        insert_git_workspace_parent_directories(project_root, &mut entries, &relative)?;
+    }
+
+    let mut mtime_entries = Vec::with_capacity(entries.len());
+    for (relative, entry) in entries {
+        let metadata = fs::symlink_metadata(&entry.source)?;
+        let expected = match entry.kind {
+            GitWorkspaceMtimeEntryKind::RegularFile => metadata.file_type().is_file(),
+            GitWorkspaceMtimeEntryKind::Directory => metadata.file_type().is_dir(),
+        };
+        if !expected {
+            return Err(std::io::Error::other(format!(
+                "Git workspace metadata source {} changed type",
+                entry.source.display()
+            )));
+        }
+        let is_regular_file = entry.kind == GitWorkspaceMtimeEntryKind::RegularFile;
+        mtime_entries.push(GitWorkspaceMtimeEntry {
+            relative,
+            kind: entry.kind,
+            permissions: is_regular_file.then(|| metadata.permissions()),
+            permission_fingerprint: is_regular_file
+                .then(|| copied_regular_file_permissions_value(Some(&metadata))),
+            modified: metadata.modified()?,
+        });
+    }
+    mtime_entries.sort_by_key(|entry| {
+        (!entry.relative.as_os_str().is_empty())
+            .then(|| normalized_cache_path(project_root, &entry.relative))
+    });
+    Ok(mtime_entries)
+}
+
+/// Record the regular source copied into a Git-worktree destination.
+///
+/// For a dirty symlink overlay, `source` is the resolved in-root target while
+/// `relative` stays the regular destination path in the workspace.
+fn insert_git_workspace_regular_entry(
+    entries: &mut BTreeMap<PathBuf, GitWorkspaceMtimeSource>,
+    relative: PathBuf,
+    source: PathBuf,
+) -> std::io::Result<()> {
+    if !is_safe_relative_path(&relative) {
+        return Err(invalid_workspace_relative_path(&relative));
+    }
+    if !fs::symlink_metadata(&source)?.file_type().is_file() {
+        return Err(std::io::Error::other(format!(
+            "Git workspace metadata source {} is not a regular file",
+            source.display()
+        )));
+    }
+    entries.insert(
+        relative,
+        GitWorkspaceMtimeSource {
+            kind: GitWorkspaceMtimeEntryKind::RegularFile,
+            source,
+        },
+    );
+    Ok(())
+}
+
+/// Record non-root source directories that the Git checkout or overlay uses.
+///
+/// This deliberately records parents of clean symlinks and submodules without
+/// treating those leaves themselves as canonical regular files.
+fn insert_git_workspace_parent_directories(
+    project_root: &Path,
+    entries: &mut BTreeMap<PathBuf, GitWorkspaceMtimeSource>,
+    relative: &Path,
+) -> std::io::Result<()> {
+    let mut parent = relative.parent();
+    while let Some(current) = parent {
+        if current.as_os_str().is_empty() {
+            break;
+        }
+        if !is_safe_relative_path(current) {
+            return Err(invalid_workspace_relative_path(current));
+        }
+        entries
+            .entry(current.to_path_buf())
+            .or_insert_with(|| GitWorkspaceMtimeSource {
+                kind: GitWorkspaceMtimeEntryKind::Directory,
+                source: project_root.join(current),
+            });
+        parent = current.parent();
+    }
+    Ok(())
 }
 
 fn collect_replay_git_worktree_overlay(project_root: &Path) -> std::io::Result<GitWorktreeOverlay> {
@@ -2524,10 +3159,12 @@ fn collect_replay_git_worktree_overlay(project_root: &Path) -> std::io::Result<G
     for copied in &copy_paths {
         remove_paths.remove(copied);
     }
-
     Ok(GitWorktreeOverlay {
+        head: String::new(),
+        index_entries: Vec::new(),
         copy_paths: copy_paths.into_iter().collect(),
         remove_paths: remove_paths.into_iter().collect(),
+        mtime_entries: Vec::new(),
     })
 }
 
@@ -2783,6 +3420,13 @@ fn prepare_workspace_destination(
     Ok(destination)
 }
 
+/// Canonically copy a regular source file into a mutation workspace.
+///
+/// This is an execution sandbox, not an archival copy: it deliberately
+/// preserves only bytes, `std::fs::Permissions`, and mtime. Source ACLs,
+/// xattrs, ADS/resource forks, ownership, and link relationships are excluded
+/// so platform-specific or privilege-bearing metadata cannot affect copied
+/// execution. [`copied_workspace_fingerprint`] hashes this same contract.
 fn copy_regular_source_file_to_workspace(
     source: &Path,
     workspace_root: &Path,
@@ -2795,8 +3439,13 @@ fn copy_regular_source_file_to_workspace(
             source.display()
         )));
     }
+    let modified = metadata.modified()?;
     let destination = prepare_workspace_destination(workspace_root, relative)?;
-    fs::copy(source, destination)?;
+    let mut source_file = fs::File::open(source)?;
+    let mut destination_file = fs::File::create(destination)?;
+    std::io::copy(&mut source_file, &mut destination_file)?;
+    destination_file.set_times(fs::FileTimes::new().set_modified(modified))?;
+    destination_file.set_permissions(metadata.permissions())?;
     Ok(())
 }
 
@@ -2861,9 +3510,7 @@ fn copy_overlay_file(
         remove_workspace_path(&workspace_root.join(relative))?;
         return Ok(());
     };
-    let destination = prepare_workspace_destination(workspace_root, relative)?;
-    fs::copy(source, destination)?;
-    Ok(())
+    copy_regular_source_file_to_workspace(&source, workspace_root, relative)
 }
 
 /// Move preserved dirs to sibling stashes before deleting the workspace.
@@ -2903,14 +3550,12 @@ fn restore_workspace_dirs(
     Ok(())
 }
 
-fn populate_workspace(
+fn configure_workspace_copy_walk(
+    builder: &mut ignore::WalkBuilder,
     project_root: &Path,
-    root: &Path,
     respect_ignores: bool,
-) -> std::io::Result<()> {
+) {
     let project_root_for_filter = project_root.to_path_buf();
-
-    let mut builder = ignore::WalkBuilder::new(project_root);
     builder
         .hidden(false)
         .ignore(respect_ignores)
@@ -2921,6 +3566,130 @@ fn populate_workspace(
         .filter_entry(move |entry| {
             should_copy_workspace_entry(&project_root_for_filter, entry.path())
         });
+}
+
+/// `FILE_WRITE_ATTRIBUTES` (WinNT.h) permits [`fs::File::set_times`].
+#[cfg(windows)]
+const WINDOWS_FILE_WRITE_ATTRIBUTES: u32 = 0x0000_0100;
+/// `FILE_FLAG_BACKUP_SEMANTICS` (WinBase.h) permits opening a directory.
+#[cfg(windows)]
+const WINDOWS_FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+
+/// Open a path with the rights required to update its mtime.
+///
+/// Windows requires `FILE_WRITE_ATTRIBUTES`, and directory handles additionally
+/// require `FILE_FLAG_BACKUP_SEMANTICS`; Unix retains the ordinary read handle.
+#[cfg(windows)]
+fn open_for_mtime_update(path: &Path, is_directory: bool) -> std::io::Result<fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let mut options = fs::OpenOptions::new();
+    options.access_mode(WINDOWS_FILE_WRITE_ATTRIBUTES);
+    if is_directory {
+        options.custom_flags(WINDOWS_FILE_FLAG_BACKUP_SEMANTICS);
+    }
+    options.open(path)
+}
+
+#[cfg(not(windows))]
+fn open_for_mtime_update(path: &Path, _is_directory: bool) -> std::io::Result<fs::File> {
+    fs::File::open(path)
+}
+
+/// Restore non-root source directory mtimes after all descendants have been
+/// created.
+///
+/// The canonical workspace-copy contract preserves non-root directory mtime
+/// but not directory modes, ACLs, xattrs, ownership, or other native metadata.
+fn restore_copied_workspace_directory_mtimes(
+    project_root: &Path,
+    workspace_root: &Path,
+    directories: &mut [PathBuf],
+) -> std::io::Result<()> {
+    directories.sort_by_key(|relative| std::cmp::Reverse(relative.components().count()));
+    for relative in directories {
+        let source = project_root.join(&relative);
+        let metadata = fs::symlink_metadata(&source)?;
+        if !metadata.file_type().is_dir() {
+            continue;
+        }
+        let modified = metadata.modified()?;
+        let destination = workspace_root.join(&relative);
+        if !fs::symlink_metadata(&destination)?.file_type().is_dir() {
+            return Err(std::io::Error::other(format!(
+                "workspace directory {} is not a directory",
+                destination.display()
+            )));
+        }
+        open_for_mtime_update(&destination, true)?
+            .set_times(fs::FileTimes::new().set_modified(modified))?;
+    }
+    Ok(())
+}
+
+fn set_workspace_entry_mtime(
+    destination: &Path,
+    modified: SystemTime,
+    kind: GitWorkspaceMtimeEntryKind,
+) -> std::io::Result<()> {
+    let metadata = fs::symlink_metadata(destination)?;
+    let expected = match kind {
+        GitWorkspaceMtimeEntryKind::RegularFile => metadata.file_type().is_file(),
+        GitWorkspaceMtimeEntryKind::Directory => metadata.file_type().is_dir(),
+    };
+    if !expected {
+        return Err(std::io::Error::other(format!(
+            "workspace entry {} changed type before mtime normalization",
+            destination.display()
+        )));
+    }
+    open_for_mtime_update(
+        destination,
+        matches!(kind, GitWorkspaceMtimeEntryKind::Directory),
+    )?
+    .set_times(fs::FileTimes::new().set_modified(modified))
+}
+
+/// Apply the mtime snapshot that participates in the Git-worktree cache key.
+///
+/// Directories are timestamped after all overlay file creation, deepest first,
+/// so materialization cannot perturb their restored mtimes.
+fn normalize_git_workspace_mtimes(
+    workspace_root: &Path,
+    entries: &[GitWorkspaceMtimeEntry],
+) -> std::io::Result<()> {
+    let mut directories: Vec<_> = entries
+        .iter()
+        .filter(|entry| entry.kind == GitWorkspaceMtimeEntryKind::Directory)
+        .collect();
+    directories.sort_by_key(|entry| std::cmp::Reverse(entry.relative.components().count()));
+
+    for entry in entries
+        .iter()
+        .filter(|entry| entry.kind == GitWorkspaceMtimeEntryKind::RegularFile)
+    {
+        let destination = workspace_root.join(&entry.relative);
+        set_workspace_entry_mtime(&destination, entry.modified, entry.kind)?;
+        if let Some(permissions) = &entry.permissions {
+            fs::set_permissions(destination, permissions.clone())?;
+        }
+    }
+
+    for entry in directories {
+        let destination = workspace_root.join(&entry.relative);
+        set_workspace_entry_mtime(&destination, entry.modified, entry.kind)?;
+    }
+    Ok(())
+}
+
+fn populate_workspace(
+    project_root: &Path,
+    root: &Path,
+    respect_ignores: bool,
+) -> std::io::Result<()> {
+    let mut builder = ignore::WalkBuilder::new(project_root);
+    configure_workspace_copy_walk(&mut builder, project_root, respect_ignores);
+    let mut directories = Vec::new();
 
     for entry in builder.build() {
         let entry = match entry {
@@ -2940,12 +3709,12 @@ fn populate_workspace(
 
         if entry.file_type().is_some_and(|ft| ft.is_dir()) {
             materialize_workspace_directory_at(root, relative)?;
+            directories.push(relative.to_path_buf());
         } else if entry.file_type().is_some_and(|ft| ft.is_file()) {
             copy_regular_source_file_to_workspace(path, root, relative)?;
         }
     }
-
-    Ok(())
+    restore_copied_workspace_directory_mtimes(project_root, root, &mut directories)
 }
 
 /// Populate a replay clone through capabilities rather than destination paths.
@@ -2999,11 +3768,14 @@ fn populate_replay_workspace(
 
 pub(crate) struct WorkspacePool {
     slots: Arc<Vec<WorkspaceCopy>>,
+    strategy: WorkspaceStrategy,
+    git_overlay: Option<GitWorktreeOverlay>,
     free_slots: Arc<(Mutex<VecDeque<usize>>, Condvar)>,
     dirty_slots: Arc<Mutex<Vec<bool>>>,
 }
 
 impl WorkspacePool {
+    #[cfg(test)]
     pub(crate) fn new(project_root: &Path, slots: usize) -> std::io::Result<Self> {
         Self::new_with_options(project_root, slots, true)
     }
@@ -3014,24 +3786,78 @@ impl WorkspacePool {
         respect_ignores: bool,
     ) -> std::io::Result<Self> {
         let slots = slots.max(1);
-        let mut copies = Vec::with_capacity(slots);
-        for _ in 0..slots {
-            let copy = if respect_ignores {
-                copy_workspace(project_root)?
-            } else {
-                copy_workspace_with_options(project_root, false)?
-            };
-            copies.push(copy);
+        if !respect_ignores {
+            return Self::new_copy_only(project_root, slots, false);
         }
 
+        let mut copies = Vec::with_capacity(slots);
+        for _ in 0..slots {
+            copies.push(copy_workspace(project_root)?);
+        }
+        if copies
+            .iter()
+            .all(|copy| copy.strategy() == WorkspaceStrategy::GitWorktree)
+        {
+            let first_overlay = copies
+                .first()
+                .and_then(WorkspaceCopy::git_overlay)
+                .expect("Git worktree slots must retain their overlay snapshot");
+            if copies
+                .iter()
+                .all(|copy| copy.git_overlay() == Some(first_overlay))
+            {
+                return Ok(Self::from_copies(copies, WorkspaceStrategy::GitWorktree));
+            }
+        }
+
+        // A Git workspace may fail or its snapshot may change partway through
+        // pool creation. Rebuild every slot as a normal copy so one cache
+        // domain never spans different shapes or metadata snapshots.
+        drop(copies);
+        Self::new_copy_only(project_root, slots, true)
+    }
+
+    fn new_copy_only(
+        project_root: &Path,
+        slots: usize,
+        respect_ignores: bool,
+    ) -> std::io::Result<Self> {
+        let slots = slots.max(1);
+        let mut copies = Vec::with_capacity(slots);
+        for _ in 0..slots {
+            copies.push(copy_workspace_without_git(project_root, respect_ignores)?);
+        }
+        Ok(Self::from_copies(copies, WorkspaceStrategy::Copy))
+    }
+
+    fn from_copies(copies: Vec<WorkspaceCopy>, strategy: WorkspaceStrategy) -> Self {
+        debug_assert!(!copies.is_empty());
+        let git_overlay = (strategy == WorkspaceStrategy::GitWorktree).then(|| {
+            copies
+                .first()
+                .and_then(WorkspaceCopy::git_overlay)
+                .expect("Git worktree pool must have a snapshot")
+                .clone()
+        });
+        let slots = copies.len();
         let free_slots = (0..slots).collect();
         let dirty_slots = vec![false; slots];
 
-        Ok(Self {
+        Self {
             slots: Arc::new(copies),
+            strategy,
+            git_overlay,
             free_slots: Arc::new((Mutex::new(free_slots), Condvar::new())),
             dirty_slots: Arc::new(Mutex::new(dirty_slots)),
-        })
+        }
+    }
+
+    fn strategy(&self) -> WorkspaceStrategy {
+        self.strategy
+    }
+
+    fn git_overlay(&self) -> Option<&GitWorktreeOverlay> {
+        self.git_overlay.as_ref()
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -3066,6 +3892,37 @@ impl WorkspacePool {
             needs_reset,
         }
     }
+}
+
+/// Create the campaign's complete workspace pool before cache classification.
+///
+/// If a Git slot cannot supply a Git context after creation, discard the pool
+/// and recreate it as copies before any result can be restored.
+fn prepare_campaign_workspace_pool(
+    project_root: &Path,
+    slots: usize,
+    respect_workspace_ignores: bool,
+) -> std::io::Result<(WorkspacePool, WorkspaceCacheContext)> {
+    let mut pool = WorkspacePool::new_with_options(project_root, slots, respect_workspace_ignores)?;
+    let context = match workspace_cache_context_for_strategy(
+        project_root,
+        respect_workspace_ignores,
+        pool.strategy(),
+        pool.git_overlay(),
+    ) {
+        Some(context) => context,
+        None => {
+            pool = WorkspacePool::new_copy_only(project_root, slots, respect_workspace_ignores)?;
+            workspace_cache_context_for_strategy(
+                project_root,
+                respect_workspace_ignores,
+                pool.strategy(),
+                pool.git_overlay(),
+            )
+            .expect("a normal copy pool always has a cache context")
+        }
+    };
+    Ok((pool, context))
 }
 
 pub(crate) struct WorkspaceSlot {
@@ -3368,6 +4225,7 @@ struct RunShared<'a> {
     early_stop: Option<&'a Arc<EarlyStopState>>,
     respect_workspace_ignores: bool,
     cache_context_fingerprint: u64,
+    cache_context_provenance: WorkspaceCacheContextProvenance,
     test_context_index: &'a TestContextIndex,
     source_contents: &'a SourceContentCache,
     history: Option<&'a cache::IncrementalHistoryStore>,
@@ -3399,15 +4257,53 @@ fn incremental_history_query(
     mutation: &Mutation,
     source_content: &[u8],
     command_context: &str,
-    relevant_test_hash: u64,
+    selected_test_hash: u64,
+    workspace_fingerprint: u64,
+    provenance: WorkspaceCacheContextProvenance,
 ) -> cache::IncrementalHistoryQuery {
     cache::IncrementalHistoryQuery {
         mutation_identity: cache_identity(project_root, mutation),
         mutation_description: mutation.description.clone(),
         source_hash: cache::hash_bytes(source_content),
         command_hash: cache::hash_str(command_context),
-        relevant_test_hash,
+        relevant_test_hash: incremental_history_relevant_test_hash(
+            selected_test_hash,
+            workspace_fingerprint,
+            provenance,
+        ),
     }
+}
+
+/// Bind selected-test history to every workspace identity domain. The V4 Git
+/// domain intentionally invalidates legacy entries that did not cover all
+/// actual Git-worktree inputs.
+fn incremental_history_relevant_test_hash(
+    selected_test_hash: u64,
+    workspace_fingerprint: u64,
+    provenance: WorkspaceCacheContextProvenance,
+) -> u64 {
+    let mut hasher = StableCacheHasher::default();
+    match provenance {
+        WorkspaceCacheContextProvenance::GitWorktreeV4 => {
+            update_cache_hash(&mut hasher, b"incremental-history-git-worktree-v4");
+        }
+        WorkspaceCacheContextProvenance::WorkspaceCopy {
+            respect_workspace_ignores,
+        } => {
+            update_cache_hash(&mut hasher, b"incremental-history-workspace-copy-v7");
+            update_cache_hash(
+                &mut hasher,
+                if respect_workspace_ignores {
+                    b"workspace-ignores=true"
+                } else {
+                    b"workspace-ignores=false"
+                },
+            );
+        }
+    }
+    update_cache_hash(&mut hasher, &selected_test_hash.to_le_bytes());
+    update_cache_hash(&mut hasher, &workspace_fingerprint.to_le_bytes());
+    hasher.finish()
 }
 
 fn record_incremental_history(
@@ -3502,17 +4398,56 @@ struct PreparedMutationContext<'a> {
     history: Option<&'a cache::IncrementalHistoryStore>,
     source_contents: &'a SourceContentCache,
     cache_context_fingerprint: u64,
+    cache_context_provenance: WorkspaceCacheContextProvenance,
     test_context_index: &'a TestContextIndex,
     env: &'a HashMap<String, String>,
 }
 
+struct CampaignCacheContext {
+    cache_context_fingerprint: u64,
+    cache_context_provenance: WorkspaceCacheContextProvenance,
+    test_context_index: TestContextIndex,
+}
+
+impl CampaignCacheContext {
+    fn from_workspace_context(project_root: &Path, cache_context: WorkspaceCacheContext) -> Self {
+        Self {
+            cache_context_fingerprint: cache_context.fingerprint,
+            cache_context_provenance: cache_context.provenance,
+            test_context_index: TestContextIndex::build(project_root),
+        }
+    }
+
+    fn learned_selection_context(&self) -> LearnedSelectionContext<'_> {
+        LearnedSelectionContext {
+            test_context_index: &self.test_context_index,
+            cache_context_fingerprint: self.cache_context_fingerprint,
+            cache_context_provenance: self.cache_context_provenance,
+        }
+    }
+
+    #[cfg(test)]
+    fn build(project_root: &Path, respect_workspace_ignores: bool) -> Self {
+        Self::from_workspace_context(
+            project_root,
+            workspace_cache_context(project_root, respect_workspace_ignores),
+        )
+    }
+}
+
 impl PreparedMutationRun {
     fn new(project_root: &Path, mutation: &Mutation, context: PreparedMutationContext<'_>) -> Self {
+        let learned_selection_context = LearnedSelectionContext {
+            test_context_index: context.test_context_index,
+            cache_context_fingerprint: context.cache_context_fingerprint,
+            cache_context_provenance: context.cache_context_provenance,
+        };
         let selected_test = select_test_command_with_history(
             project_root,
             context.commands,
             mutation,
             context.history,
+            Some(learned_selection_context),
         );
         let mutation_identity = cache_identity(project_root, mutation);
         let command_ctx = selected_test.cache_context(
@@ -3521,7 +4456,7 @@ impl PreparedMutationRun {
             context.commands.sandbox_command.as_slice(),
             context.env,
         );
-        let relevant_test_hash = context.test_context_index.fingerprint_for_tests(
+        let selected_test_hash = context.test_context_index.fingerprint_for_tests(
             &selected_test.selected_tests,
             context.cache_context_fingerprint,
         );
@@ -3530,11 +4465,16 @@ impl PreparedMutationRun {
                 &mutation_identity,
                 &mutation.description,
                 &selected_test.selected_tests,
+                |killer| {
+                    learned_selection_context
+                        .relevant_test_hash_for_killer(&selected_test.selected_tests, killer)
+                },
             )
         });
-        let cache_ctx = format!(
-            "{command_ctx};context={:016x}",
-            context.cache_context_fingerprint
+        let cache_ctx = exact_cache_context(
+            &command_ctx,
+            context.cache_context_fingerprint,
+            context.cache_context_provenance,
         );
         let source_content = context
             .source_contents
@@ -3545,7 +4485,9 @@ impl PreparedMutationRun {
                 mutation,
                 content,
                 &command_ctx,
-                relevant_test_hash,
+                selected_test_hash,
+                context.cache_context_fingerprint,
+                context.cache_context_provenance,
             )
         });
         let cache_key = source_content.as_ref().map(|content| {
@@ -3726,6 +4668,7 @@ fn run_queued_mutation(
             history: shared.history,
             source_contents: shared.source_contents,
             cache_context_fingerprint: shared.cache_context_fingerprint,
+            cache_context_provenance: shared.cache_context_provenance,
             test_context_index: shared.test_context_index,
             env: shared.env,
         },
@@ -4059,7 +5002,11 @@ impl TestRunner {
     /// Resolve reusable verdicts before early-stop decisions so the gate sees
     /// the complete fresh-work denominator rather than only cache hits
     /// encountered so far by workers.
-    fn preclassify_for_early_stop(&self, mutations: &[Mutation]) -> PreclassifiedMutations {
+    fn preclassify_for_early_stop(
+        &self,
+        mutations: &[Mutation],
+        campaign_context: &CampaignCacheContext,
+    ) -> PreclassifiedMutations {
         if !self.early_stop.is_enabled() {
             return PreclassifiedMutations {
                 fresh: mutations
@@ -4078,8 +5025,6 @@ impl TestRunner {
         }
 
         let source_contents = SourceContentCache::default();
-        let cache_context_hash = cache_context_fingerprint(&self.project_root);
-        let test_context_index = TestContextIndex::build(&self.project_root);
         let history = self
             .incremental_history
             .then(|| cache::IncrementalHistoryStore::load(&self.project_root));
@@ -4106,8 +5051,9 @@ impl TestRunner {
                     commands: &self.commands,
                     history: history.as_ref(),
                     source_contents: &source_contents,
-                    cache_context_fingerprint: cache_context_hash,
-                    test_context_index: &test_context_index,
+                    cache_context_fingerprint: campaign_context.cache_context_fingerprint,
+                    cache_context_provenance: campaign_context.cache_context_provenance,
+                    test_context_index: &campaign_context.test_context_index,
                     env: &self.env,
                 },
             );
@@ -4165,11 +5111,59 @@ impl TestRunner {
         PreclassifiedMutations { fresh, restored }
     }
 
+    fn workspace_pool_failure_outcome(
+        &self,
+        mutations: Vec<Mutation>,
+        start: Instant,
+        runner: &str,
+        error: &std::io::Error,
+    ) -> RunOutcome {
+        eprintln!("warning: could not create isolated mutation workspaces: {error}");
+        let planned_total = mutations.len();
+        let records = mutations
+            .into_iter()
+            .map(|mutation| {
+                let diagnostic = BuildErrorDiagnostic::new(
+                    mutation.id,
+                    runner,
+                    "workspace_pool",
+                    vec![],
+                    format!("could not create isolated mutation workspaces: {error}"),
+                );
+                MutationRunRecord::new(mutation, MutationResult::BuildError, Some(diagnostic))
+            })
+            .collect();
+        self.outcome_from_records_with_status(records, start.elapsed(), planned_total, None)
+    }
+
     #[allow(clippy::manual_is_multiple_of)]
     pub fn run(&self, mutations: Vec<Mutation>) -> RunOutcome {
-        let (mutations, subsumed) = self.split_subsumed(mutations);
+        let start = Instant::now();
+        let initial_planned_total = mutations.len();
+        if mutations.is_empty() {
+            return self.outcome_from_records_with_status(
+                Vec::new(),
+                start.elapsed(),
+                initial_planned_total,
+                None,
+            );
+        }
+        let workspace_slots = workspace_pool_slot_count(self.parallelism, mutations.len());
+        let (workspace_pool, cache_context) = match prepare_campaign_workspace_pool(
+            &self.project_root,
+            workspace_slots,
+            self.respect_workspace_ignores,
+        ) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                return self.workspace_pool_failure_outcome(mutations, start, "regular", &error);
+            }
+        };
+        let campaign_context =
+            CampaignCacheContext::from_workspace_context(&self.project_root, cache_context);
+        let (mutations, subsumed) = self.split_subsumed(mutations, &campaign_context);
         let planned_total = mutations.len();
-        let preclassified = self.preclassify_for_early_stop(&mutations);
+        let preclassified = self.preclassify_for_early_stop(&mutations, &campaign_context);
         let early_stop =
             EarlyStopState::for_config(self.early_stop.clone(), preclassified.fresh.len());
         if let Some(early_stop) = &early_stop {
@@ -4181,6 +5175,9 @@ impl TestRunner {
             early_stop,
             planned_total,
             Arc::new(AtomicUsize::new(0)),
+            workspace_pool,
+            &campaign_context,
+            start,
         );
         merge_subsumed(&mut outcome.report, subsumed);
         outcome
@@ -4189,8 +5186,32 @@ impl TestRunner {
     pub fn run_with_schemata(&self, mutations: Vec<Mutation>) -> RunOutcome {
         // Learned selection runs before schemata planning so subsumed
         // mutants never end up in schema rewrites.
-        let (mutations, subsumed) = self.split_subsumed(mutations);
-        let mut outcome = self.run_with_schemata_planned(mutations);
+        let start = Instant::now();
+        let initial_planned_total = mutations.len();
+        if mutations.is_empty() {
+            return self.outcome_from_records_with_status(
+                Vec::new(),
+                start.elapsed(),
+                initial_planned_total,
+                None,
+            );
+        }
+        let workspace_slots = workspace_pool_slot_count(self.parallelism, mutations.len());
+        let (workspace_pool, cache_context) = match prepare_campaign_workspace_pool(
+            &self.project_root,
+            workspace_slots,
+            self.respect_workspace_ignores,
+        ) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                return self.workspace_pool_failure_outcome(mutations, start, "schemata", &error);
+            }
+        };
+        let campaign_context =
+            CampaignCacheContext::from_workspace_context(&self.project_root, cache_context);
+        let (mutations, subsumed) = self.split_subsumed(mutations, &campaign_context);
+        let mut outcome =
+            self.run_with_schemata_planned(mutations, workspace_pool, &campaign_context, start);
         merge_subsumed(&mut outcome.report, subsumed);
         outcome
     }
@@ -4200,7 +5221,11 @@ impl TestRunner {
     /// without the flag or without incremental history every mutation
     /// executes, exactly as before. `--force-rerun` still bypasses verdict
     /// restore for the canonical mutants but does not disable clustering.
-    fn split_subsumed(&self, mutations: Vec<Mutation>) -> (Vec<Mutation>, Vec<Mutation>) {
+    fn split_subsumed(
+        &self,
+        mutations: Vec<Mutation>,
+        campaign_context: &CampaignCacheContext,
+    ) -> (Vec<Mutation>, Vec<Mutation>) {
         if !self.learned_selection || !self.incremental_history {
             return (mutations, Vec::new());
         }
@@ -4213,6 +5238,7 @@ impl TestRunner {
                 &self.commands,
                 mutation,
                 Some(&history),
+                Some(campaign_context.learned_selection_context()),
             );
             let command_ctx = selected.cache_context(
                 &self.commands.build_command,
@@ -4220,11 +5246,21 @@ impl TestRunner {
                 &self.commands.sandbox_command,
                 &self.env,
             );
+            let selected_test_hash = campaign_context.test_context_index.fingerprint_for_tests(
+                &selected.selected_tests,
+                campaign_context.cache_context_fingerprint,
+            );
+            let relevant_test_hash = incremental_history_relevant_test_hash(
+                selected_test_hash,
+                campaign_context.cache_context_fingerprint,
+                campaign_context.cache_context_provenance,
+            );
             history.learned_killer_test(
                 &cache_identity(&self.project_root, mutation),
                 &mutation.description,
                 cache::hash_bytes(&source),
                 cache::hash_str(&command_ctx),
+                relevant_test_hash,
             )
         });
         if !partition.subsumed.is_empty() {
@@ -4237,13 +5273,18 @@ impl TestRunner {
         (partition.to_run, partition.subsumed)
     }
 
-    fn run_with_schemata_planned(&self, mutations: Vec<Mutation>) -> RunOutcome {
-        let start = Instant::now();
+    fn run_with_schemata_planned(
+        &self,
+        mutations: Vec<Mutation>,
+        workspace_pool: WorkspacePool,
+        campaign_context: &CampaignCacheContext,
+        start: Instant,
+    ) -> RunOutcome {
         if mutations.is_empty() {
             return self.outcome_from_records(Vec::new(), start.elapsed());
         }
         let planned_total = mutations.len();
-        let preclassified = self.preclassify_for_early_stop(&mutations);
+        let preclassified = self.preclassify_for_early_stop(&mutations, campaign_context);
         let pending_restores: HashMap<u32, RestoredMutationResult> = preclassified
             .fresh
             .iter()
@@ -4336,6 +5377,8 @@ impl TestRunner {
                 tested_counter.clone(),
                 restore_checked,
                 &pending_restores,
+                campaign_context,
+                &workspace_pool,
             ) {
                 Ok((records, demoted)) => {
                     schemata_summary.fast_path += records
@@ -4379,6 +5422,9 @@ impl TestRunner {
                 early_stop.clone(),
                 planned_total,
                 tested_counter,
+                workspace_pool,
+                campaign_context,
+                start,
             );
             all_records.extend(records_from_report(
                 fallback.report,
@@ -4402,7 +5448,7 @@ impl TestRunner {
         outcome
     }
 
-    #[allow(clippy::manual_is_multiple_of)]
+    #[allow(clippy::manual_is_multiple_of, clippy::too_many_arguments)]
     fn run_regular_with_state(
         &self,
         mutations: Vec<QueuedMutation>,
@@ -4410,8 +5456,10 @@ impl TestRunner {
         early_stop: Option<Arc<EarlyStopState>>,
         planned_total: usize,
         tested_counter: Arc<AtomicUsize>,
+        workspace_pool: WorkspacePool,
+        campaign_context: &CampaignCacheContext,
+        start: Instant,
     ) -> RunOutcome {
-        let start = Instant::now();
         let fresh_total = mutations.len();
         let total = fresh_total + restored.len();
         if fresh_total == 0
@@ -4430,43 +5478,7 @@ impl TestRunner {
         let counter = Arc::new(AtomicUsize::new(restored.len()));
         let verbose = self.verbose;
         let is_tty = std::io::stderr().is_terminal();
-        let workspace_slots = workspace_pool_slot_count(self.parallelism, fresh_total);
-
-        let workspace_pool_result = if self.respect_workspace_ignores {
-            WorkspacePool::new(&self.project_root, workspace_slots)
-        } else {
-            WorkspacePool::new_with_options(&self.project_root, workspace_slots, false)
-        };
-        let workspace_pool = match workspace_pool_result {
-            Ok(pool) => Arc::new(pool),
-            Err(e) => {
-                eprintln!("warning: could not create isolated mutation workspaces: {e}");
-                restored.extend(mutations.into_iter().map(|queued| {
-                    let diagnostic = BuildErrorDiagnostic::new(
-                        queued.mutation.id,
-                        "regular",
-                        "workspace_pool",
-                        vec![],
-                        format!("could not create isolated mutation workspaces: {e}"),
-                    );
-                    (
-                        queued.index,
-                        MutationRunRecord::new(
-                            queued.mutation,
-                            MutationResult::BuildError,
-                            Some(diagnostic),
-                        ),
-                    )
-                }));
-                restored.sort_by_key(|(index, _)| *index);
-                return self.outcome_from_records_with_status(
-                    restored.into_iter().map(|(_, record)| record).collect(),
-                    start.elapsed(),
-                    planned_total,
-                    early_stop.as_ref().and_then(|state| state.reason()),
-                );
-            }
-        };
+        let workspace_pool = Arc::new(workspace_pool);
 
         let source_contents = SourceContentCache::default();
         let project_root = Arc::new(self.project_root.clone());
@@ -4474,9 +5486,8 @@ impl TestRunner {
         let build_command_origin = self.commands.build_command_origin;
         let queue = Arc::new(Mutex::new(mutations.into_iter().collect::<VecDeque<_>>()));
         let results = Arc::new(Mutex::new(restored));
+        let worker_failed = Arc::new(AtomicBool::new(false));
         let worker_count = workspace_pool.len().min(fresh_total).max(1);
-        let cache_context_hash = cache_context_fingerprint(&self.project_root);
-        let test_context_index = TestContextIndex::build(&self.project_root);
         let history = self
             .incremental_history
             .then(|| cache::IncrementalHistoryStore::load(&self.project_root));
@@ -4484,6 +5495,7 @@ impl TestRunner {
         thread::scope(|scope| {
             for _ in 0..worker_count {
                 let queue = queue.clone();
+                let worker_failed = worker_failed.clone();
                 let results = results.clone();
                 let workspace_pool = workspace_pool.clone();
                 let project_root = project_root.clone();
@@ -4496,14 +5508,17 @@ impl TestRunner {
                 let max_tested = self.max_tested;
                 let show_output = self.show_output;
                 let source_contents = &source_contents;
-                let test_context_index = &test_context_index;
+                let test_context_index = &campaign_context.test_context_index;
                 let history = history.as_ref();
                 let force_rerun = self.force_rerun;
                 let early_stop = early_stop.clone();
 
                 scope.spawn(move || {
                     loop {
-                        if cancelled.load(Ordering::Relaxed) || should_stop_early(&early_stop) {
+                        if cancelled.load(Ordering::Relaxed)
+                            || worker_failed.load(Ordering::Acquire)
+                            || should_stop_early(&early_stop)
+                        {
                             break;
                         }
 
@@ -4512,12 +5527,18 @@ impl TestRunner {
                         else {
                             break;
                         };
-                        if should_stop_early(&early_stop) {
+                        if worker_failed.load(Ordering::Acquire) || should_stop_early(&early_stop) {
                             reservation.release();
                             break;
                         }
                         let next = match queue.lock() {
-                            Ok(mut queue) => queue.pop_front(),
+                            Ok(mut queue) => {
+                                if worker_failed.load(Ordering::Acquire) {
+                                    None
+                                } else {
+                                    queue.pop_front()
+                                }
+                            }
                             Err(_) => {
                                 eprintln!("warning: mutation queue mutex poisoned");
                                 break;
@@ -4526,8 +5547,18 @@ impl TestRunner {
                         let Some(queued) = next else {
                             break;
                         };
+                        let panic_index = queued.index;
+                        let panic_mutation = queued.mutation.clone();
 
                         let outcome = catch_unwind(PanicBoundary(|| {
+                            if worker_failed.load(Ordering::Acquire) {
+                                return None;
+                            }
+                            #[cfg(test)]
+                            run_mutation_worker_after_dequeue_hook(
+                                project_root.as_ref().as_path(),
+                                &queued.mutation,
+                            );
                             run_queued_mutation(
                                 queued,
                                 reservation,
@@ -4546,7 +5577,10 @@ impl TestRunner {
                                     cancelled: &cancelled,
                                     early_stop: early_stop.as_ref(),
                                     respect_workspace_ignores: self.respect_workspace_ignores,
-                                    cache_context_fingerprint: cache_context_hash,
+                                    cache_context_fingerprint: campaign_context
+                                        .cache_context_fingerprint,
+                                    cache_context_provenance: campaign_context
+                                        .cache_context_provenance,
                                     test_context_index,
                                     source_contents,
                                     history,
@@ -4564,7 +5598,28 @@ impl TestRunner {
                                 }
                             },
                             Ok(None) => {}
-                            Err(_) => eprintln!("warning: mutation task panicked"),
+                            Err(_) => {
+                                worker_failed.store(true, Ordering::Release);
+                                let diagnostic = BuildErrorDiagnostic::new(
+                                    panic_mutation.id,
+                                    "regular",
+                                    "mutation_worker_panic",
+                                    vec![],
+                                    "mutation worker panicked after dequeuing this mutation",
+                                );
+                                let mut results = results
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                                results.push((
+                                    panic_index,
+                                    MutationRunRecord::new(
+                                        panic_mutation,
+                                        MutationResult::BuildError,
+                                        Some(diagnostic),
+                                    ),
+                                ));
+                                break;
+                            }
                         }
                     }
                 });
@@ -4595,6 +5650,7 @@ impl TestRunner {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn run_schema_mutations(
         &self,
         language: &str,
@@ -4603,7 +5659,10 @@ impl TestRunner {
         tested_counter: Arc<AtomicUsize>,
         restore_checked: bool,
         pending_restores: &HashMap<u32, RestoredMutationResult>,
+        campaign_context: &CampaignCacheContext,
+        workspace_pool: &WorkspacePool,
     ) -> Result<(Vec<MutationRunRecord>, Vec<Mutation>), crate::schemata::SchemaRewriteError> {
+        let workspace = workspace_pool.acquire();
         self.run_schema_mutations_inner(
             language,
             schema_mutations,
@@ -4611,6 +5670,8 @@ impl TestRunner {
             tested_counter,
             restore_checked,
             pending_restores,
+            campaign_context,
+            &workspace,
             true,
         )
     }
@@ -4624,22 +5685,22 @@ impl TestRunner {
         tested_counter: Arc<AtomicUsize>,
         restore_checked: bool,
         pending_restores: &HashMap<u32, RestoredMutationResult>,
+        campaign_context: &CampaignCacheContext,
+        workspace: &WorkspaceSlot,
         allow_build_bisection: bool,
     ) -> Result<(Vec<MutationRunRecord>, Vec<Mutation>), crate::schemata::SchemaRewriteError> {
+        workspace
+            .reset(&self.project_root, self.respect_workspace_ignores)
+            .map_err(|e| {
+                crate::schemata::SchemaRewriteError::new(format!(
+                    "could not reset schema workspace {}: {e}",
+                    workspace.root().display()
+                ))
+            })?;
         let rewrites =
             schema_rewrites_for_language(&self.project_root, language, schema_mutations)?;
-        let workspace =
-            copy_workspace_with_options(&self.project_root, self.respect_workspace_ignores)
-                .map_err(|e| {
-                    crate::schemata::SchemaRewriteError::new(format!(
-                        "could not create schema workspace: {e}"
-                    ))
-                })?;
-
         let mut results = Vec::with_capacity(schema_mutations.len());
         let source_contents = SourceContentCache::default();
-        let cache_context_hash = cache_context_fingerprint(&self.project_root);
-        let test_context_index = TestContextIndex::build(&self.project_root);
         let history = self
             .incremental_history
             .then(|| cache::IncrementalHistoryStore::load(&self.project_root));
@@ -4671,8 +5732,9 @@ impl TestRunner {
                     commands: &self.commands,
                     history: history.as_ref(),
                     source_contents: &source_contents,
-                    cache_context_fingerprint: cache_context_hash,
-                    test_context_index: &test_context_index,
+                    cache_context_fingerprint: campaign_context.cache_context_fingerprint,
+                    cache_context_provenance: campaign_context.cache_context_provenance,
+                    test_context_index: &campaign_context.test_context_index,
                     env: &self.env,
                 },
             );
@@ -4781,7 +5843,7 @@ impl TestRunner {
                     .unwrap_or_else(|| "no compiler diagnostic captured".into());
 
                 if allow_build_bisection {
-                    match self.bisect_schema_build_batch(language, remaining) {
+                    match self.bisect_schema_build_batch(language, remaining, workspace) {
                         Ok((salvaged_batches, newly_demoted)) => {
                             let salvaged_count: usize =
                                 salvaged_batches.iter().map(|batch| batch.len()).sum();
@@ -4803,6 +5865,8 @@ impl TestRunner {
                                     tested_counter.clone(),
                                     restore_checked,
                                     pending_restores,
+                                    campaign_context,
+                                    workspace,
                                     false,
                                 ) {
                                     Ok((batch_records, batch_demoted)) => {
@@ -4982,23 +6046,17 @@ impl TestRunner {
         &self,
         language: &str,
         schema_mutations: &[crate::schemata::SchemaMutation],
+        workspace: &WorkspaceSlot,
     ) -> Result<
         (Vec<Vec<crate::schemata::SchemaMutation>>, Vec<Mutation>),
         crate::schemata::SchemaRewriteError,
     > {
-        let workspace =
-            copy_workspace_with_options(&self.project_root, self.respect_workspace_ignores)
-                .map_err(|e| {
-                    crate::schemata::SchemaRewriteError::new(format!(
-                        "could not create schema bisection workspace: {e}"
-                    ))
-                })?;
         let mut salvaged_batches = Vec::new();
         let mut demoted = Vec::new();
         self.partition_schema_build_batch(
             language,
             schema_mutations,
-            &workspace,
+            workspace,
             &mut salvaged_batches,
             &mut demoted,
         )?;
@@ -5009,7 +6067,7 @@ impl TestRunner {
         &self,
         language: &str,
         schema_mutations: &[crate::schemata::SchemaMutation],
-        workspace: &WorkspaceCopy,
+        workspace: &WorkspaceSlot,
         salvaged_batches: &mut Vec<Vec<crate::schemata::SchemaMutation>>,
         demoted: &mut Vec<Mutation>,
     ) -> Result<(), crate::schemata::SchemaRewriteError> {
@@ -5045,7 +6103,7 @@ impl TestRunner {
         &self,
         language: &str,
         schema_mutations: &[crate::schemata::SchemaMutation],
-        workspace: &WorkspaceCopy,
+        workspace: &WorkspaceSlot,
     ) -> Result<Option<bool>, crate::schemata::SchemaRewriteError> {
         workspace
             .reset(&self.project_root, self.respect_workspace_ignores)
@@ -8089,7 +9147,11 @@ mod tests {
                     &source,
                     &cache_identity(project_root, mutation),
                     &mutation.description,
-                    &format!("{command_context};context={context_hash:016x}"),
+                    &exact_cache_context(
+                        &command_context,
+                        context_hash,
+                        workspace_cache_context(project_root, true).provenance,
+                    ),
                 );
                 cache::store(project_root, &key, result);
             }
@@ -8102,6 +9164,8 @@ mod tests {
                     &command_context,
                     test_context_index
                         .fingerprint_for_tests(&selected.selected_tests, context_hash),
+                    context_hash,
+                    workspace_cache_context(project_root, true).provenance,
                 );
                 cache::IncrementalHistoryStore::load(project_root).record(
                     cache::IncrementalHistoryEntry {
@@ -8256,6 +9320,65 @@ test "$runs" -eq 1
     }
 
     #[test]
+    fn workspace_history_hash_binds_selected_tests_to_workspace_context() {
+        let selected_test_hash = 0x0123_4567_89ab_cdef;
+        let first_workspace = 0x1111_2222_3333_4444;
+        let second_workspace = 0x5555_6666_7777_8888;
+
+        let first_git = incremental_history_relevant_test_hash(
+            selected_test_hash,
+            first_workspace,
+            WorkspaceCacheContextProvenance::GitWorktreeV4,
+        );
+        assert_ne!(
+            first_git, selected_test_hash,
+            "V4 Git history must not match legacy selected-test-only entries"
+        );
+        assert_ne!(
+            first_git,
+            incremental_history_relevant_test_hash(
+                selected_test_hash,
+                second_workspace,
+                WorkspaceCacheContextProvenance::GitWorktreeV4,
+            ),
+            "V4 Git history must bind every Git-worktree input"
+        );
+        let first_true = incremental_history_relevant_test_hash(
+            selected_test_hash,
+            first_workspace,
+            WorkspaceCacheContextProvenance::WorkspaceCopy {
+                respect_workspace_ignores: true,
+            },
+        );
+        let first_false = incremental_history_relevant_test_hash(
+            selected_test_hash,
+            first_workspace,
+            WorkspaceCacheContextProvenance::WorkspaceCopy {
+                respect_workspace_ignores: false,
+            },
+        );
+        assert_ne!(
+            first_true, first_git,
+            "copy-based history must not match Git-worktree entries"
+        );
+        assert_ne!(
+            first_false, first_true,
+            "false-policy history must not match default fallback entries"
+        );
+        assert_ne!(
+            first_false,
+            incremental_history_relevant_test_hash(
+                selected_test_hash,
+                second_workspace,
+                WorkspaceCacheContextProvenance::WorkspaceCopy {
+                    respect_workspace_ignores: false,
+                },
+            ),
+            "false-policy history must bind the copied workspace fingerprint"
+        );
+    }
+
+    #[test]
     fn source_content_cache_reads_each_file_once_lazily() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("src.txt");
@@ -8282,7 +9405,7 @@ test "$runs" -eq 1
     }
 
     #[test]
-    fn git_cache_context_uses_index_when_context_is_clean() {
+    fn git_cache_context_tracks_clean_index_and_dirty_overlay() {
         if !git_available() {
             return;
         }
@@ -8307,9 +9430,11 @@ test "$runs" -eq 1
 
         let clean = git_cache_context_fingerprint(root).expect("clean git fingerprint");
         std::fs::write(root.join("src/lib.rs"), b"pub fn value() -> i32 { 2 }\n").unwrap();
-        assert!(
-            git_cache_context_fingerprint(root).is_none(),
-            "dirty source files should fall back to filesystem hashing"
+        let source_overlay =
+            git_cache_context_fingerprint(root).expect("dirty source overlay fingerprint");
+        assert_ne!(
+            source_overlay, clean,
+            "dirty source overlays must change the Git-worktree context"
         );
         assert_ne!(
             cache_context_fingerprint(root),
@@ -8322,10 +9447,1815 @@ test "$runs" -eq 1
             b"#[test]\nfn changed() {}\n",
         )
         .unwrap();
-        assert!(
-            git_cache_context_fingerprint(root).is_none(),
-            "dirty test files should fall back to filesystem hashing"
+        assert_ne!(
+            git_cache_context_fingerprint(root).expect("dirty test overlay fingerprint"),
+            source_overlay,
+            "dirty test overlays must change the Git-worktree context"
         );
+    }
+
+    #[test]
+    fn git_context_tracks_clean_copy_fallback_metadata() -> anyhow::Result<()> {
+        if !git_available() {
+            return Ok(());
+        }
+
+        let dir = tempfile::tempdir()?;
+        let root = dir.path();
+        run_git(root, &["init"]);
+        run_git(root, &["config", "user.email", "test@example.com"]);
+        run_git(root, &["config", "user.name", "Test"]);
+
+        let regular_file = root.join("fixture.txt");
+        let directory = root.join("fixture");
+        std::fs::create_dir(&directory)?;
+        std::fs::write(&regular_file, b"fixture")?;
+        std::fs::write(directory.join("nested.txt"), b"nested")?;
+        run_git(root, &["add", "."]);
+        run_git(root, &["commit", "-m", "initial"]);
+
+        set_file_modification_time(&regular_file, 1_000_000_000)?;
+        set_file_modification_time(&directory, 1_100_000_000)?;
+        let initial = workspace_cache_context(root, true);
+        assert_eq!(
+            initial.provenance,
+            WorkspaceCacheContextProvenance::GitWorktreeV4
+        );
+        assert_eq!(
+            git_cache_context_is_dirty(root),
+            Some(false),
+            "mtime-only source metadata must leave the Git overlay clean"
+        );
+
+        let (git_pool, git_context) = prepare_campaign_workspace_pool(root, 1, true)?;
+        assert_eq!(git_pool.strategy(), WorkspaceStrategy::GitWorktree);
+        assert_eq!(git_context.fingerprint, initial.fingerprint);
+        {
+            let workspace = git_pool.acquire();
+            assert_eq!(
+                std::fs::metadata(&regular_file)?.modified()?,
+                std::fs::metadata(workspace.root().join("fixture.txt"))?.modified()?,
+                "Git worktree regular files must receive captured source mtimes"
+            );
+            assert_eq!(
+                std::fs::metadata(&directory)?.modified()?,
+                std::fs::metadata(workspace.root().join("fixture"))?.modified()?,
+                "Git worktree directories must receive captured source mtimes"
+            );
+        }
+
+        {
+            let workspace = git_pool.acquire();
+            assert!(workspace.needs_reset());
+            workspace.reset(root, true)?;
+            assert_eq!(
+                std::fs::metadata(&regular_file)?.modified()?,
+                std::fs::metadata(workspace.root().join("fixture.txt"))?.modified()?,
+                "Git reset must restore the captured regular-file mtime"
+            );
+            assert_eq!(
+                std::fs::metadata(&directory)?.modified()?,
+                std::fs::metadata(workspace.root().join("fixture"))?.modified()?,
+                "Git reset must restore the captured non-root directory mtime"
+            );
+        }
+
+        set_file_modification_time(&regular_file, 1_700_000_000)?;
+        let regular_file_changed = workspace_cache_context(root, true);
+        assert_ne!(
+            regular_file_changed.fingerprint, initial.fingerprint,
+            "a clean tracked regular file mtime must affect a fresh Git context"
+        );
+        assert_eq!(
+            workspace_cache_context_for_strategy(
+                root,
+                true,
+                git_pool.strategy(),
+                git_pool.git_overlay(),
+            )
+            .expect("the prebuilt Git pool has a context")
+            .fingerprint,
+            git_context.fingerprint,
+            "the context must use the prebuilt workspace metadata snapshot"
+        );
+
+        set_file_modification_time(&directory, 1_800_000_000)?;
+        let changed = workspace_cache_context(root, true);
+        assert_ne!(
+            changed.fingerprint, regular_file_changed.fingerprint,
+            "a copied non-root directory mtime must affect a fresh Git context"
+        );
+
+        drop(git_pool);
+        // Capability probing still succeeds, but `git worktree add` fails.
+        std::fs::write(root.join(".git/worktrees"), b"block worktree creation")?;
+        let (fallback_pool, fallback_context) = prepare_campaign_workspace_pool(root, 1, true)?;
+        assert_eq!(fallback_pool.strategy(), WorkspaceStrategy::Copy);
+        assert_eq!(
+            fallback_context.provenance,
+            WorkspaceCacheContextProvenance::WorkspaceCopy {
+                respect_workspace_ignores: true,
+            }
+        );
+        {
+            let workspace = fallback_pool.acquire();
+            assert_eq!(
+                std::fs::metadata(&regular_file)?.modified()?,
+                std::fs::metadata(workspace.root().join("fixture.txt"))?.modified()?
+            );
+            assert_eq!(
+                std::fs::metadata(&directory)?.modified()?,
+                std::fs::metadata(workspace.root().join("fixture"))?.modified()?
+            );
+        }
+        assert_ne!(
+            exact_cache_context("test-command", initial.fingerprint, initial.provenance),
+            exact_cache_context(
+                "test-command",
+                fallback_context.fingerprint,
+                fallback_context.provenance,
+            ),
+            "Git and fallback-copy results must not share exact-cache entries"
+        );
+        assert_ne!(
+            incremental_history_relevant_test_hash(
+                0x0123_4567_89ab_cdef,
+                initial.fingerprint,
+                initial.provenance,
+            ),
+            incremental_history_relevant_test_hash(
+                0x0123_4567_89ab_cdef,
+                fallback_context.fingerprint,
+                fallback_context.provenance,
+            ),
+            "Git and fallback-copy results must not share incremental or learned entries"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn git_workspace_keeps_untracked_empty_directories_absent_and_normalizes_tracked_excluded_metadata()
+    -> anyhow::Result<()> {
+        if !git_available() {
+            return Ok(());
+        }
+
+        let dir = tempfile::tempdir()?;
+        let root = dir.path();
+        run_git(root, &["init"]);
+        run_git(root, &["config", "user.email", "test@example.com"]);
+        run_git(root, &["config", "user.name", "Test"]);
+        std::fs::write(root.join("fixture.txt"), b"fixture")?;
+        let tracked_directory = root.join("target");
+        let tracked_file = tracked_directory.join("fixture.txt");
+        std::fs::create_dir(&tracked_directory)?;
+        std::fs::write(&tracked_file, b"tracked but copy-excluded")?;
+        run_git(root, &["add", "."]);
+        run_git(root, &["commit", "-m", "initial"]);
+
+        let before = workspace_cache_context(root, true);
+        let untracked_empty_directory = root.join("runtime/empty");
+        std::fs::create_dir_all(&untracked_empty_directory)?;
+        assert_eq!(
+            workspace_cache_context(root, true).fingerprint,
+            before.fingerprint,
+            "source-only untracked empty directories must not affect Git identity"
+        );
+        set_file_modification_time(&tracked_file, 1_000_000_000)?;
+        set_file_modification_time(&tracked_directory, 1_100_000_000)?;
+        let changed = workspace_cache_context(root, true);
+        assert_ne!(
+            changed.fingerprint, before.fingerprint,
+            "tracked Git-worktree inputs excluded from normal copies must affect identity"
+        );
+
+        let workspace = copy_workspace(root)?;
+        assert_eq!(workspace.strategy(), WorkspaceStrategy::GitWorktree);
+        assert_eq!(
+            std::fs::metadata(&tracked_file)?.modified()?,
+            std::fs::metadata(workspace.root().join("target/fixture.txt"))?.modified()?
+        );
+        assert_eq!(
+            std::fs::metadata(&tracked_directory)?.modified()?,
+            std::fs::metadata(workspace.root().join("target"))?.modified()?
+        );
+        assert!(
+            !workspace.root().join("runtime").exists(),
+            "Git worktrees must not materialize source-only untracked empty directories"
+        );
+
+        set_file_modification_time(&workspace.root().join("target/fixture.txt"), 1_700_000_000)?;
+        set_file_modification_time(&workspace.root().join("target"), 1_800_000_000)?;
+        workspace.reset(root, true)?;
+        assert_eq!(
+            std::fs::metadata(&tracked_file)?.modified()?,
+            std::fs::metadata(workspace.root().join("target/fixture.txt"))?.modified()?,
+            "Git resets must restore tracked copy-excluded source file mtimes"
+        );
+        assert_eq!(
+            std::fs::metadata(&tracked_directory)?.modified()?,
+            std::fs::metadata(workspace.root().join("target"))?.modified()?,
+            "Git resets must restore tracked copy-excluded source directory mtimes"
+        );
+        assert!(
+            !workspace.root().join("runtime").exists(),
+            "Git resets must keep source-only untracked empty directories absent"
+        );
+
+        let copy = copy_workspace_without_git(root, true)?;
+        assert!(
+            copy.root().join("runtime/empty").is_dir(),
+            "normal copies must retain their admitted untracked empty directories"
+        );
+        assert!(
+            !copy.root().join("target").exists(),
+            "normal copies must retain their copy-excluded shape"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_context_tracks_dirty_symlink_overlay_target_metadata() -> anyhow::Result<()> {
+        use std::os::unix::fs::symlink;
+
+        if !git_available() {
+            return Ok(());
+        }
+
+        let dir = tempfile::tempdir()?;
+        let root = dir.path();
+        run_git(root, &["init"]);
+        run_git(root, &["config", "user.email", "test@example.com"]);
+        run_git(root, &["config", "user.name", "Test"]);
+        std::fs::write(root.join(".gitignore"), b"ignored-target.txt\n")?;
+        std::fs::write(root.join("fixture.txt"), b"fixture")?;
+        run_git(root, &["add", "."]);
+        run_git(root, &["commit", "-m", "initial"]);
+
+        let target = root.join("ignored-target.txt");
+        std::fs::write(&target, b"overlay target")?;
+        symlink("ignored-target.txt", root.join("overlay.txt"))?;
+        set_file_modification_time(&target, 1_000_000_000)?;
+        let initial_target_mtime = std::fs::metadata(&target)?.modified()?;
+        let initial = workspace_cache_context(root, true);
+        assert_eq!(
+            initial.provenance,
+            WorkspaceCacheContextProvenance::GitWorktreeV4
+        );
+
+        let workspace = copy_workspace(root)?;
+        assert_eq!(workspace.strategy(), WorkspaceStrategy::GitWorktree);
+        let destination = workspace.root().join("overlay.txt");
+        assert!(
+            fs::symlink_metadata(&destination)?.file_type().is_file(),
+            "a dirty overlay symlink must materialize as a regular file"
+        );
+        assert_eq!(
+            std::fs::metadata(&target)?.modified()?,
+            std::fs::metadata(&destination)?.modified()?,
+            "the overlay destination must receive resolved-target mtime"
+        );
+
+        set_file_modification_time(&target, 1_700_000_000)?;
+        let changed = workspace_cache_context(root, true);
+        assert_ne!(
+            changed.fingerprint, initial.fingerprint,
+            "resolved dirty symlink-target metadata must affect Git identity"
+        );
+        workspace.reset(root, true)?;
+        assert_eq!(
+            initial_target_mtime,
+            std::fs::metadata(&destination)?.modified()?,
+            "Git resets must restore the captured overlay-target mtime"
+        );
+        drop(workspace);
+        let changed_workspace = copy_workspace(root)?;
+        assert_eq!(
+            std::fs::metadata(&target)?.modified()?,
+            std::fs::metadata(changed_workspace.root().join("overlay.txt"))?.modified()?,
+            "a fresh Git workspace must receive the changed resolved-target mtime"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_context_tracks_parent_mtime_of_clean_tracked_symlink() -> anyhow::Result<()> {
+        use std::os::unix::fs::symlink;
+
+        if !git_available() {
+            return Ok(());
+        }
+
+        let dir = tempfile::tempdir()?;
+        let root = dir.path();
+        run_git(root, &["init"]);
+        run_git(root, &["config", "user.email", "test@example.com"]);
+        run_git(root, &["config", "user.name", "Test"]);
+        std::fs::write(root.join("target.txt"), b"target")?;
+        let links = root.join("links");
+        std::fs::create_dir(&links)?;
+        symlink("../target.txt", links.join("fixture-link"))?;
+        run_git(root, &["add", "."]);
+        run_git(root, &["commit", "-m", "initial"]);
+
+        set_file_modification_time(&links, 1_000_000_000)?;
+        let initial_parent_mtime = std::fs::metadata(&links)?.modified()?;
+        let initial = workspace_cache_context(root, true);
+        let workspace = copy_workspace(root)?;
+        assert_eq!(workspace.strategy(), WorkspaceStrategy::GitWorktree);
+        assert!(
+            fs::symlink_metadata(workspace.root().join("links/fixture-link"))?
+                .file_type()
+                .is_symlink(),
+            "clean Git symlinks must retain their excluded link representation"
+        );
+        assert_eq!(
+            initial_parent_mtime,
+            std::fs::metadata(workspace.root().join("links"))?.modified()?,
+            "Git worktrees must normalize parents materialized for clean symlinks"
+        );
+
+        set_file_modification_time(&links, 1_700_000_000)?;
+        let changed = workspace_cache_context(root, true);
+        assert_ne!(
+            changed.fingerprint, initial.fingerprint,
+            "clean symlink parent mtime must affect Git identity"
+        );
+        workspace.reset(root, true)?;
+        assert_eq!(
+            initial_parent_mtime,
+            std::fs::metadata(workspace.root().join("links"))?.modified()?,
+            "Git reset must restore the captured clean-symlink parent mtime"
+        );
+        drop(workspace);
+        let changed_workspace = copy_workspace(root)?;
+        assert_eq!(
+            std::fs::metadata(&links)?.modified()?,
+            std::fs::metadata(changed_workspace.root().join("links"))?.modified()?,
+            "a fresh Git workspace must receive the changed clean-symlink parent mtime"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn missing_tracked_copy_excluded_source_falls_back_to_normal_copy() -> anyhow::Result<()> {
+        if !git_available() {
+            return Ok(());
+        }
+
+        let dir = tempfile::tempdir()?;
+        let root = dir.path();
+        run_git(root, &["init"]);
+        run_git(root, &["config", "user.email", "test@example.com"]);
+        run_git(root, &["config", "user.name", "Test"]);
+        std::fs::create_dir(root.join("target"))?;
+        std::fs::write(
+            root.join("target/fixture.txt"),
+            b"tracked but copy-excluded",
+        )?;
+        run_git(root, &["add", "."]);
+        run_git(root, &["commit", "-m", "initial"]);
+        run_git(root, &["rm", "target/fixture.txt"]);
+
+        let (pool, context) = prepare_campaign_workspace_pool(root, 1, true)?;
+        assert_eq!(
+            pool.strategy(),
+            WorkspaceStrategy::Copy,
+            "a dirty tracked copy-excluded path must fail closed to normal copy"
+        );
+        assert_eq!(
+            context.provenance,
+            WorkspaceCacheContextProvenance::WorkspaceCopy {
+                respect_workspace_ignores: true,
+            }
+        );
+        assert!(
+            !pool.acquire().root().join("target").exists(),
+            "the normal-copy fallback retains its own source shape"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn assert_exact_cache_tracks_ignored_workspace_input(
+        ignored_relative: &str,
+    ) -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path();
+        run_git(root, &["init"]);
+        run_git(root, &["config", "user.email", "test@example.com"]);
+        run_git(root, &["config", "user.name", "Test"]);
+        std::fs::create_dir_all(root.join("src"))?;
+        std::fs::write(
+            root.join(".gitignore"),
+            format!("{ignored_relative}\ntarget/\nruntime-link\n"),
+        )?;
+        std::fs::write(root.join("src/lib.rs"), b"hello world")?;
+        run_git(root, &["add", "."]);
+        run_git(root, &["commit", "-m", "initial"]);
+
+        let ignored_input = root.join(ignored_relative);
+        std::fs::create_dir_all(
+            ignored_input
+                .parent()
+                .expect("ignored fixture must have a parent directory"),
+        )?;
+        std::fs::write(&ignored_input, b"kill")?;
+        let excluded_input = root.join("target/runtime.txt");
+        std::fs::create_dir_all(excluded_input.parent().expect("target input has a parent"))?;
+        std::fs::write(&excluded_input, b"excluded-before")?;
+        let included_context = cache_context_fingerprint_for_workspace(root, false);
+        std::fs::write(&excluded_input, b"excluded-after")?;
+        assert_eq!(
+            cache_context_fingerprint_for_workspace(root, false),
+            included_context,
+            "hard-excluded workspace files must not affect the false-policy context"
+        );
+        std::os::unix::fs::symlink(&ignored_input, root.join("runtime-link"))?;
+        assert_eq!(
+            cache_context_fingerprint_for_workspace(root, false),
+            included_context,
+            "uncopied symlinks must not affect the false-policy context"
+        );
+        assert!(
+            git_cache_context_fingerprint(root).is_some(),
+            "ignored untracked inputs must leave the Git workspace clean"
+        );
+
+        let default_context = cache_context_fingerprint_for_workspace(root, true);
+        {
+            let workspace = copy_workspace(root)?;
+            assert!(
+                !workspace.root().join(ignored_relative).exists(),
+                "the default workspace must not copy ignored inputs"
+            );
+        }
+        {
+            let workspace = copy_workspace_with_options(root, false)?;
+            assert_eq!(
+                std::fs::read(workspace.root().join(ignored_relative))?,
+                b"kill"
+            );
+            assert!(
+                !workspace.root().join("target/runtime.txt").exists(),
+                "hard-excluded directories must not be copied"
+            );
+            assert!(
+                !workspace.root().join("runtime-link").exists(),
+                "symlinks must not be copied"
+            );
+        }
+
+        let mutation = make_test_mutation(Path::new("src/lib.rs"));
+        let mut commands = test_command_config();
+        commands.command = vec![
+            "sh".into(),
+            "-c".into(),
+            format!("test \"$(cat {ignored_relative})\" = survive"),
+        ];
+        let selected = select_test_command(root, &commands, &mutation);
+        let command_context = selected.cache_context(
+            &commands.build_command,
+            commands.build_command_origin,
+            &commands.sandbox_command,
+            &HashMap::new(),
+        );
+        let source = std::fs::read(root.join("src/lib.rs"))?;
+        let initial_key = CacheKey::new(
+            &source,
+            &cache_identity(root, &mutation),
+            &mutation.description,
+            &exact_cache_context(
+                &command_context,
+                included_context,
+                WorkspaceCacheContextProvenance::WorkspaceCopy {
+                    respect_workspace_ignores: false,
+                },
+            ),
+        );
+        cache::store(root, &initial_key, MutationResult::Killed);
+
+        std::fs::write(&ignored_input, b"survive")?;
+        assert_eq!(
+            cache_context_fingerprint_for_workspace(root, true),
+            default_context,
+            "ignored input must not invalidate the default policy"
+        );
+        let changed_context = cache_context_fingerprint_for_workspace(root, false);
+        assert_ne!(
+            changed_context, included_context,
+            "ignored copied workspace input must invalidate the false-policy context"
+        );
+        assert_ne!(
+            exact_cache_context(
+                &command_context,
+                default_context,
+                WorkspaceCacheContextProvenance::GitWorktreeV4,
+            ),
+            exact_cache_context(
+                &command_context,
+                changed_context,
+                WorkspaceCacheContextProvenance::WorkspaceCopy {
+                    respect_workspace_ignores: false,
+                },
+            ),
+            "workspace ignore policies must have distinct exact-cache identities"
+        );
+
+        let report = TestRunner {
+            commands,
+            parallelism: 1,
+            project_root: root.to_path_buf(),
+            verbose: false,
+            show_output: false,
+            max_tested: None,
+            early_stop: Default::default(),
+            respect_workspace_ignores: false,
+            env: HashMap::new(),
+            incremental_history: false,
+            force_rerun: false,
+            learned_selection: false,
+            cancelled: Arc::new(AtomicBool::new(false)),
+        }
+        .run(vec![mutation.clone()])
+        .report;
+
+        assert_eq!(report.results.len(), 1);
+        assert_eq!(report.results[0].0.id, mutation.id);
+        assert_eq!(report.results[0].1, MutationResult::Survived);
+        assert_eq!(
+            report.execution_for(mutation.id, MutationResult::Survived),
+            MutationExecution::Executed
+        );
+        assert_eq!(report.execution_counts().exact_cache_reused, 0);
+        assert_eq!(report.execution_counts().executed, 1);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_cache_tracks_ignored_context_when_workspace_ignores_are_disabled() -> anyhow::Result<()>
+    {
+        if !git_available() {
+            return Ok(());
+        }
+
+        assert_exact_cache_tracks_ignored_workspace_input("tests/ignored_test.rs")?;
+        assert_exact_cache_tracks_ignored_workspace_input("fixtures/expected.txt")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_cache_tracks_ignored_workspace_file_modes() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        if !git_available() {
+            return Ok(());
+        }
+
+        let dir = tempfile::tempdir()?;
+        let root = dir.path();
+        run_git(root, &["init"]);
+        run_git(root, &["config", "user.email", "test@example.com"]);
+        run_git(root, &["config", "user.name", "Test"]);
+        std::fs::create_dir_all(root.join("src"))?;
+        std::fs::write(root.join(".gitignore"), b"helper.sh\n")?;
+        std::fs::write(root.join("src/lib.rs"), b"hello world")?;
+        run_git(root, &["add", "."]);
+        run_git(root, &["commit", "-m", "initial"]);
+
+        let helper = root.join("helper.sh");
+        std::fs::write(&helper, b"#!/bin/sh\nexit 0\n")?;
+        let mut permissions = std::fs::metadata(&helper)?.permissions();
+        permissions.set_mode(0o644);
+        std::fs::set_permissions(&helper, permissions)?;
+        let helper_content = std::fs::read(&helper)?;
+        let default_context = cache_context_fingerprint_for_workspace(root, true);
+        let non_executable_context = cache_context_fingerprint_for_workspace(root, false);
+        assert!(
+            git_cache_context_fingerprint(root).is_some(),
+            "the ignored helper must leave the Git workspace clean"
+        );
+
+        let mutation = make_test_mutation(Path::new("src/lib.rs"));
+        let test_command = vec!["sh".into(), "-c".into(), "test -x helper.sh".into()];
+        let run = |force_rerun| {
+            let mut commands = test_command_config();
+            commands.command = test_command.clone();
+            TestRunner {
+                commands,
+                parallelism: 1,
+                project_root: root.to_path_buf(),
+                verbose: false,
+                show_output: false,
+                max_tested: None,
+                early_stop: Default::default(),
+                respect_workspace_ignores: false,
+                env: HashMap::new(),
+                incremental_history: false,
+                force_rerun,
+                learned_selection: false,
+                cancelled: Arc::new(AtomicBool::new(false)),
+            }
+            .run(vec![mutation.clone()])
+            .report
+        };
+
+        let killed = run(false);
+        assert_eq!(killed.results.len(), 1);
+        assert_eq!(killed.results[0].1, MutationResult::Killed);
+        assert_eq!(
+            killed.execution_for(mutation.id, MutationResult::Killed),
+            MutationExecution::Executed
+        );
+
+        let mut permissions = std::fs::metadata(&helper)?.permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&helper, permissions)?;
+        assert_eq!(
+            std::fs::read(&helper)?,
+            helper_content,
+            "the helper content must remain unchanged across chmod"
+        );
+        assert_eq!(
+            cache_context_fingerprint_for_workspace(root, true),
+            default_context,
+            "ignored chmod must not alter default-policy identity"
+        );
+        assert_ne!(
+            cache_context_fingerprint_for_workspace(root, false),
+            non_executable_context,
+            "copied helper mode must invalidate false-policy identity"
+        );
+
+        let survived = run(false);
+        assert_eq!(survived.results.len(), 1);
+        assert_eq!(survived.results[0].1, MutationResult::Survived);
+        assert_eq!(
+            survived.execution_for(mutation.id, MutationResult::Survived),
+            MutationExecution::Executed
+        );
+        assert_eq!(survived.execution_counts().exact_cache_reused, 0);
+
+        let forced = run(true);
+        assert_eq!(forced.results.len(), 1);
+        assert_eq!(forced.results[0].1, MutationResult::Survived);
+        assert_eq!(forced.results[0].1, survived.results[0].1);
+        assert_eq!(
+            forced.execution_for(mutation.id, MutationResult::Survived),
+            MutationExecution::Executed
+        );
+        assert_eq!(forced.execution_counts().exact_cache_reused, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn false_policy_history_tracks_ignored_arbitrary_data_file_changes() -> anyhow::Result<()> {
+        if !git_available()
+            || !std::process::Command::new("go")
+                .arg("version")
+                .output()
+                .is_ok_and(|output| output.status.success())
+        {
+            return Ok(());
+        }
+
+        let dir = tempfile::tempdir()?;
+        let root = dir.path();
+        run_git(root, &["init"]);
+        run_git(root, &["config", "user.email", "test@example.com"]);
+        run_git(root, &["config", "user.name", "Test"]);
+        let source = "package calc\n\nfunc Equal(a, b int) bool { return a == b }\n";
+        std::fs::write(
+            root.join("go.mod"),
+            "module example.com/cachefixture\ngo 1.20\n",
+        )?;
+        std::fs::write(root.join("calc.go"), source)?;
+        std::fs::write(
+            root.join("calc_test.go"),
+            "package calc\n\nimport (\n    \"os\"\n    \"testing\"\n)\n\nfunc TestSelected(t *testing.T) {\n    fixture, err := os.ReadFile(\"fixture.txt\")\n    if err != nil {\n        t.Fatal(err)\n    }\n    if string(fixture) != \"survive\" {\n        t.Fatal(\"fixture says kill\")\n    }\n}\n",
+        )?;
+        std::fs::write(root.join(".gitignore"), b"fixture.txt\n")?;
+        run_git(root, &["add", "."]);
+        run_git(root, &["commit", "-m", "initial"]);
+        std::fs::write(root.join("fixture.txt"), b"kill")?;
+
+        let mut mutation = go_operator_mutation(0, "calc.go", source, 0);
+        mutation.line = 3;
+        let mut selection = TestSelectionConfig::new();
+        selection.insert(
+            root,
+            Path::new("calc.go"),
+            mutation.line,
+            vec!["TestSelected".into()],
+        );
+        let make_commands = || {
+            let mut commands = test_command_config();
+            commands.command = vec![
+                "go".into(),
+                "test".into(),
+                "-count=1".into(),
+                "./...".into(),
+            ];
+            commands.timeout = Duration::from_secs(90);
+            commands.test_selection = Some(selection.clone());
+            commands
+        };
+        let run = |force_rerun| {
+            TestRunner {
+                commands: make_commands(),
+                parallelism: 1,
+                project_root: root.to_path_buf(),
+                verbose: false,
+                show_output: false,
+                max_tested: None,
+                early_stop: Default::default(),
+                respect_workspace_ignores: false,
+                env: HashMap::new(),
+                incremental_history: true,
+                force_rerun,
+                learned_selection: false,
+                cancelled: Arc::new(AtomicBool::new(false)),
+            }
+            .run(vec![mutation.clone()])
+            .report
+        };
+
+        let commands = make_commands();
+        let selected = select_test_command(root, &commands, &mutation);
+        assert!(selected.is_narrowed());
+        assert_eq!(selected.selected_tests, vec!["TestSelected"]);
+        let initial_context = cache_context_fingerprint_for_workspace(root, false);
+        let initial_selected_hash = TestContextIndex::build(root)
+            .fingerprint_for_tests(&selected.selected_tests, initial_context);
+        let initial_history_hash = incremental_history_relevant_test_hash(
+            initial_selected_hash,
+            initial_context,
+            WorkspaceCacheContextProvenance::WorkspaceCopy {
+                respect_workspace_ignores: false,
+            },
+        );
+        let killed = run(false);
+        assert_eq!(killed.results.len(), 1);
+        assert_eq!(killed.results[0].1, MutationResult::Killed);
+        assert_eq!(
+            killed.execution_for(mutation.id, MutationResult::Killed),
+            MutationExecution::Executed
+        );
+
+        std::fs::write(root.join("fixture.txt"), b"survive")?;
+        let changed_context = cache_context_fingerprint_for_workspace(root, false);
+        assert_ne!(
+            changed_context, initial_context,
+            "the copied ignored input must change the workspace fingerprint"
+        );
+        let changed_selected_hash = TestContextIndex::build(root)
+            .fingerprint_for_tests(&selected.selected_tests, changed_context);
+        assert_eq!(
+            changed_selected_hash, initial_selected_hash,
+            "the narrowed-test hash intentionally excludes this runtime input"
+        );
+        assert_ne!(
+            incremental_history_relevant_test_hash(
+                changed_selected_hash,
+                changed_context,
+                WorkspaceCacheContextProvenance::WorkspaceCopy {
+                    respect_workspace_ignores: false,
+                },
+            ),
+            initial_history_hash,
+            "false-policy history must also bind the copied workspace"
+        );
+        let command_context = selected.cache_context(
+            &commands.build_command,
+            commands.build_command_origin,
+            &commands.sandbox_command,
+            &HashMap::new(),
+        );
+        let changed_key = CacheKey::new(
+            &std::fs::read(root.join("calc.go"))?,
+            &cache_identity(root, &mutation),
+            &mutation.description,
+            &exact_cache_context(
+                &command_context,
+                changed_context,
+                WorkspaceCacheContextProvenance::WorkspaceCopy {
+                    respect_workspace_ignores: false,
+                },
+            ),
+        );
+        assert_eq!(
+            cache::lookup(root, &changed_key),
+            None,
+            "the changed copied input must not share the initial exact key"
+        );
+
+        let survived = run(false);
+        assert_eq!(survived.results.len(), 1);
+        assert_eq!(survived.results[0].1, MutationResult::Survived);
+        assert_eq!(
+            survived.execution_for(mutation.id, MutationResult::Survived),
+            MutationExecution::Executed
+        );
+        assert_eq!(survived.execution_counts().exact_cache_reused, 0);
+        assert_eq!(survived.execution_counts().incremental_history_reused, 0);
+        assert_eq!(survived.execution_counts().executed, 1);
+        assert_eq!(
+            cache::lookup(root, &changed_key),
+            Some(MutationResult::Survived),
+            "fresh execution must replace rather than repopulate a stale exact verdict"
+        );
+
+        let forced = run(true);
+        assert_eq!(forced.results.len(), 1);
+        assert_eq!(forced.results[0].1, MutationResult::Survived);
+        assert_eq!(forced.results[0].1, survived.results[0].1);
+        assert_eq!(
+            forced.execution_for(mutation.id, MutationResult::Survived),
+            MutationExecution::Executed
+        );
+        assert_eq!(forced.execution_counts().exact_cache_reused, 0);
+        assert_eq!(forced.execution_counts().incremental_history_reused, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn learned_selection_rejects_stale_killers_after_ignored_empty_directory_removal()
+    -> anyhow::Result<()> {
+        if !git_available()
+            || !std::process::Command::new("go")
+                .arg("version")
+                .output()
+                .is_ok_and(|output| output.status.success())
+        {
+            return Ok(());
+        }
+
+        let dir = tempfile::tempdir()?;
+        let root = dir.path();
+        run_git(root, &["init"]);
+        run_git(root, &["config", "user.email", "test@example.com"]);
+        run_git(root, &["config", "user.name", "Test"]);
+        let source = "package calc\n\nfunc Equal(a, b int) bool { return a == b }\nfunc Other(a, b int) bool { return a == b }\n";
+        std::fs::write(
+            root.join("go.mod"),
+            "module example.com/learnedfixture\ngo 1.20\n",
+        )?;
+        std::fs::write(root.join("calc.go"), source)?;
+        std::fs::write(
+            root.join("calc_test.go"),
+            "package calc\n\nimport (\n    \"os\"\n    \"testing\"\n)\n\nfunc TestSelected(t *testing.T) {\n    if _, err := os.Stat(\"runtime\"); err == nil {\n        t.Fatal(\"runtime directory says kill\")\n    }\n}\n",
+        )?;
+        std::fs::write(root.join(".gitignore"), b"runtime/\n")?;
+        run_git(root, &["add", "."]);
+        run_git(root, &["commit", "-m", "initial"]);
+        std::fs::create_dir(root.join("runtime"))?;
+        let default_context = cache_context_fingerprint_for_workspace(root, true);
+        {
+            let default_workspace = copy_workspace(root)?;
+            assert!(
+                !default_workspace.root().join("runtime").exists(),
+                "the default workspace must not materialize ignored directories"
+            );
+        }
+        let initial_context = cache_context_fingerprint_for_workspace(root, false);
+
+        let mut first = go_operator_mutation(1, "calc.go", source, 0);
+        first.line = 3;
+        let mut second = go_operator_mutation(2, "calc.go", source, 1);
+        second.line = 4;
+        let mutations = vec![first, second];
+        let mut selection = TestSelectionConfig::new();
+        for mutation in &mutations {
+            selection.insert(
+                root,
+                Path::new("calc.go"),
+                mutation.line,
+                vec!["TestSelected".into()],
+            );
+        }
+        let make_commands = || {
+            let mut commands = test_command_config();
+            commands.command = vec![
+                "go".into(),
+                "test".into(),
+                "-count=1".into(),
+                "./...".into(),
+            ];
+            commands.timeout = Duration::from_secs(90);
+            commands.test_selection = Some(selection.clone());
+            commands
+        };
+        let run = |force_rerun| {
+            TestRunner {
+                commands: make_commands(),
+                parallelism: 1,
+                project_root: root.to_path_buf(),
+                verbose: false,
+                show_output: false,
+                max_tested: None,
+                early_stop: Default::default(),
+                respect_workspace_ignores: false,
+                env: HashMap::new(),
+                incremental_history: true,
+                force_rerun,
+                learned_selection: true,
+                cancelled: Arc::new(AtomicBool::new(false)),
+            }
+            .run(mutations.clone())
+            .report
+        };
+
+        let killed = run(false);
+        assert_eq!(killed.results.len(), 2);
+        assert_eq!(killed.killed, 2);
+        assert_eq!(killed.subsumed_count(), 0);
+        assert_eq!(killed.execution_counts().executed, 2);
+
+        std::fs::remove_dir(root.join("runtime"))?;
+        assert_eq!(
+            cache_context_fingerprint_for_workspace(root, true),
+            default_context,
+            "removing an ignored directory must not invalidate the default policy"
+        );
+        assert_ne!(
+            cache_context_fingerprint_for_workspace(root, false),
+            initial_context,
+            "an admitted ignored directory must change false-policy identity"
+        );
+        let survived = run(false);
+        assert_eq!(survived.results.len(), 2);
+        assert_eq!(survived.subsumed_count(), 0);
+        assert_eq!(survived.execution_counts().exact_cache_reused, 0);
+        assert_eq!(survived.execution_counts().incremental_history_reused, 0);
+        assert_eq!(survived.execution_counts().executed, 2);
+        for mutation in &mutations {
+            assert_eq!(
+                survived
+                    .results
+                    .iter()
+                    .find(|(candidate, _)| candidate.id == mutation.id)
+                    .map(|(_, result)| *result),
+                Some(MutationResult::Survived)
+            );
+            assert_eq!(
+                survived.execution_for(mutation.id, MutationResult::Survived),
+                MutationExecution::Executed
+            );
+        }
+
+        let forced = run(true);
+        assert_eq!(forced.results.len(), 2);
+        assert_eq!(forced.subsumed_count(), 0);
+        assert_eq!(forced.execution_counts().exact_cache_reused, 0);
+        assert_eq!(forced.execution_counts().incremental_history_reused, 0);
+        assert_eq!(forced.execution_counts().executed, 2);
+        assert!(
+            forced
+                .results
+                .iter()
+                .all(|(_, result)| *result == MutationResult::Survived)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn git_worktree_context_rejects_stale_killers_after_dirty_tracked_ignored_fixture_mtime_changes()
+    -> anyhow::Result<()> {
+        if !git_available()
+            || !std::process::Command::new("go")
+                .arg("version")
+                .output()
+                .is_ok_and(|output| output.status.success())
+        {
+            return Ok(());
+        }
+
+        let dir = tempfile::tempdir()?;
+        let root = dir.path();
+        run_git(root, &["init"]);
+        run_git(root, &["config", "user.email", "test@example.com"]);
+        run_git(root, &["config", "user.name", "Test"]);
+        run_git(root, &["config", "core.autocrlf", "false"]);
+        let source = "package calc\n\nfunc Equal(a, b int) bool { return a == b }\nfunc Other(a, b int) bool { return a == b }\n";
+        std::fs::write(
+            root.join("go.mod"),
+            "module example.com/mtimefixture\ngo 1.20\n",
+        )?;
+        std::fs::write(root.join("calc.go"), source)?;
+        std::fs::write(
+            root.join("calc_test.go"),
+            "package calc\n\nimport (\n    \"os\"\n    \"testing\"\n)\n\nfunc TestSelected(t *testing.T) {\n    info, err := os.Stat(\"fixture.txt\")\n    if err != nil {\n        t.Fatal(err)\n    }\n    if info.ModTime().Unix() < 1500000000 {\n        t.Fatal(\"fixture mtime says kill\")\n    }\n}\n",
+        )?;
+        assert!(
+            !is_cache_context_file(Path::new("fixture.txt")),
+            "the regression fixture must remain outside the narrow verdict-context classifier"
+        );
+        std::fs::write(root.join(".gitignore"), b"fixture.txt\n")?;
+        let fixture = root.join("fixture.txt");
+        std::fs::write(&fixture, b"base")?;
+        run_git(root, &["add", "."]);
+        run_git(root, &["add", "-f", "fixture.txt"]);
+        run_git(root, &["commit", "-m", "initial"]);
+        let clean_context = cache_context_fingerprint_for_workspace(root, true);
+        {
+            let workspace = copy_workspace(root)?;
+            assert_eq!(
+                std::fs::read(workspace.root().join("fixture.txt"))?,
+                b"base",
+                "a tracked ignored file must be present in a clean Git workspace"
+            );
+        }
+
+        std::fs::write(&fixture, b"unchanged")?;
+        set_file_modification_time(&fixture, 1_000_000_000)?;
+        assert_eq!(
+            git_cache_context_is_dirty(root),
+            Some(true),
+            "a dirty arbitrary tracked fixture must select the Git overlay"
+        );
+        let fixture_content = std::fs::read(&fixture)?;
+        let initial_context = cache_context_fingerprint_for_workspace(root, true);
+        assert_ne!(
+            initial_context, clean_context,
+            "a dirty tracked ignored fixture must invalidate clean Git identity"
+        );
+        assert_eq!(
+            workspace_cache_context(root, true).provenance,
+            WorkspaceCacheContextProvenance::GitWorktreeV4,
+            "dirty Git worktrees use the matching overlay identity"
+        );
+
+        let mut first = go_operator_mutation(1, "calc.go", source, 0);
+        first.line = 3;
+        let mut second = go_operator_mutation(2, "calc.go", source, 1);
+        second.line = 4;
+        let mutations = vec![first, second];
+        let mut selection = TestSelectionConfig::new();
+        for mutation in &mutations {
+            selection.insert(
+                root,
+                Path::new("calc.go"),
+                mutation.line,
+                vec!["TestSelected".into()],
+            );
+        }
+        let make_commands = || {
+            let mut commands = test_command_config();
+            commands.command = vec![
+                "go".into(),
+                "test".into(),
+                "-count=1".into(),
+                "./...".into(),
+            ];
+            commands.timeout = Duration::from_secs(90);
+            commands.test_selection = Some(selection.clone());
+            commands
+        };
+        let commands = make_commands();
+        let selected = select_test_command(root, &commands, &mutations[0]);
+        assert!(selected.is_narrowed());
+        let initial_selected_hash = TestContextIndex::build(root)
+            .fingerprint_for_tests(&selected.selected_tests, initial_context);
+        let initial_history_hash = incremental_history_relevant_test_hash(
+            initial_selected_hash,
+            initial_context,
+            workspace_cache_context(root, true).provenance,
+        );
+        let run = |force_rerun| {
+            TestRunner {
+                commands: make_commands(),
+                parallelism: 1,
+                project_root: root.to_path_buf(),
+                verbose: false,
+                show_output: false,
+                max_tested: None,
+                early_stop: Default::default(),
+                respect_workspace_ignores: true,
+                env: HashMap::new(),
+                incremental_history: true,
+                force_rerun,
+                learned_selection: true,
+                cancelled: Arc::new(AtomicBool::new(false)),
+            }
+            .run(mutations.clone())
+            .report
+        };
+
+        let killed = run(false);
+        assert_eq!(killed.results.len(), 2);
+        assert_eq!(killed.killed, 2);
+        assert_eq!(killed.subsumed_count(), 0);
+        assert_eq!(killed.execution_counts().executed, 2);
+
+        set_file_modification_time(&fixture, 1_700_000_000)?;
+        assert_eq!(std::fs::read(&fixture)?, fixture_content);
+        let changed_context = cache_context_fingerprint_for_workspace(root, true);
+        assert_ne!(
+            changed_context, initial_context,
+            "a dirty tracked ignored fixture mtime must invalidate Git overlay identity"
+        );
+        let changed_selected_hash = TestContextIndex::build(root)
+            .fingerprint_for_tests(&selected.selected_tests, changed_context);
+        assert_eq!(
+            changed_selected_hash, initial_selected_hash,
+            "the narrowed-test hash intentionally excludes the helper mtime"
+        );
+        assert_ne!(
+            incremental_history_relevant_test_hash(
+                changed_selected_hash,
+                changed_context,
+                workspace_cache_context(root, true).provenance,
+            ),
+            initial_history_hash,
+            "Git-worktree history must bind dirty overlay metadata"
+        );
+
+        let survived = run(false);
+        assert_eq!(survived.results.len(), 2);
+        assert_eq!(survived.subsumed_count(), 0);
+        assert_eq!(survived.execution_counts().exact_cache_reused, 0);
+        assert_eq!(survived.execution_counts().incremental_history_reused, 0);
+        assert_eq!(survived.execution_counts().executed, 2);
+        assert!(
+            survived
+                .results
+                .iter()
+                .all(|(_, result)| *result == MutationResult::Survived)
+        );
+
+        let forced = run(true);
+        assert_eq!(forced.results.len(), 2);
+        assert_eq!(forced.subsumed_count(), 0);
+        assert_eq!(forced.execution_counts().exact_cache_reused, 0);
+        assert_eq!(forced.execution_counts().incremental_history_reused, 0);
+        assert_eq!(forced.execution_counts().executed, 2);
+        assert!(
+            forced
+                .results
+                .iter()
+                .all(|(_, result)| *result == MutationResult::Survived)
+        );
+        Ok(())
+    }
+
+    fn assert_normal_copy_fallback_rejects_stale_mtime_reuse(
+        use_schemata: bool,
+    ) -> anyhow::Result<()> {
+        if !git_available()
+            || !std::process::Command::new("go")
+                .arg("version")
+                .output()
+                .is_ok_and(|output| output.status.success())
+        {
+            return Ok(());
+        }
+
+        let dir = tempfile::tempdir()?;
+        let root = dir.path();
+        run_git(root, &["init"]);
+        run_git(root, &["config", "user.email", "test@example.com"]);
+        run_git(root, &["config", "user.name", "Test"]);
+        let source = "package calc\n\nfunc Equal(a, b int) bool { return a == b }\nfunc Other(a, b int) bool { return a == b }\n";
+        std::fs::write(
+            root.join("go.mod"),
+            "module example.com/fallbackmtimefixture\ngo 1.20\n",
+        )?;
+        std::fs::write(root.join("calc.go"), source)?;
+        std::fs::write(
+            root.join("calc_test.go"),
+            "package calc\n\nimport (\n    \"os\"\n    \"testing\"\n)\n\nfunc TestSelected(t *testing.T) {\n    info, err := os.Stat(\"fixture.txt\")\n    if err != nil {\n        t.Fatal(err)\n    }\n    if info.ModTime().Unix() < 1500000000 {\n        t.Fatal(\"fixture mtime says kill\")\n    }\n}\n",
+        )?;
+        assert!(
+            !is_cache_context_file(Path::new("fixture.txt")),
+            "the regression fixture must remain outside the narrow verdict-context classifier"
+        );
+        let fixture = root.join("fixture.txt");
+        std::fs::write(&fixture, b"fixture")?;
+        run_git(root, &["add", "."]);
+        run_git(root, &["commit", "-m", "initial"]);
+
+        set_file_modification_time(&fixture, 1_000_000_000)?;
+        assert_eq!(
+            git_cache_context_is_dirty(root),
+            Some(false),
+            "mtime-only source metadata must leave the Git overlay clean"
+        );
+        std::fs::write(root.join(".git/worktrees"), b"block worktree creation")?;
+        let (initial_pool, initial_context) = prepare_campaign_workspace_pool(root, 1, true)?;
+        assert_eq!(initial_pool.strategy(), WorkspaceStrategy::Copy);
+        assert_eq!(
+            initial_context.provenance,
+            WorkspaceCacheContextProvenance::WorkspaceCopy {
+                respect_workspace_ignores: true,
+            },
+            "cache lookup must use the actual normal-copy fallback domain"
+        );
+        drop(initial_pool);
+        {
+            let workspace = copy_workspace(root)?;
+            assert!(
+                matches!(&workspace.reset_strategy, WorkspaceResetStrategy::Copy),
+                "the injected worktree failure must use the normal copy fallback"
+            );
+            assert_eq!(
+                std::fs::metadata(&fixture)?.modified()?,
+                std::fs::metadata(workspace.root().join("fixture.txt"))?.modified()?
+            );
+        }
+
+        let mut first = go_operator_mutation(1, "calc.go", source, 0);
+        first.line = 3;
+        let mut second = go_operator_mutation(2, "calc.go", source, 1);
+        second.line = 4;
+        let mutations = vec![first, second];
+        let mut selection = TestSelectionConfig::new();
+        for mutation in &mutations {
+            selection.insert(
+                root,
+                Path::new("calc.go"),
+                mutation.line,
+                vec!["TestSelected".into()],
+            );
+        }
+        let make_commands = || {
+            let mut commands = test_command_config();
+            commands.command = vec![
+                "go".into(),
+                "test".into(),
+                "-count=1".into(),
+                "./...".into(),
+            ];
+            commands.timeout = Duration::from_secs(90);
+            commands.test_selection = Some(selection.clone());
+            commands
+        };
+        let commands = make_commands();
+        let selected = select_test_command(root, &commands, &mutations[0]);
+        assert!(selected.is_narrowed());
+        let initial_selected_hash = TestContextIndex::build(root)
+            .fingerprint_for_tests(&selected.selected_tests, initial_context.fingerprint);
+        let initial_history_hash = incremental_history_relevant_test_hash(
+            initial_selected_hash,
+            initial_context.fingerprint,
+            initial_context.provenance,
+        );
+        let run = |force_rerun| {
+            let runner = TestRunner {
+                commands: make_commands(),
+                parallelism: 1,
+                project_root: root.to_path_buf(),
+                verbose: false,
+                show_output: false,
+                max_tested: None,
+                early_stop: Default::default(),
+                respect_workspace_ignores: true,
+                env: HashMap::new(),
+                incremental_history: true,
+                force_rerun,
+                learned_selection: true,
+                cancelled: Arc::new(AtomicBool::new(false)),
+            };
+            if use_schemata {
+                runner.run_with_schemata(mutations.clone()).report
+            } else {
+                runner.run(mutations.clone()).report
+            }
+        };
+
+        let killed = run(false);
+        assert_eq!(killed.results.len(), 2);
+        assert_eq!(killed.killed, 2);
+        assert_eq!(killed.subsumed_count(), 0);
+        assert_eq!(killed.execution_counts().executed, 2);
+
+        let fixture_content = std::fs::read(&fixture)?;
+        let (control_pool, control_context) = prepare_campaign_workspace_pool(root, 1, true)?;
+        assert_eq!(control_pool.strategy(), WorkspaceStrategy::Copy);
+        assert_eq!(
+            control_context.fingerprint, initial_context.fingerprint,
+            "Togi control state must not alter the source workspace identity"
+        );
+        drop(control_pool);
+        set_file_modification_time(&fixture, 1_700_000_000)?;
+        assert_eq!(std::fs::read(&fixture)?, fixture_content);
+        let (changed_pool, changed_context) = prepare_campaign_workspace_pool(root, 1, true)?;
+        assert_eq!(changed_pool.strategy(), WorkspaceStrategy::Copy);
+        drop(changed_pool);
+        assert_ne!(
+            changed_context.fingerprint, initial_context.fingerprint,
+            "a copy-observable clean tracked mtime must invalidate fallback identity"
+        );
+        let changed_selected_hash = TestContextIndex::build(root)
+            .fingerprint_for_tests(&selected.selected_tests, changed_context.fingerprint);
+        assert_eq!(
+            changed_selected_hash, initial_selected_hash,
+            "the narrowed-test hash intentionally excludes the helper mtime"
+        );
+        assert_ne!(
+            incremental_history_relevant_test_hash(
+                changed_selected_hash,
+                changed_context.fingerprint,
+                changed_context.provenance,
+            ),
+            initial_history_hash,
+            "incremental and learned identities must bind fallback metadata"
+        );
+
+        let survived = run(false);
+        assert_eq!(survived.results.len(), 2);
+        assert_eq!(survived.subsumed_count(), 0);
+        assert_eq!(survived.execution_counts().exact_cache_reused, 0);
+        assert_eq!(survived.execution_counts().incremental_history_reused, 0);
+        assert_eq!(survived.execution_counts().executed, 2);
+        assert!(
+            survived
+                .results
+                .iter()
+                .all(|(_, result)| *result == MutationResult::Survived)
+        );
+        if use_schemata {
+            assert!(
+                survived.schemata.is_some(),
+                "the shared campaign context must reach the schemata path"
+            );
+        }
+
+        let forced = run(true);
+        assert_eq!(forced.results.len(), 2);
+        assert_eq!(forced.subsumed_count(), 0);
+        assert_eq!(forced.execution_counts().exact_cache_reused, 0);
+        assert_eq!(forced.execution_counts().incremental_history_reused, 0);
+        assert_eq!(forced.execution_counts().executed, 2);
+        assert!(
+            forced
+                .results
+                .iter()
+                .all(|(_, result)| *result == MutationResult::Survived)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn normal_copy_fallback_rejects_stale_mtime_reuse_in_regular_runs() -> anyhow::Result<()> {
+        assert_normal_copy_fallback_rejects_stale_mtime_reuse(false)
+    }
+
+    #[test]
+    fn normal_copy_fallback_rejects_stale_mtime_reuse_in_schemata_runs() -> anyhow::Result<()> {
+        assert_normal_copy_fallback_rejects_stale_mtime_reuse(true)
+    }
+
+    #[cfg(unix)]
+    fn assert_workspace_contexts_do_not_share_reuse(
+        initial: WorkspaceCacheContext,
+        changed: WorkspaceCacheContext,
+    ) {
+        assert_ne!(
+            exact_cache_context("test-command", initial.fingerprint, initial.provenance),
+            exact_cache_context("test-command", changed.fingerprint, changed.provenance),
+            "workspace strategies must have distinct exact-cache domains"
+        );
+        assert_ne!(
+            incremental_history_relevant_test_hash(
+                0x0123_4567_89ab_cdef,
+                initial.fingerprint,
+                initial.provenance,
+            ),
+            incremental_history_relevant_test_hash(
+                0x0123_4567_89ab_cdef,
+                changed.fingerprint,
+                changed.provenance,
+            ),
+            "workspace strategies must have distinct incremental and learned domains"
+        );
+    }
+
+    #[cfg(unix)]
+    fn assert_tracked_ignored_pool_shape(
+        root: &Path,
+        expected_strategy: WorkspaceStrategy,
+    ) -> anyhow::Result<WorkspaceCacheContext> {
+        let (pool, context) = prepare_campaign_workspace_pool(root, 2, true)?;
+        assert_eq!(pool.strategy(), expected_strategy);
+        assert_eq!(pool.len(), 2);
+        let expected_fixture = expected_strategy == WorkspaceStrategy::GitWorktree;
+        let first = pool.acquire();
+        let second = pool.acquire();
+        assert_eq!(
+            first.root().join("fixture.txt").exists(),
+            expected_fixture,
+            "the first slot must match its cache-visible workspace shape"
+        );
+        assert_eq!(
+            second.root().join("fixture.txt").exists(),
+            expected_fixture,
+            "all slots must share the same workspace strategy"
+        );
+        let expected_provenance = match expected_strategy {
+            WorkspaceStrategy::GitWorktree => WorkspaceCacheContextProvenance::GitWorktreeV4,
+            WorkspaceStrategy::Copy => WorkspaceCacheContextProvenance::WorkspaceCopy {
+                respect_workspace_ignores: true,
+            },
+        };
+        assert_eq!(context.provenance, expected_provenance);
+        Ok(context)
+    }
+
+    #[cfg(unix)]
+    fn assert_tracked_ignored_strategy_transition_rejects_stale_reuse(
+        first_strategy: WorkspaceStrategy,
+        use_schemata: bool,
+    ) -> anyhow::Result<()> {
+        if !git_available() {
+            return Ok(());
+        }
+
+        let dir = tempfile::tempdir()?;
+        let root = dir.path();
+        run_git(root, &["init"]);
+        run_git(root, &["config", "user.email", "test@example.com"]);
+        run_git(root, &["config", "user.name", "Test"]);
+        let source = "package calc\n\nfunc Equal(a, b int) bool { return a == b }\nfunc Other(a, b int) bool { return a == b }\n";
+        std::fs::write(root.join("calc.go"), source)?;
+        std::fs::write(root.join(".gitignore"), b"fixture.txt\n")?;
+        std::fs::write(root.join("fixture.txt"), b"tracked but ignored")?;
+        run_git(root, &["add", "."]);
+        run_git(root, &["add", "-f", "fixture.txt"]);
+        run_git(root, &["commit", "-m", "initial"]);
+
+        let worktrees = root.join(".git/worktrees");
+        if first_strategy == WorkspaceStrategy::Copy {
+            std::fs::write(&worktrees, b"block worktree creation")?;
+        }
+        let initial_context = assert_tracked_ignored_pool_shape(root, first_strategy)?;
+
+        let mut first = go_operator_mutation(1, "calc.go", source, 0);
+        first.line = 3;
+        let mut second = go_operator_mutation(2, "calc.go", source, 1);
+        second.line = 4;
+        let mutations = vec![first, second];
+        let mut selection = TestSelectionConfig::new();
+        for mutation in &mutations {
+            selection.insert(
+                root,
+                Path::new("calc.go"),
+                mutation.line,
+                vec!["TestFixture".into()],
+            );
+        }
+        let script = if first_strategy == WorkspaceStrategy::GitWorktree {
+            "test ! -e fixture.txt"
+        } else {
+            "test -e fixture.txt"
+        };
+        let make_commands = || {
+            let mut commands = test_command_config();
+            commands.command = vec!["sh".into(), "-c".into(), script.into()];
+            commands.test_selection = Some(selection.clone());
+            commands
+        };
+        let run = || {
+            let runner = TestRunner {
+                commands: make_commands(),
+                parallelism: 2,
+                project_root: root.to_path_buf(),
+                verbose: false,
+                show_output: false,
+                max_tested: None,
+                early_stop: Default::default(),
+                respect_workspace_ignores: true,
+                env: HashMap::new(),
+                incremental_history: true,
+                force_rerun: false,
+                learned_selection: true,
+                cancelled: Arc::new(AtomicBool::new(false)),
+            };
+            if use_schemata {
+                runner.run_with_schemata(mutations.clone()).report
+            } else {
+                runner.run(mutations.clone()).report
+            }
+        };
+
+        let killed = run();
+        assert_eq!(killed.killed, 2);
+        assert_eq!(killed.subsumed_count(), 0);
+        assert_eq!(killed.execution_counts().executed, 2);
+
+        let changed_strategy = match first_strategy {
+            WorkspaceStrategy::GitWorktree => {
+                std::fs::write(&worktrees, b"block worktree creation")?;
+                WorkspaceStrategy::Copy
+            }
+            WorkspaceStrategy::Copy => {
+                std::fs::remove_file(&worktrees)?;
+                WorkspaceStrategy::GitWorktree
+            }
+        };
+        let changed_context = assert_tracked_ignored_pool_shape(root, changed_strategy)?;
+        assert_workspace_contexts_do_not_share_reuse(initial_context, changed_context);
+
+        let survived = run();
+        assert_eq!(survived.results.len(), 2);
+        assert_eq!(survived.survived, 2);
+        assert_eq!(survived.subsumed_count(), 0);
+        assert_eq!(survived.execution_counts().exact_cache_reused, 0);
+        assert_eq!(survived.execution_counts().incremental_history_reused, 0);
+        assert_eq!(survived.execution_counts().executed, 2);
+        if use_schemata {
+            assert!(
+                survived.schemata.is_some(),
+                "the selected pool context must also govern schemata execution"
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn assert_identical_tree_head_transition_rejects_stale_reuse(
+        use_schemata: bool,
+    ) -> anyhow::Result<()> {
+        if !git_available() {
+            return Ok(());
+        }
+
+        let dir = tempfile::tempdir()?;
+        let root = dir.path();
+        run_git(root, &["init"]);
+        run_git(root, &["config", "user.email", "test@example.com"]);
+        run_git(root, &["config", "user.name", "Test"]);
+        let source = "package calc\n\nfunc Equal(a, b int) bool { return a == b }\nfunc Other(a, b int) bool { return a == b }\n";
+        std::fs::write(root.join("calc.go"), source)?;
+        run_git(root, &["add", "."]);
+        run_git(root, &["commit", "-m", "initial"]);
+        let initial_head = git_snapshot_revision(root)?;
+        let (initial_pool, initial_context) = prepare_campaign_workspace_pool(root, 2, true)?;
+        assert_eq!(initial_pool.strategy(), WorkspaceStrategy::GitWorktree);
+        drop(initial_pool);
+
+        let mut first = go_operator_mutation(1, "calc.go", source, 0);
+        first.line = 3;
+        let mut second = go_operator_mutation(2, "calc.go", source, 1);
+        second.line = 4;
+        let mutations = vec![first, second];
+        let mut selection = TestSelectionConfig::new();
+        for mutation in &mutations {
+            selection.insert(
+                root,
+                Path::new("calc.go"),
+                mutation.line,
+                vec!["TestHead".into()],
+            );
+        }
+        let script = format!("test \"$(git rev-parse HEAD)\" != \"{initial_head}\"");
+        let make_commands = || {
+            let mut commands = test_command_config();
+            commands.command = vec!["sh".into(), "-c".into(), script.clone()];
+            commands.test_selection = Some(selection.clone());
+            commands
+        };
+        let run = || {
+            let runner = TestRunner {
+                commands: make_commands(),
+                parallelism: 2,
+                project_root: root.to_path_buf(),
+                verbose: false,
+                show_output: false,
+                max_tested: None,
+                early_stop: Default::default(),
+                respect_workspace_ignores: true,
+                env: HashMap::new(),
+                incremental_history: true,
+                force_rerun: false,
+                learned_selection: true,
+                cancelled: Arc::new(AtomicBool::new(false)),
+            };
+            if use_schemata {
+                runner.run_with_schemata(mutations.clone()).report
+            } else {
+                runner.run(mutations.clone()).report
+            }
+        };
+
+        let killed = run();
+        assert_eq!(killed.killed, 2);
+        assert_eq!(killed.subsumed_count(), 0);
+        assert_eq!(killed.execution_counts().executed, 2);
+
+        // An empty commit changes only HEAD: the checked-out tree remains the
+        // same, and child worktrees are detached at that new object id.
+        run_git(root, &["commit", "--allow-empty", "-m", "same tree"]);
+        let changed_head = git_snapshot_revision(root)?;
+        assert_ne!(changed_head, initial_head);
+        let (changed_pool, changed_context) = prepare_campaign_workspace_pool(root, 2, true)?;
+        assert_eq!(changed_pool.strategy(), WorkspaceStrategy::GitWorktree);
+        drop(changed_pool);
+        assert_workspace_contexts_do_not_share_reuse(initial_context, changed_context);
+
+        let survived = run();
+        assert_eq!(survived.results.len(), 2);
+        assert_eq!(survived.survived, 2);
+        assert_eq!(survived.subsumed_count(), 0);
+        assert_eq!(survived.execution_counts().exact_cache_reused, 0);
+        assert_eq!(survived.execution_counts().incremental_history_reused, 0);
+        assert_eq!(survived.execution_counts().executed, 2);
+        if use_schemata {
+            assert!(
+                survived.schemata.is_some(),
+                "HEAD identity must reach the schemata path"
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tracked_ignored_git_to_copy_rejects_stale_reuse_in_regular_runs() -> anyhow::Result<()> {
+        assert_tracked_ignored_strategy_transition_rejects_stale_reuse(
+            WorkspaceStrategy::GitWorktree,
+            false,
+        )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tracked_ignored_copy_to_git_rejects_stale_reuse_in_regular_runs() -> anyhow::Result<()> {
+        assert_tracked_ignored_strategy_transition_rejects_stale_reuse(
+            WorkspaceStrategy::Copy,
+            false,
+        )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tracked_ignored_git_to_copy_rejects_stale_reuse_in_schemata_runs() -> anyhow::Result<()> {
+        assert_tracked_ignored_strategy_transition_rejects_stale_reuse(
+            WorkspaceStrategy::GitWorktree,
+            true,
+        )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn identical_tree_heads_reject_stale_reuse_in_regular_runs() -> anyhow::Result<()> {
+        assert_identical_tree_head_transition_rejects_stale_reuse(false)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn identical_tree_heads_reject_stale_reuse_in_schemata_runs() -> anyhow::Result<()> {
+        assert_identical_tree_head_transition_rejects_stale_reuse(true)
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn copied_workspace_fingerprint_tracks_readonly_permission() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let file = dir.path().join("helper.txt");
+        std::fs::write(&file, b"helper")?;
+
+        let mut permissions = std::fs::metadata(&file)?.permissions();
+        permissions.set_readonly(false);
+        std::fs::set_permissions(&file, permissions)?;
+        let writable = copied_workspace_fingerprint(dir.path(), false);
+
+        let mut permissions = std::fs::metadata(&file)?.permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&file, permissions)?;
+        let readonly = copied_workspace_fingerprint(dir.path(), false);
+
+        let mut permissions = std::fs::metadata(&file)?.permissions();
+        permissions.set_readonly(false);
+        std::fs::set_permissions(&file, permissions)?;
+        assert_ne!(readonly, writable);
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn copied_workspace_fingerprint_tracks_windows_file_attributes() -> anyhow::Result<()> {
+        use std::os::windows::{ffi::OsStrExt, fs::MetadataExt};
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_NORMAL, SetFileAttributesW,
+        };
+
+        fn set_file_attributes(path: &Path, attributes: u32) -> std::io::Result<()> {
+            let path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+            if unsafe { SetFileAttributesW(path.as_ptr(), attributes) } == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        }
+
+        let dir = tempfile::tempdir()?;
+        let file = dir.path().join("helper.txt");
+        std::fs::write(&file, b"helper")?;
+        let initial = copied_workspace_fingerprint(dir.path(), false);
+
+        let original_attributes = std::fs::metadata(&file)?.file_attributes();
+        let hidden_attributes =
+            (original_attributes & !FILE_ATTRIBUTE_NORMAL) | FILE_ATTRIBUTE_HIDDEN;
+        set_file_attributes(&file, hidden_attributes)?;
+        let hidden = copied_workspace_fingerprint(dir.path(), false);
+        assert_ne!(
+            hidden, initial,
+            "non-readonly Windows file attributes must affect copied-workspace identity"
+        );
+
+        let workspace = copy_workspace_with_options(dir.path(), false)?;
+        assert_eq!(
+            std::fs::metadata(&file)?.file_attributes(),
+            std::fs::metadata(workspace.root().join("helper.txt"))?.file_attributes(),
+            "canonical copies must retain the Windows attributes their fingerprint hashes"
+        );
+        set_file_attributes(&file, original_attributes)?;
+        Ok(())
+    }
+
+    #[test]
+    fn copied_workspace_fingerprint_tracks_modification_time() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let file = dir.path().join("helper.txt");
+        std::fs::write(&file, b"helper")?;
+        set_file_modification_time(&file, 1_000_000_000)?;
+        let before = copied_workspace_fingerprint(dir.path(), false);
+
+        set_file_modification_time(&file, 1_700_000_000)?;
+        assert_ne!(copied_workspace_fingerprint(dir.path(), false), before);
+        Ok(())
+    }
+
+    #[test]
+    fn copied_workspace_fingerprint_tracks_non_root_directories_and_preserves_their_mtimes()
+    -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let runtime = dir.path().join("runtime");
+        let nested = runtime.join("nested");
+        std::fs::create_dir_all(&nested)?;
+        set_file_modification_time(&runtime, 1_000_000_000)?;
+        set_file_modification_time(&nested, 1_100_000_000)?;
+        let initial = copied_workspace_fingerprint(dir.path(), false);
+
+        {
+            let workspace = copy_workspace_with_options(dir.path(), false)?;
+            for relative in [Path::new("runtime"), Path::new("runtime/nested")] {
+                assert_eq!(
+                    std::fs::metadata(dir.path().join(relative))?.modified()?,
+                    std::fs::metadata(workspace.root().join(relative))?.modified()?,
+                    "{relative:?} mtime must match after child creation"
+                );
+            }
+        }
+
+        set_file_modification_time(&runtime, 1_700_000_000)?;
+        let changed_mtime = copied_workspace_fingerprint(dir.path(), false);
+        assert_ne!(
+            changed_mtime, initial,
+            "non-root source directory mtime must affect copied-workspace identity"
+        );
+        std::fs::remove_dir_all(&runtime)?;
+        assert_ne!(
+            copied_workspace_fingerprint(dir.path(), false),
+            changed_mtime,
+            "removing an admitted empty directory must affect copied-workspace identity"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn copied_workspace_fingerprint_excludes_workspace_root_mtime() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        std::fs::write(dir.path().join("helper.txt"), b"helper")?;
+        set_file_modification_time(dir.path(), 1_000_000_000)?;
+        let before = copied_workspace_fingerprint(dir.path(), false);
+
+        set_file_modification_time(dir.path(), 1_700_000_000)?;
+        assert_eq!(
+            copied_workspace_fingerprint(dir.path(), false),
+            before,
+            "workspace-root mtime belongs to excluded control-state metadata"
+        );
+        Ok(())
+    }
+    #[cfg(windows)]
+    #[test]
+    fn windows_mtime_update_handle_supports_directories() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let directory = dir.path().join("directory");
+        std::fs::create_dir(&directory)?;
+
+        set_file_modification_time(&directory, 1_000_000_000)?;
+        assert_eq!(
+            std::fs::metadata(&directory)?
+                .modified()?
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_secs(),
+            1_000_000_000
+        );
+        Ok(())
     }
 
     #[test]
@@ -8405,6 +11335,14 @@ test "$runs" -eq 1
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    fn set_file_modification_time(path: &Path, seconds_since_epoch: u64) -> std::io::Result<()> {
+        let is_directory = fs::symlink_metadata(path)?.file_type().is_dir();
+        open_for_mtime_update(path, is_directory)?.set_times(
+            fs::FileTimes::new()
+                .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(seconds_since_epoch)),
+        )
     }
 
     fn init_clean_git_fixture(root: &Path) {
@@ -9195,6 +12133,7 @@ test "$runs" -eq 1
         )
         .unwrap();
 
+        let cached_context = workspace_cache_context(dir.path(), true);
         let mut runner = confirmation_runner(dir.path(), commands, env);
         runner.force_rerun = false;
         let report = runner.run(vec![mutation.clone()]).report;
@@ -9225,15 +12164,15 @@ test "$runs" -eq 1
             &source,
             &cache_identity(dir.path(), &mutation),
             &mutation.description,
-            &format!(
-                "{};context={:016x}",
-                selected.cache_context(
+            &exact_cache_context(
+                &selected.cache_context(
                     &runner.commands.build_command,
                     runner.commands.build_command_origin,
                     &runner.commands.sandbox_command,
                     &runner.env,
                 ),
-                cache_context_fingerprint(dir.path())
+                cached_context.fingerprint,
+                cached_context.provenance,
             ),
         );
         assert_eq!(
@@ -9352,7 +12291,7 @@ test "$runs" -eq 1
     }
 
     #[test]
-    fn select_test_command_prioritizes_history_killer() -> anyhow::Result<()> {
+    fn select_test_command_scopes_history_killer_to_workspace_context() -> anyhow::Result<()> {
         let tmp = tempfile::tempdir()?;
         let mut selection = TestSelectionConfig::new();
         selection.insert(
@@ -9368,6 +12307,18 @@ test "$runs" -eq 1
 
         let mut mutation = make_test_mutation(Path::new("src/calc.py"));
         mutation.line = 3;
+        let test_context_index = TestContextIndex::default();
+        let learned_selection_context = LearnedSelectionContext {
+            test_context_index: &test_context_index,
+            cache_context_fingerprint: 0x0123_4567_89ab_cdef,
+            cache_context_provenance: WorkspaceCacheContextProvenance::WorkspaceCopy {
+                respect_workspace_ignores: true,
+            },
+        };
+        let candidate_tests = vec!["test_slow".into(), "test_fast".into()];
+        let relevant_test_hash = learned_selection_context
+            .relevant_test_hash_for_killer(&candidate_tests, "test_fast")
+            .expect("recorded killer must be a candidate");
         let history = cache::IncrementalHistoryStore::load(tmp.path());
         history.record(cache::IncrementalHistoryEntry {
             mutation_identity: cache_identity(tmp.path(), &mutation),
@@ -9375,17 +12326,123 @@ test "$runs" -eq 1
             result: MutationResult::Killed,
             source_hash: 1,
             command_hash: 2,
-            relevant_test_hash: 3,
-            covering_tests: vec!["test_slow".into(), "test_fast".into()],
+            relevant_test_hash,
+            covering_tests: candidate_tests,
             killer_test: Some("test_fast".into()),
         });
 
-        let selected =
-            select_test_command_with_history(tmp.path(), &commands, &mutation, Some(&history));
+        let selected = select_test_command_with_history(
+            tmp.path(),
+            &commands,
+            &mutation,
+            Some(&history),
+            Some(learned_selection_context),
+        );
 
         assert_eq!(
             selected.argv,
             vec!["pytest", "-k", "test_fast or test_slow"]
+        );
+        let git_selection_context = LearnedSelectionContext {
+            test_context_index: &test_context_index,
+            cache_context_fingerprint: learned_selection_context.cache_context_fingerprint,
+            cache_context_provenance: WorkspaceCacheContextProvenance::GitWorktreeV4,
+        };
+        let cross_context = select_test_command_with_history(
+            tmp.path(),
+            &commands,
+            &mutation,
+            Some(&history),
+            Some(git_selection_context),
+        );
+        assert_eq!(
+            cross_context.argv,
+            vec!["pytest", "-k", "test_slow or test_fast"],
+            "a copy-domain killer must not reorder Git-worktree selection"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn learned_selection_reorders_a_fresh_fast_killer() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir()?;
+        let root = dir.path();
+        std::fs::write(
+            root.join("calc.py"),
+            "hello\n\ndef test_slow():\n    pass\n\ndef test_fast():\n    pass\n",
+        )?;
+        let log_dir = tempfile::tempdir()?;
+        let log = log_dir.path().join("pytest.log");
+        let bin = root.join("bin");
+        std::fs::create_dir(&bin)?;
+        let pytest = bin.join("pytest");
+        std::fs::write(
+            &pytest,
+            b"#!/bin/sh\nprintf '<%s>\\n' \"$*\" >> \"$TOGI_TEST_LOG\"\nprintf 'test test_fast ... FAILED\\n'\nexit 1\n",
+        )?;
+        let mut permissions = std::fs::metadata(&pytest)?.permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&pytest, permissions)?;
+
+        let mut selection = TestSelectionConfig::new();
+        selection.insert(
+            root,
+            Path::new("calc.py"),
+            1,
+            vec!["test_slow".into(), "test_fast".into()],
+        );
+        let mutation = make_test_mutation(Path::new("calc.py"));
+        let make_commands = || {
+            let mut commands = test_command_config();
+            commands.command = vec!["pytest".into()];
+            commands.test_selection = Some(selection.clone());
+            commands
+        };
+        let mut env = HashMap::new();
+        env.insert(
+            "PATH".into(),
+            format!(
+                "{}:{}",
+                bin.display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        );
+        env.insert("TOGI_TEST_LOG".into(), log.display().to_string());
+        let run = || {
+            TestRunner {
+                commands: make_commands(),
+                parallelism: 1,
+                project_root: root.to_path_buf(),
+                verbose: false,
+                show_output: false,
+                max_tested: None,
+                early_stop: EarlyStopConfig::default(),
+                respect_workspace_ignores: true,
+                env: env.clone(),
+                incremental_history: true,
+                force_rerun: true,
+                learned_selection: true,
+                cancelled: Arc::new(AtomicBool::new(false)),
+            }
+            .run(vec![mutation.clone()])
+            .report
+        };
+
+        let first = run();
+        assert_eq!(first.killed, 1);
+        let history: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.join(".togi-cache/history.json"))?)?;
+        assert_eq!(history["entries"][0]["killer_test"], "test_fast");
+
+        let second = run();
+        assert_eq!(second.killed, 1);
+        assert_eq!(
+            std::fs::read_to_string(log)?.lines().collect::<Vec<_>>(),
+            ["<-k test_slow or test_fast>", "<-k test_fast or test_slow>"],
+            "the learned fast killer must move ahead of the configured slow test"
         );
         Ok(())
     }
@@ -9417,7 +12474,7 @@ test "$runs" -eq 1
 
         let command_config = commands();
         let selected =
-            select_test_command_with_history(dir.path(), &command_config, &mutation, None);
+            select_test_command_with_history(dir.path(), &command_config, &mutation, None, None);
         let command_ctx = selected.cache_context(
             &command_config.build_command,
             BuildCommandOrigin::None,
@@ -9426,7 +12483,7 @@ test "$runs" -eq 1
         );
         let context_hash = cache_context_fingerprint(dir.path());
         let test_context_index = TestContextIndex::build(dir.path());
-        let relevant_test_hash =
+        let selected_test_hash =
             test_context_index.fingerprint_for_tests(&selected.selected_tests, context_hash);
         let source = std::fs::read(&file)?;
         let query = incremental_history_query(
@@ -9434,7 +12491,9 @@ test "$runs" -eq 1
             &mutation,
             &source,
             &command_ctx,
-            relevant_test_hash,
+            selected_test_hash,
+            context_hash,
+            workspace_cache_context(dir.path(), true).provenance,
         );
         cache::IncrementalHistoryStore::load(dir.path()).record(cache::IncrementalHistoryEntry {
             mutation_identity: query.mutation_identity.clone(),
@@ -9543,7 +12602,11 @@ test "$runs" -eq 1
             &std::fs::read(dir.path().join(&cached.file))?,
             &cache_identity(dir.path(), &cached),
             &cached.description,
-            &format!("{context};context={context_hash:016x}"),
+            &exact_cache_context(
+                &context,
+                context_hash,
+                workspace_cache_context(dir.path(), true).provenance,
+            ),
         );
         cache::store(dir.path(), &key, MutationResult::BuildError);
 
@@ -9562,6 +12625,8 @@ test "$runs" -eq 1
             &source,
             &command_context,
             test_context_index.fingerprint_for_tests(&selected.selected_tests, context_hash),
+            context_hash,
+            workspace_cache_context(dir.path(), true).provenance,
         );
         cache::IncrementalHistoryStore::load(dir.path()).record(cache::IncrementalHistoryEntry {
             mutation_identity: query.mutation_identity,
@@ -9652,7 +12717,7 @@ test "$runs" -eq 1
         );
         let context_hash = cache_context_fingerprint(dir.path());
         let test_context_index = TestContextIndex::build(dir.path());
-        let relevant_test_hash =
+        let selected_test_hash =
             test_context_index.fingerprint_for_tests(&selected.selected_tests, context_hash);
         let source = std::fs::read(&file)?;
         let query = incremental_history_query(
@@ -9660,7 +12725,9 @@ test "$runs" -eq 1
             &mutation,
             &source,
             &command_ctx,
-            relevant_test_hash,
+            selected_test_hash,
+            context_hash,
+            workspace_cache_context(dir.path(), true).provenance,
         );
         cache::IncrementalHistoryStore::load(dir.path()).record(cache::IncrementalHistoryEntry {
             mutation_identity: query.mutation_identity.clone(),
@@ -9835,9 +12902,8 @@ test "$runs" -eq 1
 
     /// Seed a Killed entry with a shared killer test for each mutation.
     ///
-    /// `relevant_test_hash` is deliberately stale so verdict restore misses:
-    /// the canonical mutant really executes, making the subsumed siblings'
-    /// skipped execution observable in the report.
+    /// `force_rerun` bypasses verdict restore so the canonical mutant executes,
+    /// while learned selection still consumes this matching evidence.
     fn seed_killer_cluster_history(dir: &Path, file: &Path, mutations: &[Mutation]) {
         let commands = CommandConfig {
             command: failing_command(),
@@ -9854,6 +12920,7 @@ test "$runs" -eq 1
         };
         let store = cache::IncrementalHistoryStore::load(dir);
         let source = std::fs::read(file).expect("source file should exist");
+        let campaign_context = CampaignCacheContext::build(dir, true);
         for mutation in mutations {
             let selected = select_test_command(dir, &commands, mutation);
             let command_ctx = selected.cache_context(
@@ -9862,13 +12929,21 @@ test "$runs" -eq 1
                 &commands.sandbox_command,
                 &HashMap::new(),
             );
+            let selected_test_hash = campaign_context.test_context_index.fingerprint_for_tests(
+                &selected.selected_tests,
+                campaign_context.cache_context_fingerprint,
+            );
             store.record(cache::IncrementalHistoryEntry {
                 mutation_identity: cache_identity(dir, mutation),
                 mutation_description: mutation.description.clone(),
                 result: MutationResult::Killed,
                 source_hash: cache::hash_bytes(&source),
                 command_hash: cache::hash_str(&command_ctx),
-                relevant_test_hash: 3,
+                relevant_test_hash: incremental_history_relevant_test_hash(
+                    selected_test_hash,
+                    campaign_context.cache_context_fingerprint,
+                    campaign_context.cache_context_provenance,
+                ),
                 covering_tests: vec!["test_shared".into()],
                 killer_test: Some("test_shared".into()),
             });
@@ -9899,7 +12974,7 @@ test "$runs" -eq 1
             respect_workspace_ignores: true,
             env: HashMap::new(),
             incremental_history: true,
-            force_rerun: false,
+            force_rerun: true,
             learned_selection,
             cancelled: Arc::new(AtomicBool::new(false)),
         }
@@ -10128,6 +13203,7 @@ test "$runs" -eq 1
         std::fs::create_dir_all(root.join("target/debug")).unwrap();
         std::fs::write(root.join(".gitignore"), b"ignored.txt\n").unwrap();
         std::fs::write(root.join("ignored.txt"), b"copy me").unwrap();
+        set_file_modification_time(&root.join("ignored.txt"), 1_000_000_000).unwrap();
         std::fs::write(root.join("src/lib.rs"), b"pub fn f() {}\n").unwrap();
         std::fs::write(root.join("target/debug/build-artifact"), b"skip").unwrap();
 
@@ -10136,6 +13212,16 @@ test "$runs" -eq 1
         assert_eq!(
             std::fs::read(copy.root().join("ignored.txt")).unwrap(),
             b"copy me"
+        );
+        assert_eq!(
+            std::fs::metadata(copy.root().join("ignored.txt"))
+                .unwrap()
+                .modified()
+                .unwrap()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            1_000_000_000
         );
         assert!(copy.root().join("src/lib.rs").exists());
         assert!(!copy.root().join("target").exists());
@@ -10436,6 +13522,36 @@ test "$runs" -eq 1
                 .is_file()
         );
         assert_eq!(std::fs::read(destination)?, b"overlay contents");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn normal_overlay_copy_preserves_regular_file_metadata() -> std::io::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir()?;
+        let root = tmp.path().join("project");
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir(&root)?;
+        std::fs::create_dir(&workspace)?;
+        let source = root.join("helper.sh");
+        std::fs::write(&source, b"#!/bin/sh\nexit 0\n")?;
+        set_file_modification_time(&source, 1_000_000_000)?;
+        let mut permissions = std::fs::metadata(&source)?.permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&source, permissions)?;
+
+        copy_overlay_file(&root, &workspace, Path::new("helper.sh"))?;
+        let destination = workspace.join("helper.sh");
+        assert_eq!(
+            std::fs::metadata(&destination)?.modified()?,
+            std::fs::metadata(&source)?.modified()?
+        );
+        assert_eq!(
+            std::fs::metadata(&destination)?.permissions().mode() & 0o777,
+            0o755
+        );
         Ok(())
     }
 
@@ -11850,6 +14966,45 @@ sleep 10"#
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "hello world");
     }
 
+    #[test]
+    fn pre_cancelled_campaigns_preserve_regular_and_schemata_reporting() {
+        let (dir, _, mutation) = make_relative_test_setup();
+        let runner = TestRunner {
+            commands: test_command_config(),
+            parallelism: 1,
+            project_root: dir.path().to_path_buf(),
+            verbose: false,
+            show_output: false,
+            max_tested: None,
+            early_stop: Default::default(),
+            respect_workspace_ignores: true,
+            env: HashMap::new(),
+            incremental_history: false,
+            force_rerun: false,
+            learned_selection: false,
+            cancelled: Arc::new(AtomicBool::new(true)),
+        };
+
+        let regular = runner.run(vec![mutation.clone()]);
+        assert!(regular.cancelled);
+        assert!(regular.report.results.is_empty());
+        assert_eq!(regular.report.total, 0);
+        assert_eq!(regular.report.planned_total, 1);
+        assert!(regular.report.schemata.is_none());
+
+        let schemata = runner.run_with_schemata(vec![mutation]);
+        assert!(schemata.cancelled);
+        assert!(schemata.report.results.is_empty());
+        assert_eq!(schemata.report.total, 0);
+        assert_eq!(schemata.report.planned_total, 1);
+        let summary = schemata
+            .report
+            .schemata
+            .expect("pre-cancelled schemata run must retain its summary");
+        assert_eq!(summary.fast_path, 0);
+        assert_eq!(summary.fallback, 1);
+    }
+
     #[cfg(unix)]
     #[test]
     fn run_with_schemata_reports_unsupported_runner_fallback() {
@@ -12276,9 +15431,10 @@ esac
             &commands.sandbox_command,
             &cache_env,
         );
-        let cache_ctx = format!(
-            "{cache_ctx};context={:016x}",
-            cache_context_fingerprint(dir.path())
+        let cache_ctx = exact_cache_context(
+            &cache_ctx,
+            cache_context_fingerprint(dir.path()),
+            workspace_cache_context(dir.path(), true).provenance,
         );
         let key = CacheKey::new(
             source.as_bytes(),
@@ -12365,14 +15521,16 @@ esac
         let source_content = std::fs::read(dir.path().join("calc.go"))?;
         let context_hash = cache_context_fingerprint(dir.path());
         let test_context_index = TestContextIndex::build(dir.path());
-        let relevant_test_hash =
+        let selected_test_hash =
             test_context_index.fingerprint_for_tests(&selected.selected_tests, context_hash);
         let query = incremental_history_query(
             dir.path(),
             &mutation,
             &source_content,
             &command_context,
-            relevant_test_hash,
+            selected_test_hash,
+            context_hash,
+            workspace_cache_context(dir.path(), true).provenance,
         );
         cache::IncrementalHistoryStore::load(dir.path()).record(cache::IncrementalHistoryEntry {
             mutation_identity: query.mutation_identity,
@@ -12758,7 +15916,11 @@ def second(c, d):
                 &commands.sandbox_command,
                 &env,
             );
-            let context = format!("{context};context={context_hash:016x}");
+            let context = exact_cache_context(
+                &context,
+                context_hash,
+                workspace_cache_context(dir.path(), true).provenance,
+            );
             let source = std::fs::read(dir.path().join(&mutation.file))?;
             let key = CacheKey::new(
                 &source,
@@ -12786,6 +15948,8 @@ def second(c, d):
             &source,
             &command_context,
             test_context_index.fingerprint_for_tests(&selected.selected_tests, context_hash),
+            context_hash,
+            workspace_cache_context(dir.path(), true).provenance,
         );
         cache::IncrementalHistoryStore::load(dir.path()).record(cache::IncrementalHistoryEntry {
             mutation_identity: query.mutation_identity,
@@ -13186,6 +16350,75 @@ mod tests {
 
         let report = runner.run(mutations).report;
         assert_eq!(report.total, 2, "should stop after max_tested");
+    }
+
+    #[test]
+    fn worker_panic_records_build_error_and_stops_campaign() {
+        let (dir, file, first) = make_test_setup();
+        let mut second = make_test_mutation(&file);
+        second.id = 2;
+        second.description = "second mutation".into();
+        let project_root = dir.path().to_path_buf();
+        let mutation_id = first.id;
+        let panicked = Arc::new(AtomicBool::new(false));
+        let hook_root = project_root.clone();
+        let hook_panicked = panicked.clone();
+        set_mutation_worker_after_dequeue_hook(Some(Arc::new(move |root, mutation| {
+            if root == hook_root.as_path()
+                && mutation.id == mutation_id
+                && !hook_panicked.swap(true, Ordering::AcqRel)
+            {
+                panic!("simulated mutation worker panic after dequeue");
+            }
+        })));
+
+        let command_log = dir.path().join("worker-command.log");
+        let mut commands = test_command_config();
+        commands.command = appending_log_command(&command_log);
+        let runner = TestRunner {
+            commands,
+            parallelism: 1,
+            project_root,
+            verbose: false,
+            show_output: false,
+            max_tested: None,
+            early_stop: Default::default(),
+            respect_workspace_ignores: true,
+            env: HashMap::new(),
+            incremental_history: false,
+            force_rerun: true,
+            learned_selection: false,
+            cancelled: Arc::new(AtomicBool::new(false)),
+        };
+
+        let outcome = runner.run(vec![first, second]);
+        set_mutation_worker_after_dequeue_hook(None);
+
+        assert!(panicked.load(Ordering::Acquire));
+        assert!(!outcome.cancelled);
+        let report = outcome.report;
+        assert_eq!(report.planned_total, 2);
+        assert_eq!(report.total, 1);
+        let (recorded, result) = report
+            .results
+            .first()
+            .expect("the panicked mutation should be recorded");
+        assert_eq!(recorded.id, mutation_id);
+        assert_eq!(*result, MutationResult::BuildError);
+        assert_eq!(report.build_errors, 1);
+        let diagnostic = report
+            .build_error_diagnostics
+            .first()
+            .expect("the panic should retain a build-error diagnostic");
+        assert_eq!(diagnostic.mutation_id, mutation_id);
+        assert_eq!(diagnostic.runner, "regular");
+        assert_eq!(diagnostic.phase, "mutation_worker_panic");
+        assert!(diagnostic.message.contains("mutation worker panicked"));
+        assert!(
+            !command_log.exists(),
+            "no later mutation should be scheduled"
+        );
+        assert!(!crate::baseline::is_baseline_eligible(&report));
     }
 
     #[test]
@@ -13752,9 +16985,10 @@ rmdir "$lock"
                 &commands.sandbox_command,
                 &env,
             );
-            let cache_ctx = format!(
-                "{cache_ctx};context={:016x}",
-                cache_context_fingerprint(dir.path())
+            let cache_ctx = exact_cache_context(
+                &cache_ctx,
+                cache_context_fingerprint(dir.path()),
+                workspace_cache_context(dir.path(), true).provenance,
             );
             let cached_content = std::fs::read(&cached_file).unwrap();
             let key = CacheKey::new(
