@@ -26,7 +26,7 @@ Mutation testing is usually too slow to run on every PR. togi is built for the P
 - **Performance controls**: caching, sharding, fail-fast commands, LCOV filtering, and source-line test selection
 - **Guardrails**: build pre-checks, baselines, operator filters, noisy-file skips, and path-safe mutation execution
 
-If a mutation survives, your tests still pass after behavior changed. That is a concrete test gap.
+If a mutation survives, your tests still pass after the edit. Check whether it changes observable behavior: a behavior-changing survivor is a test gap; an equivalent mutation is not.
 
 ```
 $ togi check --base HEAD~1
@@ -199,6 +199,9 @@ togi explain 1 --report togi-report.json
 
 # Force a fresh replay from a trusted versioned JSON report
 togi replay 1 --report togi-report.json
+
+# After improving tests, verify that the same survivor is now killed
+togi replay 1 --report togi-report.json --verify-killed
 
 # GitHub annotations or HTML report
 togi check --format github
@@ -702,6 +705,8 @@ Baselines let existing weak spots stay visible without blocking every PR. New re
 
 Schemata are enabled by default. They batch compatible mutations into one build and switch mutants at runtime with `TOGI_MUTANT`. The runner currently supports expression-safe mutations in runtime contexts for Go, Rust, Java, C, and C++; unsupported languages, unsupported operators, and compile-time contexts automatically fall back to the regular one-mutant-at-a-time runner. Use `--no-schemata` or `schemata = false` to force regular execution.
 
+Before reporting a schemata survivor, Togi confirms the concrete edit with a fresh, regular run of its full test route. This also applies to cached schemata survivors: confirmation consumes one tested-mutant slot and records a direct replay recipe in a source-validated JSON report. Killed schemata mutants keep the fast path; they do not gain a direct replay recipe.
+
 ## Coverage and test selection
 
 For large repos, togi can avoid work before the runner starts and can also
@@ -775,15 +780,17 @@ Duration: 1.59s
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ```
 
-Each surviving mutation reveals a concrete test gap:
+Most survivors here expose test gaps, but one is equivalent:
 
 - **`false_to_true` at line 13** — `TestIsPositive` never checks `IsPositive(0)` or negative inputs
-- **`gt_to_gte` at line 18** — `TestMax` only tests `Max(3,5)`, never the `a > b` path
-- **`return_empty` at line 19** — same: `Max` return value never verified for first-arg-wins
+- **`gt_to_gte` at line 18** — equivalent: when `a == b`, either branch returns the same integer. No test can distinguish this edit.
+- **`return_empty` at line 19** — `Max` return value never verified for first-arg-wins; add an assertion such as `Max(5,3) == 5`
 - **`zero_to_one` at line 26** — `TestAbs` is entirely missing
 - **`return_empty` at line 29** — `Abs` return value never tested
 
 Run it yourself: `cargo test -- --ignored` (requires Go).
+
+To close a genuine gap, save a JSON report, replay its survivor, then add a test and run `togi replay <id> --report togi-report.json --verify-killed`. Verification succeeds only if the unmutated build/test route passes and a fresh direct run kills that exact mutant, using two isolated copies of the same input snapshot. Ordinary replay still checks the historical outcome and Git HEAD. Verification allows committed or uncommitted test changes at a different HEAD, but the entire target source file must remain unchanged (including any inline tests). It proves the snapshotted suite rejects the mutant, not that only tests changed or that the suite is non-flaky. Both modes use the report's stored commands and leave the report and Togi cache/history unchanged.
 
 ## Supported languages
 
