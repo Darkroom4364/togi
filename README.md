@@ -200,6 +200,9 @@ togi explain 1 --report togi-report.json
 # Force a fresh replay from a trusted versioned JSON report
 togi replay 1 --report togi-report.json
 
+# After improving tests, verify that the same survivor is now killed
+togi replay 1 --report togi-report.json --verify-killed
+
 # GitHub annotations or HTML report
 togi check --format github
 togi check --format html
@@ -786,6 +789,8 @@ Each surviving mutation reveals a concrete test gap:
 - **`return_empty` at line 29** — `Abs` return value never tested
 
 Run it yourself: `cargo test -- --ignored` (requires Go).
+
+To close a genuine gap, save a JSON report, replay its survivor, then add a test and run `togi replay <id> --report togi-report.json --verify-killed`. Verification succeeds only if the current unmutated build/test route passes and a fresh direct run kills that exact mutant. Ordinary replay still checks the historical outcome and Git HEAD. Verification allows committed or uncommitted test changes at a different HEAD, but the entire target source file must remain unchanged (including any inline tests). It proves the current suite rejects the mutant, not that only tests changed or that the suite is non-flaky. Both modes use the report's stored commands and leave the report and Togi cache/history unchanged.
 
 ## Supported languages
 

@@ -417,6 +417,302 @@ fn replay_forces_a_real_direct_execution_without_source_or_cache_residue() {
 }
 
 #[test]
+fn verify_killed_fails_closed_before_or_after_execution() {
+    for (case, expected_error, invocations) in [
+        ("survived", "repair not verified: expected killed", 2),
+        ("baseline", "current unmutated suite must pass first", 1),
+        (
+            "baseline-side-effect",
+            "repair not verified: expected killed",
+            2,
+        ),
+        ("source", "source fingerprint does not match", 0),
+        ("not-survivor", "requires a recorded survivor", 0),
+    ] {
+        let fixture = setup_replay_fixture();
+        match case {
+            "baseline" => {
+                #[cfg(windows)]
+                fs::write(
+                    fixture.repo.path().join("test.cmd"),
+                    "@echo off\r\n>>\"%TOGI_REPLAY_LOG%\" echo x\r\nexit /b 1\r\n",
+                )
+                .unwrap();
+                #[cfg(not(windows))]
+                fs::write(
+                    fixture.repo.path().join("test.sh"),
+                    "printf x >> \"$TOGI_REPLAY_LOG\"\nexit 1\n",
+                )
+                .unwrap();
+            }
+            "source" => fs::write(&fixture.source_path, "package main\n// changed\n").unwrap(),
+            "baseline-side-effect" => {
+                #[cfg(windows)]
+                fs::write(fixture.repo.path().join("test.cmd"), "@echo off\r\n>>\"%TOGI_REPLAY_LOG%\" echo x\r\nif exist baseline-side-effect exit /b 1\r\ntype nul >baseline-side-effect\r\nexit /b 0\r\n").unwrap();
+                #[cfg(not(windows))]
+                fs::write(fixture.repo.path().join("test.sh"), "printf x >> \"$TOGI_REPLAY_LOG\"\ntest ! -f baseline-side-effect || exit 1\ntouch baseline-side-effect\n").unwrap();
+            }
+            "not-survivor" => {
+                let mut report = fixture.report.clone();
+                report["mutations"][0]["result"] = json!("killed");
+                write_json(&fixture.report_path, &report);
+            }
+            _ => {}
+        }
+        let log_before = fs::read(&fixture.log_path).unwrap();
+        let output = verify_fixture(&fixture);
+        assert_eq!(output.status.code(), Some(2), "{case}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(expected_error),
+            "{case}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("Verified:"));
+        let log_after = fs::read(&fixture.log_path).unwrap();
+        assert_eq!(
+            log_after.iter().filter(|&&b| b == b'x').count()
+                - log_before.iter().filter(|&&b| b == b'x').count(),
+            invocations,
+            "{case}"
+        );
+    }
+}
+
+fn verify_fixture(fixture: &ReplayFixture) -> std::process::Output {
+    togi()
+        .args([
+            "replay",
+            &fixture.report["mutations"][0]["id"].to_string(),
+            "--report",
+            fixture.report_path.to_str().unwrap(),
+            "--verify-killed",
+        ])
+        .current_dir(fixture.repo.path())
+        .env("TOGI_REPLAY_LOG", &fixture.log_path)
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn verify_killed_accepts_committed_and_uncommitted_tests_without_residue() {
+    let fixture = setup_replay_fixture();
+    let root = fixture.repo.path();
+    let source = fs::read(&fixture.source_path).unwrap();
+    fs::write(root.join("original.txt"), &source).unwrap();
+    // The baseline writes a sentinel. Verification must use a clean workspace
+    // for the mutant so an unrelated baseline side effect cannot count as a kill.
+    #[cfg(windows)]
+    fs::write(root.join("test.cmd"), "@echo off\r\n>>\"%TOGI_REPLAY_LOG%\" echo x\r\nif exist baseline-side-effect exit /b 1\r\ntype nul >baseline-side-effect\r\nfc /B main.go original.txt >nul\r\nexit /b %errorlevel%\r\n").unwrap();
+    #[cfg(not(windows))]
+    fs::write(root.join("test.sh"), "printf x >> \"$TOGI_REPLAY_LOG\"\ntest ! -f baseline-side-effect || exit 1\ntouch baseline-side-effect\ncmp -s main.go original.txt\n").unwrap();
+    for committed in [false, true] {
+        if committed {
+            git(root, &["add", "main.go", "original.txt"]);
+            #[cfg(windows)]
+            git(root, &["add", "test.cmd"]);
+            #[cfg(not(windows))]
+            git(root, &["add", "test.sh"]);
+            git(root, &["commit", "-m", "test repair"]);
+        }
+        let status_before = git_status(root);
+        let cache_before = snapshot_tree(&root.join(".togi-cache"));
+        let report_before = fs::read(&fixture.report_path).unwrap();
+        let output = verify_fixture(&fixture);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("current unmutated suite passed"));
+        assert!(stdout.contains("Fresh result: killed"));
+        assert!(stdout.contains("Verified: the current suite kills mutation"));
+        assert_eq!(fs::read(&fixture.source_path).unwrap(), source);
+        assert_eq!(git_status(root), status_before);
+        assert_eq!(snapshot_tree(&root.join(".togi-cache")), cache_before);
+        assert_eq!(fs::read(&fixture.report_path).unwrap(), report_before);
+        assert!(!root.join("baseline-side-effect").exists());
+
+        let historical = togi()
+            .args([
+                "replay",
+                &fixture.report["mutations"][0]["id"].to_string(),
+                "--report",
+                fixture.report_path.to_str().unwrap(),
+            ])
+            .current_dir(root)
+            .env("TOGI_REPLAY_LOG", &fixture.log_path)
+            .output()
+            .unwrap();
+        assert_eq!(historical.status.code(), Some(2));
+        assert!(
+            String::from_utf8_lossy(&historical.stderr).contains(if committed {
+                "does not match current Git HEAD"
+            } else {
+                "replay divergence"
+            })
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn verify_killed_does_not_accept_timeout_or_build_error() {
+    for result in ["timeout", "build_error"] {
+        let fixture = setup_replay_fixture();
+        fs::write(
+            fixture.repo.path().join("original.txt"),
+            fs::read(&fixture.source_path).unwrap(),
+        )
+        .unwrap();
+        let mut report = fixture.report.clone();
+        let recipe = &mut report["mutations"][0]["replay"];
+        if result == "timeout" {
+            recipe["timeout_ms"] = json!(500);
+            recipe["test_command"] = json!(["sh", "-c", "cmp -s main.go original.txt || sleep 2"]);
+        } else {
+            recipe["build_command"] = json!(["sh", "-c", "cmp -s main.go original.txt"]);
+            recipe["build_command_origin"] = json!("configured");
+        }
+        write_json(&fixture.report_path, &report);
+        let output = verify_fixture(&fixture);
+        assert_eq!(output.status.code(), Some(2));
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains(&format!("fresh execution returned {result}")),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("Verified:"));
+    }
+}
+
+#[test]
+#[ignore = "requires Go"]
+fn default_go_survivor_can_be_replayed_and_verified_after_a_boundary_test() {
+    let repo = TempDir::new().unwrap();
+    let state = TempDir::new().unwrap();
+    let root = repo.path();
+    git(root, &["init"]);
+    git(root, &["config", "user.email", "test@example.com"]);
+    git(root, &["config", "user.name", "Togi Test"]);
+    git(root, &["config", "core.autocrlf", "false"]);
+    let source = "package boundary\n\nfunc Above(n int) bool { return n > 10 }\n";
+    let weak_tests = "package boundary\nimport \"testing\"\nfunc TestAbove(t *testing.T) {\n if Above(9) || !Above(11) { t.Fatal(\"wrong result\") }\n}\n";
+    fs::write(root.join("calc.go"), source).unwrap();
+    fs::write(root.join("calc_test.go"), weak_tests).unwrap();
+    fs::write(
+        root.join("go.mod"),
+        "module example.com/boundary\n\ngo 1.21\n",
+    )
+    .unwrap();
+    fs::write(root.join(".gitignore"), "/.togi-cache/\n/.togi.lock\n").unwrap();
+    git(root, &["add", "."]);
+    git(root, &["commit", "-m", "weak tests"]);
+    let go_cache = state.path().join("go-cache");
+    let campaign = togi()
+        .args([
+            "check",
+            "--all",
+            "--operators",
+            "gt_to_gte",
+            "--max-per-run",
+            "1",
+            "--timeout",
+            "60",
+            "--format",
+            "json",
+        ])
+        .current_dir(root)
+        .env("GOCACHE", &go_cache)
+        .env("GOTOOLCHAIN", "local")
+        .output()
+        .unwrap();
+    assert_eq!(
+        campaign.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&campaign.stderr)
+    );
+    let report: Value = serde_json::from_slice(&campaign.stdout).unwrap();
+    let mutation = &report["mutations"][0];
+    assert_eq!(report["mutations"].as_array().unwrap().len(), 1);
+    assert_eq!(report["schemata"]["fast_path"], 1);
+    assert_eq!(mutation["result"], "survived");
+    assert_eq!(mutation["execution"]["state"], "executed");
+    assert_eq!(mutation["replay"]["kind"], "regular_direct");
+    assert!(
+        mutation["replay"]["test_command"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("-count=1"))
+    );
+    assert!(mutation["replay"]["env"].get("TOGI_MUTANT").is_none());
+    let report_path = state.path().join("report.json");
+    fs::write(&report_path, &campaign.stdout).unwrap();
+    let replay = |verify: bool| {
+        let mut command = togi();
+        command.args([
+            "replay",
+            &mutation["id"].to_string(),
+            "--report",
+            report_path.to_str().unwrap(),
+        ]);
+        if verify {
+            command.arg("--verify-killed");
+        }
+        command
+            .current_dir(root)
+            .env("GOCACHE", &go_cache)
+            .env("GOTOOLCHAIN", "local")
+            .output()
+            .unwrap()
+    };
+    let historical = replay(false);
+    assert!(
+        historical.status.success(),
+        "{}",
+        String::from_utf8_lossy(&historical.stderr)
+    );
+    assert!(String::from_utf8_lossy(&historical.stdout).contains("Fresh result: survived"));
+    assert_eq!(
+        replay(true).status.code(),
+        Some(2),
+        "unchanged weak tests must not verify"
+    );
+    let strong_tests = format!(
+        "{weak_tests}\nfunc TestBoundary(t *testing.T) {{ if Above(10) {{ t.Fatal(\"10 is not above 10\") }} }}\n"
+    );
+    fs::write(root.join("calc_test.go"), &strong_tests).unwrap();
+    for committed in [false, true] {
+        if committed {
+            git(root, &["add", "calc_test.go"]);
+            git(root, &["commit", "-m", "cover the boundary"]);
+        }
+        let cache_before = snapshot_tree(&root.join(".togi-cache"));
+        let status_before = git_status(root);
+        let verified = replay(true);
+        assert!(
+            verified.status.success(),
+            "{}",
+            String::from_utf8_lossy(&verified.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&verified.stdout)
+                .contains("Verified: the current suite kills mutation")
+        );
+        assert_eq!(fs::read_to_string(root.join("calc.go")).unwrap(), source);
+        assert_eq!(
+            fs::read_to_string(root.join("calc_test.go")).unwrap(),
+            strong_tests
+        );
+        assert_eq!(snapshot_tree(&root.join(".togi-cache")), cache_before);
+        assert_eq!(git_status(root), status_before);
+        assert_eq!(fs::read(&report_path).unwrap(), campaign.stdout);
+    }
+}
+
+#[test]
 fn legacy_report_without_build_origin_replays_configured_go_lookalike_unchanged() {
     let fixture = setup_replay_fixture();
     let id = fixture.report["mutations"][0]["id"]

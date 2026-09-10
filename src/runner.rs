@@ -5699,6 +5699,47 @@ fn validate_replay_snapshot_target(
     Ok(())
 }
 
+/// Verify against the current suite only after its unmutated route passes in
+/// a separate disposable workspace, so baseline side effects cannot kill the mutant.
+pub fn run_repair_verification(
+    project_root: &Path,
+    mutation: &Mutation,
+    config: ReplayRunConfig<'_>,
+) -> anyhow::Result<ReplayRunOutcome> {
+    {
+        let workspace = copy_workspace_for_replay(
+            project_root,
+            config.source_revision,
+            config.respect_workspace_ignores,
+        )
+        .context("could not create repair baseline workspace")?;
+        let target = ResolvedMutation::new_for_replay(project_root, workspace.root(), mutation);
+        validate_replay_snapshot_target(&workspace, &target, config.source_fingerprint)?;
+        for (phase, command) in config
+            .build_command
+            .as_deref()
+            .map(|command| (SuiteFailurePhase::Build, command))
+            .into_iter()
+            .chain(std::iter::once((
+                SuiteFailurePhase::Test,
+                config.test_command.as_slice(),
+            )))
+        {
+            measure_baseline_command(
+                phase,
+                command,
+                &[],
+                workspace.root(),
+                config.timeout,
+                &config.env,
+                config.cancelled,
+            )
+            .context("repair not verified: current unmutated suite must pass first")?;
+        }
+    }
+    run_replay_mutation(project_root, mutation, config)
+}
+
 /// Execute one validated replay in a disposable workspace without consulting
 /// or updating any normal-run cache/history state.
 pub fn run_replay_mutation(
