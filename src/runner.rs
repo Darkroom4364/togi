@@ -4059,7 +4059,11 @@ impl TestRunner {
     /// Resolve reusable verdicts before early-stop decisions so the gate sees
     /// the complete fresh-work denominator rather than only cache hits
     /// encountered so far by workers.
-    fn preclassify_for_early_stop(&self, mutations: &[Mutation]) -> PreclassifiedMutations {
+    fn preclassify_for_early_stop(
+        &self,
+        mutations: &[Mutation],
+        schema_candidate_ids: &HashSet<u32>,
+    ) -> PreclassifiedMutations {
         if !self.early_stop.is_enabled() {
             return PreclassifiedMutations {
                 fresh: mutations
@@ -4122,7 +4126,10 @@ impl TestRunner {
             if let Some(restored_result) =
                 prepared.restore_result(&self.project_root, history.as_ref(), self.force_rerun)
             {
-                if needs_survivor_confirmation(&prepared.selected_test, restored_result.result) {
+                if needs_survivor_confirmation(&prepared.selected_test, restored_result.result)
+                    || (restored_result.result == MutationResult::Survived
+                        && schema_candidate_ids.contains(&mutation.id))
+                {
                     fresh.push(QueuedMutation {
                         index,
                         mutation: mutation.clone(),
@@ -4169,7 +4176,7 @@ impl TestRunner {
     pub fn run(&self, mutations: Vec<Mutation>) -> RunOutcome {
         let (mutations, subsumed) = self.split_subsumed(mutations);
         let planned_total = mutations.len();
-        let preclassified = self.preclassify_for_early_stop(&mutations);
+        let preclassified = self.preclassify_for_early_stop(&mutations, &HashSet::new());
         let early_stop =
             EarlyStopState::for_config(self.early_stop.clone(), preclassified.fresh.len());
         if let Some(early_stop) = &early_stop {
@@ -4243,7 +4250,24 @@ impl TestRunner {
             return self.outcome_from_records(Vec::new(), start.elapsed());
         }
         let planned_total = mutations.len();
-        let preclassified = self.preclassify_for_early_stop(&mutations);
+        let index_by_id: HashMap<u32, usize> = mutations
+            .iter()
+            .enumerate()
+            .map(|(index, mutation)| (mutation.id, index))
+            .collect();
+        let plan = crate::schemata::plan(&self.project_root, mutations.clone());
+        let schema_candidate_ids: HashSet<u32> = plan
+            .selected
+            .iter()
+            .filter(|schema_mutation| {
+                matches!(
+                    schema_mutation.mutation.language.as_str(),
+                    "c" | "cpp" | "go" | "java" | "rust"
+                )
+            })
+            .map(|schema_mutation| schema_mutation.mutation.id)
+            .collect();
+        let preclassified = self.preclassify_for_early_stop(&mutations, &schema_candidate_ids);
         let pending_restores: HashMap<u32, RestoredMutationResult> = preclassified
             .fresh
             .iter()
@@ -4266,23 +4290,6 @@ impl TestRunner {
         }
         let tested_counter = Arc::new(AtomicUsize::new(0));
 
-        let index_by_id: HashMap<u32, usize> = mutations
-            .iter()
-            .enumerate()
-            .map(|(index, mutation)| (mutation.id, index))
-            .collect();
-        let plan = crate::schemata::plan(&self.project_root, mutations);
-        let schema_candidate_ids: HashSet<u32> = plan
-            .selected
-            .iter()
-            .filter(|schema_mutation| {
-                matches!(
-                    schema_mutation.mutation.language.as_str(),
-                    "c" | "cpp" | "go" | "java" | "rust"
-                )
-            })
-            .map(|schema_mutation| schema_mutation.mutation.id)
-            .collect();
         let mut schema_by_language = HashMap::<String, Vec<crate::schemata::SchemaMutation>>::new();
         let mut fallback_mutations = Vec::new();
         let mut schemata_summary = SchemataRunSummary::default();
@@ -4689,7 +4696,7 @@ impl TestRunner {
                 }
             });
             if let Some(restored) = primary_restore {
-                if !needs_survivor_confirmation(&prepared.selected_test, restored.result) {
+                if restored.result != MutationResult::Survived {
                     reservation.release();
                     record_restored_for_early_stop(
                         early_stop.as_ref(),
@@ -4848,7 +4855,10 @@ impl TestRunner {
                 }
                 break;
             }
-            if !primary_was_restored {
+            if !primary_was_restored
+                && (outcome.result != MutationResult::Survived
+                    || prepared.selected_test.is_narrowed())
+            {
                 if cacheable {
                     prepared.store_cache(&self.project_root, outcome.result);
                 }
@@ -4864,59 +4874,70 @@ impl TestRunner {
             let mut execution = primary_restore
                 .map(|restored| restored.execution)
                 .unwrap_or(MutationExecution::Executed);
-            let confirmation = if needs_survivor_confirmation(
-                &prepared.selected_test,
-                primary_result,
-            ) {
-                match prepared.selected_test.unnarrowed_argv() {
-                    Some(full_argv) => {
-                        let full_argv = if language == "go" {
-                            force_go_no_test_cache(full_argv.to_vec())
-                        } else {
-                            full_argv.to_vec()
-                        };
-                        let mut confirmation_cacheable = true;
-                        let confirmed = match workspace
-                            .reset(&self.project_root, self.respect_workspace_ignores)
-                        {
-                            Ok(()) => {
-                                workspace_needs_reset = true;
-                                run_schema_workspace_mutation(
-                                    self,
-                                    workspace.root(),
-                                    &rewrites,
-                                    &full_argv,
-                                    prepared.selected_test.timeout,
-                                    &env,
-                                    &mut confirmation_cacheable,
-                                )
-                            }
-                            Err(error) => MutationOutcome::build_error_with(
-                                "confirmation_workspace_reset",
-                                vec![],
-                                format!(
-                                    "could not reset schema workspace {} before full-suite confirmation: {error}",
-                                    workspace.root().display()
-                                ),
-                            ),
-                        };
-                        if confirmed.cancelled {
-                            break;
+            let mut direct_recipe = None;
+            let confirmation = if primary_result == MutationResult::Survived {
+                // Confirm the concrete edit, not the instrumented schema, on
+                // the full route. Only this fresh execution earns a recipe.
+                let full_argv = prepared
+                    .selected_test
+                    .unnarrowed_argv()
+                    .unwrap_or(&prepared.selected_test.argv);
+                let full_argv = if language == "go" {
+                    force_go_no_test_cache(full_argv.to_vec())
+                } else {
+                    full_argv.to_vec()
+                };
+                final_outcome =
+                    match workspace.reset(&self.project_root, self.respect_workspace_ignores) {
+                        Ok(()) => {
+                            workspace_needs_reset = true;
+                            let target = ResolvedMutation::new_for_execution(
+                                &self.project_root,
+                                workspace.root(),
+                                mutation,
+                            );
+                            run_single_mutation(
+                                &full_argv,
+                                &self.commands.sandbox_command,
+                                BuildCommand {
+                                    argv: &self.commands.build_command,
+                                    origin: self.commands.build_command_origin,
+                                },
+                                prepared.selected_test.timeout,
+                                workspace.root(),
+                                target,
+                                self.show_output || history.is_some(),
+                                &self.env,
+                                &self.cancelled,
+                            )
                         }
-                        execution = MutationExecution::Executed;
-                        final_outcome = confirmed;
-                        confirmation_from_result(final_outcome.result)
-                    }
-                    None => {
-                        final_outcome = MutationOutcome::build_error_with(
-                            "confirmation_full_route",
-                            vec![],
-                            "narrowed test command is missing its full route",
+                        Err(error) => confirmation_workspace_reset_error(workspace.root(), error),
+                    };
+                if final_outcome.cancelled {
+                    break;
+                }
+                execution = MutationExecution::for_result(final_outcome.result);
+                if matches!(
+                    final_outcome.result,
+                    MutationResult::Killed | MutationResult::Survived | MutationResult::Timeout
+                ) {
+                    direct_recipe = Some(prepared.direct_recipe_for(
+                        &full_argv,
+                        &self.commands,
+                        &self.env,
+                        self.respect_workspace_ignores,
+                        DirectRecipeOrigin::Executed,
+                    ));
+                    if !prepared.selected_test.is_narrowed() {
+                        prepared.store_cache(&self.project_root, final_outcome.result);
+                        prepared.record_history(
+                            history.as_ref(),
+                            final_outcome.result,
+                            final_outcome.test_output.as_deref(),
                         );
-                        execution = MutationExecution::for_result(final_outcome.result);
-                        confirmation_from_result(final_outcome.result)
                     }
                 }
+                confirmation_from_result(final_outcome.result)
             } else {
                 SurvivorConfirmation::NotNeeded
             };
@@ -4968,11 +4989,12 @@ impl TestRunner {
             }
             let diagnostic =
                 build_error_diagnostic_from_outcome(mutation, "schemata", &final_outcome);
-            results.push(
+            let mut record =
                 MutationRunRecord::new(mutation.clone(), final_outcome.result, diagnostic)
                     .with_execution(execution)
-                    .with_selection(prepared.selected_test.selection_provenance(confirmation)),
-            );
+                    .with_selection(prepared.selected_test.selection_provenance(confirmation));
+            record.replay_recipe = direct_recipe;
+            results.push(record);
         }
 
         Ok((results, demoted))
@@ -12059,6 +12081,9 @@ func second(c, d int) bool { return c == d }
         let first = go_operator_mutation(0, "calc.go", source, 0);
         let second = go_operator_mutation(1, "calc.go", source, 1);
         let script = r#"
+if [ -z "${TOGI_MUTANT:-}" ]; then
+  case "$(cat calc.go)" in *'return c != d'*) exit 0 ;; *) exit 2 ;; esac
+fi
 case "$(cat calc.go)" in
   *__togi_active*) ;;
   *) exit 2 ;;
@@ -12178,7 +12203,7 @@ func second(c, d int) bool { return c == d }
         let second = go_operator_mutation(1, "calc.go", source, 1);
         let script = r#"
 case "$(cat calc.go)" in
-  *__togi_active*) ;;
+  *__togi_active*|*'!='*) ;;
   *) exit 2 ;;
 esac
 test ! -f side_effect || exit 1
@@ -12239,7 +12264,7 @@ if [ -f "$STATE_DIR/runs" ]; then runs=$(cat "$STATE_DIR/runs"); fi
 runs=$((runs + 1))
 printf '%s\n' "$runs" > "$STATE_DIR/runs"
 case "$TOGI_MUTANT" in
-  1) exit 0 ;;
+  1|'') exit 0 ;;
   *) exit 2 ;;
 esac
 "#;
@@ -12286,7 +12311,7 @@ esac
             &first.description,
             &cache_ctx,
         );
-        cache::store(dir.path(), &key, MutationResult::Survived);
+        cache::store(dir.path(), &key, MutationResult::Killed);
 
         let runner = TestRunner {
             commands,
@@ -12312,10 +12337,10 @@ esac
             .unwrap();
 
         assert_eq!(report.total, 2);
-        assert_eq!(report.results[0].1, MutationResult::Survived);
+        assert_eq!(report.results[0].1, MutationResult::Killed);
         assert_eq!(report.results[1].1, MutationResult::Survived);
         assert_eq!(
-            report.execution_for(report.results[0].0.id, MutationResult::Survived),
+            report.execution_for(report.results[0].0.id, MutationResult::Killed),
             MutationExecution::ExactCache
         );
         assert_eq!(
@@ -12332,7 +12357,7 @@ esac
             report.tested_count()
         );
         assert_eq!(report.execution_counts().exact_cache_reused, 1);
-        assert_eq!(runs, 1);
+        assert_eq!(runs, 2, "the fresh survivor also needs direct confirmation");
     }
 
     #[cfg(unix)]
@@ -12377,7 +12402,7 @@ esac
         cache::IncrementalHistoryStore::load(dir.path()).record(cache::IncrementalHistoryEntry {
             mutation_identity: query.mutation_identity,
             mutation_description: query.mutation_description,
-            result: MutationResult::Survived,
+            result: MutationResult::Killed,
             source_hash: query.source_hash,
             command_hash: query.command_hash,
             relevant_test_hash: query.relevant_test_hash,
@@ -12402,9 +12427,9 @@ esac
         };
 
         let report = runner.run_with_schemata(vec![mutation]).report;
-        assert_eq!(report.results[0].1, MutationResult::Survived);
+        assert_eq!(report.results[0].1, MutationResult::Killed);
         assert_eq!(
-            report.execution_for(report.results[0].0.id, MutationResult::Survived),
+            report.execution_for(report.results[0].0.id, MutationResult::Killed),
             MutationExecution::IncrementalHistory
         );
         assert_eq!(
@@ -12481,19 +12506,22 @@ func third(a, b int) bool { return a == b }
 
         assert_eq!(report.planned_total, 3);
         assert_eq!(report.total, 3);
-        assert_eq!(report.killed, 2);
-        assert_eq!(report.survived, 1);
+        assert_eq!(report.killed, if use_schemata { 3 } else { 2 });
+        assert_eq!(report.survived, if use_schemata { 0 } else { 1 });
         assert_eq!(report.tested_count(), 2);
         assert_eq!(
             report.execution_for(0, MutationResult::Killed),
             MutationExecution::ExactCache
         );
-        assert_eq!(crate::report::mutation_score(&report), 50.0);
+        assert_eq!(
+            crate::report::mutation_score(&report),
+            if use_schemata { 100.0 } else { 50.0 }
+        );
         assert!(crate::report::fail_under_score(&report) > 60.0);
         assert!(report.early_stop_reason.is_none(), "{report:?}");
         assert_eq!(
             std::fs::read_to_string(state.path().join("runs"))?.trim(),
-            "2"
+            if use_schemata { "3" } else { "2" }
         );
         if use_schemata {
             assert_eq!(
@@ -12510,7 +12538,7 @@ func third(a, b int) bool { return a == b }
 
     #[cfg(unix)]
     #[test]
-    fn reused_schemata_survivor_keeps_max_survivors_fresh_only() -> anyhow::Result<()> {
+    fn reused_schemata_survivor_is_confirmed_before_early_stop() -> anyhow::Result<()> {
         for reuse_source in [ReuseSource::ExactCache, ReuseSource::IncrementalHistory] {
             for (early_stop, gate) in [
                 (
@@ -12553,10 +12581,6 @@ func third(a, b int) bool { return a == b }
                     test_selection: None,
                 };
                 seed_reused_survivor(dir.path(), &commands, &mutations[0], reuse_source)?;
-                let expected_execution = match reuse_source {
-                    ReuseSource::ExactCache => MutationExecution::ExactCache,
-                    ReuseSource::IncrementalHistory => MutationExecution::IncrementalHistory,
-                };
                 let runner = TestRunner {
                     commands,
                     parallelism: 1,
@@ -12575,34 +12599,16 @@ func third(a, b int) bool { return a == b }
                 let report = runner.run_with_schemata(mutations).report;
                 let schemata = report.schemata.as_ref().expect("schemata summary");
 
-                if matches!(reuse_source, ReuseSource::ExactCache) && gate == "fail under" {
-                    assert_eq!(report.total, 1, "{gate}: {report:?}");
-                    assert_eq!(report.survived, 1);
-                    assert_eq!(report.killed, 0);
-                    assert_eq!(report.tested_count(), 0);
-                    assert_eq!(
-                        report.execution_for(0, MutationResult::Survived),
-                        MutationExecution::ExactCache
-                    );
-                    assert!(
-                        report
-                            .early_stop_reason
-                            .as_deref()
-                            .is_some_and(|reason| reason.contains("--fail-under 100.0")),
-                        "{report:?}"
-                    );
-                } else {
-                    assert_eq!(report.total, 3, "{gate} should not stop fresh mutations");
-                    assert_eq!(report.survived, 1);
-                    assert_eq!(report.killed, 2);
-                    assert_eq!(report.tested_count(), 2);
-                    assert_eq!(schemata.fast_path, report.tested_count());
-                    assert_eq!(
-                        report.execution_for(0, MutationResult::Survived),
-                        expected_execution
-                    );
-                    assert!(report.early_stop_reason.is_none(), "{gate}: {report:?}");
-                }
+                assert_eq!(report.total, 3, "{gate} should not stop fresh mutations");
+                assert_eq!(report.survived, 0);
+                assert_eq!(report.killed, 3);
+                assert_eq!(report.tested_count(), 3);
+                assert_eq!(schemata.fast_path, report.tested_count());
+                assert_eq!(
+                    report.execution_for(0, MutationResult::Killed),
+                    MutationExecution::Executed
+                );
+                assert!(report.early_stop_reason.is_none(), "{gate}: {report:?}");
             }
         }
         Ok(())
@@ -12616,7 +12622,8 @@ func third(a, b int) bool { return a == b }
 
     #[cfg(unix)]
     #[test]
-    fn late_restored_schemata_survivor_reduces_fail_under_fresh_budget() -> anyhow::Result<()> {
+    fn late_restored_schemata_survivor_gets_a_fresh_verdict_before_the_gate() -> anyhow::Result<()>
+    {
         for reuse_source in [ReuseSource::ExactCache, ReuseSource::IncrementalHistory] {
             let dir = tempfile::tempdir()?;
             let state = tempfile::tempdir()?;
@@ -12644,10 +12651,6 @@ func third(a, b int) bool { return a == b }
                 test_selection: None,
             };
             seed_reused_survivor(dir.path(), &commands, &mutations[2], reuse_source)?;
-            let expected_execution = match reuse_source {
-                ReuseSource::ExactCache => MutationExecution::ExactCache,
-                ReuseSource::IncrementalHistory => MutationExecution::IncrementalHistory,
-            };
             let runner = TestRunner {
                 commands,
                 parallelism: 1,
@@ -12672,27 +12675,21 @@ func third(a, b int) bool { return a == b }
             let schemata = report.schemata.as_ref().expect("schemata summary");
 
             assert_eq!(report.planned_total, 3);
-            assert_eq!(report.total, 2);
-            assert_eq!(report.survived, 2);
-            assert_eq!(report.killed, 0);
-            assert_eq!(report.tested_count(), 1);
+            assert_eq!(report.total, 3);
+            assert_eq!(report.survived, 0);
+            assert_eq!(report.killed, 3);
+            assert_eq!(report.tested_count(), 3);
             assert_eq!(schemata.fast_path, report.tested_count());
             assert_eq!(
-                report.execution_for(0, MutationResult::Survived),
+                report.execution_for(0, MutationResult::Killed),
                 MutationExecution::Executed
             );
             assert_eq!(
-                report.execution_for(2, MutationResult::Survived),
-                expected_execution
+                report.execution_for(2, MutationResult::Killed),
+                MutationExecution::Executed
             );
-            assert!(report.results.iter().all(|(mutation, _)| mutation.id != 1));
-            assert_eq!(runs.trim(), "1");
-            assert!(
-                report
-                    .early_stop_reason
-                    .as_deref()
-                    .is_some_and(|reason| reason.contains("--fail-under 60.0"))
-            );
+            assert_eq!(runs.trim(), "4");
+            assert!(report.early_stop_reason.is_none());
         }
         Ok(())
     }
@@ -12817,11 +12814,11 @@ def second(c, d):
             .run_with_schemata(vec![go, python_cached, python_history])
             .report;
 
-        assert_eq!(report.tested_count(), 0);
+        assert_eq!(report.tested_count(), 1);
         assert!(report.build_error_diagnostics.is_empty());
         assert_eq!(
             report.execution_for(0, MutationResult::Survived),
-            MutationExecution::ExactCache
+            MutationExecution::Executed
         );
         assert_eq!(
             report.execution_for(1, MutationResult::Survived),
@@ -12838,7 +12835,7 @@ def second(c, d):
         let json: serde_json::Value =
             serde_json::from_str(&crate::report::json::to_json_string(&report)?)?;
         let mutations = json["mutations"].as_array().expect("mutation array");
-        assert_eq!(mutations[0]["execution"]["state"], "exact_cache");
+        assert_eq!(mutations[0]["execution"]["state"], "executed");
         assert_eq!(mutations[1]["execution"]["state"], "exact_cache");
         assert_eq!(mutations[2]["execution"]["state"], "incremental_history");
         Ok(())
@@ -13106,6 +13103,96 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn schemata_survivors_get_fresh_direct_recipes_including_cache_and_early_stop()
+    -> anyhow::Result<()> {
+        for reuse in [
+            None,
+            Some(ReuseSource::ExactCache),
+            Some(ReuseSource::IncrementalHistory),
+        ] {
+            for early_stop in [false, true] {
+                for (status, expected) in
+                    [(0, MutationResult::Survived), (1, MutationResult::Killed)]
+                {
+                    let dir = tempfile::tempdir()?;
+                    let state = tempfile::tempdir()?;
+                    std::fs::create_dir(dir.path().join("src"))?;
+                    let source = "pub fn same(a: i32, b: i32) -> bool { a == b }\n";
+                    std::fs::write(dir.path().join("src/lib.rs"), source)?;
+                    let mutation = rust_operator_mutation(0, "src/lib.rs", source, 0);
+                    let log = state.path().join("runs");
+                    let env = HashMap::from([
+                        ("TOGI_CONFIRMATION_LOG".into(), log.display().to_string()),
+                        ("TOGI_DIRECT_STATUS".into(), status.to_string()),
+                    ]);
+                    let mut commands = test_command_config();
+                    commands.command = vec![
+                        "sh".into(),
+                        "-c".into(),
+                        r#"
+if [ -n "${TOGI_MUTANT:-}" ]; then
+    printf 'schema\n' >> "$TOGI_CONFIRMATION_LOG"
+    touch side_effect
+    exit 0
+fi
+printf 'direct:%s\n' "$(cat src/lib.rs)" >> "$TOGI_CONFIRMATION_LOG"
+test ! -f side_effect || exit 2
+exit "$TOGI_DIRECT_STATUS"
+"#
+                        .into(),
+                    ];
+                    if let Some(reuse) = reuse {
+                        seed_reused_survivor_with_env(
+                            dir.path(),
+                            &commands,
+                            &mutation,
+                            reuse,
+                            &env,
+                        )?;
+                    }
+                    let mut runner = confirmation_runner(dir.path(), commands, env);
+                    runner.force_rerun = false;
+                    runner.incremental_history = true;
+                    runner.max_tested = Some(1);
+                    runner.early_stop.max_survivors = early_stop.then_some(1);
+                    let outcome = runner.run_with_schemata(vec![mutation.clone()]);
+                    assert_eq!(outcome.report.results[0].1, expected);
+                    assert_eq!(
+                        outcome.report.execution_for(0, expected),
+                        MutationExecution::Executed
+                    );
+                    assert_eq!(outcome.report.tested_count(), 1);
+                    let recipe = &outcome.replay_recipes[&0];
+                    assert_eq!(recipe.origin, DirectRecipeOrigin::Executed);
+                    assert_eq!(recipe.test_command, runner.commands.command);
+                    assert!(!recipe.env.contains_key("TOGI_MUTANT"));
+                    let expected_log = format!(
+                        "{}direct:{}",
+                        if reuse.is_some() { "" } else { "schema\n" },
+                        source.replace("==", "!="),
+                    );
+                    assert_eq!(std::fs::read_to_string(log)?, expected_log);
+                    assert_eq!(
+                        std::fs::read_to_string(dir.path().join("src/lib.rs"))?,
+                        source
+                    );
+                    assert!(!dir.path().join("side_effect").exists());
+                    // A subsequent regular run must reuse the direct verdict,
+                    // not a stale pre-confirmation schema survivor.
+                    let repeated = runner.run(vec![mutation]).report;
+                    assert_eq!(repeated.results[0].1, expected);
+                    assert_eq!(
+                        repeated.execution_for(0, expected),
+                        MutationExecution::ExactCache
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn schemata_confirmation_rechecks_narrowed_rust_survivors_on_the_full_route() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("src")).unwrap();
@@ -13124,11 +13211,20 @@ mod tests {
         commands.command = vec!["cargo".into(), "test".into()];
         commands.test_selection = Some(selection);
 
-        let report = confirmation_runner(dir.path(), commands, env)
-            .run_with_schemata(vec![mutation.clone()])
-            .report;
+        let outcome = confirmation_runner(dir.path(), commands, env)
+            .run_with_schemata(vec![mutation.clone()]);
+        let report = outcome.report;
 
         assert_eq!(report.results[0].1, MutationResult::Killed);
+        assert_eq!(
+            outcome.replay_recipes[&mutation.id].test_command,
+            ["cargo", "test"]
+        );
+        assert!(
+            !outcome.replay_recipes[&mutation.id]
+                .env
+                .contains_key("TOGI_MUTANT")
+        );
         assert_eq!(
             report.selection_for(mutation.id),
             Some(TestSelectionProvenance::Narrowed {

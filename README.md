@@ -702,6 +702,8 @@ Baselines let existing weak spots stay visible without blocking every PR. New re
 
 Schemata are enabled by default. They batch compatible mutations into one build and switch mutants at runtime with `TOGI_MUTANT`. The runner currently supports expression-safe mutations in runtime contexts for Go, Rust, Java, C, and C++; unsupported languages, unsupported operators, and compile-time contexts automatically fall back to the regular one-mutant-at-a-time runner. Use `--no-schemata` or `schemata = false` to force regular execution.
 
+Before reporting a schemata survivor, Togi confirms the concrete edit with a fresh, regular run of its full test route. This also applies to cached schemata survivors: confirmation consumes one tested-mutant slot and records a direct replay recipe in a source-validated JSON report. Killed schemata mutants keep the fast path; they do not gain a direct replay recipe.
+
 ## Coverage and test selection
 
 For large repos, togi can avoid work before the runner starts and can also
