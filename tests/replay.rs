@@ -432,6 +432,7 @@ fn verify_killed_fails_closed_before_or_after_execution() {
             "repair not verified: expected killed",
             2,
         ),
+        ("git-origin", "repair not verified: expected killed", 2),
         ("not-survivor", "requires a recorded survivor", 0),
     ] {
         let fixture = setup_replay_fixture();
@@ -476,6 +477,18 @@ fn verify_killed_fails_closed_before_or_after_execution() {
                 let mut report = fixture.report.clone();
                 report["mutations"][0]["replay"]["env"]["TOGI_LIVE_TEST"] = json!(script_path);
                 write_json(&fixture.report_path, &report);
+            }
+            "git-origin" => {
+                // The frozen mutant must not point origin at a discarded
+                // baseline directory: an origin lookup is not a mutation kill.
+                #[cfg(windows)]
+                fs::write(fixture.repo.path().join("test.cmd"), "@echo off\r\n>>\"%TOGI_REPLAY_LOG%\" echo x\r\ngit ls-remote origin HEAD >nul\r\nexit /b %errorlevel%\r\n").unwrap();
+                #[cfg(not(windows))]
+                fs::write(
+                    fixture.repo.path().join("test.sh"),
+                    "printf x >> \"$TOGI_REPLAY_LOG\"\ngit ls-remote origin HEAD >/dev/null\n",
+                )
+                .unwrap();
             }
             "not-survivor" => {
                 let mut report = fixture.report.clone();

@@ -5731,6 +5731,20 @@ pub fn run_repair_verification(
             config.respect_workspace_ignores,
         )
         .context("could not freeze repair mutation workspace")?;
+        // Both clones must retain the same stable Git origin. The baseline
+        // directory is disposable and must not become a test dependency.
+        let origin = std::process::Command::new("git")
+            .args(["remote", "set-url", "origin"])
+            .arg(project_root)
+            .current_dir(frozen_mutant.root())
+            .output()
+            .context("could not preserve repair workspace Git origin")?;
+        if !origin.status.success() {
+            bail!(
+                "could not preserve repair workspace Git origin: {}",
+                String::from_utf8_lossy(&origin.stderr)
+            );
+        }
         for (phase, command) in config
             .build_command
             .as_deref()
