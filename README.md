@@ -26,7 +26,7 @@ Mutation testing is usually too slow to run on every PR. togi is built for the P
 - **Performance controls**: caching, sharding, fail-fast commands, LCOV filtering, and source-line test selection
 - **Guardrails**: build pre-checks, baselines, operator filters, noisy-file skips, and path-safe mutation execution
 
-If a mutation survives, your tests still pass after behavior changed. That is a concrete test gap.
+If a mutation survives, your tests still pass after the edit. Check whether it changes observable behavior: a behavior-changing survivor is a test gap; an equivalent mutation is not.
 
 ```
 $ togi check --base HEAD~1
@@ -780,11 +780,11 @@ Duration: 1.59s
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ```
 
-Each surviving mutation reveals a concrete test gap:
+Most survivors here expose test gaps, but one is equivalent:
 
 - **`false_to_true` at line 13** — `TestIsPositive` never checks `IsPositive(0)` or negative inputs
-- **`gt_to_gte` at line 18** — `TestMax` only tests `Max(3,5)`, never the `a > b` path
-- **`return_empty` at line 19** — same: `Max` return value never verified for first-arg-wins
+- **`gt_to_gte` at line 18** — equivalent: when `a == b`, either branch returns the same integer. No test can distinguish this edit.
+- **`return_empty` at line 19** — `Max` return value never verified for first-arg-wins; add an assertion such as `Max(5,3) == 5`
 - **`zero_to_one` at line 26** — `TestAbs` is entirely missing
 - **`return_empty` at line 29** — `Abs` return value never tested
 
