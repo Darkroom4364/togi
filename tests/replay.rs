@@ -427,6 +427,11 @@ fn verify_killed_fails_closed_before_or_after_execution() {
             2,
         ),
         ("source", "source fingerprint does not match", 0),
+        (
+            "live-test-change",
+            "repair not verified: expected killed",
+            2,
+        ),
         ("not-survivor", "requires a recorded survivor", 0),
     ] {
         let fixture = setup_replay_fixture();
@@ -451,6 +456,26 @@ fn verify_killed_fails_closed_before_or_after_execution() {
                 fs::write(fixture.repo.path().join("test.cmd"), "@echo off\r\n>>\"%TOGI_REPLAY_LOG%\" echo x\r\nif exist baseline-side-effect exit /b 1\r\ntype nul >baseline-side-effect\r\nexit /b 0\r\n").unwrap();
                 #[cfg(not(windows))]
                 fs::write(fixture.repo.path().join("test.sh"), "printf x >> \"$TOGI_REPLAY_LOG\"\ntest ! -f baseline-side-effect || exit 1\ntouch baseline-side-effect\n").unwrap();
+            }
+            "live-test-change" => {
+                // Deterministically change the live test file while the
+                // baseline runs. The mutant must still use the frozen passing
+                // test, not count the newly broken live suite as a kill.
+                #[cfg(windows)]
+                let (script, content) = (
+                    "test.cmd",
+                    "@echo off\r\n>>\"%TOGI_REPLAY_LOG%\" echo x\r\n>\"%TOGI_LIVE_TEST%\" echo @exit /b 1\r\nexit /b 0\r\n",
+                );
+                #[cfg(not(windows))]
+                let (script, content) = (
+                    "test.sh",
+                    "printf x >> \"$TOGI_REPLAY_LOG\"\nprintf 'exit 1\\n' > \"$TOGI_LIVE_TEST\"\nexit 0\n",
+                );
+                let script_path = fixture.repo.path().join(script);
+                fs::write(&script_path, content).unwrap();
+                let mut report = fixture.report.clone();
+                report["mutations"][0]["replay"]["env"]["TOGI_LIVE_TEST"] = json!(script_path);
+                write_json(&fixture.report_path, &report);
             }
             "not-survivor" => {
                 let mut report = fixture.report.clone();

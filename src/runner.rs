@@ -4377,9 +4377,15 @@ impl TestRunner {
                     .enumerate()
                     .map(|(index, mutation)| QueuedMutation {
                         index,
-                        primary_restore: pending_restores.get(&mutation.id).copied(),
+                        // A demoted schema candidate still needs direct
+                        // execution; its cached verdict is not confirmation.
+                        primary_restore: pending_restores
+                            .get(&mutation.id)
+                            .copied()
+                            .filter(|_| !schema_candidate_ids.contains(&mutation.id)),
+                        restore_checked: restore_checked
+                            || schema_candidate_ids.contains(&mutation.id),
                         mutation,
-                        restore_checked,
                     })
                     .collect(),
                 Vec::new(),
@@ -4928,14 +4934,16 @@ impl TestRunner {
                         self.respect_workspace_ignores,
                         DirectRecipeOrigin::Executed,
                     ));
-                    if !prepared.selected_test.is_narrowed() {
-                        prepared.store_cache(&self.project_root, final_outcome.result);
-                        prepared.record_history(
-                            history.as_ref(),
-                            final_outcome.result,
-                            final_outcome.test_output.as_deref(),
-                        );
-                    }
+                }
+                if !prepared.selected_test.is_narrowed() {
+                    // Replace stale schema evidence even when confirmation
+                    // cannot build; it must not reappear as a cached survivor.
+                    prepared.store_cache(&self.project_root, final_outcome.result);
+                    prepared.record_history(
+                        history.as_ref(),
+                        final_outcome.result,
+                        final_outcome.test_output.as_deref(),
+                    );
                 }
                 confirmation_from_result(final_outcome.result)
             } else {
@@ -5706,7 +5714,7 @@ pub fn run_repair_verification(
     mutation: &Mutation,
     config: ReplayRunConfig<'_>,
 ) -> anyhow::Result<ReplayRunOutcome> {
-    {
+    let frozen_mutant = {
         let workspace = copy_workspace_for_replay(
             project_root,
             config.source_revision,
@@ -5715,6 +5723,14 @@ pub fn run_repair_verification(
         .context("could not create repair baseline workspace")?;
         let target = ResolvedMutation::new_for_replay(project_root, workspace.root(), mutation);
         validate_replay_snapshot_target(&workspace, &target, config.source_fingerprint)?;
+        // Freeze both inputs before any commands run. Recopying the live
+        // worktree afterwards could mistake a newly failing test for a kill.
+        let frozen_mutant = copy_workspace_for_replay(
+            workspace.root(),
+            config.source_revision,
+            config.respect_workspace_ignores,
+        )
+        .context("could not freeze repair mutation workspace")?;
         for (phase, command) in config
             .build_command
             .as_deref()
@@ -5736,8 +5752,9 @@ pub fn run_repair_verification(
             )
             .context("repair not verified: current unmutated suite must pass first")?;
         }
-    }
-    run_replay_mutation(project_root, mutation, config)
+        frozen_mutant
+    };
+    run_replay_in_workspace(project_root, mutation, config, &frozen_mutant)
 }
 
 /// Execute one validated replay in a disposable workspace without consulting
@@ -5758,8 +5775,17 @@ pub fn run_replay_mutation(
         config.respect_workspace_ignores,
     )
     .with_context(|| "could not create replay workspace")?;
+    run_replay_in_workspace(project_root, mutation, config, &workspace)
+}
+
+fn run_replay_in_workspace(
+    project_root: &Path,
+    mutation: &Mutation,
+    config: ReplayRunConfig<'_>,
+    workspace: &ReplayWorkspace,
+) -> anyhow::Result<ReplayRunOutcome> {
     let target = ResolvedMutation::new_for_replay(project_root, workspace.root(), mutation);
-    validate_replay_snapshot_target(&workspace, &target, config.source_fingerprint)?;
+    validate_replay_snapshot_target(workspace, &target, config.source_fingerprint)?;
     let build_command = config.build_command.as_deref().unwrap_or(&[]);
     let outcome = run_single_mutation_with_replay_access(
         &config.test_command,
@@ -5778,7 +5804,7 @@ pub fn run_replay_mutation(
         config.show_output,
         &config.env,
         config.cancelled,
-        Some(&workspace),
+        Some(workspace),
     );
     Ok(ReplayRunOutcome {
         result: outcome.result,
@@ -12501,7 +12527,23 @@ func third(a, b int) bool { return a == b }
             .map(|id| go_operator_mutation(id, "calc.go", source, id as usize))
             .collect::<Vec<_>>();
         let commands = CommandConfig {
-            command: first_run_survives_second_kills_command(state.path()),
+            command: vec![
+                "sh".into(),
+                "-c".into(),
+                r#"
+runs=0
+if [ -f "$1/runs" ]; then runs=$(cat "$1/runs"); fi
+printf '%s\n' "$((runs + 1))" > "$1/runs"
+if [ -n "${TOGI_MUTANT:-}" ]; then test "$TOGI_MUTANT" = 1; exit $?; fi
+case "$(cat calc.go)" in
+  *'func second(a, b int) bool { return a != b }'*) exit 0 ;;
+  *) exit 1 ;;
+esac
+"#
+                .into(),
+                "gate".into(),
+                state.path().display().to_string(),
+            ],
             force_default_command: false,
             force_default_timeout: false,
             project_commands: vec![],
@@ -12547,17 +12589,14 @@ func third(a, b int) bool { return a == b }
 
         assert_eq!(report.planned_total, 3);
         assert_eq!(report.total, 3);
-        assert_eq!(report.killed, if use_schemata { 3 } else { 2 });
-        assert_eq!(report.survived, if use_schemata { 0 } else { 1 });
+        assert_eq!(report.killed, 2);
+        assert_eq!(report.survived, 1);
         assert_eq!(report.tested_count(), 2);
         assert_eq!(
             report.execution_for(0, MutationResult::Killed),
             MutationExecution::ExactCache
         );
-        assert_eq!(
-            crate::report::mutation_score(&report),
-            if use_schemata { 100.0 } else { 50.0 }
-        );
+        assert_eq!(crate::report::mutation_score(&report), 50.0);
         assert!(crate::report::fail_under_score(&report) > 60.0);
         assert!(report.early_stop_reason.is_none(), "{report:?}");
         assert_eq!(
@@ -13228,6 +13267,108 @@ exit "$TOGI_DIRECT_STATUS"
                     );
                 }
             }
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn confirmed_schema_survivor_triggers_the_fresh_survivor_limit() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let source = "package calc\nfunc first(a,b int) bool { return a == b }\nfunc second(a,b int) bool { return a == b }\n";
+        std::fs::write(dir.path().join("calc.go"), source)?;
+        let first = go_operator_mutation(0, "calc.go", source, 0);
+        let second = go_operator_mutation(1, "calc.go", source, 1);
+        let mut commands = test_command_config();
+        commands.command = successful_command();
+        seed_reused_survivor(dir.path(), &commands, &first, ReuseSource::ExactCache)?;
+        let mut runner = confirmation_runner(dir.path(), commands, HashMap::new());
+        runner.force_rerun = false;
+        runner.early_stop.max_survivors = Some(1);
+        let outcome = runner.run_with_schemata(vec![first, second]);
+        assert_eq!(outcome.report.planned_total, 2);
+        assert_eq!(outcome.report.total, 1);
+        assert_eq!(outcome.report.survived, 1);
+        assert_eq!(outcome.report.tested_count(), 1);
+        assert_eq!(
+            outcome.replay_recipes[&0].origin,
+            DirectRecipeOrigin::Executed
+        );
+        assert!(
+            outcome
+                .report
+                .early_stop_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("--max-survivors 1"))
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn demoted_schema_survivors_do_not_restore_unconfirmed_verdicts() -> anyhow::Result<()> {
+        for reuse in [ReuseSource::ExactCache, ReuseSource::IncrementalHistory] {
+            for early_stop in [false, true] {
+                let dir = tempfile::tempdir()?;
+                let source = "package calc\nfunc first(a,b int) bool { return a == b }\nfunc second(a,b int) bool { return a == b }\n";
+                std::fs::write(dir.path().join("calc.go"), source)?;
+                let first = go_operator_mutation(0, "calc.go", source, 0);
+                let second = go_operator_mutation(1, "calc.go", source, 1);
+                let mut commands = test_command_config();
+                commands.command = failing_command();
+                commands.build_command = vec![
+                    "sh".into(),
+                    "-c".into(),
+                    "case \"$(cat calc.go)\" in *__togi_active*) exit 1 ;; esac".into(),
+                ];
+                commands.build_command_origin = BuildCommandOrigin::Configured;
+                seed_reused_survivor(dir.path(), &commands, &second, reuse)?;
+                let mut runner = confirmation_runner(dir.path(), commands, HashMap::new());
+                runner.force_rerun = false;
+                runner.incremental_history = true;
+                runner.max_tested = Some(2);
+                runner.early_stop.max_survivors = early_stop.then_some(1);
+                // The first mutant's schema build demotes the whole batch,
+                // including the queued cache/history survivor.
+                let outcome = runner.run_with_schemata(vec![first, second]);
+                assert_eq!(outcome.report.killed, 2);
+                assert_eq!(outcome.report.tested_count(), 2);
+                assert_eq!(outcome.replay_recipes.len(), 2);
+                assert!(
+                    outcome
+                        .replay_recipes
+                        .values()
+                        .all(|recipe| recipe.origin == DirectRecipeOrigin::Executed)
+                );
+                assert!(outcome.report.early_stop_reason.is_none());
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_direct_confirmation_does_not_leave_a_cached_schema_survivor() -> anyhow::Result<()> {
+        for reuse in [ReuseSource::ExactCache, ReuseSource::IncrementalHistory] {
+            let dir = tempfile::tempdir()?;
+            let source = "package calc\nfunc same(a,b int) bool { return a == b }\n";
+            std::fs::write(dir.path().join("calc.go"), source)?;
+            let mutation = go_operator_mutation(0, "calc.go", source, 0);
+            let mut commands = test_command_config();
+            commands.command = successful_command();
+            commands.build_command = failing_command();
+            commands.build_command_origin = BuildCommandOrigin::Configured;
+            seed_reused_survivor(dir.path(), &commands, &mutation, reuse)?;
+            let mut runner = confirmation_runner(dir.path(), commands, HashMap::new());
+            runner.force_rerun = false;
+            runner.incremental_history = true;
+            let outcome = runner.run_with_schemata(vec![mutation.clone()]);
+            assert_eq!(outcome.report.build_errors, 1);
+            assert!(outcome.replay_recipes.is_empty());
+            let repeated = runner.run(vec![mutation]);
+            assert_eq!(repeated.report.build_errors, 1);
+            assert_eq!(repeated.report.survived, 0);
+            assert!(repeated.replay_recipes.is_empty());
         }
         Ok(())
     }
