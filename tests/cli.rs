@@ -5507,8 +5507,8 @@ fn github_action_guide_and_advisory_pin_released_contract() {
         "actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0",
         "node-version: 24 # Choose the version required by this repository.",
         "name: Install project test dependencies\n        run: npm ci",
-        "Darkroom4364/togi@e692e2d169b7a717c6b911884e90c0bcd0d133b1 # v0.5.2",
-        "version: v0.5.2",
+        "Darkroom4364/togi@10970abd97c0d13d8e0ee4b0c568552ebcf84720 # v0.6.0",
+        "version: v0.6.0",
         "base: origin/${{ github.base_ref }}",
         "test-cmd: npm test",
         "format: json",
@@ -5544,7 +5544,7 @@ fn github_action_guide_and_advisory_pin_released_contract() {
         ),
         (
             "run: npm ci",
-            "Darkroom4364/togi@e692e2d169b7a717c6b911884e90c0bcd0d133b1",
+            "Darkroom4364/togi@10970abd97c0d13d8e0ee4b0c568552ebcf84720",
         ),
     ] {
         assert!(
@@ -5555,10 +5555,11 @@ fn github_action_guide_and_advisory_pin_released_contract() {
 
     for expected in [
         "Those inputs override `togi.toml`",
-        "`format: github`; the Action preserves that review run and performs a second\nfull JSON mutation run",
+        "the Action runs one mutation campaign",
+        "`togi-report.json` using `--json-report`",
         "A failed baseline test or build is a fatal exit `2`",
         "Never use `pull_request_target` to run PR code.",
-        "immutable version identifiers for v0.5.2",
+        "does not independently pin archive bytes.",
     ] {
         assert!(
             readme.contains(expected),
@@ -5595,7 +5596,7 @@ fn github_action_guide_and_advisory_pin_released_contract() {
 }
 
 #[test]
-fn github_release_install_guide_documents_v0_5_2_contract() {
+fn github_release_install_guide_documents_released_contract() {
     let readme = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md"))
         .unwrap()
         .replace("\r\n", "\n");
@@ -5609,7 +5610,7 @@ fn github_release_install_guide_documents_v0_5_2_contract() {
 
     for expected in [
         "GitHub Releases are the supported binary-install path.",
-        "TOGI_VERSION=v0.5.2",
+        "TOGI_VERSION=v0.6.0",
         "TOGI_ARCHIVE=togi-linux-x86_64.tar.gz",
         "https://github.com/Darkroom4364/togi/releases/download/${TOGI_VERSION}",
         "curl -fsSLo \"$TOGI_ARCHIVE\"",
@@ -5626,8 +5627,8 @@ fn github_release_install_guide_documents_v0_5_2_contract() {
         );
     }
     assert!(
-        !install.contains("TOGI_VERSION=v0.4.1"),
-        "Install section must not point the release archive at v0.4.1"
+        !install.contains("TOGI_VERSION=v0.5.2"),
+        "Install section must not point the release archive at v0.5.2"
     );
     assert!(
         !install.contains("cargo install togi"),
