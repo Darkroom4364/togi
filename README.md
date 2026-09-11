@@ -43,7 +43,7 @@ Duration: 0.84s
 
 ## Try a complete test repair
 
-From a source checkout, with Bash, Git, Go, and `jq` installed:
+From a Togi source checkout, with Bash, Git, Go, and `jq` installed:
 
 ```bash
 bash examples/demo.sh
@@ -51,8 +51,13 @@ bash examples/demo.sh
 
 The script builds this checkout's debug binary (requires Rust), or you can
 supply a trusted build with `TOGI_BIN=/path/to/togi bash examples/demo.sh`.
-This walkthrough requires `replay --verify-killed`; the published v0.5.2
-binary does not include it.
+This walkthrough requires `replay --verify-killed`, included in
+[v0.6.0](https://github.com/Darkroom4364/togi/releases/tag/v0.6.0).
+After installing the [released binary](#install), use it without a Rust build:
+
+```bash
+TOGI_BIN="$(command -v togi)" bash examples/demo.sh
+```
 
 The demo stages a one-line change to `IsPositive` in a temporary Go project
 and focuses on one boundary mutation: `n > 0` becomes `n >= 0`. The original
@@ -115,7 +120,7 @@ with a parent commit and at least one changed supported source line.
 ```bash
 (
   set -euo pipefail
-  TOGI_VERSION=v0.5.2
+  TOGI_VERSION=v0.6.0
   TOGI_ARCHIVE=togi-linux-x86_64.tar.gz
   RELEASE_BASE="https://github.com/Darkroom4364/togi/releases/download/${TOGI_VERSION}"
   TEMP_DIR="$(mktemp -d)"
@@ -1026,9 +1031,9 @@ jobs:
       - name: Install project test dependencies
         run: npm ci
       - id: togi
-        uses: Darkroom4364/togi@e692e2d169b7a717c6b911884e90c0bcd0d133b1 # v0.5.2
+        uses: Darkroom4364/togi@10970abd97c0d13d8e0ee4b0c568552ebcf84720 # v0.6.0
         with:
-          version: v0.5.2
+          version: v0.6.0
           base: origin/${{ github.base_ref }}
           test-cmd: npm test
           format: json
@@ -1056,10 +1061,10 @@ using another runner or architecture.
 `fetch-depth: 0` makes the PR base available for
 `origin/${{ github.base_ref }}`. The checkout therefore needs a Git history
 that contains the base branch and a project with changed supported source
-lines. The Action source commit and downloaded binary version are both pinned to
-the immutable version identifiers for v0.5.2: its release commit and `v0.5.2`
-release tag. When upgrading, update both together to a reviewed release commit
-and immutable version tag.
+lines. The Action source is pinned to the v0.6.0 release commit, and
+`version: v0.6.0` selects its checksum-verified release archive. The source SHA
+does not independently pin archive bytes. When upgrading, update the source
+commit and release version together.
 
 The Action passes `--base`, `--timeout`, `--format`, and `--test-cmd` only for
 non-empty inputs. Those inputs override `togi.toml`; remove `test-cmd` to use
@@ -1078,10 +1083,10 @@ base = "origin/main"
 command = ["npm", "test"]
 ```
 
-`format: json` is the one-run path: its JSON stream becomes the replayable
-`togi-report.json`. To opt into GitHub annotations instead, set
-`format: github`; the Action preserves that review run and performs a second
-full JSON mutation run to create the replayable report.
+`format: json` prints the campaign's JSON report. For GitHub annotations, set
+`format: github`. In either case, the Action runs one mutation campaign and
+writes `togi-report.json` using `--json-report`; the review output and saved
+report describe the same execution.
 
 For a normal mutation report, the Action uploads `togi-report.json` as the
 `togi-report` artifact. This example explicitly retains it for 14 days. Set a
