@@ -5111,7 +5111,10 @@ fn github_action_report_replays_a_direct_mutation() {
         .arg(helper)
         .current_dir(repo.path())
         .env("TOGI_BIN", assert_cmd::cargo::cargo_bin("togi"))
-        .env("TOGI_EXPECTED_VERSION", "v0.5.2")
+        .env(
+            "TOGI_EXPECTED_VERSION",
+            concat!("v", env!("CARGO_PKG_VERSION")),
+        )
         .env("RUNNER_TEMP", report_dir.path())
         .env("GITHUB_OUTPUT", &github_output)
         .env("TOGI_BASE", "HEAD")
