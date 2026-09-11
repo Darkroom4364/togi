@@ -41,6 +41,32 @@ Duration: 0.84s
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ```
 
+## Try a complete test repair
+
+From a source checkout, with Bash, Git, Go, and `jq` installed:
+
+```bash
+bash examples/demo.sh
+```
+
+The script builds this checkout's debug binary (requires Rust), or you can
+supply a trusted build with `TOGI_BIN=/path/to/togi bash examples/demo.sh`.
+This walkthrough requires `replay --verify-killed`; the published v0.5.2
+binary does not include it.
+
+The demo stages a one-line change to `IsPositive` in a temporary Go project
+and focuses on one boundary mutation: `n > 0` becomes `n >= 0`. The original
+tests pass, but never check zero. It saves the survivor's JSON report, replays
+that exact mutation, and confirms the unchanged tests cannot verify a repair.
+It then adds an assertion that `IsPositive(0)` is false and runs
+`togi replay <id> --report <report.json> --verify-killed` successfully.
+
+Success ends with `Demo complete: the added test kills the recorded boundary
+mutation.` The source fixture is unchanged, and the temporary project/report
+are removed. This demonstrates one repaired gap, not complete test adequacy;
+see the [verification contract](#example-finding-real-test-gaps) before using
+the same loop in your own project.
+
 ## Why
 
 Good mutation testing tools exist, but each makes trade-offs:
@@ -788,7 +814,7 @@ Most survivors here expose test gaps, but one is equivalent:
 - **`zero_to_one` at line 26** — `TestAbs` is entirely missing
 - **`return_empty` at line 29** — `Abs` return value never tested
 
-Run it yourself: `cargo test -- --ignored` (requires Go).
+For a runnable find-and-repair walkthrough, see [Try a complete test repair](#try-a-complete-test-repair).
 
 To close a genuine gap, save a JSON report, replay its survivor, then add a test and run `togi replay <id> --report togi-report.json --verify-killed`. Verification succeeds only if the unmutated build/test route passes and a fresh direct run kills that exact mutant, using two isolated copies of the same input snapshot. Ordinary replay still checks the historical outcome and Git HEAD. Verification allows committed or uncommitted test changes at a different HEAD, but the entire target source file must remain unchanged (including any inline tests). It proves the snapshotted suite rejects the mutant, not that only tests changed or that the suite is non-flaky. Both modes use the report's stored commands and leave the report and Togi cache/history unchanged.
 

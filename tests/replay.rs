@@ -750,6 +750,214 @@ fn default_go_survivor_can_be_replayed_and_verified_after_a_boundary_test() {
     }
 }
 
+#[cfg(unix)]
+mod go_demo {
+    use super::*;
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    fn fixture() -> TempDir {
+        let sandbox = TempDir::new().unwrap();
+        let root = sandbox.path();
+        let repo = root.join("demo repo");
+        fs::create_dir_all(repo.join("examples")).unwrap();
+        fs::create_dir_all(repo.join("tests/fixtures/go")).unwrap();
+        let original = Path::new(env!("CARGO_MANIFEST_DIR"));
+        fs::copy(
+            original.join("examples/demo.sh"),
+            repo.join("examples/demo.sh"),
+        )
+        .unwrap();
+        for name in ["calc.go", "calc_test.go", "numbers.go", "go.mod"] {
+            fs::copy(
+                original.join("tests/fixtures/go").join(name),
+                repo.join("tests/fixtures/go").join(name),
+            )
+            .unwrap();
+        }
+        fs::create_dir(root.join("bin")).unwrap();
+        fs::create_dir(root.join("scratch with spaces")).unwrap();
+        // No configured identity, and commits would require signing unless the
+        // demo explicitly configures its disposable repository.
+        fs::write(root.join("gitconfig"), "[commit]\n\tgpgsign = true\n").unwrap();
+        sandbox
+    }
+
+    fn command(root: &Path) -> Command {
+        let mut cmd = Command::new("bash");
+        cmd.arg(root.join("demo repo/examples/demo.sh"))
+            .current_dir(root)
+            .env("TOGI_BIN", "bin/togi with spaces")
+            .env("GIT_CONFIG_GLOBAL", root.join("gitconfig"))
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GOCACHE", root.join("go-cache"))
+            .env("GOTOOLCHAIN", "local")
+            .env("TMPDIR", root.join("scratch with spaces"))
+            .timeout(std::time::Duration::from_secs(180));
+        cmd
+    }
+
+    #[test]
+    #[ignore = "requires Bash, Go, and jq"]
+    fn script_finds_replays_and_verifies_a_real_gap() {
+        let sandbox = fixture();
+        let root = sandbox.path();
+        symlink(togi().get_program(), root.join("bin/togi with spaces")).unwrap();
+        let before = snapshot_tree(&root.join("demo repo"));
+        let output = command(root).output().unwrap();
+        assert!(
+            output.status.success(),
+            "demo failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for expected in [
+            "SURVIVED: IsPositive(0)",
+            "Fresh result: survived",
+            "Unchanged weak tests: repair correctly rejected.",
+            "func TestIsPositiveAtZero",
+            "Fresh result: killed",
+            "Verified: the current suite kills mutation",
+            "Demo complete: the added test kills the recorded boundary mutation.",
+        ] {
+            assert!(stdout.contains(expected), "missing {expected}\n{stdout}");
+        }
+        assert_eq!(snapshot_tree(&root.join("demo repo")), before);
+        assert_eq!(
+            fs::read_dir(root.join("scratch with spaces"))
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    #[ignore = "requires Bash and jq"]
+    fn script_rejects_campaign_and_repair_failures() {
+        let sandbox = fixture();
+        let root = sandbox.path();
+        let bin = root.join("bin");
+        fs::write(bin.join("go"), "#!/bin/sh\nexit \"$DEMO_GO_STATUS\"\n").unwrap();
+        fs::set_permissions(bin.join("go"), fs::Permissions::from_mode(0o755)).unwrap();
+        let stub = bin.join("togi with spaces");
+        fs::write(
+            &stub,
+            r#"#!/usr/bin/env bash
+set -eu
+if [[ ${2:-} == --help ]]; then
+  echo '  --verify-killed'
+  exit 0
+fi
+echo "$1" >> "$DEMO_CALLS"
+if [[ $1 == check ]]; then
+  cat "$DEMO_REPORT"
+  exit "$DEMO_CHECK_STATUS"
+fi
+if [[ ${5:-} != --verify-killed ]]; then
+  [[ $DEMO_CASE != replay_error ]] || exit 2
+  echo 'Fresh result: survived'
+elif ! grep -q 'func TestIsPositiveAtZero' calc_test.go; then
+  [[ $DEMO_CASE != weak_success ]] || exit 0
+  [[ $DEMO_CASE != weak_unrelated_error ]] || exit 2
+  echo 'repair not verified: expected killed, fresh execution returned survived' >&2
+  exit 2
+else
+  [[ $DEMO_CASE != repair_error ]] || exit 2
+  echo 'Verified: the current suite kills mutation #1'
+fi
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
+        let path = std::env::join_paths(
+            std::iter::once(bin).chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+        )
+        .unwrap();
+        let before = snapshot_tree(&root.join("demo repo"));
+        for case in [
+            "baseline_error",
+            "check_success",
+            "check_error",
+            "invalid_json",
+            "partial",
+            "timeout",
+            "build_error",
+            "cached",
+            "unreplayable",
+            "replay_error",
+            "weak_success",
+            "weak_unrelated_error",
+            "repair_error",
+        ] {
+            let mut report = json!({
+                "schema_version": 1, "kind": "mutation_report", "partial": false,
+                "total": 1, "planned_total": 1, "killed": 0, "survived": 1,
+                "timeout": 0, "build_errors": 0,
+                "mutations": [{"id": 1, "source_path": "calc.go", "operator": "gt_to_gte",
+                    "original": ">", "replacement": ">=", "result": "survived",
+                    "execution": {"state": "executed"}, "replay": {"kind": "regular_direct"}}]
+            });
+            match case {
+                "partial" => report["partial"] = json!(true),
+                "timeout" => report["timeout"] = json!(1),
+                "build_error" => report["build_errors"] = json!(1),
+                "cached" => report["mutations"][0]["execution"]["state"] = json!("exact_cache"),
+                "unreplayable" => report["mutations"][0]["replay"]["kind"] = json!("unavailable"),
+                _ => {}
+            }
+            let report_path = root.join("stub-report.json");
+            if case == "invalid_json" {
+                fs::write(&report_path, "not a report").unwrap();
+            } else {
+                write_json(&report_path, &report);
+            }
+            let calls = root.join("calls");
+            fs::write(&calls, "").unwrap();
+            let output = command(root)
+                .env("PATH", &path)
+                .env("DEMO_CASE", case)
+                .env("DEMO_REPORT", &report_path)
+                .env("DEMO_CALLS", &calls)
+                .env(
+                    "DEMO_GO_STATUS",
+                    if case == "baseline_error" { "1" } else { "0" },
+                )
+                .env(
+                    "DEMO_CHECK_STATUS",
+                    match case {
+                        "check_success" => "0",
+                        "check_error" => "2",
+                        _ => "1",
+                    },
+                )
+                .output()
+                .unwrap();
+            assert!(!output.status.success(), "{case} unexpectedly succeeded");
+            let expected_calls = match case {
+                "baseline_error" => "",
+                "replay_error" => "check\nreplay\n",
+                "weak_success" | "weak_unrelated_error" => "check\nreplay\nreplay\n",
+                "repair_error" => "check\nreplay\nreplay\nreplay\n",
+                _ => "check\n",
+            };
+            assert_eq!(
+                fs::read_to_string(&calls).unwrap(),
+                expected_calls,
+                "{case} did not reach its intended failure stage: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(!String::from_utf8_lossy(&output.stdout).contains("Demo complete:"));
+            assert_eq!(snapshot_tree(&root.join("demo repo")), before);
+            assert_eq!(
+                fs::read_dir(root.join("scratch with spaces"))
+                    .unwrap()
+                    .count(),
+                0
+            );
+        }
+    }
+}
+
 #[test]
 fn legacy_report_without_build_origin_replays_configured_go_lookalike_unchanged() {
     let fixture = setup_replay_fixture();
