@@ -5369,7 +5369,7 @@ fn github_action_inputs_have_no_baked_in_defaults() {
     }
 
     for (name, default) in [
-        ("version", "'v0.5.2'"),
+        ("version", "'v0.6.0'"),
         ("upload-report", "'true'"),
         ("report-retention-days", "'14'"),
         ("report-artifact-name", "'togi-report'"),
@@ -5398,7 +5398,7 @@ fn github_action_inputs_have_no_baked_in_defaults() {
         "Action releases must not resolve a mutable version"
     );
     for expected in [
-        "VERSION=\"${TOGI_VERSION_INPUT:-v0.5.2}\"",
+        "VERSION=\"${TOGI_VERSION_INPUT:-v0.6.0}\"",
         "^v[0-9]+[.][0-9]+[.][0-9]+$",
         "resolve-togi-asset.sh",
         "fetch-togi-release-asset.sh",
@@ -6803,6 +6803,13 @@ fn released_binary_smoke_stages_complete_go_fixture() {
     let bin_dir = dir.path().join("bin");
     fs::create_dir_all(&bin_dir).unwrap();
     write_fake_curl(&bin_dir);
+    let cargo = bin_dir.join("cargo");
+    fs::write(
+        &cargo,
+        "#!/usr/bin/env bash\necho 'release smoke must not rebuild togi' >&2\nexit 97\n",
+    )
+    .unwrap();
+    chmod_executable(&cargo);
     let mut paths = vec![bin_dir];
     paths.extend(
         std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
@@ -6839,6 +6846,14 @@ fn released_binary_smoke_stages_complete_go_fixture() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for expected in [
+        "SURVIVED: IsPositive(0) changes from false to true;",
+        "Unchanged weak tests: repair correctly rejected.",
+        "Demo complete: the added test kills the recorded boundary mutation.",
+    ] {
+        assert!(stdout.contains(expected), "missing {expected:?}: {stdout}");
+    }
 }
 
 #[test]
