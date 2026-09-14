@@ -862,7 +862,7 @@ fn setup_two_line_mutation_repo() -> TempDir {
     dir
 }
 
-fn coverage_gate_sarif(gate_args: &[&str]) -> serde_json::Value {
+fn coverage_gate_sarif(scope_args: &[&str], gate_args: &[&str]) -> serde_json::Value {
     let dir = setup_git_repo();
     fs::write(
         dir.path().join("lcov.info"),
@@ -872,8 +872,6 @@ fn coverage_gate_sarif(gate_args: &[&str]) -> serde_json::Value {
     let output = togi()
         .args([
             "check",
-            "--base",
-            "HEAD",
             "--format",
             "sarif",
             "--coverage-file",
@@ -881,6 +879,7 @@ fn coverage_gate_sarif(gate_args: &[&str]) -> serde_json::Value {
             "--test-cmd",
             "togi-coverage-gate-must-not-run-tests",
         ])
+        .args(scope_args)
         .args(gate_args)
         .current_dir(dir.path())
         .output()
@@ -917,7 +916,7 @@ fn coverage_gate_sarif(gate_args: &[&str]) -> serde_json::Value {
 
 #[test]
 fn check_coverage_gate_sarif_line_threshold() {
-    let sarif = coverage_gate_sarif(&["--min-line-coverage", "80"]);
+    let sarif = coverage_gate_sarif(&["--base", "HEAD"], &["--min-line-coverage", "80"]);
     let results = sarif["runs"][0]["results"].as_array().unwrap();
     assert_eq!(results.len(), 1);
     assert_eq!(results[0]["ruleId"], "togi.coverage.line-threshold");
@@ -928,7 +927,7 @@ fn check_coverage_gate_sarif_line_threshold() {
 
 #[test]
 fn check_coverage_gate_sarif_diff_threshold() {
-    let sarif = coverage_gate_sarif(&["--min-diff-coverage", "80"]);
+    let sarif = coverage_gate_sarif(&["--base", "HEAD"], &["--min-diff-coverage", "80"]);
     let results = sarif["runs"][0]["results"].as_array().unwrap();
     assert_eq!(results.len(), 1);
     assert_eq!(results[0]["ruleId"], "togi.coverage.diff-threshold");
@@ -939,13 +938,16 @@ fn check_coverage_gate_sarif_diff_threshold() {
 
 #[test]
 fn check_coverage_gate_sarif_uncovered_lines_excludes_passing_thresholds() {
-    let sarif = coverage_gate_sarif(&[
-        "--min-line-coverage",
-        "0",
-        "--min-diff-coverage",
-        "0",
-        "--fail-on-uncovered-diff",
-    ]);
+    let sarif = coverage_gate_sarif(
+        &["--base", "HEAD"],
+        &[
+            "--min-line-coverage",
+            "0",
+            "--min-diff-coverage",
+            "0",
+            "--fail-on-uncovered-diff",
+        ],
+    );
     let results = sarif["runs"][0]["results"].as_array().unwrap();
     assert_eq!(results.len(), 2);
     for (result, line) in results.iter().zip([5, 6]) {
@@ -956,6 +958,16 @@ fn check_coverage_gate_sarif_uncovered_lines_excludes_passing_thresholds() {
         assert_eq!(location["artifactLocation"]["uri"], "main.go");
         assert_eq!(location["region"]["startLine"], line);
     }
+}
+
+#[test]
+fn check_coverage_gate_sarif_all_has_no_stdout_banner() {
+    let sarif = coverage_gate_sarif(&["--all"], &["--min-line-coverage", "80"]);
+    assert_eq!(sarif["runs"][0]["results"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        sarif["runs"][0]["results"][0]["ruleId"],
+        "togi.coverage.line-threshold"
+    );
 }
 
 #[cfg(unix)]

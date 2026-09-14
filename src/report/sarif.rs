@@ -346,12 +346,20 @@ fn coverage_gate_to_sarif_string(report: &crate::coverage::CoverageGateReport) -
 fn coverage_artifact_uri(file: &std::path::Path) -> String {
     use std::fmt::Write;
 
-    let mut uri = String::new();
-    for byte in file
+    #[cfg(unix)]
+    let path = {
+        use std::os::unix::ffi::OsStrExt;
+        file.as_os_str().as_bytes()
+    };
+    #[cfg(not(unix))]
+    let normalized = file
         .to_string_lossy()
-        .replace(std::path::MAIN_SEPARATOR, "/")
-        .bytes()
-    {
+        .replace(std::path::MAIN_SEPARATOR, "/");
+    #[cfg(not(unix))]
+    let path = normalized.as_bytes();
+
+    let mut uri = String::new();
+    for &byte in path {
         match byte {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' => {
                 uri.push(byte as char);
@@ -535,6 +543,23 @@ mod tests {
                     .is_empty()
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn coverage_gate_sarif_preserves_non_utf8_path_bytes() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let mut report = coverage_report();
+        report.uncovered_changed_lines[0].file =
+            PathBuf::from(std::ffi::OsStr::from_bytes(b"src/gap-\xff.go"));
+        let value: Value =
+            serde_json::from_str(&coverage_gate_to_sarif_string(&report).unwrap()).unwrap();
+        assert_eq!(
+            value["runs"][0]["results"][2]["locations"][0]["physicalLocation"]["artifactLocation"]
+                ["uri"],
+            "src/gap-%FF.go"
+        );
     }
 
     fn mutation(id: u32, file: &str, line: usize, operator: &str, description: &str) -> Mutation {
