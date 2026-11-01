@@ -98,10 +98,15 @@ fn main() {
             mutant_id,
             report,
             show_output,
+            verify_killed,
         } => {
-            if let Err(e) =
-                togi::replay::replay_mutation(mutant_id, &report, show_output, cancelled.as_ref())
-            {
+            if let Err(e) = togi::replay::replay_mutation(
+                mutant_id,
+                &report,
+                show_output,
+                verify_killed,
+                cancelled.as_ref(),
+            ) {
                 eprintln!("Error: {e:#}");
                 process::exit(2);
             }
@@ -393,7 +398,10 @@ fn run_check(cfg: togi::cli::CheckArgs, cancelled: Arc<AtomicBool>) -> anyhow::R
         &config,
         all,
         &paths,
-        output_format == togi::cli::OutputFormat::Json,
+        matches!(
+            output_format,
+            togi::cli::OutputFormat::Json | togi::cli::OutputFormat::Sarif
+        ),
         &project_root,
     )?;
     if changed_files.is_empty() {
@@ -1333,7 +1341,7 @@ fn collect_files(
     config: &togi::config::Config,
     all: bool,
     paths: &[PathBuf],
-    json_output: bool,
+    machine_output: bool,
     project_root: &Path,
 ) -> anyhow::Result<Vec<ChangedFile>> {
     let skip_noisy = config.mutations.skip_noisy_files;
@@ -1346,14 +1354,14 @@ fn collect_files(
             files.retain(|f| paths.iter().any(|p| f.path.starts_with(p)));
         }
         if files.is_empty() {
-            if json_output {
+            if machine_output {
                 eprintln!("No supported source files found. Nothing to mutate.");
             } else {
                 println!("No supported source files found. Nothing to mutate.");
             }
             return Ok(vec![]);
         }
-        if json_output {
+        if machine_output {
             eprintln!("Scanning all {} supported files...", files.len());
         } else {
             println!("Scanning all {} supported files...", files.len());
@@ -1363,7 +1371,7 @@ fn collect_files(
 
     let diff_output = get_git_diff(&config.diff.base)?;
     if diff_output.is_empty() {
-        if json_output {
+        if machine_output {
             eprintln!(
                 "No changes found in diff against `{}`. The selected diff is empty; that is normal for a clean clone, not an error.\n\
 Preview all supported files without tests (bounded):\n\
@@ -1393,7 +1401,7 @@ If command detection is ambiguous, run `togi init` from the repository root.",
     }
     files.retain(|f| !togi::diff::matches_user_excludes(&f.path, exclude_globs));
     if files.is_empty() {
-        if json_output {
+        if machine_output {
             eprintln!("No added/modified lines found. Nothing to mutate.");
         } else {
             println!("No added/modified lines found. Nothing to mutate.");

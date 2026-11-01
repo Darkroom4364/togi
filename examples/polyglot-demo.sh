@@ -44,6 +44,8 @@ if [[ ! -x "$TOGI" ]]; then
   echo "Building togi..."
   cargo build --manifest-path "$ROOT/Cargo.toml" --target-dir "$TARGET_DIR"
 fi
+# Resolve a caller-supplied relative path before entering the temporary project.
+TOGI="$(cd "$(dirname "$TOGI")" && pwd)/$(basename "$TOGI")"
 
 echo "=== togi demo: one mutation run across Go + Rust + Python ==="
 echo ""
@@ -54,8 +56,11 @@ echo "language's suite and reports one unified result with one score gate."
 echo ""
 
 # Work in a temp copy so we don't pollute the fixture
-WORK=$(mktemp -d)
-trap 'rm -rf "$WORK"' EXIT
+DEMO_DIR=$(mktemp -d "${TMPDIR:-/tmp}/togi-polyglot.XXXXXX")
+trap 'rm -rf -- "$DEMO_DIR"' EXIT
+WORK="$DEMO_DIR/project"
+REPORT="$DEMO_DIR/togi-report.json"
+mkdir "$WORK"
 cp -r "$FIXTURE"/* "$WORK/"
 cd "$WORK"
 REPORT="$WORK/togi-report.json"
