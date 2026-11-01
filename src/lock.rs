@@ -1,7 +1,7 @@
 //! File-based lock to prevent concurrent togi runs on the same repo.
 
 use anyhow::{Context, Result, bail};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
@@ -76,6 +76,45 @@ fn flock_with_retry(file: &File) -> std::io::Result<()> {
     }
 }
 
+#[cfg(all(test, unix))]
+mod test_hooks {
+    use std::sync::mpsc::{Receiver, Sender, channel};
+    use std::sync::{LazyLock, Mutex};
+
+    struct AfterCreatePause {
+        created: Sender<()>,
+        resume: Receiver<()>,
+    }
+
+    static AFTER_CREATE_PAUSE: LazyLock<Mutex<Option<AfterCreatePause>>> =
+        LazyLock::new(|| Mutex::new(None));
+
+    pub(super) fn install_after_create_pause() -> (Receiver<()>, Sender<()>) {
+        let (created, created_rx) = channel();
+        let (resume, resume_rx) = channel();
+        let mut pause = AFTER_CREATE_PAUSE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(pause.is_none(), "after-create pause already installed");
+        *pause = Some(AfterCreatePause {
+            created,
+            resume: resume_rx,
+        });
+        (created_rx, resume)
+    }
+
+    pub(super) fn pause_after_create() {
+        if let Some(pause) = AFTER_CREATE_PAUSE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        {
+            pause.created.send(()).unwrap();
+            pause.resume.recv().unwrap();
+        }
+    }
+}
+
 /// Acquire a lock for the given project root directory.
 /// Returns an error if another togi process is already running.
 pub fn acquire(project_root: &Path) -> Result<LockGuard> {
@@ -94,8 +133,9 @@ pub fn acquire(project_root: &Path) -> Result<LockGuard> {
                 .open(&path)
             {
                 Ok(mut f) => {
+                    #[cfg(all(test, unix))]
+                    test_hooks::pause_after_create();
                     if let Err(e) = flock_with_retry(&f) {
-                        let _ = fs::remove_file(&path);
                         bail!(
                             "failed to acquire advisory lock on new file {}: {e}",
                             path.display()
@@ -157,8 +197,16 @@ pub fn acquire(project_root: &Path) -> Result<LockGuard> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::sync::{Mutex, OnceLock};
     use tempfile::TempDir;
+
+    #[cfg(unix)]
+    use std::io::{BufRead, BufReader, Read};
+    #[cfg(unix)]
+    use std::process::{Command, Stdio};
+    #[cfg(unix)]
+    use std::thread;
 
     fn lock_test_guard() -> std::sync::MutexGuard<'static, ()> {
         static LOCK_TEST_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
@@ -204,5 +252,76 @@ mod tests {
 
         let _guard = acquire(dir.path()).unwrap();
         assert!(lock_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fast_path_flock_failure_keeps_holder_inode_reachable() {
+        let _serial = lock_test_guard();
+        let dir = TempDir::new().unwrap();
+        let lock_path = dir.path().join(LOCK_FILE);
+        let (created, resume) = test_hooks::install_after_create_pause();
+
+        let root = dir.path().to_path_buf();
+        let creator = thread::spawn(move || acquire(&root));
+        created.recv().unwrap();
+
+        // A separate process owns the advisory lock on the inode A just created.
+        // foxguard: ignore[rs/no-command-injection]
+        // `current_exe` is this active test binary; fixed child-test arguments and
+        // its subprocess are required to exercise the lock race.
+        let mut holder = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "lock::tests::fast_path_lock_race_holder",
+                "--nocapture",
+            ])
+            .env("TOGI_LOCK_RACE_HOLDER_PATH", &lock_path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap();
+        let mut holder_stdout = BufReader::new(holder.stdout.take().unwrap());
+        loop {
+            let mut line = String::new();
+            assert_ne!(holder_stdout.read_line(&mut line).unwrap(), 0);
+            if line.trim_end() == "TOGI_LOCK_RACE_HOLDER_READY" {
+                break;
+            }
+        }
+
+        resume.send(()).unwrap();
+        assert!(creator.join().unwrap().is_err());
+        assert!(lock_path.exists());
+        assert!(acquire(dir.path()).is_err());
+
+        std::io::Write::write_all(holder.stdin.as_mut().unwrap(), b"release").unwrap();
+        drop(holder.stdin.take());
+        let mut holder_output = String::new();
+        holder_stdout.read_to_string(&mut holder_output).unwrap();
+        assert!(holder.wait().unwrap().success(), "{holder_output}");
+
+        let _guard = acquire(dir.path()).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fast_path_lock_race_holder() {
+        let Some(lock_path) = std::env::var_os("TOGI_LOCK_RACE_HOLDER_PATH") else {
+            return;
+        };
+
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(lock_path)
+            .unwrap();
+        try_flock(&file).unwrap();
+        println!("TOGI_LOCK_RACE_HOLDER_READY");
+        std::io::Write::flush(&mut std::io::stdout()).unwrap();
+
+        let mut release = [0];
+        std::io::Read::read_exact(&mut std::io::stdin(), &mut release).unwrap();
     }
 }

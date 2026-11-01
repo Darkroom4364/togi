@@ -9,10 +9,9 @@
 //! Killer-test equality is only a conservative *proxy* for subsumption, so
 //! skipping is strictly opt-in and strictly evidence-based: a mutant is only
 //! ever skipped when history holds a `Killed` verdict with a recorded killer
-//! test whose source and command hashes still match the current run. Any
-//! doubt (no entry, stale hashes, non-killed verdict, no killer test) means
-//! the mutant executes normally.
-
+//! test whose source, command, and relevant-test hashes still match the
+//! current run. Any doubt (no entry, stale hashes, non-killed verdict, no
+//! killer test) means the mutant executes normally.
 use crate::Mutation;
 use std::collections::HashMap;
 use std::path::PathBuf;

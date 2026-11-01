@@ -1,27 +1,48 @@
 #!/usr/bin/env bash
-# Demo: find, replay, and repair one genuine Go test gap.
-# Requires: Bash, Git, Go, jq, and Rust (unless TOGI_BIN supplies a trusted build).
+# Demo: togi finding test gaps in a Go project with weak tests
+# Requires: go and either cargo or an executable TOGI_BIN.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-TOGI="${TOGI_BIN:-$ROOT/target/debug/togi}"
+TARGET_DIR="${CARGO_TARGET_DIR:-"$ROOT/target"}"
+case "$TARGET_DIR" in
+  /*) ;;
+  *) TARGET_DIR="$ROOT/$TARGET_DIR" ;;
+esac
+TOGI="${TOGI_BIN:-"$TARGET_DIR/debug/togi"}"
+case "$TOGI" in
+  /*) ;;
+  *) TOGI="$ROOT/$TOGI" ;;
+esac
 FIXTURE="$ROOT/tests/fixtures/go"
 
-for tool in git go jq; do
-  command -v "$tool" >/dev/null || { echo "Missing demo prerequisite: $tool" >&2; exit 1; }
-done
+is_clean_survivor_report() {
+  local report survived timeout build_errors pattern
 
-if [[ -z "${TOGI_BIN:-}" ]]; then
+  [[ -s "$1" ]] || return 1
+  report=$(<"$1")
+
+  pattern='"survived"[[:space:]]*:[[:space:]]*([0-9]+)'
+  [[ "$report" =~ $pattern ]] || return 1
+  survived="${BASH_REMATCH[1]}"
+  pattern='"timeout"[[:space:]]*:[[:space:]]*([0-9]+)'
+  [[ "$report" =~ $pattern ]] || return 1
+  timeout="${BASH_REMATCH[1]}"
+  pattern='"build_errors"[[:space:]]*:[[:space:]]*([0-9]+)'
+  [[ "$report" =~ $pattern ]] || return 1
+  build_errors="${BASH_REMATCH[1]}"
+
+  (( survived > 0 && timeout == 0 && build_errors == 0 ))
+}
+
+if [[ ! -x "$TOGI" ]]; then
+  if [[ -n "${TOGI_BIN:-}" ]]; then
+    echo "togi binary not found at $TOGI" >&2
+    exit 1
+  fi
   echo "Building togi..."
-  cargo build --locked --manifest-path "$ROOT/Cargo.toml" --target-dir "$ROOT/target"
-fi
-[[ -x "$TOGI" ]] || { echo "Togi binary is not executable: $TOGI" >&2; exit 1; }
-# Resolve a caller-supplied relative path before entering the temporary project.
-TOGI="$(cd "$(dirname "$TOGI")" && pwd)/$(basename "$TOGI")"
-if ! "$TOGI" replay --help | grep -F -- '--verify-killed' >/dev/null; then
-  echo "This demo requires a Togi build with replay --verify-killed (not v0.5.2)." >&2
-  exit 1
+  cargo build --manifest-path "$ROOT/Cargo.toml" --target-dir "$TARGET_DIR"
 fi
 
 echo "=== togi demo: find -> replay -> add a test -> verify ==="
@@ -35,8 +56,7 @@ REPORT="$DEMO_DIR/togi-report.json"
 mkdir "$WORK"
 cp "$FIXTURE"/*.go "$FIXTURE/go.mod" "$WORK/"
 cd "$WORK"
-export GOWORK=off
-export GOTOOLCHAIN=local
+REPORT="$WORK/togi-report.json"
 
 # Stage a one-line PR: fix the negative-input check, leaving zero untested.
 # Only that changed line is selected; unrelated/equivalent Max mutants stay out.
@@ -103,6 +123,17 @@ printf '\n%s\n' 'func TestIsPositiveAtZero(t *testing.T) {
     }
 }' | tee -a calc_test.go
 
-echo "5. Verify the original suite passes and the exact recorded mutant is killed."
-"$TOGI" replay "$MUTANT_ID" --report "$REPORT" --verify-killed
-echo "Demo complete: the added test kills the recorded boundary mutation."
+# GOWORK=off avoids Go complaining about workspace in temp dirs
+# A clean survivor report is expected; reject timeout and build-error reports.
+if GOWORK=off "$TOGI" check --base HEAD~1 --test-cmd "go test ./..." --timeout 30 --jobs 1 --json-report "$REPORT"; then
+  status=0
+else
+  status=$?
+fi
+if [[ "$status" != 0 && "$status" != 1 ]]; then
+  exit "$status"
+fi
+if ! is_clean_survivor_report "$REPORT"; then
+  echo "Expected a JSON report with survived > 0, timeout == 0, and build_errors == 0." >&2
+  exit 1
+fi

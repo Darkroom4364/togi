@@ -286,17 +286,9 @@ pub fn print_coverage_gate_report(
     report: &crate::coverage::CoverageGateReport,
     format: crate::cli::OutputFormat,
 ) -> anyhow::Result<()> {
-    use crate::cli::OutputFormat;
-    match format {
-        OutputFormat::Json => coverage::print_json(report)?,
-        OutputFormat::Github => coverage::print_github(report),
-        OutputFormat::Html => {
-            let path = std::path::Path::new("togi-coverage-report.html");
-            coverage::write_html(report, path)?;
-            eprintln!("HTML coverage report written to {}", path.display());
-        }
-        OutputFormat::Sarif => sarif::print_coverage_gate_report(report)?,
-        OutputFormat::Terminal => coverage::print_terminal(report),
+    coverage::print(report, format)?;
+    if matches!(format, crate::cli::OutputFormat::Html) {
+        eprintln!("HTML coverage report written to togi-coverage-report.html");
     }
     Ok(())
 }
