@@ -5726,7 +5726,8 @@ fn github_release_install_guide_documents_released_contract() {
         "EXPECTED_SHA=$(awk",
         "ACTUAL_SHA=$(sha256sum",
         "Checksum mismatch",
-        "`togi` is not currently published on crates.io.",
+        "cargo install togi --locked",
+        "uses: Darkroom4364/togi@v0",
         "cargo install --git https://github.com/Darkroom4364/togi --rev <commit-sha> --locked",
     ] {
         assert!(
@@ -5737,10 +5738,6 @@ fn github_release_install_guide_documents_released_contract() {
     assert!(
         !install.contains("TOGI_VERSION=v0.5.2"),
         "Install section must not point the release archive at v0.5.2"
-    );
-    assert!(
-        !install.contains("cargo install togi"),
-        "Install section must not present an unavailable crates.io install"
     );
 }
 

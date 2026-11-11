@@ -105,6 +105,21 @@ Try it: `examples/polyglot-demo.sh` runs a PR-sized Go + Rust + Python change th
 
 ## Install
 
+```bash
+cargo install togi --locked
+```
+
+Or run it in CI with the GitHub Action:
+
+```yaml
+- uses: actions/checkout@v4
+  with:
+    fetch-depth: 0
+- uses: Darkroom4364/togi@v0
+  with:
+    format: github
+```
+
 ### Linux x86_64 (Tier 1) first success
 
 GitHub Releases are the supported binary-install path. This tested release
@@ -156,8 +171,7 @@ its score threshold determines that gate instead; a baseline regression still ex
 `1`. Exit `2` means an execution error (for example configuration, Git, or parsing)
 that you should fix before relying on the result.
 
-`togi` is not currently published on crates.io. If you intentionally want a
-source-based install tied to a reviewed revision:
+If you intentionally want a source-based install tied to a reviewed revision:
 ```bash
 cargo install --git https://github.com/Darkroom4364/togi --rev <commit-sha> --locked
 ```
