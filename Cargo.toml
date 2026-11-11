@@ -9,6 +9,7 @@ repository = "https://github.com/Darkroom4364/togi"
 readme = "README.md"
 keywords = ["mutation-testing", "testing", "diff", "tree-sitter", "code-quality"]
 categories = ["development-tools::testing", "command-line-utilities"]
+exclude = [".github/", "tests/", "benchmarks/", "docs/", "editors/", "examples/", "CLAUDE.md", "action.yml"]
 
 [features]
 # Narrowly exposes the libFuzzer execution harness; normal builds have no fuzz API.
