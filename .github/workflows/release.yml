@@ -3,7 +3,7 @@ name: Release
 on:
   push:
     tags:
-      - 'v*'
+      - 'v*.*.*'
 
 permissions:
   contents: write
@@ -331,3 +331,16 @@ jobs:
         if: ${{ matrix.tier == 2 }}
         shell: bash
         run: bash ./.github/scripts/run-released-binary-install-smoke.sh
+
+  update-major-tag:
+    name: Update Floating Major Tag
+    needs: [verify-release-identity, verify-release]
+    if: ${{ !contains(github.ref_name, '-') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Move vN tag to this release
+        run: |
+          MAJOR="${GITHUB_REF_NAME%%.*}"
+          git tag -f "$MAJOR" "$GITHUB_SHA"
+          git push -f origin "refs/tags/$MAJOR"
